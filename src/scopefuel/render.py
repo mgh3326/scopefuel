@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from .cache import format_age
-from .model import ProviderResult, iso_to_local
+from .model import ProviderResult, iso_to_local, overall_mark
 
-MARK_TEXT = {"ok": "ok", "warn": "WARN", "crit": "CRIT"}
-MARK_COLOR = {"ok": "\033[32m", "warn": "\033[33m", "crit": "\033[31m"}
+MARK_TEXT = {"ok": "ok", "warn": "WARN", "crit": "CRIT", "degraded": "DEGRADED"}
+MARK_COLOR = {"ok": "\033[32m", "warn": "\033[33m", "crit": "\033[31m", "degraded": "\033[33m"}
 RESET = "\033[0m"
 
 
@@ -77,15 +77,13 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
     예: [CRIT] claude now 6% week 97%(Fable소진) | codex week 82% | agy gemini 7% / 3p 57%
     """
     chunks: list[str] = []
-    worst = "ok"
-    ranking = {"ok": 0, "warn": 1, "crit": 2}
+    worst = overall_mark(results)
     for result in results:
         if result.error:
-            chunks.append(f"{result.id} n/a")
+            err_msg = result.error.splitlines()[0]
+            chunks.append(f"{result.id} n/a({err_msg})")
             continue
         verdict = result.verdict
-        if ranking[verdict.mark] > ranking[worst]:
-            worst = verdict.mark
         parts: list[str] = []
         if verdict.basis == "group":
             parts += [f"{g} {v:g}%" for g, v in sorted(verdict.groups.items())]

@@ -70,6 +70,8 @@ def _from_entry(entry: dict, provider_id: str, now: float) -> ProviderResult:
         plan=payload.get("plan"),
         buckets=buckets,
         note=payload.get("note"),
+        error=payload.get("error"),
+        hint=payload.get("hint"),
         source=payload.get("source"),
         fetched_at=fetched_at,
         age_s=now - fetched_at,

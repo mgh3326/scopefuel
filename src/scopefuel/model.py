@@ -19,7 +19,7 @@ SCHEMA = "scopefuel.v1"
 
 ScopeKind = Literal["account", "model", "group"]
 Horizon = Literal["now", "week"]
-Mark = Literal["ok", "warn", "crit"]
+Mark = Literal["ok", "warn", "crit", "degraded"]
 
 WARN_PCT = 75.0
 CRIT_PCT = 90.0
@@ -114,13 +114,28 @@ class ProviderResult:
     raw: dict | None = None
 
     @property
+    def status(self) -> str:
+        return "error" if self.error else ("stale" if self.stale else "ok")
+
+    @property
     def verdict(self) -> Verdict:
-        return verdict_for(self.buckets)
+        v = verdict_for(self.buckets)
+        if (self.error or self.status != "ok") and v.mark == "ok":
+            return Verdict(
+                now_pct=v.now_pct,
+                week_pct=v.week_pct,
+                blocking_pct=v.blocking_pct,
+                basis=v.basis,
+                mark="degraded",
+                exhausted=v.exhausted,
+                groups=v.groups,
+            )
+        return v
 
     def as_dict(self, include_raw: bool = False) -> dict:
         out = {
             "id": self.id,
-            "status": "error" if self.error else ("stale" if self.stale else "ok"),
+            "status": self.status,
             "plan": self.plan,
             "source": self.source,
             "fetched_at": self.fetched_at,
@@ -204,13 +219,12 @@ def verdict_for(buckets: list[Bucket]) -> Verdict:
 
 
 def overall_mark(results: list[ProviderResult]) -> Mark:
-    ranking = {"ok": 0, "warn": 1, "crit": 2}
+    ranking = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
     worst: Mark = "ok"
     for result in results:
-        if result.error:
-            continue
-        if ranking[result.verdict.mark] > ranking[worst]:
-            worst = result.verdict.mark
+        mark = result.verdict.mark
+        if ranking[mark] > ranking[worst]:
+            worst = mark
     return worst
 
 

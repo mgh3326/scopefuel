@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scopefuel.model import Bucket, ProviderResult, Scope, verdict_for
+from scopefuel.model import Bucket, ProviderResult, Scope, overall_mark, verdict_for
 
 
 def account(used: float, *, window: str = "7d", horizon: str = "week") -> Bucket:
@@ -67,3 +67,16 @@ def test_provider_result_serialization_includes_scope_and_horizon():
     assert payload["buckets"][0]["horizon"] == "week"
     assert payload["verdict"]["blocking_pct"] == 50
     assert payload["status"] == "ok"
+
+
+def test_errored_provider_has_degraded_verdict_mark():
+    res = ProviderResult(id="codex", error="HTTP 503 circuit open")
+    assert res.verdict.mark == "degraded"
+    assert res.as_dict()["verdict"]["mark"] == "degraded"
+
+
+def test_errored_provider_summary_mark_is_not_ok():
+    ok_res = ProviderResult(id="claude", buckets=[account(16)])
+    err_res = ProviderResult(id="codex", error="HTTP 503 circuit open")
+    assert overall_mark([ok_res, err_res]) == "degraded"
+

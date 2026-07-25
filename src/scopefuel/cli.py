@@ -17,7 +17,7 @@ from .cache import DEFAULT_TTL_S, collect
 from .model import SCHEMA, ProviderResult, overall_mark
 from .providers import default_order, registry
 
-MARK_RANK = {"ok": 0, "warn": 1, "crit": 2}
+MARK_RANK = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
 
 
 def build_parser(available: list[str]) -> argparse.ArgumentParser:

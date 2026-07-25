@@ -82,3 +82,25 @@ def test_table_marks_model_scope(capsys):
     assert "이 모델만" in out
     assert "Fable 소진" in out
     assert "지금(5h급) 6%" in out
+
+
+def test_brief_shows_error_reason_and_degraded_mark():
+    err_res = ProviderResult(id="codex", error="HTTP 503 circuit open")
+    line = render.brief([err_res], color=False)
+    assert line == "[DEGRADED] codex n/a(HTTP 503 circuit open)"
+
+
+def test_errored_provider_summary_mark_json(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: ProviderResult(id="codex", error="HTTP 503")})
+    assert cli.main(["--json", "--no-cache"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["mark"] == "degraded"
+    assert payload["providers"][0]["status"] == "error"
+    assert payload["providers"][0]["verdict"]["mark"] == "degraded"
+
+
+def test_exit_code_on_warn_triggers_exit_2_on_errored_provider(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: ProviderResult(id="codex", error="HTTP 503")})
+    assert cli.main(["--brief", "--no-cache", "--exit-code-on", "warn"]) == 2
+    capsys.readouterr()
+
