@@ -1,0 +1,26 @@
+id = "scopefuel.gauge"
+name = "scopefuel"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "AI 코딩 플랜의 스코프별 남은 여유(계정/모델/그룹 × 지금/이번주) 계기판"
+platforms = ["macos", "linux"]
+
+# scopefuel 은 의존성이 없으므로 build 단계는 uv tool 설치 한 번이면 끝난다.
+[[build]]
+command = ["uv", "tool", "install", "--force", "."]
+
+[[actions]]
+id = "check"
+title = "쿼타 한 줄 확인"
+command = ["scopefuel", "--brief"]
+
+[[actions]]
+id = "check-now"
+title = "지금 띄울 수 있나 (5h 창만)"
+command = ["scopefuel", "--brief", "--horizon", "now"]
+
+[[panes]]
+id = "gauge"
+title = "scopefuel"
+placement = "overlay"
+command = ["scopefuel", "--watch", "60"]

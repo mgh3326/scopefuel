@@ -1,0 +1,42 @@
+[project]
+name = "scopefuel"
+version = "0.1.0"
+description = "Scope-aware headroom gauge for AI coding agent plans — what is actually blocked, and when it refills"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "mgh3326" }]
+keywords = ["quota", "rate-limit", "headroom", "cli", "agents", "herdr"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mgh3326/scopefuel"
+Issues = "https://github.com/mgh3326/scopefuel/issues"
+
+[project.scripts]
+scopefuel = "scopefuel.cli:main"
+sfuel = "scopefuel.cli:main"
+
+# 서드파티 provider 플러그인은 entry-point 그룹 "scopefuel.providers" 에 등록한다
+# (docs/adding-a-provider.md 참고 — 여기서 빈 테이블을 선언할 필요는 없다).
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scopefuel"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

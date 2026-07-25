@@ -1,0 +1,84 @@
+"""CLI 계약: JSON 스키마, 종료코드, brief 표현."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from scopefuel import cli, render
+from scopefuel.model import SCHEMA, Bucket, ProviderResult, Scope
+
+CLAUDE = ProviderResult(
+    id="claude",
+    plan="max",
+    buckets=[
+        Bucket(label="5h", window="5h", used_pct=6.0, scope=Scope("account"), horizon="now"),
+        Bucket(label="7d all", window="7d", used_pct=97.0, scope=Scope("account"), horizon="week"),
+        Bucket(label="7d Fable", window="7d", used_pct=100.0, scope=Scope("model", "Fable"), horizon="week"),
+    ],
+)
+AGY = ProviderResult(
+    id="agy",
+    buckets=[
+        Bucket(label="gemini 5h", window="5h", used_pct=7.4, scope=Scope("group", "gemini"), horizon="now"),
+        Bucket(label="3p 5h", window="5h", used_pct=57.3, scope=Scope("group", "3p"), horizon="now"),
+    ],
+)
+
+
+@pytest.fixture(autouse=True)
+def stub_registry(monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": lambda: CLAUDE, "agy": lambda: AGY})
+
+
+def test_json_contract(capsys):
+    assert cli.main(["--json", "--no-cache"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == SCHEMA
+    assert payload["summary"]["mark"] == "crit"
+    claude = next(p for p in payload["providers"] if p["id"] == "claude")
+    assert claude["verdict"]["now_pct"] == 6.0
+    assert claude["verdict"]["week_pct"] == 97.0
+    assert claude["verdict"]["blocking_pct"] == 97.0
+    assert [b["scope"]["kind"] for b in claude["buckets"]] == ["account", "account", "model"]
+    agy = next(p for p in payload["providers"] if p["id"] == "agy")
+    assert agy["verdict"]["basis"] == "group"
+
+
+def test_brief_shows_both_axes_and_exhausted_scope():
+    line = render.brief([CLAUDE, AGY], color=False)
+    assert "now 6%" in line and "week 97%" in line
+    assert "Fable소진" in line
+    assert "gemini 7.4%" in line and "3p 57.3%" in line
+    assert line.startswith("[CRIT]")
+
+
+def test_brief_horizon_now_only():
+    line = render.brief([CLAUDE], color=False, horizon="now")
+    assert "now 6%" in line and "week" not in line
+
+
+def test_exit_code_on_threshold(capsys):
+    assert cli.main(["--brief", "--no-cache", "--exit-code-on", "crit"]) == 2
+    assert cli.main(["--brief", "--no-cache", "--only", "agy", "--exit-code-on", "crit"]) == 0
+    capsys.readouterr()
+
+
+def test_unknown_provider_is_rejected(capsys):
+    assert cli.main(["--only", "nope"]) == 2
+    assert "알 수 없는 provider" in capsys.readouterr().err
+
+
+def test_error_provider_yields_exit_1(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: {"x": lambda: ProviderResult(id="x", error="boom")})
+    assert cli.main(["--no-cache"]) == 1
+    assert "boom" in capsys.readouterr().out
+
+
+def test_table_marks_model_scope(capsys):
+    cli.main(["--no-cache", "--no-color", "--only", "claude"])
+    out = capsys.readouterr().out
+    assert "이 모델만" in out
+    assert "Fable 소진" in out
+    assert "지금(5h급) 6%" in out

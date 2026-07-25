@@ -1,0 +1,52 @@
+# 예제 스펙 — 이 디렉터리는 자동 로드되지 않습니다.
+# 실제로 쓰려면 ~/.config/scopefuel/providers/<id>.toml 로 복사하세요.
+#
+#   cp specs/example-generic.toml ~/.config/scopefuel/providers/myplan.toml
+#   scopefuel --only myplan
+#
+# 형식 설명: docs/adding-a-provider.md
+
+id = "myplan"
+plan_path = ["plan_type"]
+
+[credentials]
+file = "~/.myagent/auth.json"
+token_path = ["tokens", "access_token"]
+# token_env = "MYPLAN_TOKEN"   # 파일 대신 환경변수에서 읽을 때
+
+[request]
+method = "GET"
+url = "https://api.example.com/v1/usage"
+timeout = 20
+
+[request.headers]
+Authorization = "Bearer {token}"
+Accept = "application/json"
+
+# 계정 전체를 막는 한도
+[[buckets]]
+label = "5h"
+window = "5h"
+scope = "account"
+used_pct_path = ["rate_limit", "primary_window", "used_percent"]
+resets_at_path = ["rate_limit", "primary_window", "reset_at"]
+resets_at_kind = "epoch"
+
+[[buckets]]
+label = "7d"
+window = "7d"
+scope = "account"
+used_pct_path = ["rate_limit", "secondary_window", "used_percent"]
+resets_at_path = ["rate_limit", "secondary_window", "reset_at"]
+resets_at_kind = "epoch"
+
+# 모델 전용 한도 — 소진돼도 다른 모델은 계정 한도 안에서 계속 쓸 수 있다
+[[buckets]]
+for_each = ["additional_rate_limits"]
+label = "{item[limit_name]} 7d"
+window = "7d"
+scope = "model"
+scope_name = "{item[limit_name]}"
+used_pct_path = ["rate_limit", "primary_window", "used_percent"]
+resets_at_path = ["rate_limit", "primary_window", "reset_at"]
+resets_at_kind = "epoch"
