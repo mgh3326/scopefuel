@@ -79,4 +79,3 @@ def test_errored_provider_summary_mark_is_not_ok():
     ok_res = ProviderResult(id="claude", buckets=[account(16)])
     err_res = ProviderResult(id="codex", error="HTTP 503 circuit open")
     assert overall_mark([ok_res, err_res]) == "degraded"
-
