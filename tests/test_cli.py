@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 
 import pytest
 
 from scopefuel import cli, render
-from scopefuel.model import SCHEMA, Bucket, ProviderResult, Scope
+from scopefuel.model import SCHEMA, Bucket, ProviderResult, Scope, pace_for
 
 CLAUDE = ProviderResult(
     id="claude",
@@ -91,7 +92,9 @@ def test_brief_shows_error_reason_and_degraded_mark():
 
 
 def test_errored_provider_summary_mark_json(capsys, monkeypatch):
-    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: ProviderResult(id="codex", error="HTTP 503")})
+    monkeypatch.setattr(
+        cli, "registry", lambda: {"codex": lambda: ProviderResult(id="codex", error="HTTP 503")}
+    )
     assert cli.main(["--json", "--no-cache"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["summary"]["mark"] == "degraded"
@@ -100,7 +103,57 @@ def test_errored_provider_summary_mark_json(capsys, monkeypatch):
 
 
 def test_exit_code_on_warn_triggers_exit_2_on_errored_provider(capsys, monkeypatch):
-    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: ProviderResult(id="codex", error="HTTP 503")})
+    monkeypatch.setattr(
+        cli, "registry", lambda: {"codex": lambda: ProviderResult(id="codex", error="HTTP 503")}
+    )
     assert cli.main(["--brief", "--no-cache", "--exit-code-on", "warn"]) == 2
     capsys.readouterr()
 
+
+NOW = dt.datetime(2026, 7, 26, 12, tzinfo=dt.UTC)
+
+
+@pytest.mark.parametrize(
+    ("window", "reset_at", "expected_pace", "expected_rate", "unit"),
+    [
+        ("7d", "2026-07-29T12:00:00Z", 0.7, 20.0, "%/일"),
+        ("5h", "2026-07-26T14:30:00Z", 0.8, 24.0, "%/h"),
+    ],
+)
+def test_pace_supports_day_and_hour_windows(window, reset_at, expected_pace, expected_rate, unit):
+    pace = pace_for(Bucket(label=window, window=window, used_pct=40, resets_at=reset_at), now=NOW)
+    assert pace.ratio == pytest.approx(expected_pace)
+    assert pace.full_use_rate == pytest.approx(expected_rate)
+    assert pace.full_use_rate_unit == unit
+
+
+@pytest.mark.parametrize(
+    "window,reset_at",
+    [("nonsense", "2026-07-29T12:00:00Z"), ("7d", None), ("7d", "not-a-date")],
+)
+def test_pace_is_blank_when_window_or_reset_is_unparseable(window, reset_at):
+    pace = pace_for(Bucket(label="x", window=window, used_pct=40, resets_at=reset_at), now=NOW)
+    assert pace.ratio is pace.full_use_rate is pace.full_use_rate_unit is None
+
+
+@pytest.mark.parametrize(
+    "reset_at",
+    ["2026-08-02T12:00:00Z", "2026-07-19T12:00:00Z"],
+)
+def test_pace_is_blank_outside_active_window(reset_at):
+    pace = pace_for(Bucket(label="x", window="7d", used_pct=40, resets_at=reset_at), now=NOW)
+    assert pace.ratio is pace.full_use_rate is None
+
+
+def test_pace_is_blank_at_reset_and_after_reset():
+    for reset_at in ("2026-07-26T12:00:00Z", "2026-07-26T11:59:59Z"):
+        pace = pace_for(Bucket(label="x", window="7d", used_pct=40, resets_at=reset_at), now=NOW)
+        assert pace.ratio is pace.full_use_rate is None
+
+
+def test_json_adds_null_pace_instead_of_misleading_zero(capsys):
+    assert cli.main(["--json", "--no-cache", "--only", "claude"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    bucket = payload["providers"][0]["buckets"][0]
+    assert bucket["pace"] is None
+    assert bucket["full_use_rate"] is None

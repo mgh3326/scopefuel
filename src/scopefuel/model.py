@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -26,6 +27,68 @@ CRIT_PCT = 90.0
 
 # 이 이하의 창은 "지금"으로 본다 (5h 창 = 21600초).
 NOW_HORIZON_MAX_S = 6 * 3600
+
+_WINDOW_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>[dhms])$")
+_WINDOW_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+
+
+@dataclass(frozen=True)
+class Pace:
+    """시간 창 대비 사용 속도와 창을 모두 쓰기 위한 권장 사용률."""
+
+    ratio: float | None
+    full_use_rate: float | None
+    full_use_rate_unit: str | None
+
+
+def _window_seconds(window: str | None) -> float | None:
+    if not window:
+        return None
+    match = _WINDOW_RE.fullmatch(window.strip())
+    if not match:
+        return None
+    return float(match["value"]) * _WINDOW_SECONDS[match["unit"]]
+
+
+def _parse_reset(iso: str | None) -> dt.datetime | None:
+    if not iso:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.UTC)
+
+
+def pace_for(bucket: Bucket, *, now: dt.datetime | None = None) -> Pace:
+    """계산할 수 없을 때는 0을 추측하지 않고 모두 None으로 둔다."""
+    window_seconds = _window_seconds(bucket.window)
+    reset_at = _parse_reset(bucket.resets_at)
+    if bucket.used_pct is None or window_seconds is None or window_seconds <= 0 or reset_at is None:
+        return Pace(None, None, None)
+
+    now = now or dt.datetime.now(dt.UTC)
+    now = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
+    time_to_reset = (reset_at - now).total_seconds()
+    elapsed_fraction = (window_seconds - time_to_reset) / window_seconds
+    # stale cache / clock skew can put either endpoint outside the active window.
+    if not 0 < elapsed_fraction <= 1 or time_to_reset <= 0:
+        return Pace(None, None, None)
+
+    if window_seconds < 86400:
+        rate_divisor, unit = 3600, "%/h"
+    else:
+        rate_divisor, unit = 86400, "%/일"
+    remaining_duration_units = time_to_reset / rate_divisor
+    if remaining_duration_units <= 0:
+        return Pace(None, None, None)
+    return Pace(
+        ratio=(bucket.used_pct / 100) / elapsed_fraction,
+        full_use_rate=bucket.remaining_pct / remaining_duration_units,
+        full_use_rate_unit=unit,
+    )
 
 
 @dataclass(frozen=True)
@@ -61,13 +124,21 @@ class Bucket:
     def mark(self) -> Mark:
         return mark_for(self.used_pct)
 
+    @property
+    def pace(self) -> Pace:
+        return pace_for(self)
+
     def as_dict(self) -> dict:
+        pace = self.pace
         return {
             "label": self.label,
             "window": self.window,
             "horizon": self.horizon,
             "used_pct": self.used_pct,
             "remaining_pct": self.remaining_pct,
+            "pace": pace.ratio,
+            "full_use_rate": pace.full_use_rate,
+            "full_use_rate_unit": pace.full_use_rate_unit,
             "resets_at": self.resets_at,
             "scope": self.scope.as_dict(),
             "severity": self.mark,
