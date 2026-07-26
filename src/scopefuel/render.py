@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .cache import format_age
-from .model import ProviderResult, iso_to_local, overall_mark
+from .model import Bucket, ProviderResult, iso_to_local, overall_mark
 
 MARK_TEXT = {"ok": "ok", "warn": "WARN", "crit": "CRIT", "degraded": "DEGRADED"}
 MARK_COLOR = {"ok": "\033[32m", "warn": "\033[33m", "crit": "\033[31m", "degraded": "\033[33m"}
@@ -17,6 +17,36 @@ def _mark(mark: str, color: bool) -> str:
 
 def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value:g}%"
+
+
+def _pace(bucket: Bucket) -> str:
+    value = bucket.pace.ratio
+    return "" if value is None else f" {value:.1f}x"
+
+
+def _table_pace(bucket: Bucket) -> str:
+    pace = bucket.pace
+    if pace.ratio is None:
+        return ""
+    rate = (
+        f"  완소진 {pace.full_use_rate:.1f}{pace.full_use_rate_unit}"
+        if pace.full_use_rate is not None
+        else ""
+    )
+    return f"  pace {pace.ratio:.2f}x{rate}"
+
+
+def _bucket_for(
+    result: ProviderResult, *, scope_name: str | None = None, horizon: str | None = None
+) -> Bucket | None:
+    matches = [
+        b
+        for b in result.buckets
+        if b.used_pct is not None
+        and (scope_name is None or b.scope.label == scope_name)
+        and (horizon is None or b.horizon == horizon)
+    ]
+    return max(matches, key=lambda b: b.used_pct or 0.0, default=None)
 
 
 def table(results: list[ProviderResult], *, color: bool = True) -> str:
@@ -52,7 +82,7 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
             horizon = "now " if bucket.horizon == "now" else "week"
             lines.append(
                 f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>6}"
-                f"   reset {iso_to_local(bucket.resets_at)}{tag_s}"
+                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket)}{tag_s}"
             )
 
         for bucket in verdict.exhausted:
@@ -86,12 +116,15 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
         verdict = result.verdict
         parts: list[str] = []
         if verdict.basis == "group":
-            parts += [f"{g} {v:g}%" for g, v in sorted(verdict.groups.items())]
+            parts += [
+                f"{g} {v:g}%{_pace(_bucket_for(result, scope_name=g))}"
+                for g, v in sorted(verdict.groups.items())
+            ]
         else:
             if horizon in ("now", "both") and verdict.now_pct is not None:
-                parts.append(f"now {verdict.now_pct:g}%")
+                parts.append(f"now {verdict.now_pct:g}%{_pace(_bucket_for(result, horizon='now'))}")
             if horizon in ("week", "both") and verdict.week_pct is not None:
-                parts.append(f"week {verdict.week_pct:g}%")
+                parts.append(f"week {verdict.week_pct:g}%{_pace(_bucket_for(result, horizon='week'))}")
         if not parts:
             # 요청한 지평에 데이터가 없으면 빈칸을 남기지 않고 있는 축을 보여준다.
             other = verdict.week_pct if horizon == "now" else verdict.now_pct
