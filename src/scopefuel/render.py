@@ -16,7 +16,8 @@ def _mark(mark: str, color: bool) -> str:
 
 
 def _pct(value: float | None) -> str:
-    return "?" if value is None else f"{value:g}%"
+    """사용률 표시. '사용' 접두사로 잔량(남은 %)과 혼동되지 않게 한다."""
+    return "?" if value is None else f"사용 {value:g}%"
 
 
 def _pace(bucket: Bucket) -> str:
@@ -64,7 +65,7 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
         if verdict.basis == "account":
             basis = f"지금(5h급) {_pct(verdict.now_pct)} · 이번주 {_pct(verdict.week_pct)}"
         elif verdict.basis == "group":
-            per = " / ".join(f"{g} {v:g}%" for g, v in sorted(verdict.groups.items()))
+            per = " / ".join(f"{g} {_pct(v)}" for g, v in sorted(verdict.groups.items()))
             basis = f"그룹별 독립: {per}"
         else:
             basis = "한도 정보 없음"
@@ -81,7 +82,7 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
             tag_s = f"  [{', '.join(tags)}]" if tags else ""
             horizon = "now " if bucket.horizon == "now" else "week"
             lines.append(
-                f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>6}"
+                f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>11}"
                 f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket)}{tag_s}"
             )
 
@@ -104,7 +105,8 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
 def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "both") -> str:
     """한 줄 요약. herdr pane / statusline / 알림용.
 
-    예: [CRIT] claude now 6% week 97%(Fable소진) | codex week 82% | agy gemini 7% / 3p 57%
+    예: [CRIT] claude now 사용 6% week 사용 97%(Fable소진)
+        | codex week 사용 82% | agy gemini 사용 7% / 3p 사용 57%
     """
     chunks: list[str] = []
     worst = overall_mark(results)
@@ -117,19 +119,19 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
         parts: list[str] = []
         if verdict.basis == "group":
             parts += [
-                f"{g} {v:g}%{_pace(_bucket_for(result, scope_name=g))}"
+                f"{g} 사용 {v:g}%{_pace(_bucket_for(result, scope_name=g))}"
                 for g, v in sorted(verdict.groups.items())
             ]
         else:
             if horizon in ("now", "both") and verdict.now_pct is not None:
-                parts.append(f"now {verdict.now_pct:g}%{_pace(_bucket_for(result, horizon='now'))}")
+                parts.append(f"now 사용 {verdict.now_pct:g}%{_pace(_bucket_for(result, horizon='now'))}")
             if horizon in ("week", "both") and verdict.week_pct is not None:
-                parts.append(f"week {verdict.week_pct:g}%{_pace(_bucket_for(result, horizon='week'))}")
+                parts.append(f"week 사용 {verdict.week_pct:g}%{_pace(_bucket_for(result, horizon='week'))}")
         if not parts:
             # 요청한 지평에 데이터가 없으면 빈칸을 남기지 않고 있는 축을 보여준다.
             other = verdict.week_pct if horizon == "now" else verdict.now_pct
             label = "week" if horizon == "now" else "now"
-            parts.append(f"{label} {other:g}%" if other is not None else "n/a")
+            parts.append(f"{label} 사용 {other:g}%" if other is not None else "n/a")
         if verdict.exhausted:
             parts.append("(" + ",".join(f"{b.scope.label}소진" for b in verdict.exhausted) + ")")
         if result.stale:

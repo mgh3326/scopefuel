@@ -49,15 +49,15 @@ def test_json_contract(capsys):
 
 def test_brief_shows_both_axes_and_exhausted_scope():
     line = render.brief([CLAUDE, AGY], color=False)
-    assert "now 6%" in line and "week 97%" in line
+    assert "now 사용 6%" in line and "week 사용 97%" in line
     assert "Fable소진" in line
-    assert "gemini 7.4%" in line and "3p 57.3%" in line
+    assert "gemini 사용 7.4%" in line and "3p 사용 57.3%" in line
     assert line.startswith("[CRIT]")
 
 
 def test_brief_horizon_now_only():
     line = render.brief([CLAUDE], color=False, horizon="now")
-    assert "now 6%" in line and "week" not in line
+    assert "now 사용 6%" in line and "week" not in line
 
 
 def test_exit_code_on_threshold(capsys):
@@ -82,7 +82,7 @@ def test_table_marks_model_scope(capsys):
     out = capsys.readouterr().out
     assert "이 모델만" in out
     assert "Fable 소진" in out
-    assert "지금(5h급) 6%" in out
+    assert "지금(5h급) 사용 6%" in out
 
 
 def test_brief_shows_error_reason_and_degraded_mark():
