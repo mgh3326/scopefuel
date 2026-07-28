@@ -1,0 +1,15 @@
+Use /help for more information and happy coding!
+
+Model: auto (/model to change) | Plan: KIRO PRO MAX (/usage for more detail)
+
+
+Estimated Usage | resets on 2026-08-01 | KIRO PRO MAX
+Credits (0.50 of 5000 covered in plan)
+████████████████████████████████████████████████████████████████████████████████ 0%
+
+Additional credits
+Add-on credits available for purchase
+
+To manage your plan or purchase add-on credits navigate to https://app.kiro.dev/account/usage
+
+Tip: to see context window usage, run /context

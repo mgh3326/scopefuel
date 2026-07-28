@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from scopefuel.providers import agy, claude, codex
+from scopefuel.providers import agy, claude, codex, kiro
 
 
 def test_claude_marks_weekly_scoped_as_model_scope(fixture_json, monkeypatch, tmp_path):
@@ -79,3 +79,77 @@ def test_agy_reports_error_when_both_paths_fail(monkeypatch):
     monkeypatch.setattr(agy, "_cloud_token", lambda: (_ for _ in ()).throw(RuntimeError("no token")))
     result = agy.fetch()
     assert result.error and "no token" in result.error
+
+
+def test_kiro_parses_plan_credits(fixture_text):
+    result = kiro.parse(fixture_text("kiro_usage"))
+
+    assert result.plan == "pro max"
+    assert result.source == "cli:/usage"
+    (bucket,) = result.buckets
+    assert (bucket.scope.kind, bucket.horizon, bucket.window) == ("account", "week", "30d")
+    assert bucket.used_pct == 0.01  # 0.50 / 5000
+    # CLI 는 날짜만 준다 → 로컬 자정으로 고정(오프셋은 실행 환경에 따라 다르다).
+    assert bucket.resets_at and bucket.resets_at.startswith("2026-08-01T00:00:00")
+    assert bucket.note is None
+
+
+def test_kiro_folds_addon_credits_into_one_account_bucket(fixture_text):
+    """플랜이 100% 여도 애드온이 남으면 막힌 게 아니다 — 합산 한 줄로 낸다."""
+    result = kiro.parse(fixture_text("kiro_usage_bonus"))
+
+    assert result.plan == "free"
+    (bucket,) = result.buckets
+    assert bucket.scope.kind == "account"
+    # 플랜 50/50 + 애드온 122.54/500 → 합산 172.54/550
+    assert round(bucket.used_pct, 2) == 31.37
+    assert result.verdict.blocking_pct < 90  # 플랜만 보면 100% 라 crit 으로 오판했을 값
+    assert bucket.note and "애드온" in bucket.note
+    assert bucket.resets_at and bucket.resets_at.startswith("20")
+
+
+def test_kiro_unparsable_output_is_error_not_zero(fixture_text):
+    result = kiro.parse("Please log in to continue\n")
+    assert result.error and result.buckets == []
+    assert result.hint and "login" in result.hint
+    assert result.verdict.blocking_pct == 0  # 값을 지어내지 않는다
+
+
+def test_kiro_missing_binary_is_error_with_hint(monkeypatch):
+    monkeypatch.setattr(kiro.shutil, "which", lambda _name: None)
+    result = kiro.fetch()
+    assert result.error and result.hint
+    assert result.buckets == []
+
+
+def test_kiro_strips_ansi_before_parsing():
+    noisy = "\x1b[38;5;1mCredits (1.00 of 10 covered in plan)\x1b[0m\n"
+    result = kiro.parse(noisy)
+    assert result.buckets[0].used_pct == 10.0
+
+
+def test_kiro_retries_once_on_expired_token(fixture_text, monkeypatch):
+    """만료 토큰은 CLI 호출이 갱신한다 — 1회 재시도 후 성공하면 그 값을 쓴다."""
+    outputs = iter(
+        [
+            "⚠️  Warning: Could not retrieve usage information from backend\n"
+            "Error: AccessDeniedError [AccessDeniedException]: Token expired\n",
+            fixture_text("kiro_usage"),
+        ]
+    )
+    monkeypatch.setattr(kiro.shutil, "which", lambda _name: "/usr/local/bin/kiro-cli")
+    monkeypatch.setattr(kiro, "_probe_once", lambda: kiro.parse(next(outputs)))
+
+    result = kiro.fetch()
+    assert result.error is None
+    assert result.buckets[0].used_pct == 0.01
+
+
+def test_kiro_expired_token_twice_keeps_error_with_login_hint(monkeypatch):
+    expired = "Error: AccessDeniedError [AccessDeniedException]: Token expired\n"
+    monkeypatch.setattr(kiro.shutil, "which", lambda _name: "/usr/local/bin/kiro-cli")
+    monkeypatch.setattr(kiro, "_probe_once", lambda: kiro.parse(expired))
+
+    result = kiro.fetch()
+    assert result.error and "login" in (result.hint or "")
+    assert result.buckets == []

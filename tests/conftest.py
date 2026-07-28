@@ -16,6 +16,14 @@ def fixture_json():
     return _load
 
 
+@pytest.fixture
+def fixture_text():
+    def _load(name: str) -> str:
+        return (FIXTURES / f"{name}.txt").read_text()
+
+    return _load
+
+
 @pytest.fixture(autouse=True)
 def isolated_cache(tmp_path, monkeypatch):
     """실제 홈 디렉터리 캐시/스펙을 건드리지 않는다."""
