@@ -82,6 +82,18 @@ herdr plugin link ~/work/scopefuel
 | `claude` | `~/.claude/.credentials.json` → `api.anthropic.com/api/oauth/usage` | 5h·7d 계정 한도 + 모델별(weekly_scoped) | 토큰 만료 시 claude 세션이 갱신해야 함 |
 | `codex` | `~/.codex/auth.json` → `chatgpt.com/backend-api/wham/usage` | primary/secondary 창 + 모델 전용 버킷 | — |
 | `agy` | 실행 중 `agy`의 로컬 language server → 실패 시 cloudcode-pa | 로컬=weekly+5h, 클라우드=5h만 | 모델별 분해 불가(아래) |
+| `kiro` | `kiro-cli` 에 `/usage` 를 물려 출력 파싱 | 월 크레딧 1줄 (플랜+애드온 합산) | 5h급 창 없음, 호출 7초(아래) |
+
+**kiro는 API가 아니라 CLI를 읽습니다.** 같은 값을 주는 `GetUsageLimits` API가 있지만 토큰이
+JSON 파일이 아니라 sqlite(`data.sqlite3`의 `auth_kv`)에 있고 만료 시 갱신이 필요합니다. 읽기 전용
+계기판이 남의 토큰 저장소와 갱신 흐름까지 떠안는 것보다, 이미 인증을 끝낸 CLI에 물어보는 편이
+경계가 깨끗합니다. 대가는 두 가지 — **출력 포맷이 바뀌면 파싱이 깨지고**(그때는 0을 채우지 않고
+error로 보고합니다), **한 번에 7초쯤** 걸립니다(60초 캐시 전제). 액세스 토큰이 만료된 상태면
+CLI 호출 자체가 갱신하므로 1회 재시도합니다.
+
+`kiro`에는 **5시간급 창이 없습니다** — 월 크레딧 한 줄뿐이라 `--horizon now`에는 안 나옵니다.
+리셋은 CLI가 날짜만 주므로 로컬 자정으로 표시합니다. 플랜 크레딧이 다 차도 애드온이 남아 있으면
+작업은 계속되므로, 두 풀이 있으면 **합산 한 줄**만 account로 냅니다(각각 내면 "계정 차단"으로 오독합니다).
 
 **agy 모델별 분해는 불가능합니다.** 클라우드 응답은 모델 이름별 행을 주지만 값이 그룹 공유입니다
 (gemini 계열 전부 동일 fraction, claude/gpt-oss 전부 동일 fraction — 로컬 그룹값과 일치).
