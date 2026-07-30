@@ -123,7 +123,15 @@ provider는 운영 의도에 따라 두 class로 구분됩니다.
 - **spend**: 고사용을 정상으로 본다. reset 전 24시간 미만, 70% 미만 bucket이 있으면
   **WASTE** 권고를 낸다. `kiro`, `clinepass`, `agy`.
 
-선언형 TOML 스펙에서 `class = "preserve" | "spend"`로 지정할 수 있으며(같은 `id`로 내장 provider를 대체할 때도 전체 대체 스펙에 `class` 지정 가능), Python 플러그인 메타데이터 또는 반환 `ProviderResult.pool_class`로도 설정할 수 있습니다. 자세한 내용은 [docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요. raw `used_pct`, reset, pace는 그대로 보존하며, `--exit-code-on`과 전체 mark는 failure/warning/stale 우선 순위를 유지합니다.
+선언형 TOML 스펙에서 `class = "preserve" | "spend"`로 지정할 수 있으며(같은 `id`로 내장 provider를 대체할 때도 전체 대체 스펙에 `class` 지정 가능), Python 플러그인 메타데이터 또는 반환 `ProviderResult.pool_class`로도 설정할 수 있습니다. 자세한 내용은 [docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요.
+
+### 두 축: `mark`와 `usage_mark`
+
+`mark`는 사람이 먼저 보아야 할 provider 판정입니다. 조회 실패·stale이면 사용률이 높아도 `degraded`가 우선합니다. `usage_mark`는 scope와 provider class를 적용한 별도 사용률 판정(`ok|warn|crit`)입니다. 예를 들어 마지막으로 알려진 preserve 사용률이 97%인 stale 결과는 `status=stale`, `mark=degraded`, `usage_mark=crit`로 두 진실을 함께 냅니다.
+
+`summary.mark`와 `summary.usage_mark`는 각각 두 축의 전체 판정입니다. `--exit-code-on LEVEL`은 어느 축이든 LEVEL 이상이면 종료코드 2를, 그렇지 않은 실제 provider error는 1을, 나머지는 0을 반환합니다. WASTE는 informational이며 종료코드를 올리지 않습니다.
+
+`scopefuel.v1` JSON에는 호환 가능한 필드가 추가될 수 있으므로 소비자는 알 수 없는 필드를 무시해야 합니다. 기존 `mark`의 의미·타입은 유지됩니다. raw `used_pct`, reset, pace는 그대로 보존하며, `--exit-code-on`과 전체 mark는 failure/warning/stale 우선 순위를 유지합니다.
 
 ## 주의
 

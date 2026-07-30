@@ -156,7 +156,7 @@ def brief(
         | codex week 사용 82% | agy gemini 사용 7% / 3p 사용 57%
     """
     chunks: list[str] = []
-    worst = overall_mark(results)
+    worst = overall_mark(results, now=now)
     for result in results:
         display_id = _display_id(result)
         if result.error:

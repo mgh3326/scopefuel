@@ -17,6 +17,7 @@ from scopefuel.model import (
     Scope,
     _is_valid_used_pct,
     overall_mark,
+    overall_usage_mark,
     verdict_for,
 )
 from scopefuel.providers import BUILTIN
@@ -1223,3 +1224,238 @@ def test_preserve_high_fresh_warning_keeps_crit():
     )
     assert result.verdict.mark == "crit"
     assert result.status == "warning"
+
+
+# --------------------------------------------------------- r5: additive usage_mark axis
+
+
+@pytest.mark.parametrize("status_attr", ["stale", "error", "warning_stale"])
+def test_preserve_high_degraded_preserves_usage_mark_crit(status_attr):
+    """stale/error/warning+stale × preserve 95%: mark=degraded, usage_mark=crit."""
+    kwargs: dict = {"id": "test", "pool_class": "preserve", "buckets": [bucket(95.0)]}
+    if status_attr == "stale":
+        kwargs["stale"] = True
+        kwargs["age_s"] = 600.0
+    elif status_attr == "error":
+        kwargs["error"] = "fetch failed"
+    else:
+        kwargs["warning"] = "auth fail"
+        kwargs["stale"] = True
+        kwargs["age_s"] = 600.0
+
+    result = ProviderResult(**kwargs)
+    v = result.verdict
+    assert v.mark == "degraded"
+    assert v.usage_mark == "crit"
+    assert v.blocking_pct == 95.0
+    assert result.status in ("stale", "error")
+
+    payload = result.as_dict()
+    assert payload["verdict"]["mark"] == "degraded"
+    assert payload["verdict"]["usage_mark"] == "crit"
+    assert payload["buckets"][0]["severity"] == "crit"
+
+
+def test_preserve_stale_low_usage_usage_mark_ok():
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[bucket(10.0)], stale=True, age_s=600.0)
+    assert result.verdict.mark == "degraded"
+    assert result.verdict.usage_mark == "ok"
+
+
+def test_preserve_stale_warn_usage_usage_mark_warn():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(80.0)],
+        stale=True,
+        age_s=600.0,
+    )
+    assert result.verdict.mark == "degraded"
+    assert result.verdict.usage_mark == "warn"
+
+
+def test_error_no_data_usage_mark_ok():
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[], error="fetch failed")
+    assert result.verdict.mark == "degraded"
+    assert result.verdict.usage_mark == "ok"
+
+
+def test_spend_stale_high_usage_usage_mark_ok():
+    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(97.0)], stale=True, age_s=600.0)
+    assert result.verdict.mark == "degraded"
+    assert result.verdict.usage_mark == "ok"
+
+
+def test_fresh_preserve_high_usage_both_marks_crit():
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[bucket(97.0)])
+    assert result.verdict.mark == "crit"
+    assert result.verdict.usage_mark == "crit"
+
+
+def test_fresh_spend_high_usage_both_marks_ok():
+    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(97.0)])
+    assert result.verdict.mark == "ok"
+    assert result.verdict.usage_mark == "ok"
+
+
+def test_fresh_warning_high_usage_usage_mark_crit():
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[bucket(95.0)], warning="auth expiring")
+    assert result.verdict.mark == "crit"
+    assert result.verdict.usage_mark == "crit"
+
+
+def test_overall_usage_mark_aggregates_usage_axis():
+    degraded_low = ProviderResult(id="a", pool_class="preserve", buckets=[bucket(10.0)], stale=True)
+    fresh_warn = ProviderResult(id="b", pool_class="preserve", buckets=[bucket(80.0)])
+    assert overall_mark([degraded_low, fresh_warn]) == "degraded"
+    assert overall_usage_mark([degraded_low, fresh_warn]) == "warn"
+
+
+def test_verdict_legacy_constructor_derives_usage_mark_from_mark():
+    from scopefuel.model import Verdict
+
+    v_ok = Verdict(10.0, None, None, 10.0, "account", "ok")
+    assert v_ok.usage_mark == "ok"
+    v_warn = Verdict(80.0, None, None, 80.0, "account", "warn")
+    assert v_warn.usage_mark == "warn"
+    v_crit = Verdict(95.0, None, None, 95.0, "account", "crit")
+    assert v_crit.usage_mark == "crit"
+    v_degraded = Verdict(None, None, None, 0.0, "none", "degraded")
+    assert v_degraded.usage_mark == "ok"
+
+
+def test_verdict_as_dict_includes_usage_mark():
+    from scopefuel.model import Verdict
+
+    v = Verdict(95.0, None, None, 95.0, "account", "crit")
+    assert v.as_dict()["usage_mark"] == "crit"
+
+
+def test_real_cache_fallback_high_usage_exit_code_on_crit(monkeypatch, tmp_path, capsys):
+    """preserve 97% 캐시 → fetch 실패 → stale fallback이 --exit-code-on crit에서 rc=2."""
+    from scopefuel import cache as cache_mod
+
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
+    cache_path = tmp_path / "snapshots.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "claude": {
+                    "fetched_at": 1.0,
+                    "result": {
+                        "id": "claude",
+                        "plan": "pro",
+                        "buckets": [
+                            {
+                                "label": "week",
+                                "window": "7d",
+                                "used_pct": 97.0,
+                                "scope": {"kind": "account"},
+                                "horizon": "week",
+                            }
+                        ],
+                        "pool_class": "preserve",
+                    },
+                }
+            }
+        )
+    )
+
+    def fetcher():
+        raise RuntimeError("HTTP 503")
+
+    fetcher.pool_class = "preserve"
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": fetcher})
+    monkeypatch.setattr(cache_mod.time, "time", lambda: 100.0)
+
+    class MockDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    monkeypatch.setattr(cli.dt, "datetime", MockDatetime)
+
+    ec = cli.main(["--json", "--exit-code-on", "crit"])
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+
+    assert payload["providers"][0]["status"] == "stale"
+    assert payload["providers"][0]["age_s"] == 99.0
+    assert "조회 실패" in payload["providers"][0]["note"]
+    assert payload["providers"][0]["verdict"]["mark"] == "degraded"
+    assert payload["providers"][0]["verdict"]["usage_mark"] == "crit"
+    assert payload["providers"][0]["verdict"]["blocking_pct"] == 97.0
+    assert payload["summary"]["mark"] == "degraded"
+    assert payload["summary"]["usage_mark"] == "crit"
+    assert ec == 2
+
+
+def test_preserve_stale_low_usage_exit_code_on_crit_rc0(capsys, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {
+            "test": lambda: ProviderResult(
+                id="test", pool_class="preserve", buckets=[bucket(10.0)], stale=True, age_s=600.0
+            )
+        },
+    )
+    ec = cli.main(["--json", "--no-cache", "--exit-code-on", "crit"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["mark"] == "degraded"
+    assert payload["summary"]["usage_mark"] == "ok"
+    assert ec == 0
+
+
+def test_spend_stale_high_usage_exit_code_on_crit_rc0(capsys, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {
+            "kiro": lambda: ProviderResult(
+                id="kiro", pool_class="spend", buckets=[bucket(97.0)], stale=True, age_s=600.0
+            )
+        },
+    )
+    ec = cli.main(["--json", "--no-cache", "--exit-code-on", "crit"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["mark"] == "degraded"
+    assert payload["summary"]["usage_mark"] == "ok"
+    assert ec == 0
+
+
+def test_error_no_data_exit_code_on_crit_rc1(capsys, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"test": lambda: ProviderResult(id="test", pool_class="preserve", error="boom")},
+    )
+    ec = cli.main(["--json", "--no-cache", "--exit-code-on", "crit"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["mark"] == "degraded"
+    assert payload["summary"]["usage_mark"] == "ok"
+    assert ec == 1
+
+
+def test_fresh_preserve_high_usage_exit_code_on_crit_rc2(capsys, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"test": lambda: ProviderResult(id="test", pool_class="preserve", buckets=[bucket(97.0)])},
+    )
+    ec = cli.main(["--json", "--no-cache", "--exit-code-on", "crit"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["mark"] == "crit"
+    assert payload["summary"]["usage_mark"] == "crit"
+    assert ec == 2
+
+
+def test_waste_only_usage_mark_stays_ok():
+    waste = ProviderResult(
+        id="kiro",
+        pool_class="spend",
+        buckets=[bucket(20.0, reset_delta_s=3600)],
+    )
+    assert waste.verdict_at(NOW).waste is True
+    assert overall_mark([waste], now=NOW) == "ok"
+    assert overall_usage_mark([waste], now=NOW) == "ok"

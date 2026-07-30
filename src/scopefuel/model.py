@@ -161,7 +161,12 @@ class Bucket:
 
 @dataclass
 class Verdict:
-    """'실제로 무엇이 막히는가'의 판정."""
+    """'실제로 무엇이 막히는가'의 판정.
+
+    `mark`는 provider 신뢰도 축(실패·stale이면 degraded가 우선). `usage_mark`은
+    scope·pool class를 적용한 사용률 축(ok|warn|crit)으로, 신뢰도 덮어쓰기 전
+    판정을 그대로 보존한다. 두 축은 `--exit-code-on`에서 함께 평가된다.
+    """
 
     now_pct: float | None
     week_pct: float | None
@@ -173,6 +178,12 @@ class Verdict:
     groups: dict[str, float] = field(default_factory=dict)
     waste: bool = False
     waste_advice: str | None = None
+    usage_mark: Mark | None = None
+
+    def __post_init__(self) -> None:
+        # legacy 생성자 호환: non-degraded mark는 같은 usage_mark로 유도.
+        if self.usage_mark is None:
+            self.usage_mark = self.mark if self.mark in ("ok", "warn", "crit") else "ok"
 
     def as_dict(self, *, now: dt.datetime | None = None) -> dict:
         out = {
@@ -181,6 +192,7 @@ class Verdict:
             "blocking_pct": self.blocking_pct,
             "basis": self.basis,
             "mark": self.mark,
+            "usage_mark": self.usage_mark,
             "groups": self.groups,
             "exhausted": [b.as_dict(now=now) for b in self.exhausted],
             "waste": self.waste,
@@ -233,6 +245,7 @@ class ProviderResult:
                 groups=v.groups,
                 waste=False,
                 waste_advice=None,
+                usage_mark=v.usage_mark,
             )
         if self.warning:
             mark = v.mark if v.mark in ("crit", "degraded") else "warn"
@@ -247,6 +260,7 @@ class ProviderResult:
                 groups=v.groups,
                 waste=False,
                 waste_advice=None,
+                usage_mark=v.usage_mark,
             )
         return v
 
@@ -390,26 +404,45 @@ def verdict_for(
         else [b for b in known if b.scope.kind != "account" and (b.used_pct or 0.0) >= CRIT_PCT]
     )
     waste, waste_advice = waste_for(buckets, pool_class, now=now)
+    usage_mark = mark_for(blocking, pool_class)
     return Verdict(
         now_pct=axis("now"),
         week_pct=axis("week"),
         month_pct=axis("month"),
         blocking_pct=blocking,
         basis=basis,
-        mark=mark_for(blocking, pool_class),
+        mark=usage_mark,
         exhausted=exhausted,
         groups=groups,
         waste=waste,
         waste_advice=waste_advice,
+        usage_mark=usage_mark,
     )
 
 
-def overall_mark(results: list[ProviderResult]) -> Mark:
+def _result_mark(result: ProviderResult, now: dt.datetime | None, attr: str) -> Mark:
+    verdict = result.verdict if now is None else result.verdict_at(now)
+    return getattr(verdict, attr)
+
+
+def overall_mark(results: list[ProviderResult], *, now: dt.datetime | None = None) -> Mark:
     ranking = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
     worst: Mark = "ok"
     for result in results:
-        mark = result.verdict.mark
+        mark = _result_mark(result, now, "mark")
         if ranking[mark] > ranking[worst]:
+            worst = mark
+    return worst
+
+
+def overall_usage_mark(results: list[ProviderResult], *, now: dt.datetime | None = None) -> Mark:
+    """사용률 축 집계. `usage_mark`은 ok|warn|crit만 사용한다."""
+    ranking = {"ok": 0, "warn": 1, "crit": 2}
+    worst: Mark = "ok"
+    for result in results:
+        mark = _result_mark(result, now, "usage_mark")
+        # degraded는 usage 축에 없으므로 무시(legacy 안전장치).
+        if mark in ranking and ranking[mark] > ranking[worst]:
             worst = mark
     return worst
 

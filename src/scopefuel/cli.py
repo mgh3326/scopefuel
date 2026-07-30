@@ -14,7 +14,7 @@ import time
 
 from . import render
 from .cache import DEFAULT_TTL_S, collect
-from .model import SCHEMA, ProviderResult, overall_mark
+from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .providers import default_order, registry
 
 MARK_RANK = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
@@ -61,7 +61,10 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
         payload = {
             "schema": SCHEMA,
             "generated_at": now.isoformat(),
-            "summary": {"mark": overall_mark(results)},
+            "summary": {
+                "mark": overall_mark(results, now=now),
+                "usage_mark": overall_usage_mark(results, now=now),
+            },
             "providers": [r.as_dict(now=now) for r in results],
         }
         return json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
@@ -98,7 +101,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.exit_code_on != "never":
         threshold = MARK_RANK[args.exit_code_on]
-        if MARK_RANK[overall_mark(results)] >= threshold:
+        if MARK_RANK[overall_mark(results, now=now)] >= threshold:
+            return 2
+        if MARK_RANK[overall_usage_mark(results, now=now)] >= threshold:
             return 2
     return 1 if any(r.error for r in results) else 0
 
