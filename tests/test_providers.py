@@ -377,6 +377,7 @@ def test_clinepass_partial_limits_stays_usable_and_marks_invalid_reset(monkeypat
         ("12.5", "percentUsed 숫자 문자열 허용 안 함"),
         (-1, "percentUsed 음수 (-1)"),
         ("not-a-number", "percentUsed 숫자 문자열 허용 안 함"),
+        (10**400, "percentUsed 숫자 한도 초과"),
     ],
 )
 def test_clinepass_percent_used_anomalies_are_explicit_warnings(monkeypatch, value, problem):
@@ -466,6 +467,40 @@ def test_clinepass_past_reset_is_preserved_and_warns_as_stale(monkeypatch):
     assert "resetsAt 과거(stale)" in output
 
 
+def test_clinepass_exact_now_reset_is_not_stale(monkeypatch):
+    import datetime as dt
+
+    fixed_now = dt.datetime(2026, 7, 30, 10, 0, 0, tzinfo=dt.UTC)
+    now_iso = fixed_now.isoformat()
+    payload = {
+        "data": {
+            "limits": [
+                {
+                    "type": "monthly",
+                    "percentUsed": 25,
+                    "resetsAt": now_iso,
+                }
+            ]
+        },
+        "success": True,
+    }
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (200, json.dumps(payload).encode()))
+
+    class MockDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    monkeypatch.setattr(clinepass.dt, "datetime", MockDatetime)
+
+    result = clinepass.fetch()
+
+    assert result.status == "ok"
+    assert result.warning is None
+    assert result.buckets[0].note is None
+
+
 def test_clinepass_auth_failures_warn_but_empty_limits_is_no_data(monkeypatch):
     monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
 
@@ -509,7 +544,7 @@ def test_clinepass_fallback_http_failures_are_warnings_not_false_ok(monkeypatch)
     monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
 
     outputs = {}
-    for status in (400, 429, 500, 503):
+    for status in (301, 302, 304, 399, 400, 429, 500, 503):
         monkeypatch.setattr(
             clinepass,
             "_probe",
@@ -524,6 +559,9 @@ def test_clinepass_fallback_http_failures_are_warnings_not_false_ok(monkeypatch)
         assert result.raw and result.raw["status"] == 404
         assert result.raw["fallback_status"] == status
 
+    assert outputs[301].startswith(
+        "clinepass [fallback(probe)]  [WARN] completions fallback HTTP 301 — 정상으로 간주하지 않음"
+    )
     assert outputs[400].startswith(
         "clinepass [fallback(probe)]  [WARN] completions fallback HTTP 400 — 정상으로 간주하지 않음"
     )

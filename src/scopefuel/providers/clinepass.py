@@ -254,7 +254,10 @@ def _percent_used(value: object) -> tuple[float | None, str | None]:
         return None, "percentUsed 숫자 문자열 허용 안 함"
     if not isinstance(value, (int, float)):
         return None, "percentUsed 숫자 아님"
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError):
+        return None, "percentUsed 숫자 한도 초과"
     if not math.isfinite(parsed):
         return None, "percentUsed 유한 숫자 아님"
     if parsed < 0:
@@ -277,7 +280,7 @@ def _iso_reset(value: object) -> str | None:
 
 
 def _is_past_reset(value: str) -> bool:
-    return dt.datetime.fromisoformat(value) <= dt.datetime.now(dt.UTC)
+    return dt.datetime.fromisoformat(value) < dt.datetime.now(dt.UTC)
 
 
 def _warning_result(
@@ -351,7 +354,7 @@ def _fetch_fallback(key: str, credential: dict[str, object], *, primary_status: 
         credential=credential,
         buckets=buckets,
     )
-    if status >= 400:
+    if not (200 <= status < 300):
         return _warning_result(
             warning=f"completions fallback HTTP {status} — 정상으로 간주하지 않음",
             credential=credential,
