@@ -1,17 +1,18 @@
-"""ClinePass — 최소 completions 프로브의 rate-limit 응답 헤더.
+"""ClinePass — 대시보드와 같은 usage-limits API.
 
-ClinePass 는 전용 사용량 API가 없으므로 가장 저렴한 모델에 ``max_tokens=1`` 요청을
-딱 한 번 보낸다. 성공 본문은 사용하지 않고 rate-limit 헤더만 읽는다. HTTP 4xx/5xx도
-헤더를 제공할 수 있으므로 응답 상태와 무관하게 헤더를 먼저 적용한다.
+정상 경로는 토큰을 소비하지 않는 ``GET /users/me/plan/usage-limits`` 한 번이다.
+응답의 five_hour/weekly/monthly 사용률을 account 버킷으로 변환한다.
 
-일부 티어는 rate-limit 헤더를 전혀 보내지 않는다. 이는 조회 실패가 아니며 빈 버킷과
-``no data`` note 로 보고한다. 자격증명 값과 응답 본문은 raw 결과에도 보관하지 않는다.
+endpoint가 배포 차이로 존재하지 않는 404/405/501에서만 기존 completions rate-limit
+프로브를 호환 폴백으로 한 번 시도한다. 인증 실패는 어느 경로든 warning으로 분리하고,
+자격증명 값·오류 응답 본문·계정 식별자는 raw 결과에도 보관하지 않는다.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import re
@@ -21,13 +22,21 @@ from email.message import Message
 
 from ..model import NOW_HORIZON_MAX_S, Bucket, ProviderResult, Scope
 
-USAGE_URL = "https://api.cline.bot/api/v1/chat/completions"
-MODEL = "cline-pass/deepseek-v4-flash"
+USAGE_URL = "https://api.cline.bot/api/v1/users/me/plan/usage-limits"
+COMPLETIONS_URL = "https://api.cline.bot/api/v1/chat/completions"
+FALLBACK_MODEL = "cline-pass/deepseek-v4-flash"
 OPENCODE_AUTH = pathlib.Path.home() / ".local" / "share" / "opencode" / "auth.json"
 CLINE_API_KEY_FILE = pathlib.Path.home() / ".config" / "cline" / "api-key"
 TIMEOUT_S = 20.0
 AUTH_FAILURE_STATUSES = frozenset({401, 403})
+FALLBACK_STATUSES = frozenset({404, 405, 501})
 INVALID_CREDENTIAL = "invalid credential format"
+LIMIT_ORDER = ("five_hour", "weekly", "monthly")
+LIMIT_MAP = {
+    "five_hour": ("5h", "now"),
+    "weekly": ("7d", "week"),
+    "monthly": ("30d", "month"),
+}
 
 _DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|[smhd])", re.IGNORECASE)
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
@@ -44,12 +53,192 @@ def fetch() -> ProviderResult:
                 "CLINE_API_KEY, ~/.local/share/opencode/auth.json의 cline-pass.key, "
                 "또는 ~/.config/cline/api-key 필요"
             ),
-            source="completions-probe",
+            source="usage-limits-api",
             raw={"credential": credential},
         )
     if not _valid_credential(key):
         return _invalid_credential(credential)
 
+    try:
+        status, payload_bytes = _request_usage(key)
+    except ValueError:
+        return _invalid_credential(credential)
+    except Exception as exc:
+        return ProviderResult(
+            id="clinepass",
+            error=f"usage-limits 조회 실패 ({type(exc).__name__})",
+            hint="ClinePass 네트워크/로그인 상태를 확인하세요",
+            source="usage-limits-api",
+            raw={"credential": credential},
+        )
+
+    if status in AUTH_FAILURE_STATUSES:
+        return _auth_warning(status, credential, source="usage-limits-api")
+    if status in FALLBACK_STATUSES:
+        return _fetch_fallback(key, credential, primary_status=status)
+    if status >= 400:
+        return ProviderResult(
+            id="clinepass",
+            error=f"usage-limits HTTP {status}",
+            hint="ClinePass 서비스 상태를 확인하세요",
+            source="usage-limits-api",
+            raw={"status": status, "credential": credential},
+        )
+
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except Exception as exc:
+        return ProviderResult(
+            id="clinepass",
+            error=f"usage-limits 응답 처리 실패 ({type(exc).__name__})",
+            hint="ClinePass 응답 JSON 형식을 확인하세요",
+            source="usage-limits-api",
+            raw={"status": status, "credential": credential},
+        )
+
+    if not isinstance(payload, dict):
+        return ProviderResult(
+            id="clinepass",
+            error="usage-limits 응답이 JSON object가 아님",
+            source="usage-limits-api",
+            raw={"status": status, "credential": credential},
+        )
+
+    try:
+        buckets, note, safe_limits = _usage_buckets(payload)
+    except Exception as exc:
+        return ProviderResult(
+            id="clinepass",
+            error=f"usage-limits 버킷 처리 실패 ({type(exc).__name__})",
+            hint="ClinePass limits 응답 형식을 확인하세요",
+            source="usage-limits-api",
+            raw={"status": status, "credential": credential},
+        )
+
+    raw: dict[str, object] = {
+        "status": status,
+        "credential": credential,
+        "data": {"limits": safe_limits},
+    }
+    if isinstance(payload.get("success"), bool):
+        raw["success"] = payload["success"]
+    if payload.get("success") is False:
+        return ProviderResult(
+            id="clinepass",
+            error="usage-limits 응답 success=false",
+            source="usage-limits-api",
+            raw=raw,
+        )
+
+    return ProviderResult(
+        id="clinepass",
+        buckets=buckets,
+        note=note,
+        source="usage-limits-api",
+        raw=raw,
+    )
+
+
+def _request_usage(key: str) -> tuple[int, bytes]:
+    request = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "User-Agent": "scopefuel",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        exc.read()  # 오류 본문은 계정 정보를 포함할 수 있어 폐기한다.
+        return exc.code, b""
+
+
+def _usage_buckets(payload: dict) -> tuple[list[Bucket], str | None, list[dict[str, object]]]:
+    data = payload.get("data")
+    raw_limits = data.get("limits") if isinstance(data, dict) else None
+    if not isinstance(raw_limits, list):
+        return [], "no data — usage-limits 응답에 limits 배열 없음", []
+
+    by_type: dict[str, dict] = {}
+    for item in raw_limits:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if isinstance(kind, str) and kind in LIMIT_MAP and kind not in by_type:
+            by_type[kind] = item
+
+    buckets: list[Bucket] = []
+    safe_limits: list[dict[str, object]] = []
+    for kind in LIMIT_ORDER:
+        item = by_type.get(kind)
+        if item is None:
+            continue
+        window, horizon = LIMIT_MAP[kind]
+        used_pct = _percent_used(item.get("percentUsed"))
+        resets_at = _iso_reset(item.get("resetsAt"))
+        problems: list[str] = []
+        if used_pct is None:
+            problems.append("percentUsed 없음/형식 오류")
+        if resets_at is None:
+            problems.append("resetsAt 없음/비-tz ISO8601")
+        buckets.append(
+            Bucket(
+                label=kind,
+                window=window,
+                used_pct=used_pct,
+                resets_at=resets_at,
+                scope=Scope("account"),
+                horizon=horizon,  # type: ignore[arg-type]
+                note=" / ".join(problems) or None,
+            )
+        )
+        safe_limits.append({"type": kind, "percentUsed": used_pct, "resetsAt": resets_at})
+
+    if not buckets:
+        reason = "limits 비어 있음" if not raw_limits else "알려진 limit type 없음"
+        return [], f"no data — usage-limits {reason}", []
+
+    missing = [kind for kind in LIMIT_ORDER if kind not in by_type]
+    note = f"partial data — limits 누락: {', '.join(missing)}" if missing else None
+    return buckets, note, safe_limits
+
+
+def _percent_used(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def _iso_reset(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.UTC).isoformat()
+
+
+def _auth_warning(status: int, credential: dict[str, object], *, source: str) -> ProviderResult:
+    return ProviderResult(
+        id="clinepass",
+        warning=f"인증 실패 (HTTP {status}) — 키를 확인하세요",
+        source=source,
+        raw={"status": status, "credential": credential},
+    )
+
+
+def _fetch_fallback(key: str, credential: dict[str, object], *, primary_status: int) -> ProviderResult:
     try:
         status, headers = _probe(key)
     except ValueError:
@@ -57,11 +246,14 @@ def fetch() -> ProviderResult:
     except Exception as exc:
         return ProviderResult(
             id="clinepass",
-            error=f"completions probe 실패 ({type(exc).__name__})",
-            hint="ClinePass 네트워크/로그인 상태를 확인하세요",
-            source="completions-probe",
-            raw={"credential": credential},
+            error=f"completions fallback 실패 ({type(exc).__name__})",
+            hint=f"usage-limits HTTP {primary_status}; ClinePass 서비스 상태를 확인하세요",
+            source="completions-fallback",
+            raw={"status": primary_status, "credential": credential},
         )
+
+    if status in AUTH_FAILURE_STATUSES:
+        return _auth_warning(status, credential, source="completions-fallback")
 
     try:
         rate_headers = _rate_limit_headers(headers)
@@ -69,41 +261,32 @@ def fetch() -> ProviderResult:
     except Exception as exc:
         return ProviderResult(
             id="clinepass",
-            error=f"rate-limit 헤더 처리 실패 ({type(exc).__name__})",
-            hint="ClinePass 응답 헤더 형식을 확인하세요",
-            source="completions-probe",
-            raw={"status": status, "credential": credential},
+            error=f"completions fallback 헤더 처리 실패 ({type(exc).__name__})",
+            source="completions-fallback",
+            raw={"status": primary_status, "fallback_status": status, "credential": credential},
         )
+
     raw = {
-        "status": status,
+        "status": primary_status,
+        "fallback_status": status,
         "credential": credential,
         "rate_limit_headers": rate_headers,
     }
-    if status in AUTH_FAILURE_STATUSES:
-        return ProviderResult(
-            id="clinepass",
-            buckets=buckets,
-            warning=f"인증 실패 (HTTP {status}) — 키를 확인하세요",
-            source="completions-probe",
-            raw=raw,
-        )
     if not buckets:
-        status_note = f", HTTP {status}" if status else ""
-        reason = "rate-limit 헤더 없음" if not rate_headers else "해석 가능한 limit/remaining 헤더 쌍 없음"
         return ProviderResult(
             id="clinepass",
-            buckets=[],
-            note=(f"no data — {reason}{status_note}; 이 티어는 헤더를 제공하지 않을 수 있음"),
-            source="completions-probe",
+            note=(
+                f"no data — usage-limits HTTP {primary_status}; "
+                f"completions fallback rate-limit 헤더 없음 (HTTP {status})"
+            ),
+            source="completions-fallback",
             raw=raw,
         )
-
-    note = f"HTTP {status} 응답의 rate-limit 헤더 적용" if status >= 400 else None
     return ProviderResult(
         id="clinepass",
         buckets=buckets,
-        note=note,
-        source="completions-probe",
+        note=f"usage-limits HTTP {primary_status}; completions fallback 적용",
+        source="completions-fallback",
         raw=raw,
     )
 
@@ -118,7 +301,7 @@ def _invalid_credential(credential: dict[str, object]) -> ProviderResult:
         id="clinepass",
         error=INVALID_CREDENTIAL,
         hint="ClinePass API key 형식을 확인하세요",
-        source="completions-probe",
+        source="usage-limits-api",
         raw={"credential": credential},
     )
 
@@ -150,14 +333,14 @@ def _api_key() -> tuple[str | None, str | None]:
 def _probe(key: str) -> tuple[int, Message]:
     body = json.dumps(
         {
-            "model": MODEL,
+            "model": FALLBACK_MODEL,
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
             "stream": False,
         }
     ).encode()
     request = urllib.request.Request(
-        USAGE_URL,
+        COMPLETIONS_URL,
         data=body,
         headers={
             "Authorization": f"Bearer {key}",

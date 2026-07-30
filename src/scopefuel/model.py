@@ -19,7 +19,7 @@ from typing import Literal
 SCHEMA = "scopefuel.v1"
 
 ScopeKind = Literal["account", "model", "group"]
-Horizon = Literal["now", "week"]
+Horizon = Literal["now", "week", "month"]
 Mark = Literal["ok", "warn", "crit", "degraded"]
 
 WARN_PCT = 75.0
@@ -152,6 +152,7 @@ class Verdict:
 
     now_pct: float | None
     week_pct: float | None
+    month_pct: float | None
     blocking_pct: float
     basis: Literal["account", "group", "none"]
     mark: Mark
@@ -159,7 +160,7 @@ class Verdict:
     groups: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "now_pct": self.now_pct,
             "week_pct": self.week_pct,
             "blocking_pct": self.blocking_pct,
@@ -168,6 +169,9 @@ class Verdict:
             "groups": self.groups,
             "exhausted": [b.as_dict() for b in self.exhausted],
         }
+        if self.month_pct is not None:
+            out["month_pct"] = self.month_pct
+        return out
 
 
 @dataclass
@@ -200,6 +204,7 @@ class ProviderResult:
             return Verdict(
                 now_pct=v.now_pct,
                 week_pct=v.week_pct,
+                month_pct=v.month_pct,
                 blocking_pct=v.blocking_pct,
                 basis=v.basis,
                 mark="warn" if self.warning and not self.error and not self.stale else "degraded",
@@ -288,6 +293,7 @@ def verdict_for(buckets: list[Bucket]) -> Verdict:
     return Verdict(
         now_pct=axis("now"),
         week_pct=axis("week"),
+        month_pct=axis("month"),
         blocking_pct=blocking,
         basis=basis,
         mark=mark_for(blocking),

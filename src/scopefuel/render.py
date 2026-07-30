@@ -66,6 +66,8 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
             basis = result.warning
         elif verdict.basis == "account":
             basis = f"지금(5h급) {_pct(verdict.now_pct)} · 이번주 {_pct(verdict.week_pct)}"
+            if verdict.month_pct is not None:
+                basis += f" · 이번달 {_pct(verdict.month_pct)}"
         elif verdict.basis == "group":
             per = " / ".join(f"{g} {_pct(v)}" for g, v in sorted(verdict.groups.items()))
             basis = f"그룹별 독립: {per}"
@@ -82,7 +84,7 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
             elif bucket.scope.kind == "group" and verdict.basis != "group":
                 tags.append("이 그룹만")
             tag_s = f"  [{', '.join(tags)}]" if tags else ""
-            horizon = "now " if bucket.horizon == "now" else "week"
+            horizon = {"now": "now ", "week": "week", "month": "month"}[bucket.horizon]
             lines.append(
                 f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>11}"
                 f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket)}{tag_s}"
@@ -132,6 +134,10 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
                 parts.append(f"now 사용 {verdict.now_pct:g}%{_pace(_bucket_for(result, horizon='now'))}")
             if horizon in ("week", "both") and verdict.week_pct is not None:
                 parts.append(f"week 사용 {verdict.week_pct:g}%{_pace(_bucket_for(result, horizon='week'))}")
+            if horizon == "both" and verdict.month_pct is not None:
+                parts.append(
+                    f"month 사용 {verdict.month_pct:g}%{_pace(_bucket_for(result, horizon='month'))}"
+                )
         if not parts:
             # 요청한 지평에 데이터가 없으면 빈칸을 남기지 않고 있는 축을 보여준다.
             other = verdict.week_pct if horizon == "now" else verdict.now_pct

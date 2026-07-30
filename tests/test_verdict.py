@@ -89,3 +89,12 @@ def test_warning_provider_is_warn_without_becoming_error():
     assert result.verdict.mark == "warn"
     assert result.as_dict()["warning"] == "인증 실패 (HTTP 401)"
     assert overall_mark([result]) == "warn"
+
+
+def test_month_axis_is_added_only_when_present():
+    monthly = account(30, window="30d", horizon="month")
+    result = ProviderResult(id="clinepass", buckets=[account(10), monthly])
+
+    assert result.verdict.month_pct == 30
+    assert result.as_dict()["verdict"]["month_pct"] == 30
+    assert "month_pct" not in ProviderResult(id="claude", buckets=[account(10)]).as_dict()["verdict"]

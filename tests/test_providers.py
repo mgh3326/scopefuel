@@ -181,13 +181,48 @@ def test_clinepass_key_precedence(monkeypatch, tmp_path):
     assert clinepass._api_key() == ("fallback-secret", "file:~/.config/cline/api-key")
 
 
+def test_clinepass_usage_request_is_token_free_get(monkeypatch):
+    captured = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"data":{"limits":[]},"success":true}'
+
+    def fake_urlopen(request, **kwargs):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["body"] = request.data
+        captured["authorization"] = request.get_header("Authorization")
+        return Response()
+
+    monkeypatch.setattr(clinepass.urllib.request, "urlopen", fake_urlopen)
+
+    status, _body = clinepass._request_usage("synthetic-key")
+
+    assert status == 200
+    assert captured == {
+        "url": clinepass.USAGE_URL,
+        "method": "GET",
+        "body": None,
+        "authorization": "Bearer synthetic-key",
+    }
+
+
 def test_clinepass_applies_rate_headers_from_http_error(monkeypatch):
     headers = Message()
     headers["x-ratelimit-limit-requests"] = "100"
     headers["x-ratelimit-remaining-requests"] = "75"
     headers["x-ratelimit-reset-requests"] = "5h"
     error = urllib.error.HTTPError(
-        clinepass.USAGE_URL, 429, "rate limited", headers, io.BytesIO(b'{"error":"limited"}')
+        clinepass.COMPLETIONS_URL, 429, "rate limited", headers, io.BytesIO(b'{"error":"limited"}')
     )
 
     def raise_http_error(*args, **kwargs):
@@ -200,7 +235,69 @@ def test_clinepass_applies_rate_headers_from_http_error(monkeypatch):
     assert actual["x-ratelimit-remaining-requests"] == "75"
 
 
-def test_clinepass_parses_headers_without_exposing_key(monkeypatch):
+def test_clinepass_usage_limits_maps_all_windows_and_tz_aware_resets(monkeypatch):
+    payload = {
+        "data": {
+            "limits": [
+                {"type": "monthly", "percentUsed": 30, "resetsAt": "2026-08-30T05:00:00Z"},
+                {"type": "five_hour", "percentUsed": 10, "resetsAt": "2026-07-30T10:00:00Z"},
+                {"type": "weekly", "percentUsed": 20, "resetsAt": "2026-08-06T05:00:00+00:00"},
+            ]
+        },
+        "success": True,
+        "accountId": "must-not-enter-raw",
+    }
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(
+        clinepass,
+        "_request_usage",
+        lambda _key: (200, json.dumps(payload).encode()),
+    )
+    monkeypatch.setattr(
+        clinepass,
+        "_probe",
+        lambda _key: (_ for _ in ()).throw(AssertionError("fallback called on usage success")),
+    )
+
+    result = clinepass.fetch()
+
+    assert result.source == "usage-limits-api"
+    assert result.note is None
+    assert [(b.label, b.window, b.horizon, b.used_pct) for b in result.buckets] == [
+        ("five_hour", "5h", "now", 10.0),
+        ("weekly", "7d", "week", 20.0),
+        ("monthly", "30d", "month", 30.0),
+    ]
+    assert all(b.resets_at and b.resets_at.endswith("+00:00") for b in result.buckets)
+    assert result.verdict.month_pct == 30.0
+    assert result.raw and result.raw["credential"] == {
+        "source": "env:CLINE_API_KEY",
+        "present": True,
+    }
+    assert "accountId" not in json.dumps(result.raw)
+    output = render.table([result], color=False)
+    assert "now  five_hour" in output
+    assert "week weekly" in output
+    assert "month monthly" in output
+    assert "이번달 사용 30%" in output
+
+
+def test_clinepass_server_error_does_not_spend_fallback_token(monkeypatch):
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (500, b""))
+    monkeypatch.setattr(
+        clinepass,
+        "_probe",
+        lambda _key: (_ for _ in ()).throw(AssertionError("fallback called on HTTP 500")),
+    )
+
+    result = clinepass.fetch()
+
+    assert result.error == "usage-limits HTTP 500"
+    assert result.source == "usage-limits-api"
+
+
+def test_clinepass_fallback_parses_headers_without_exposing_key(monkeypatch):
     headers = Message()
     headers["x-ratelimit-limit-requests"] = "100"
     headers["x-ratelimit-remaining-requests"] = "75"
@@ -209,12 +306,14 @@ def test_clinepass_parses_headers_without_exposing_key(monkeypatch):
     headers["x-ratelimit-remaining-tokens"] = "250"
     headers["x-ratelimit-reset-tokens"] = "1d"
     monkeypatch.setattr(clinepass, "_api_key", lambda: ("super-secret", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
     monkeypatch.setattr(clinepass, "_probe", lambda _key: (400, headers))
 
     result = clinepass.fetch()
 
     assert result.error is None
-    assert result.note == "HTTP 400 응답의 rate-limit 헤더 적용"
+    assert result.note == "usage-limits HTTP 404; completions fallback 적용"
+    assert result.source == "completions-fallback"
     assert [(b.label, b.used_pct) for b in result.buckets] == [
         ("requests", 25.0),
         ("tokens", 75.0),
@@ -226,39 +325,102 @@ def test_clinepass_parses_headers_without_exposing_key(monkeypatch):
     assert "super-secret" not in json.dumps(result.raw)
 
 
-def test_clinepass_missing_rate_headers_is_graceful_no_data(monkeypatch):
+def test_clinepass_empty_limits_is_graceful_no_data(monkeypatch):
     monkeypatch.setattr(clinepass, "_api_key", lambda: ("super-secret", "env:CLINE_API_KEY"))
-    monkeypatch.setattr(clinepass, "_probe", lambda _key: (200, Message()))
+    monkeypatch.setattr(
+        clinepass,
+        "_request_usage",
+        lambda _key: (200, b'{"data":{"limits":[]},"success":true}'),
+    )
 
     result = clinepass.fetch()
 
     assert result.status == "ok"
     assert result.error is None
     assert result.buckets == []
-    assert result.note and result.note.startswith("no data — rate-limit 헤더 없음")
-    assert result.raw and result.raw["rate_limit_headers"] == {}
+    assert result.note == "no data — usage-limits limits 비어 있음"
+    assert result.raw and result.raw["data"] == {"limits": []}
     assert "super-secret" not in json.dumps(result.as_dict(include_raw=True))
 
 
-def test_clinepass_auth_failures_warn_but_200_without_headers_is_no_data(monkeypatch):
+def test_clinepass_partial_limits_stays_usable_and_marks_invalid_reset(monkeypatch):
+    payload = {
+        "data": {
+            "limits": [
+                {"type": "weekly", "percentUsed": 42.5, "resetsAt": "2026-08-06T05:00:00Z"},
+                {"type": "monthly", "percentUsed": 55, "resetsAt": "2026-08-30T05:00:00"},
+            ]
+        },
+        "success": True,
+    }
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (200, json.dumps(payload).encode()))
+
+    result = clinepass.fetch()
+
+    assert [(b.label, b.used_pct) for b in result.buckets] == [("weekly", 42.5), ("monthly", 55.0)]
+    assert result.note == "partial data — limits 누락: five_hour"
+    monthly = next(bucket for bucket in result.buckets if bucket.label == "monthly")
+    assert monthly.resets_at is None
+    assert monthly.note and "비-tz ISO8601" in monthly.note
+    assert result.error is None
+
+
+def test_clinepass_auth_failures_warn_but_empty_limits_is_no_data(monkeypatch):
     monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
 
     outputs = {}
     for status in (401, 403, 200):
-        monkeypatch.setattr(clinepass, "_probe", lambda _key, status=status: (status, Message()))
+        body = b'{"data":{"limits":[]},"success":true}' if status == 200 else b""
+        monkeypatch.setattr(
+            clinepass,
+            "_request_usage",
+            lambda _key, status=status, body=body: (status, body),
+        )
         result = clinepass.fetch()
         outputs[status] = render.table([result], color=False)
 
     assert outputs[401] == "clinepass  [WARN] 인증 실패 (HTTP 401) — 키를 확인하세요\n"
     assert outputs[403] == "clinepass  [WARN] 인증 실패 (HTTP 403) — 키를 확인하세요\n"
     assert outputs[200].startswith("clinepass  [ok] 한도 정보 없음")
-    assert "no data — rate-limit 헤더 없음, HTTP 200" in outputs[200]
+    assert "no data — usage-limits limits 비어 있음" in outputs[200]
     assert len(set(outputs.values())) == 3
 
 
-def test_clinepass_sanitizes_probe_value_error(monkeypatch):
+def test_clinepass_fallback_auth_failure_is_warning(monkeypatch):
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
+    monkeypatch.setattr(clinepass, "_probe", lambda _key: (403, Message()))
+
+    result = clinepass.fetch()
+
+    assert result.status == "warning"
+    assert result.error is None
+    assert result.warning == "인증 실패 (HTTP 403) — 키를 확인하세요"
+    assert result.source == "completions-fallback"
+
+
+def test_clinepass_sanitizes_primary_value_error(monkeypatch):
     marker = "ZZ-SYNTHETIC-MARKER-F1-NOT-A-REAL-KEY"
     monkeypatch.setattr(clinepass, "_api_key", lambda: (marker, "env:CLINE_API_KEY"))
+
+    def leak_if_unsanitized(_key):
+        raise ValueError(f"Invalid header value b'Bearer {marker}'")
+
+    monkeypatch.setattr(clinepass, "_request_usage", leak_if_unsanitized)
+    result = clinepass.fetch()
+    output = render.table([result], color=False) + render.brief([result], color=False)
+    serialized = json.dumps(result.as_dict(include_raw=True), ensure_ascii=False)
+
+    assert result.error == "invalid credential format"
+    assert marker not in output
+    assert marker not in serialized
+
+
+def test_clinepass_sanitizes_fallback_value_error(monkeypatch):
+    marker = "ZZ-SYNTHETIC-MARKER-F1-NOT-A-REAL-KEY"
+    monkeypatch.setattr(clinepass, "_api_key", lambda: (marker, "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
 
     def leak_if_unsanitized(_key):
         raise ValueError(f"Invalid header value b'Bearer {marker}'")
@@ -273,24 +435,25 @@ def test_clinepass_sanitizes_probe_value_error(monkeypatch):
     assert marker not in serialized
 
 
-def test_clinepass_sanitizes_unexpected_probe_and_header_errors(monkeypatch):
+def test_clinepass_sanitizes_unexpected_primary_and_fallback_errors(monkeypatch):
     marker = "ZZ-SYNTHETIC-MARKER-F1-NOT-A-REAL-KEY"
     monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
 
-    def probe_failure(_key):
+    def primary_failure(_key):
         raise RuntimeError(f"request/URL/body detail: {marker}")
 
-    monkeypatch.setattr(clinepass, "_probe", probe_failure)
-    probe_result = clinepass.fetch()
+    monkeypatch.setattr(clinepass, "_request_usage", primary_failure)
+    primary_result = clinepass.fetch()
 
     class BadHeaders:
         def items(self):
             raise RuntimeError(f"response header detail: {marker}")
 
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
     monkeypatch.setattr(clinepass, "_probe", lambda _key: (200, BadHeaders()))
-    header_result = clinepass.fetch()
+    fallback_result = clinepass.fetch()
 
-    for result in (probe_result, header_result):
+    for result in (primary_result, fallback_result):
         output = render.table([result], color=False) + render.brief([result], color=False)
         serialized = json.dumps(result.as_dict(include_raw=True), ensure_ascii=False)
         assert marker not in output
@@ -310,7 +473,7 @@ def test_clinepass_rejects_unsafe_synthetic_keys_without_exposure(monkeypatch):
         monkeypatch.setattr(clinepass, "_api_key", lambda key=key: (key, "env:CLINE_API_KEY"))
         monkeypatch.setattr(
             clinepass,
-            "_probe",
+            "_request_usage",
             lambda _key: (_ for _ in ()).throw(AssertionError("unsafe key reached probe")),
         )
         result = clinepass.fetch()
