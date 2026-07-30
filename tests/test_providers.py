@@ -11,7 +11,7 @@ import pytest
 
 from scopefuel import cache, render
 from scopefuel.model import Bucket, ProviderResult
-from scopefuel.providers import BUILTIN, agy, claude, clinepass, codex, kiro
+from scopefuel.providers import BUILTIN, agy, claude, clinepass, codex, grok, kiro
 
 
 def test_claude_marks_weekly_scoped_as_model_scope(fixture_json, monkeypatch, tmp_path):
@@ -163,7 +163,7 @@ def test_kiro_expired_token_twice_keeps_error_with_login_hint(monkeypatch):
 
 
 def test_clinepass_is_appended_after_existing_builtin_providers():
-    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass"]
+    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass", "grok"]
 
 
 def test_clinepass_key_precedence(monkeypatch, tmp_path):
@@ -852,3 +852,299 @@ def test_agy_cloud_buckets_catches_overflow():
     }
     buckets = agy._cloud_buckets(raw)
     assert len(buckets) == 0
+
+
+# ------------------------------------------------------------------ grok (ROB-1179)
+
+
+def _grok_auth(tmp_path, monkeypatch, *, key="synthetic-jwt-not-real", with_ids=True):
+    auth = tmp_path / "auth.json"
+    entry = {"key": key}
+    if with_ids:
+        entry["user_id"] = "00000000-0000-4000-8000-000000000001"
+        entry["team_id"] = "00000000-0000-4000-8000-000000000002"
+        entry["email"] = "redacted@example.com"
+    auth.write_text(json.dumps({f"{grok.AUTH_KEY_PREFIX}synthetic-client": entry}))
+    monkeypatch.setattr(grok, "AUTH", auth)
+    return auth
+
+
+def test_grok_auth_selects_auth_x_ai_prefix_and_redacts_identifiers(tmp_path, monkeypatch):
+    other = tmp_path / "auth.json"
+    other.write_text(
+        json.dumps(
+            {
+                "https://other.example/sign-in": {"key": "wrong-token"},
+                f"{grok.AUTH_KEY_PREFIX}abc": {
+                    "key": "correct-token",
+                    "user_id": "uid-must-not-leak",
+                    "team_id": "tid-must-not-leak",
+                    "email": "must-not-leak@example.com",
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(grok, "AUTH", other)
+    token, meta = grok._load_token()
+    assert token == "correct-token"
+    assert meta["auth_key_prefix_match"] is True
+    assert meta["key_field_present"] is True
+    assert meta["user_id_field_present"] is True
+    assert meta["team_id_field_present"] is True
+    assert "uid-must-not-leak" not in json.dumps(meta)
+    assert "tid-must-not-leak" not in json.dumps(meta)
+
+
+def test_grok_missing_auth_is_error_with_hint(tmp_path, monkeypatch):
+    monkeypatch.setattr(grok, "AUTH", tmp_path / "missing.json")
+    result = grok.fetch()
+    assert result.error and result.hint
+    assert result.buckets == []
+    assert "auth.x.ai" in (result.hint or "")
+
+
+def test_grok_rate_limits_success_maps_windows(fixture_json, tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    payloads = {
+        "DEFAULT": fixture_json("grok_rate_limits_default"),
+        "DEEPSEARCH": fixture_json("grok_rate_limits_deepsearch"),
+        "THINK": fixture_json("grok_rate_limits_think"),
+    }
+
+    def fake_post(_token, body):
+        kind = body.get("requestKind", "DEFAULT")
+        return 200, payloads[kind], None
+
+    monkeypatch.setattr(grok, "_post_rate_limits", fake_post)
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _token: "grok pro")
+
+    result = grok.fetch()
+
+    assert result.error is None
+    assert result.plan == "grok pro"
+    assert result.source == "rate-limits"
+    assert result.pool_class == "preserve"  # class is applied by registry, not fetch()
+    by_label = {b.label: b for b in result.buckets}
+    assert by_label["default"].used_pct == 25.0  # 100-75
+    assert by_label["default"].window == "2h"
+    assert by_label["default"].horizon == "now"
+    assert by_label["default"].scope.kind == "account"
+    assert by_label["default"].resets_at and by_label["default"].resets_at.endswith("Z")
+    assert by_label["deepsearch"].used_pct == 20.0
+    assert by_label["think"].used_pct == 75.0
+    assert by_label["think"].horizon == "week"
+    # effort nested without totalQueries is not invented
+    assert "think-low-effort" not in by_label
+    raw_dump = json.dumps(result.raw)
+    assert result.raw and "synthetic-jwt" not in raw_dump
+    assert "00000000-0000-4000-8000-000000000001" not in raw_dump
+    assert "redacted@example.com" not in raw_dump
+    assert result.raw["credential"]["present"] is True
+
+    # registry class spend — text/JSON agree when pool_class applied
+    result.pool_class = "spend"
+    assert result.verdict.mark == "ok"
+    table = render.table([result], color=False)
+    brief = render.brief([result], color=False)
+    payload = result.as_dict()
+    assert payload["buckets"][0]["used_pct"] == 25.0
+    assert "25%" in table or "25" in table
+    assert "grok" in brief
+    assert "uid-must-not-leak" not in table
+
+
+_OAUTH2_FORBIDDEN_MSG = (
+    "Action cannot be performed by OAuth2 token users. [WKE=unauthorized:oauth2-auth-forbidden]"
+)
+
+
+def test_grok_oauth2_forbidden_falls_back_to_free_gates(fixture_json, tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_post_rate_limits",
+        lambda *_a, **_k: (
+            403,
+            {"code": 7, "message": _OAUTH2_FORBIDDEN_MSG, "details": []},
+            _OAUTH2_FORBIDDEN_MSG,
+        ),
+    )
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: "grok pro")
+
+    def fake_get(_token, url):
+        assert url == grok.FREE_GATES_URL
+        return 200, fixture_json("grok_free_usage_gates")
+
+    monkeypatch.setattr(grok, "_get_json", fake_get)
+
+    result = grok.fetch()
+    assert result.error is None
+    assert result.source == "free-usage-gates"
+    by_label = {b.label: (b.used_pct, b.scope.kind) for b in result.buckets}
+    assert by_label["chat"] == (75.0, "group")  # (20-5)/20
+    assert by_label["imagine"] == (0.0, "group")
+    assert by_label["build"] == (75.0, "group")
+    assert "voice" not in by_label  # allowance 0 skipped
+    assert result.note and "oauth2-auth-forbidden" in result.note
+    assert "must-not-leak" not in json.dumps(result.as_dict(include_raw=True))
+
+
+def test_grok_oauth2_forbidden_with_zero_gates_is_graceful_no_data(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_post_rate_limits",
+        lambda *_a, **_k: (403, {"message": _OAUTH2_FORBIDDEN_MSG}, _OAUTH2_FORBIDDEN_MSG),
+    )
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: "grok pro")
+    monkeypatch.setattr(
+        grok,
+        "_get_json",
+        lambda *_a, **_k: (
+            200,
+            {
+                "chat": {"allowance": "0", "remaining": "0"},
+                "imagine": {"allowance": "0", "remaining": "0"},
+                "voice": {"allowance": "0", "remaining": "0"},
+                "build": {"allowance": "0", "remaining": "0"},
+            },
+        ),
+    )
+
+    result = grok.fetch()
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.buckets == []
+    assert result.plan == "grok pro"
+    assert result.source == "no-data"
+    assert result.note and "no data" in result.note
+    assert result.verdict.blocking_pct == 0
+    assert result.verdict.mark == "ok"
+
+
+def test_grok_malformed_rate_limits_schema_is_no_data_not_zero(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_post_rate_limits",
+        lambda *_a, **_k: (200, {"remainingQueries": 5}, None),  # total 없음
+    )
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
+
+    result = grok.fetch()
+    assert result.buckets == [] or all(b.used_pct is None for b in result.buckets)
+    # used_pct 를 0으로 채우지 않는다
+    assert result.error is None
+    assert result.note or result.warning
+    if result.buckets:
+        assert result.buckets[0].used_pct is None
+
+
+def test_grok_boundary_remaining_gt_total_is_warning(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+
+    def fake_post(_token, body):
+        if body.get("requestKind") != "DEFAULT":
+            return 404, None, None
+        return 200, {"remainingQueries": 120, "totalQueries": 100, "windowSizeSeconds": 7200}, None
+
+    monkeypatch.setattr(grok, "_post_rate_limits", fake_post)
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
+    result = grok.fetch()
+    assert result.buckets
+    assert result.buckets[0].used_pct is None
+    assert result.warning or (result.buckets[0].note and "remaining>total" in result.buckets[0].note)
+
+
+def test_grok_http_429_is_error(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(grok, "_post_rate_limits", lambda *_a, **_k: (429, None, None))
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
+    result = grok.fetch()
+    assert result.error and "429" in result.error
+    assert result.buckets == []
+
+
+def test_grok_auth_401_is_warning(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_post_rate_limits",
+        lambda *_a, **_k: (401, {"message": "unauthorized"}, "unauthorized"),
+    )
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
+    result = grok.fetch()
+    assert result.warning and "401" in result.warning
+    assert result.error is None
+    assert result.buckets == []
+
+
+def test_grok_plan_from_subscriptions_redacts_account_fields(fixture_json, tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_post_rate_limits",
+        lambda *_a, **_k: (403, {"message": _OAUTH2_FORBIDDEN_MSG}, _OAUTH2_FORBIDDEN_MSG),
+    )
+
+    def fake_get(_token, url):
+        if url == grok.SUBSCRIPTIONS_URL:
+            # live-shaped but with synthetic ids that must not leak into provider raw
+            dirty = fixture_json("grok_subscriptions")
+            dirty = json.loads(json.dumps(dirty))
+            dirty["subscriptions"][0]["xaiUserId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            return 200, dirty
+        if url == grok.FREE_GATES_URL:
+            return 200, {
+                "chat": {"allowance": "0", "remaining": "0"},
+                "imagine": {"allowance": "0", "remaining": "0"},
+                "voice": {"allowance": "0", "remaining": "0"},
+                "build": {"allowance": "0", "remaining": "0"},
+            }
+        return 404, None
+
+    monkeypatch.setattr(grok, "_get_json", fake_get)
+    result = grok.fetch()
+    assert result.plan == "grok pro"
+    dumped = json.dumps(result.as_dict(include_raw=True))
+    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" not in dumped
+    assert "xaiUserId" not in dumped
+
+
+def test_grok_registry_spend_class_and_list_order():
+    assert "grok" in BUILTIN
+    assert BUILTIN["grok"].pool_class == "spend"
+    assert list(BUILTIN)[-1] == "grok"
+
+
+def test_grok_cache_json_rendering_secret_free(fixture_json, tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch, key="super-secret-token-value")
+
+    def fake_post(token, body):
+        assert token == "super-secret-token-value"
+        if body.get("requestKind") == "DEFAULT":
+            return 200, fixture_json("grok_rate_limits_default"), None
+        return 404, None, None
+
+    monkeypatch.setattr(grok, "_post_rate_limits", fake_post)
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: "grok pro")
+
+    results = cache.collect({"grok": grok.fetch}, ["grok"], ttl_s=60, use_cache=True)
+    results[0].pool_class = "spend"
+    assert results[0].buckets[0].used_pct == 25.0
+
+    # second collect hits cache
+    cached = cache.collect(
+        {"grok": lambda: (_ for _ in ()).throw(AssertionError("should use cache"))},
+        ["grok"],
+        ttl_s=60,
+        use_cache=True,
+    )
+    assert cached[0].buckets[0].used_pct == 25.0
+
+    table = render.table(results, color=False)
+    brief = render.brief(results, color=False)
+    payload = json.dumps(results[0].as_dict(include_raw=True))
+    for surface in (table, brief, payload):
+        assert "super-secret-token-value" not in surface
+        assert "00000000-0000-4000-8000" not in surface
