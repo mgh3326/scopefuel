@@ -13,6 +13,7 @@
 ```toml
 id = "myplan"                    # --only myplan 으로 지정하는 이름
 plan_path = ["plan_type"]        # (선택) 응답에서 플랜 이름을 꺼낼 경로
+class = "preserve"               # (선택) "preserve" | "spend". 미지정 시 "preserve"
 
 [credentials]
 file = "~/.myagent/auth.json"          # 또는 token_env = "MYPLAN_TOKEN"
@@ -52,6 +53,16 @@ resets_at_kind = "epoch"
 ```toml
 remaining_fraction_path = ["quotaInfo", "remainingFraction"]   # 0.42 → used 58%
 ```
+
+### pool class — 이 풀을 어떻게 다룰 것인가
+
+| class | 의미 | 예 |
+|---|---|---|
+| `preserve` | 75%/90% 사용률을 WARN/CRIT로 승격. 계정/모델/그룹 차단 판정에 그대로 사용. | claude, codex |
+| `spend` | 고사용을 정상으로 본다. 리셋 전 24시간 미만, 70% 미만 bucket이 있으면 WASTE 권고. | kiro, clinepass, agy |
+
+`class`는 provider 전체에 적용된다. 내장 provider의 기본값을 바꾸려면 같은 `id`로 스펙을
+덮어쓰되 `class`를 명시하면 된다.
 
 ### 스코프를 고르는 기준 (이 도구의 핵심)
 

@@ -12,7 +12,7 @@ import os
 import pathlib
 import time
 
-from .model import Bucket, ProviderResult, Scope
+from .model import Bucket, PoolClass, ProviderResult, Scope
 
 DEFAULT_TTL_S = 60.0
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
@@ -50,7 +50,13 @@ def _to_entry(result: ProviderResult, now: float) -> dict:
     return {"fetched_at": now, "result": payload}
 
 
-def _from_entry(entry: dict, provider_id: str, now: float) -> ProviderResult:
+def _pool_class(fetcher: object) -> PoolClass:
+    return getattr(fetcher, "pool_class", "preserve")
+
+
+def _from_entry(
+    entry: dict, provider_id: str, now: float, pool_class: PoolClass = "preserve"
+) -> ProviderResult:
     payload = entry.get("result") or {}
     fetched_at = float(entry.get("fetched_at") or 0)
     buckets = [
@@ -77,6 +83,7 @@ def _from_entry(entry: dict, provider_id: str, now: float) -> ProviderResult:
         fetched_at=fetched_at,
         age_s=now - fetched_at,
         stale=True,
+        pool_class=pool_class,
     )
 
 
@@ -96,13 +103,14 @@ def collect(
 
     for name in names:
         entry = cache.get(name)
+        fetcher = fetchers.get(name)
+        pool_class = _pool_class(fetcher)
         if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= ttl_s:
-            fresh = _from_entry(entry, name, now)
+            fresh = _from_entry(entry, name, now, pool_class)
             fresh.stale = False  # TTL 안이면 신선한 값으로 취급
             results.append(fresh)
             continue
 
-        fetcher = fetchers.get(name)
         result: ProviderResult
         if fetcher is None:
             result = ProviderResult(id=name, error="알 수 없는 provider")
@@ -111,11 +119,12 @@ def collect(
                 result = fetcher()  # type: ignore[operator]
             except Exception as exc:
                 result = ProviderResult(id=name, error=str(exc))
+        result.pool_class = pool_class
 
         if result.error and entry:
             age = now - float(entry.get("fetched_at") or 0)
             if age <= STALE_MAX_S:
-                stale = _from_entry(entry, name, now)
+                stale = _from_entry(entry, name, now, pool_class)
                 stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
                 results.append(stale)
                 continue

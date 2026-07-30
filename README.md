@@ -100,20 +100,17 @@ CLI 호출 자체가 갱신하므로 1회 재시도합니다.
 `GetCommandModelConfigs`는 CLI에서 501, `GetCascadeModelConfigs`는 빈 응답, `RetrieveUserQuota`는 404입니다.
 모델별 단가를 알고 싶으면 작업 전후로 빼는 수밖에 없습니다.
 
-## 새 provider 추가
+## provider class — preserve vs spend
 
-대부분은 **TOML 한 장**으로 끝납니다 — 코드도, 릴리스도 필요 없습니다.
+내장 provider는 운영 의도에 따라 두 class로 구분됩니다.
 
-```bash
-mkdir -p ~/.config/scopefuel/providers
-$EDITOR ~/.config/scopefuel/providers/myplan.toml
-scopefuel --only myplan
-```
+- **preserve** (기본): 75%/90% 사용률을 WARN/CRIT로 승격. `claude`, `codex`.
+- **spend**: 고사용을 정상으로 본다. reset 전 24시간 미만, 70% 미만 bucket이 있으면
+  **WASTE** 권고를 낸다. `kiro`, `clinepass`, `agy`.
 
-포맷과 예제는 [docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요. 프로세스 탐색·OAuth
-갱신·다단계 호출처럼 스펙의 틀을 벗어나는 provider는 Python entry-point 플러그인으로 붙입니다.
-같은 id를 정의하면 **스펙이 내장 provider를 덮어씁니다** — 엔드포인트가 깨졌을 때 릴리스를 기다리지
-않고 사용자가 직접 고칠 수 있게 한 의도적 설계입니다.
+사용자 스펙에서 `class = "preserve" | "spend"`로 덮어쓸 수 있습니다. 자세한 내용은
+[docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요. raw `used_pct`, reset, pace는
+그대로 보존하며, `--exit-code-on`과 전체 mark는 failure/warning/stale 우선 순위를 유지합니다.
 
 ## 주의
 

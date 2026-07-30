@@ -53,21 +53,21 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     return parser
 
 
-def _render(results: list[ProviderResult], args: argparse.Namespace) -> str:
+def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.datetime) -> str:
     color = not args.no_color and sys.stdout.isatty()
     if args.raw:
         return json.dumps({r.id: r.raw for r in results}, indent=2, ensure_ascii=False)
     if args.json:
         payload = {
             "schema": SCHEMA,
-            "generated_at": dt.datetime.now(dt.UTC).isoformat(),
+            "generated_at": now.isoformat(),
             "summary": {"mark": overall_mark(results)},
-            "providers": [r.as_dict() for r in results],
+            "providers": [r.as_dict(now=now) for r in results],
         }
         return json.dumps(payload, indent=2, ensure_ascii=False)
     if args.brief:
-        return render.brief(results, color=color, horizon=args.horizon)
-    return render.table(results, color=color)
+        return render.brief(results, color=color, horizon=args.horizon, now=now)
+    return render.table(results, color=color, now=now)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,8 +85,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     while True:
+        now = dt.datetime.now(dt.UTC)
         results = collect(fetchers, names, ttl_s=args.cache_ttl, use_cache=not args.no_cache)
-        print(_render(results, args), flush=True)
+        print(_render(results, args, now), flush=True)
         if not args.watch:
             break
         try:

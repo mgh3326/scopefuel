@@ -143,10 +143,7 @@ def fetch() -> ProviderResult:
     )
     if payload.get("success") is False:
         return ProviderResult(
-            id="clinepass",
-            error="usage-limits 응답 success=false",
-            source=PRIMARY_SOURCE,
-            raw=raw,
+            id="clinepass", error="usage-limits 응답 success=false", source=PRIMARY_SOURCE, raw=raw
         )
     if validation_warnings:
         return _warning_result(
@@ -159,13 +156,7 @@ def fetch() -> ProviderResult:
             limits=safe_limits,
         )
 
-    return ProviderResult(
-        id="clinepass",
-        buckets=buckets,
-        note=note,
-        source=PRIMARY_SOURCE,
-        raw=raw,
-    )
+    return ProviderResult(id="clinepass", buckets=buckets, note=note, source=PRIMARY_SOURCE, raw=raw)
 
 
 def _request_usage(key: str) -> tuple[int, bytes]:

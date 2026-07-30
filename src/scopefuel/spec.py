@@ -23,7 +23,7 @@ import tomllib
 from collections.abc import Callable
 
 from .http import dig, request_json
-from .model import Bucket, ProviderResult, Scope, horizon_for
+from .model import Bucket, PoolClass, ProviderResult, Scope, horizon_for
 
 SPEC_DIRS = [
     pathlib.Path(__file__).parent / "specs",
@@ -112,6 +112,15 @@ def _build_bucket(bucket_spec: dict, source: object, **ctx: object) -> Bucket:
     )
 
 
+def _pool_class(spec: dict) -> PoolClass:
+    value = spec.get("class")
+    if value is None:
+        return "preserve"
+    if value in ("preserve", "spend"):
+        return value  # type: ignore[return-value]
+    raise SpecError(f"class 는 'preserve' 또는 'spend' 여야 합니다: {value!r}")
+
+
 def make_provider(spec: dict) -> Callable[[], ProviderResult]:
     """스펙 dict → fetch 함수."""
     provider_id = spec.get("id")
@@ -120,6 +129,7 @@ def make_provider(spec: dict) -> Callable[[], ProviderResult]:
     request_spec = spec.get("request") or {}
     if not request_spec.get("url"):
         raise SpecError(f"{provider_id}: request.url 이 필요합니다")
+    pool_class = _pool_class(spec)
 
     def fetch() -> ProviderResult:
         token = _resolve_token(spec)
@@ -148,8 +158,10 @@ def make_provider(spec: dict) -> Callable[[], ProviderResult]:
             buckets=buckets,
             source=f"spec:{spec.get('source_file', 'inline')}",
             raw=raw,
+            pool_class=pool_class,
         )
 
+    fetch.pool_class = pool_class  # type: ignore[attr-defined]
     return fetch
 
 
