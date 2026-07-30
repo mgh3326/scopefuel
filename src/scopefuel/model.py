@@ -209,8 +209,7 @@ class ProviderResult:
     pool_class: PoolClass = "preserve"
 
     def __post_init__(self) -> None:
-        if self.pool_class not in ("preserve", "spend"):
-            self.pool_class = "preserve"
+        self.pool_class = _normalize_pool_class(self.pool_class)
 
     @property
     def status(self) -> str:
@@ -222,14 +221,28 @@ class ProviderResult:
 
     def verdict_at(self, now: dt.datetime | None = None) -> Verdict:
         v = verdict_for(self.buckets, self.pool_class, now=now)
-        if v.mark == "ok" and (self.error or self.stale or self.warning):
+        if self.error or self.stale:
             return Verdict(
                 now_pct=v.now_pct,
                 week_pct=v.week_pct,
                 month_pct=v.month_pct,
                 blocking_pct=v.blocking_pct,
                 basis=v.basis,
-                mark="warn" if self.warning and not self.error and not self.stale else "degraded",
+                mark="degraded",
+                exhausted=v.exhausted,
+                groups=v.groups,
+                waste=False,
+                waste_advice=None,
+            )
+        if self.warning:
+            mark = v.mark if v.mark in ("crit", "degraded") else "warn"
+            return Verdict(
+                now_pct=v.now_pct,
+                week_pct=v.week_pct,
+                month_pct=v.month_pct,
+                blocking_pct=v.blocking_pct,
+                basis=v.basis,
+                mark=mark,
                 exhausted=v.exhausted,
                 groups=v.groups,
                 waste=False,
@@ -265,8 +278,14 @@ class ProviderResult:
         return out
 
 
+def _normalize_pool_class(value: object) -> PoolClass:
+    if value in ("preserve", "spend"):
+        return value
+    return "preserve"
+
+
 def mark_for(used_pct: float | None, pool_class: PoolClass = "preserve") -> Mark:
-    if used_pct is None:
+    if not _is_valid_used_pct(used_pct):
         return "ok"
     if pool_class == "spend":
         return "ok"
@@ -284,7 +303,7 @@ def _is_valid_used_pct(value: object) -> bool:
         return False
     try:
         f = float(value)
-    except (OverflowError, ValueError):
+    except (TypeError, OverflowError, ValueError):
         return False
     return math.isfinite(f) and 0 <= f <= 100
 

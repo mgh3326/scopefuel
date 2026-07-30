@@ -12,7 +12,7 @@ import os
 import pathlib
 import time
 
-from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct
+from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
 
 DEFAULT_TTL_S = 60.0
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
@@ -126,7 +126,7 @@ def collect(
                 result = ProviderResult(id=name, error=str(exc))
 
         if explicit_class is not None:
-            result.pool_class = explicit_class
+            result.pool_class = _normalize_pool_class(explicit_class)
         elif not result.pool_class:
             result.pool_class = "preserve"
 

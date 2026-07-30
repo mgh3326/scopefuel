@@ -15,6 +15,7 @@ from scopefuel.model import (
     Bucket,
     ProviderResult,
     Scope,
+    _is_valid_used_pct,
     overall_mark,
     verdict_for,
 )
@@ -942,3 +943,283 @@ def test_invalid_values_in_json_do_not_break_serialization():
     payload = result.as_dict()
     dumped = json.dumps(payload, allow_nan=False)
     assert "NaN" not in dumped
+
+
+# --------------------------------------------------------- r3-1: invalid pool_class meta (live/write/read)
+
+
+class _InvalidClassFetcher:
+    pool_class = "gold"  # type: ignore[assignment]
+
+    def __call__(self):
+        return ProviderResult(id="bad_class", pool_class="spend", buckets=[bucket(50.0)])
+
+
+def test_invalid_fetcher_metadata_normalized_in_live_result(monkeypatch):
+    result = cache.collect({"bad": _InvalidClassFetcher()}, ["bad"], use_cache=False)[0]
+    assert result.pool_class == "preserve"
+
+
+def test_invalid_fetcher_metadata_normalized_in_cache_write(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
+    cache.collect({"bad": _InvalidClassFetcher()}, ["bad"], now=100.0, use_cache=True)
+    raw = json.loads((tmp_path / "snapshots.json").read_text())
+    entry_class = raw["bad"]["result"]["pool_class"]
+    assert entry_class == "preserve"
+    assert entry_class != "gold"
+
+
+def test_invalid_cache_entry_class_normalized_on_read(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
+    cache_path = tmp_path / "snapshots.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "bad": {
+                    "fetched_at": 1.0,
+                    "result": {"id": "bad", "buckets": [], "pool_class": "gold"},
+                }
+            }
+        )
+    )
+
+    def fetcher():
+        raise RuntimeError("trigger stale")
+
+    results = cache.collect({"bad": fetcher}, ["bad"], now=100.0, ttl_s=0.0)
+    assert results[0].pool_class == "preserve"
+
+
+@pytest.mark.parametrize("invalid", [123, True, "", "gold", None])
+def test_entry_point_class_normalized(invalid):
+    from scopefuel.providers import _with_class
+
+    def dummy():
+        return ProviderResult(id="x")
+
+    wrapped = _with_class(dummy, invalid)
+    assert wrapped.pool_class == "preserve"
+
+
+# --------------------------------------------------------- r3-2: custom int subtype TypeError (all paths)
+
+
+class TypeErrorInt(int):
+    """int subtype whose __float__ raises TypeError (simulates custom numeric)."""
+
+    def __float__(self):
+        msg = "custom numeric conversion failed"
+        raise TypeError(msg)
+
+
+TYPESUB = TypeErrorInt(50)
+
+
+def test_is_valid_used_pct_rejects_typeerror_int():
+    assert _is_valid_used_pct(TYPESUB) is False
+
+
+def test_typeerror_int_verdict_does_not_crash():
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+    v = result.verdict
+    assert v.basis == "none"
+    assert v.mark == "ok"
+
+
+def test_typeerror_int_as_dict_does_not_crash():
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+    d = result.as_dict()
+    assert d["buckets"][0]["used_pct"] is None
+    assert d["buckets"][0]["severity"] == "ok"
+    assert d["verdict"]["basis"] == "none"
+
+
+def test_typeerror_int_pace_is_none():
+    from scopefuel.model import pace_for
+
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    p = pace_for(b)
+    assert p.ratio is None
+    assert p.full_use_rate is None
+
+
+def test_typeerror_int_table_does_not_crash():
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+    out = render.table([result], color=False, now=NOW)
+    assert "?" in out
+    assert "nanx" not in out
+
+
+def test_typeerror_int_brief_does_not_crash():
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+    out = render.brief([result], color=False, now=NOW)
+    assert "n/a" in out or "?" in out
+
+
+def test_typeerror_int_json_strict_does_not_crash():
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+    payload = result.as_dict()
+    dumped = json.dumps(payload, allow_nan=False)
+    assert dumped is not None
+    assert "NaN" not in dumped
+
+
+def test_typeerror_int_cache_round_trip_normalizes(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
+    b = Bucket("credits", "30d", TYPESUB, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+
+    def fetcher():
+        return result
+
+    fetcher.pool_class = "preserve"  # type: ignore[attr-defined]
+    cache.collect({"test": fetcher}, ["test"], now=100.0, use_cache=True)
+    raw = json.loads((tmp_path / "snapshots.json").read_text())
+    stored_used = raw["test"]["result"]["buckets"][0]["used_pct"]
+    assert stored_used is None
+
+
+def test_typeerror_int_cache_read_normalizes(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
+    cache_path = tmp_path / "snapshots.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "test": {
+                    "fetched_at": 1.0,
+                    "result": {
+                        "id": "test",
+                        "buckets": [
+                            {
+                                "label": "credits",
+                                "window": "30d",
+                                "used_pct": None,
+                                "scope": {"kind": "account"},
+                                "horizon": "week",
+                            }
+                        ],
+                        "pool_class": "preserve",
+                    },
+                }
+            }
+        )
+    )
+
+    def fetcher():
+        raise RuntimeError("trigger stale")
+
+    collected = cache.collect({"test": fetcher}, ["test"], now=100.0, ttl_s=0.0)
+    assert collected[0].buckets[0].used_pct is None
+
+
+@pytest.mark.parametrize("bad_val", ["70", [70], {"v": 70}, float("inf"), 101, 10**1000, None, True])
+def test_bucket_mark_never_crashes_or_escalates(bad_val):
+    b = Bucket("credits", "30d", bad_val, scope=Scope("account"), horizon="week")
+    mark = b.mark
+    assert mark == "ok"
+
+
+# --------------------------------------------------------- r3-3: high-usage stale/error/warning (precedence)
+
+
+def test_preserve_high_stale_verdict_degraded():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        stale=True,
+        age_s=600.0,
+    )
+    assert result.verdict.mark == "degraded"
+
+
+def test_preserve_high_stale_brief_shows_degraded():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        stale=True,
+        age_s=600.0,
+    )
+    out = render.brief([result], color=False, now=NOW)
+    assert "[DEGRADED]" in out
+    assert "10분 전" in out
+
+
+def test_preserve_high_stale_table_shows_degraded():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        stale=True,
+        age_s=600.0,
+    )
+    out = render.table([result], color=False, now=NOW)
+    assert "DEGRADED" in out
+    assert "10분 전" in out
+
+
+def test_preserve_high_warning_stale_verdict_degraded():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        warning="auth fail",
+        stale=True,
+        age_s=600.0,
+    )
+    assert result.verdict.mark == "degraded"
+    assert result.status == "stale"
+
+
+def test_preserve_high_warning_stale_brief_preserves_warning_and_age():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        warning="auth fail",
+        stale=True,
+        age_s=600.0,
+    )
+    out = render.brief([result], color=False, now=NOW)
+    assert "[DEGRADED]" in out
+    assert "auth fail" in out
+    assert "10분 전" in out
+
+
+def test_preserve_high_error_verdict_degraded():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        error="fetch failed",
+    )
+    assert result.verdict.mark == "degraded"
+    assert result.status == "error"
+
+
+def test_preserve_high_error_brief_shows_degraded():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        error="fetch failed",
+    )
+    out = render.brief([result], color=False, now=NOW)
+    assert "[DEGRADED]" in out
+
+
+def test_preserve_high_fresh_warning_keeps_crit():
+    result = ProviderResult(
+        id="test",
+        pool_class="preserve",
+        buckets=[bucket(95.0)],
+        warning="auth expiring",
+    )
+    assert result.verdict.mark == "crit"
+    assert result.status == "warning"

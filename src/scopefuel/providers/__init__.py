@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from ..model import PoolClass, ProviderResult
+from ..model import PoolClass, ProviderResult, _normalize_pool_class
 from . import agy, claude, clinepass, codex, kiro
 
 
@@ -29,7 +29,7 @@ class FetcherWrapper:
 
     def __init__(self, fn: object, pool_class: PoolClass):
         self.fn = fn
-        self.pool_class = pool_class
+        self.pool_class = _normalize_pool_class(pool_class)
 
     def __call__(self) -> ProviderResult:
         return self.fn()  # type: ignore[no-any-return]
@@ -60,7 +60,7 @@ def _entry_point_providers() -> dict[str, Fetcher]:
             loaded = ep.load()
             explicit_class = getattr(loaded, "pool_class", None)
             if explicit_class is not None:
-                found[ep.name] = _with_class(loaded, explicit_class)
+                found[ep.name] = _with_class(loaded, _normalize_pool_class(explicit_class))
             else:
                 found[ep.name] = loaded
         except Exception:  # 플러그인 하나가 도구 전체를 막지 않는다
