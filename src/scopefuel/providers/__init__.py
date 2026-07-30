@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from ..model import ProviderResult
-from . import agy, claude, codex, kiro
+from . import agy, claude, clinepass, codex, kiro
 
 Fetcher = Callable[[], ProviderResult]
 
@@ -19,6 +19,7 @@ BUILTIN: dict[str, Fetcher] = {
     "codex": codex.fetch,
     "agy": agy.fetch,
     "kiro": kiro.fetch,
+    "clinepass": clinepass.fetch,
 }
 
 
