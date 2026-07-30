@@ -82,6 +82,30 @@ def test_spec_supports_remaining_fraction(tmp_path, monkeypatch):
     assert bucket.horizon == "now"  # window=5h → now 로 자동 추론
 
 
+def test_spec_supports_iso_reset_kind_by_default(tmp_path, monkeypatch):
+    creds = _write_creds(tmp_path)
+    reset = "2026-07-30T05:00:00Z"
+    monkeypatch.setattr(spec, "request_json", lambda *a, **k: {"usage": 12, "reset": reset})
+    provider = spec.make_provider(
+        {
+            "id": "iso",
+            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
+            "request": {"url": "https://example.test/u"},
+            "buckets": [
+                {
+                    "label": "5h",
+                    "window": "5h",
+                    "used_pct_path": ["usage"],
+                    "resets_at_path": ["reset"],
+                }
+            ],
+        }
+    )
+
+    bucket = provider().buckets[0]
+    assert bucket.resets_at == reset
+
+
 def test_spec_dir_discovery(tmp_path, monkeypatch):
     spec_dir = tmp_path / "specs"
     spec_dir.mkdir()
@@ -141,3 +165,18 @@ def test_cache_refuses_ancient_snapshot(monkeypatch):
     result = cache.collect({"x": boom}, ["x"], now=cache.STALE_MAX_S + 10)[0]
     assert result.error == "dead"
     assert result.buckets == []
+
+
+def test_warning_result_is_not_cached(monkeypatch):
+    calls = 0
+
+    def warning():
+        nonlocal calls
+        calls += 1
+        return ProviderResult(id="clinepass", warning="인증 실패 (HTTP 401)")
+
+    first = cache.collect({"clinepass": warning}, ["clinepass"], now=1000.0)
+    second = cache.collect({"clinepass": warning}, ["clinepass"], now=1001.0)
+
+    assert calls == 2
+    assert first[0].status == second[0].status == "warning"
