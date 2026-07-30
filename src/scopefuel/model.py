@@ -177,6 +177,7 @@ class ProviderResult:
     buckets: list[Bucket] = field(default_factory=list)
     note: str | None = None
     error: str | None = None
+    warning: str | None = None
     hint: str | None = None
     source: str | None = None  # 어떤 경로로 얻었는지 (예: "local-server", "cloud")
     fetched_at: float | None = None
@@ -186,18 +187,22 @@ class ProviderResult:
 
     @property
     def status(self) -> str:
-        return "error" if self.error else ("stale" if self.stale else "ok")
+        if self.error:
+            return "error"
+        if self.stale:
+            return "stale"
+        return "warning" if self.warning else "ok"
 
     @property
     def verdict(self) -> Verdict:
         v = verdict_for(self.buckets)
-        if (self.error or self.status != "ok") and v.mark == "ok":
+        if v.mark == "ok" and (self.error or self.stale or self.warning):
             return Verdict(
                 now_pct=v.now_pct,
                 week_pct=v.week_pct,
                 blocking_pct=v.blocking_pct,
                 basis=v.basis,
-                mark="degraded",
+                mark="warn" if self.warning and not self.error and not self.stale else "degraded",
                 exhausted=v.exhausted,
                 groups=v.groups,
             )
@@ -218,6 +223,8 @@ class ProviderResult:
             "buckets": [b.as_dict() for b in self.buckets],
             "verdict": self.verdict.as_dict(),
         }
+        if self.warning is not None:
+            out["warning"] = self.warning
         if include_raw:
             out["raw"] = self.raw
         return out

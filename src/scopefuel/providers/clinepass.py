@@ -26,6 +26,8 @@ MODEL = "cline-pass/deepseek-v4-flash"
 OPENCODE_AUTH = pathlib.Path.home() / ".local" / "share" / "opencode" / "auth.json"
 CLINE_API_KEY_FILE = pathlib.Path.home() / ".config" / "cline" / "api-key"
 TIMEOUT_S = 20.0
+AUTH_FAILURE_STATUSES = frozenset({401, 403})
+INVALID_CREDENTIAL = "invalid credential format"
 
 _DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|[smhd])", re.IGNORECASE)
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
@@ -45,10 +47,14 @@ def fetch() -> ProviderResult:
             source="completions-probe",
             raw={"credential": credential},
         )
+    if not _valid_credential(key):
+        return _invalid_credential(credential)
 
     try:
         status, headers = _probe(key)
-    except (OSError, TimeoutError, urllib.error.URLError) as exc:
+    except ValueError:
+        return _invalid_credential(credential)
+    except Exception as exc:
         return ProviderResult(
             id="clinepass",
             error=f"completions probe 실패 ({type(exc).__name__})",
@@ -57,13 +63,30 @@ def fetch() -> ProviderResult:
             raw={"credential": credential},
         )
 
-    rate_headers = _rate_limit_headers(headers)
+    try:
+        rate_headers = _rate_limit_headers(headers)
+        buckets = _buckets(rate_headers)
+    except Exception as exc:
+        return ProviderResult(
+            id="clinepass",
+            error=f"rate-limit 헤더 처리 실패 ({type(exc).__name__})",
+            hint="ClinePass 응답 헤더 형식을 확인하세요",
+            source="completions-probe",
+            raw={"status": status, "credential": credential},
+        )
     raw = {
         "status": status,
         "credential": credential,
         "rate_limit_headers": rate_headers,
     }
-    buckets = _buckets(rate_headers)
+    if status in AUTH_FAILURE_STATUSES:
+        return ProviderResult(
+            id="clinepass",
+            buckets=buckets,
+            warning=f"인증 실패 (HTTP {status}) — 키를 확인하세요",
+            source="completions-probe",
+            raw=raw,
+        )
     if not buckets:
         status_note = f", HTTP {status}" if status else ""
         reason = "rate-limit 헤더 없음" if not rate_headers else "해석 가능한 limit/remaining 헤더 쌍 없음"
@@ -82,6 +105,21 @@ def fetch() -> ProviderResult:
         note=note,
         source="completions-probe",
         raw=raw,
+    )
+
+
+def _valid_credential(key: str) -> bool:
+    """Authorization 헤더에 안전한 공백 없는 printable ASCII만 허용한다."""
+    return bool(key) and all(0x21 <= ord(char) <= 0x7E for char in key)
+
+
+def _invalid_credential(credential: dict[str, object]) -> ProviderResult:
+    return ProviderResult(
+        id="clinepass",
+        error=INVALID_CREDENTIAL,
+        hint="ClinePass API key 형식을 확인하세요",
+        source="completions-probe",
+        raw={"credential": credential},
     )
 
 

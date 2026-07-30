@@ -7,6 +7,7 @@ import json
 import urllib.error
 from email.message import Message
 
+from scopefuel import render
 from scopefuel.providers import BUILTIN, agy, claude, clinepass, codex, kiro
 
 
@@ -237,3 +238,105 @@ def test_clinepass_missing_rate_headers_is_graceful_no_data(monkeypatch):
     assert result.note and result.note.startswith("no data — rate-limit 헤더 없음")
     assert result.raw and result.raw["rate_limit_headers"] == {}
     assert "super-secret" not in json.dumps(result.as_dict(include_raw=True))
+
+
+def test_clinepass_auth_failures_warn_but_200_without_headers_is_no_data(monkeypatch):
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+
+    outputs = {}
+    for status in (401, 403, 200):
+        monkeypatch.setattr(clinepass, "_probe", lambda _key, status=status: (status, Message()))
+        result = clinepass.fetch()
+        outputs[status] = render.table([result], color=False)
+
+    assert outputs[401] == "clinepass  [WARN] 인증 실패 (HTTP 401) — 키를 확인하세요\n"
+    assert outputs[403] == "clinepass  [WARN] 인증 실패 (HTTP 403) — 키를 확인하세요\n"
+    assert outputs[200].startswith("clinepass  [ok] 한도 정보 없음")
+    assert "no data — rate-limit 헤더 없음, HTTP 200" in outputs[200]
+    assert len(set(outputs.values())) == 3
+
+
+def test_clinepass_sanitizes_probe_value_error(monkeypatch):
+    marker = "ZZ-SYNTHETIC-MARKER-F1-NOT-A-REAL-KEY"
+    monkeypatch.setattr(clinepass, "_api_key", lambda: (marker, "env:CLINE_API_KEY"))
+
+    def leak_if_unsanitized(_key):
+        raise ValueError(f"Invalid header value b'Bearer {marker}'")
+
+    monkeypatch.setattr(clinepass, "_probe", leak_if_unsanitized)
+    result = clinepass.fetch()
+    output = render.table([result], color=False) + render.brief([result], color=False)
+    serialized = json.dumps(result.as_dict(include_raw=True), ensure_ascii=False)
+
+    assert result.error == "invalid credential format"
+    assert marker not in output
+    assert marker not in serialized
+
+
+def test_clinepass_sanitizes_unexpected_probe_and_header_errors(monkeypatch):
+    marker = "ZZ-SYNTHETIC-MARKER-F1-NOT-A-REAL-KEY"
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+
+    def probe_failure(_key):
+        raise RuntimeError(f"request/URL/body detail: {marker}")
+
+    monkeypatch.setattr(clinepass, "_probe", probe_failure)
+    probe_result = clinepass.fetch()
+
+    class BadHeaders:
+        def items(self):
+            raise RuntimeError(f"response header detail: {marker}")
+
+    monkeypatch.setattr(clinepass, "_probe", lambda _key: (200, BadHeaders()))
+    header_result = clinepass.fetch()
+
+    for result in (probe_result, header_result):
+        output = render.table([result], color=False) + render.brief([result], color=False)
+        serialized = json.dumps(result.as_dict(include_raw=True), ensure_ascii=False)
+        assert marker not in output
+        assert marker not in serialized
+
+
+def test_clinepass_rejects_unsafe_synthetic_keys_without_exposure(monkeypatch):
+    marker = "ZZ-SYNTHETIC-MARKER-F1-NOT-A-REAL-KEY"
+    keys = [
+        f"{marker}\nINJECTED",
+        f"{marker}\tINJECTED",
+        f"{marker} INJECTED",
+        f"{marker}한글",
+    ]
+
+    for key in keys:
+        monkeypatch.setattr(clinepass, "_api_key", lambda key=key: (key, "env:CLINE_API_KEY"))
+        monkeypatch.setattr(
+            clinepass,
+            "_probe",
+            lambda _key: (_ for _ in ()).throw(AssertionError("unsafe key reached probe")),
+        )
+        result = clinepass.fetch()
+        output = render.table([result], color=False) + render.brief([result], color=False)
+        serialized = json.dumps(result.as_dict(include_raw=True), ensure_ascii=False)
+
+        assert result.error == "invalid credential format"
+        assert marker not in output
+        assert marker not in serialized
+
+
+def test_clinepass_ignores_zero_limit():
+    headers = {
+        "x-ratelimit-limit-requests": "0",
+        "x-ratelimit-remaining-requests": "0",
+        "x-ratelimit-reset-requests": "5h",
+    }
+
+    assert clinepass._buckets(headers) == []
+
+
+def test_clinepass_blank_env_falls_through_to_opencode(monkeypatch, tmp_path):
+    opencode = tmp_path / "auth.json"
+    opencode.write_text(json.dumps({"cline-pass": {"key": "fallback-synthetic-key"}}))
+    monkeypatch.setattr(clinepass, "OPENCODE_AUTH", opencode)
+    monkeypatch.setattr(clinepass, "CLINE_API_KEY_FILE", tmp_path / "missing")
+    monkeypatch.setenv("CLINE_API_KEY", " \t ")
+
+    assert clinepass._api_key() == ("fallback-synthetic-key", "opencode:cline-pass.key")

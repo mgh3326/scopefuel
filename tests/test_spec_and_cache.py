@@ -141,3 +141,18 @@ def test_cache_refuses_ancient_snapshot(monkeypatch):
     result = cache.collect({"x": boom}, ["x"], now=cache.STALE_MAX_S + 10)[0]
     assert result.error == "dead"
     assert result.buckets == []
+
+
+def test_warning_result_is_not_cached(monkeypatch):
+    calls = 0
+
+    def warning():
+        nonlocal calls
+        calls += 1
+        return ProviderResult(id="clinepass", warning="인증 실패 (HTTP 401)")
+
+    first = cache.collect({"clinepass": warning}, ["clinepass"], now=1000.0)
+    second = cache.collect({"clinepass": warning}, ["clinepass"], now=1001.0)
+
+    assert calls == 2
+    assert first[0].status == second[0].status == "warning"

@@ -67,6 +67,7 @@ def test_provider_result_serialization_includes_scope_and_horizon():
     assert payload["buckets"][0]["horizon"] == "week"
     assert payload["verdict"]["blocking_pct"] == 50
     assert payload["status"] == "ok"
+    assert "warning" not in payload
 
 
 def test_errored_provider_has_degraded_verdict_mark():
@@ -79,3 +80,12 @@ def test_errored_provider_summary_mark_is_not_ok():
     ok_res = ProviderResult(id="claude", buckets=[account(16)])
     err_res = ProviderResult(id="codex", error="HTTP 503 circuit open")
     assert overall_mark([ok_res, err_res]) == "degraded"
+
+
+def test_warning_provider_is_warn_without_becoming_error():
+    result = ProviderResult(id="clinepass", warning="인증 실패 (HTTP 401)")
+
+    assert result.status == "warning"
+    assert result.verdict.mark == "warn"
+    assert result.as_dict()["warning"] == "인증 실패 (HTTP 401)"
+    assert overall_mark([result]) == "warn"

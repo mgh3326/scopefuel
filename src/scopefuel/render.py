@@ -62,7 +62,9 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
 
         verdict = result.verdict
         plan = f" [{result.plan}]" if result.plan else ""
-        if verdict.basis == "account":
+        if result.warning:
+            basis = result.warning
+        elif verdict.basis == "account":
             basis = f"지금(5h급) {_pct(verdict.now_pct)} · 이번주 {_pct(verdict.week_pct)}"
         elif verdict.basis == "group":
             per = " / ".join(f"{g} {_pct(v)}" for g, v in sorted(verdict.groups.items()))
@@ -114,6 +116,9 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
         if result.error:
             err_msg = result.error.splitlines()[0]
             chunks.append(f"{result.id} n/a({err_msg})")
+            continue
+        if result.warning:
+            chunks.append(f"{result.id} warn({result.warning})")
             continue
         verdict = result.verdict
         parts: list[str] = []

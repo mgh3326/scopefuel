@@ -71,6 +71,7 @@ def _from_entry(entry: dict, provider_id: str, now: float) -> ProviderResult:
         buckets=buckets,
         note=payload.get("note"),
         error=payload.get("error"),
+        warning=payload.get("warning"),
         hint=payload.get("hint"),
         source=payload.get("source"),
         fetched_at=fetched_at,
@@ -119,7 +120,7 @@ def collect(
                 results.append(stale)
                 continue
 
-        if not result.error:
+        if not result.error and not result.warning:
             result.fetched_at = now
             result.age_s = 0.0
             cache[name] = _to_entry(result, now)

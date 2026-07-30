@@ -110,6 +110,22 @@ def test_exit_code_on_warn_triggers_exit_2_on_errored_provider(capsys, monkeypat
     capsys.readouterr()
 
 
+def test_warning_provider_stays_alive_but_is_not_false_ok(capsys, monkeypatch):
+    auth_warning = ProviderResult(id="clinepass", warning="인증 실패 (HTTP 401) — 키를 확인하세요")
+    healthy = ProviderResult(
+        id="healthy",
+        buckets=[Bucket(label="5h", window="5h", used_pct=10, horizon="now")],
+    )
+    monkeypatch.setattr(
+        cli, "registry", lambda: {"healthy": lambda: healthy, "clinepass": lambda: auth_warning}
+    )
+
+    assert cli.main(["--no-cache", "--no-color"]) == 0
+    output = capsys.readouterr().out
+    assert "healthy" in output
+    assert "clinepass  [WARN] 인증 실패 (HTTP 401) — 키를 확인하세요" in output
+
+
 NOW = dt.datetime(2026, 7, 26, 12, tzinfo=dt.UTC)
 
 
