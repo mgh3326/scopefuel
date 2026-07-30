@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 
 from ..http import request_json
@@ -82,7 +83,10 @@ def fetch() -> ProviderResult:
 
 
 def _num(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        return float(value)  # type: ignore[arg-type]
+        f = float(value)  # type: ignore[arg-type]
+        return f if math.isfinite(f) and 0 <= f <= 100 else None
     except (TypeError, ValueError):
         return None

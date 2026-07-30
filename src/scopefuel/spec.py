@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import tomllib
@@ -80,16 +81,22 @@ def _used_pct(source: object, bucket_spec: dict) -> float | None:
     raw = dig(source, bucket_spec.get("used_pct_path"))
     if raw is None and (frac_path := bucket_spec.get("remaining_fraction_path")):
         frac = dig(source, frac_path)
-        if frac is None:
+        if frac is None or isinstance(frac, bool):
             return None
         try:
-            return round((1.0 - float(frac)) * 100, 1)  # type: ignore[arg-type]
+            f = float(frac)  # type: ignore[arg-type]
+            if not math.isfinite(f) or not (0 <= f <= 1):
+                return None
+            return round((1.0 - f) * 100, 1)
         except (TypeError, ValueError):
             return None
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return None
     try:
-        return float(raw)  # type: ignore[arg-type]
+        f = float(raw)  # type: ignore[arg-type]
+        if not math.isfinite(f) or not (0 <= f <= 100):
+            return None
+        return f
     except (TypeError, ValueError):
         return None
 

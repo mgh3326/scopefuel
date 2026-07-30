@@ -445,6 +445,155 @@ def test_spec_omitted_class_defaults_preserve(tmp_path, monkeypatch):
     assert provider.pool_class == "preserve"
 
 
+# ------------------------------------------------------------------ regression tests for audit findings
+
+
+def test_stale_brief_suppresses_progress_and_waste():
+    result = ProviderResult(
+        id="kiro",
+        pool_class="spend",
+        buckets=[bucket(20.0, reset_delta_s=3600)],
+        age_s=600.0,
+        stale=True,
+    )
+    out = render.brief([result], color=False, now=NOW)
+    assert "(소진 진행)" not in out
+    assert "WASTE" not in out
+    assert out.count("10분 전") == 1
+
+
+@pytest.mark.parametrize(
+    "invalid_val",
+    [float("nan"), float("inf"), float("-inf"), -1.0, 101.0, True],
+)
+def test_invalid_numeric_matrix_does_not_emit_progress_or_waste(invalid_val):
+    b = Bucket("credits", "30d", invalid_val, scope=Scope("account"), horizon="week")
+    result = ProviderResult(id="kiro", pool_class="spend", buckets=[b])
+    v = result.verdict_at(NOW)
+    assert v.basis == "none"
+    assert v.waste is False
+
+    tbl = render.table([result], color=False, now=NOW)
+    brf = render.brief([result], color=False, now=NOW)
+    assert "소진 진행" not in tbl
+    assert "소진 진행" not in brf
+    assert "nanx" not in tbl and "infx" not in tbl
+    assert "nanx" not in brf and "infx" not in brf
+
+
+def test_toml_and_agy_bool_ingestion_end_to_end(tmp_path, monkeypatch):
+    from scopefuel import spec
+    from scopefuel.providers import agy
+
+    creds = tmp_path / "auth.json"
+    creds.write_text(json.dumps({"tokens": {"access_token": "tok"}}))
+    monkeypatch.setattr(spec, "request_json", lambda *a, **k: {"usage": True, "remaining": True})
+    provider_used = spec.make_provider(
+        {
+            "id": "myplan",
+            "class": "spend",
+            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
+            "request": {"url": "https://example.test/u"},
+            "buckets": [{"label": "5h", "window": "5h", "used_pct_path": ["usage"]}],
+        }
+    )
+    res1 = provider_used()
+    assert res1.buckets[0].used_pct is None
+
+    provider_rem = spec.make_provider(
+        {
+            "id": "myplan2",
+            "class": "spend",
+            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
+            "request": {"url": "https://example.test/u"},
+            "buckets": [{"label": "5h", "window": "5h", "remaining_fraction_path": ["remaining"]}],
+        }
+    )
+    res2 = provider_rem()
+    assert res2.buckets[0].used_pct is None
+
+    # test agy local with bool
+    raw_local = {
+        "response": {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [{"window": "5h", "remainingFraction": True}],
+                }
+            ]
+        }
+    }
+    agy_res = agy._from_local(raw_local)
+    assert agy_res.buckets[0].used_pct is None
+
+
+def test_plugin_callable_non_mutation_slots_and_precedence(monkeypatch):
+    # 1. Plain function without pool_class metadata
+    def plain_plugin():
+        return ProviderResult(id="custom", pool_class="spend", buckets=[bucket(50.0)])
+
+    assert not hasattr(plain_plugin, "pool_class")
+
+    # 2. Slotted / non-assignable callable class
+    class SlottedPlugin:
+        __slots__ = ()
+
+        def __call__(self):
+            return ProviderResult(id="slotted", pool_class="spend", buckets=[bucket(40.0)])
+
+    slotted_instance = SlottedPlugin()
+    with pytest.raises(AttributeError):
+        slotted_instance.pool_class = "spend"
+
+    fetchers = {
+        "plain": plain_plugin,
+        "slotted": slotted_instance,
+    }
+
+    results = cache.collect(fetchers, ["plain", "slotted"], use_cache=False)
+    # plain_plugin was NOT mutated
+    assert not hasattr(plain_plugin, "pool_class")
+    # returned ProviderResult.pool_class "spend" was preserved
+    assert results[0].pool_class == "spend"
+    assert results[1].pool_class == "spend"
+
+    # 3. Precedence: explicit metadata > returned class
+    def metadata_plugin():
+        return ProviderResult(id="meta", pool_class="preserve")
+
+    wrapped_meta = cache._pool_class(metadata_plugin)
+    assert wrapped_meta is None
+
+    from scopefuel.providers import _with_class
+
+    meta_fetcher = _with_class(metadata_plugin, "spend")
+    res_meta = cache.collect({"meta": meta_fetcher}, ["meta"], use_cache=False)[0]
+    assert res_meta.pool_class == "spend"
+
+
+def test_injected_clock_pace_consistency():
+    t0 = NOW
+    t_captured = t0 + dt.timedelta(hours=2.5)  # 5h window half elapsed -> pace ratio 1.0 for used_pct=50%
+    b = Bucket(
+        "5h",
+        "5h",
+        50.0,
+        resets_at=(t0 + dt.timedelta(hours=5)).isoformat(),
+        scope=Scope("account"),
+        horizon="now",
+    )
+    res = ProviderResult(id="test", pool_class="preserve", buckets=[b])
+
+    dict_out = res.as_dict(now=t_captured)
+    assert dict_out["buckets"][0]["pace"] == 1.0
+
+    tbl = render.table([res], color=False, now=t_captured)
+    assert "1.00x" in tbl
+
+    brf = render.brief([res], color=False, now=t_captured)
+    assert "1.0x" in brf
+
+
 # ------------------------------------------------------------------ JSON numeric shape
 
 

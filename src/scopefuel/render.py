@@ -33,13 +33,15 @@ def _display_id(result: ProviderResult) -> str:
     return result.id
 
 
-def _pace(bucket: Bucket) -> str:
-    value = bucket.pace.ratio
+def _pace(bucket: Bucket | None, *, now: dt.datetime | None = None) -> str:
+    if bucket is None:
+        return ""
+    value = bucket.pace_at(now).ratio
     return "" if value is None else f" {value:.1f}x"
 
 
-def _table_pace(bucket: Bucket) -> str:
-    pace = bucket.pace
+def _table_pace(bucket: Bucket, *, now: dt.datetime | None = None) -> str:
+    pace = bucket.pace_at(now)
     if pace.ratio is None:
         return ""
     rate = (
@@ -120,7 +122,7 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
             horizon = {"now": "now ", "week": "week", "month": "month"}[bucket.horizon]
             lines.append(
                 f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>11}"
-                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket)}{tag_s}"
+                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket, now=now)}{tag_s}"
             )
 
         for bucket in verdict.exhausted:
@@ -166,17 +168,21 @@ def brief(
         parts: list[str] = []
         if verdict.basis == "group":
             parts += [
-                f"{g} 사용 {v:g}%{_pace(_bucket_for(result, scope_name=g))}"
+                f"{g} 사용 {v:g}%{_pace(_bucket_for(result, scope_name=g), now=now)}"
                 for g, v in sorted(verdict.groups.items())
             ]
         else:
             if horizon in ("now", "both") and verdict.now_pct is not None:
-                parts.append(f"now 사용 {verdict.now_pct:g}%{_pace(_bucket_for(result, horizon='now'))}")
+                parts.append(
+                    f"now 사용 {verdict.now_pct:g}%{_pace(_bucket_for(result, horizon='now'), now=now)}"
+                )
             if horizon in ("week", "both") and verdict.week_pct is not None:
-                parts.append(f"week 사용 {verdict.week_pct:g}%{_pace(_bucket_for(result, horizon='week'))}")
+                parts.append(
+                    f"week 사용 {verdict.week_pct:g}%{_pace(_bucket_for(result, horizon='week'), now=now)}"
+                )
             if horizon == "both" and verdict.month_pct is not None:
                 parts.append(
-                    f"month 사용 {verdict.month_pct:g}%{_pace(_bucket_for(result, horizon='month'))}"
+                    f"month 사용 {verdict.month_pct:g}%{_pace(_bucket_for(result, horizon='month'), now=now)}"
                 )
         if not parts:
             # 요청한 지평에 데이터가 없으면 빈칸을 남기지 않고 있는 축을 보여준다.
@@ -185,10 +191,11 @@ def brief(
             parts.append(f"{label} 사용 {other:g}%" if other is not None else "n/a")
         if verdict.exhausted:
             parts.append("(" + ",".join(f"{b.scope.label}소진" for b in verdict.exhausted) + ")")
-        if verdict.waste and result.pool_class == "spend":
-            parts.append("(WASTE: 리셋 전 소진 권장)")
-        elif result.pool_class == "spend" and verdict.basis != "none":
-            parts.append("(소진 진행)")
+        if not result.stale:
+            if verdict.waste and result.pool_class == "spend":
+                parts.append("(WASTE: 리셋 전 소진 권장)")
+            elif result.pool_class == "spend" and verdict.basis != "none":
+                parts.append("(소진 진행)")
         if result.stale:
             parts.append(f"[{format_age(result.age_s)}]")
         chunks.append(f"{display_id} " + " ".join(parts))

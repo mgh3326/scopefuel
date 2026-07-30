@@ -68,9 +68,11 @@ def _parse_reset(iso: str | None) -> dt.datetime | None:
 
 def pace_for(bucket: Bucket, *, now: dt.datetime | None = None) -> Pace:
     """계산할 수 없을 때는 0을 추측하지 않고 모두 None으로 둔다."""
+    if not _is_valid_used_pct(bucket.used_pct):
+        return Pace(None, None, None)
     window_seconds = _window_seconds(bucket.window)
     reset_at = _parse_reset(bucket.resets_at)
-    if bucket.used_pct is None or window_seconds is None or window_seconds <= 0 or reset_at is None:
+    if window_seconds is None or window_seconds <= 0 or reset_at is None:
         return Pace(None, None, None)
 
     now = now or dt.datetime.now(dt.UTC)
@@ -132,8 +134,11 @@ class Bucket:
     def pace(self) -> Pace:
         return pace_for(self)
 
-    def as_dict(self, pool_class: PoolClass = "preserve") -> dict:
-        pace = self.pace
+    def pace_at(self, now: dt.datetime | None = None) -> Pace:
+        return pace_for(self, now=now)
+
+    def as_dict(self, pool_class: PoolClass = "preserve", *, now: dt.datetime | None = None) -> dict:
+        pace = self.pace_at(now)
         return {
             "label": self.label,
             "window": self.window,
@@ -242,7 +247,7 @@ class ProviderResult:
             "hint": self.hint,
             "note": self.note,
             "pool_class": self.pool_class,
-            "buckets": [b.as_dict(self.pool_class) for b in self.buckets],
+            "buckets": [b.as_dict(self.pool_class, now=now) for b in self.buckets],
             "verdict": verdict.as_dict(),
         }
         if self.warning is not None:
@@ -331,7 +336,7 @@ def verdict_for(
       (한 그룹이 막혀도 다른 그룹으로 계속 작업할 수 있으므로).
     - spend 풀은 고사용을 차단으로 보지 않는다.
     """
-    known = [b for b in buckets if b.used_pct is not None]
+    known = [b for b in buckets if _is_valid_used_pct(b.used_pct)]
     account = [b for b in known if b.scope.kind == "account"]
     groups: dict[str, float] = {}
     for bucket in known:

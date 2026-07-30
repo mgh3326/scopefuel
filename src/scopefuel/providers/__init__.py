@@ -24,11 +24,20 @@ class Fetcher(Protocol):
     def __call__(self) -> ProviderResult: ...
 
 
+class FetcherWrapper:
+    """Callable wrapper that exposes pool_class metadata without mutating the original callable."""
+
+    def __init__(self, fn: object, pool_class: PoolClass):
+        self.fn = fn
+        self.pool_class = pool_class
+
+    def __call__(self) -> ProviderResult:
+        return self.fn()  # type: ignore[no-any-return]
+
+
 def _with_class(fn: object, pool_class: PoolClass) -> Fetcher:
-    """callable에 pool_class 메타데이터를 부여한다."""
-    fetcher = fn  # type: ignore[assignment]
-    fetcher.pool_class = pool_class
-    return fetcher  # type: ignore[return-value]
+    """callable을 감싸 pool_class 메타데이터를 부여한다."""
+    return FetcherWrapper(fn, pool_class)  # type: ignore[return-value]
 
 
 BUILTIN: dict[str, Fetcher] = {
@@ -49,7 +58,11 @@ def _entry_point_providers() -> dict[str, Fetcher]:
     for ep in entry_points(group="scopefuel.providers"):
         try:
             loaded = ep.load()
-            found[ep.name] = _with_class(loaded, getattr(loaded, "pool_class", "preserve"))
+            explicit_class = getattr(loaded, "pool_class", None)
+            if explicit_class is not None:
+                found[ep.name] = _with_class(loaded, explicit_class)
+            else:
+                found[ep.name] = loaded
         except Exception:  # 플러그인 하나가 도구 전체를 막지 않는다
             continue
     return found

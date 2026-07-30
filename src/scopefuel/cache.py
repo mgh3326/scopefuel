@@ -50,15 +50,18 @@ def _to_entry(result: ProviderResult, now: float) -> dict:
     return {"fetched_at": now, "result": payload}
 
 
-def _pool_class(fetcher: object) -> PoolClass:
-    return getattr(fetcher, "pool_class", "preserve")
+def _pool_class(fetcher: object) -> PoolClass | None:
+    return getattr(fetcher, "pool_class", None)
 
 
 def _from_entry(
-    entry: dict, provider_id: str, now: float, pool_class: PoolClass = "preserve"
+    entry: dict, provider_id: str, now: float, pool_class: PoolClass | None = None
 ) -> ProviderResult:
     payload = entry.get("result") or {}
     fetched_at = float(entry.get("fetched_at") or 0)
+    effective_class: PoolClass = (
+        pool_class if pool_class is not None else payload.get("pool_class") or "preserve"
+    )
     buckets = [
         Bucket(
             label=b.get("label", "?"),
@@ -83,7 +86,7 @@ def _from_entry(
         fetched_at=fetched_at,
         age_s=now - fetched_at,
         stale=True,
-        pool_class=pool_class,
+        pool_class=effective_class,
     )
 
 
@@ -104,9 +107,9 @@ def collect(
     for name in names:
         entry = cache.get(name)
         fetcher = fetchers.get(name)
-        pool_class = _pool_class(fetcher)
+        explicit_class = _pool_class(fetcher)
         if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= ttl_s:
-            fresh = _from_entry(entry, name, now, pool_class)
+            fresh = _from_entry(entry, name, now, explicit_class)
             fresh.stale = False  # TTL 안이면 신선한 값으로 취급
             results.append(fresh)
             continue
@@ -119,12 +122,16 @@ def collect(
                 result = fetcher()  # type: ignore[operator]
             except Exception as exc:
                 result = ProviderResult(id=name, error=str(exc))
-        result.pool_class = pool_class
+
+        if explicit_class is not None:
+            result.pool_class = explicit_class
+        elif not result.pool_class:
+            result.pool_class = "preserve"
 
         if result.error and entry:
             age = now - float(entry.get("fetched_at") or 0)
             if age <= STALE_MAX_S:
-                stale = _from_entry(entry, name, now, pool_class)
+                stale = _from_entry(entry, name, now, explicit_class)
                 stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
                 results.append(stale)
                 continue
