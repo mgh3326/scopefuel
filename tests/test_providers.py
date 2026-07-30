@@ -7,7 +7,10 @@ import json
 import urllib.error
 from email.message import Message
 
-from scopefuel import render
+import pytest
+
+from scopefuel import cache, render
+from scopefuel.model import Bucket, ProviderResult
 from scopefuel.providers import BUILTIN, agy, claude, clinepass, codex, kiro
 
 
@@ -239,9 +242,9 @@ def test_clinepass_usage_limits_maps_all_windows_and_tz_aware_resets(monkeypatch
     payload = {
         "data": {
             "limits": [
-                {"type": "monthly", "percentUsed": 30, "resetsAt": "2026-08-30T05:00:00Z"},
-                {"type": "five_hour", "percentUsed": 10, "resetsAt": "2026-07-30T10:00:00Z"},
-                {"type": "weekly", "percentUsed": 20, "resetsAt": "2026-08-06T05:00:00+00:00"},
+                {"type": "monthly", "percentUsed": 30, "resetsAt": "2099-08-30T05:00:00Z"},
+                {"type": "five_hour", "percentUsed": 10, "resetsAt": "2099-07-30T10:00:00Z"},
+                {"type": "weekly", "percentUsed": 20, "resetsAt": "2099-08-06T05:00:00+00:00"},
             ]
         },
         "success": True,
@@ -261,7 +264,7 @@ def test_clinepass_usage_limits_maps_all_windows_and_tz_aware_resets(monkeypatch
 
     result = clinepass.fetch()
 
-    assert result.source == "usage-limits-api"
+    assert result.source == "primary(usage-limits)"
     assert result.note is None
     assert [(b.label, b.window, b.horizon, b.used_pct) for b in result.buckets] == [
         ("five_hour", "5h", "now", 10.0),
@@ -294,7 +297,7 @@ def test_clinepass_server_error_does_not_spend_fallback_token(monkeypatch):
     result = clinepass.fetch()
 
     assert result.error == "usage-limits HTTP 500"
-    assert result.source == "usage-limits-api"
+    assert result.source == "primary(usage-limits)"
 
 
 def test_clinepass_fallback_parses_headers_without_exposing_key(monkeypatch):
@@ -312,8 +315,9 @@ def test_clinepass_fallback_parses_headers_without_exposing_key(monkeypatch):
     result = clinepass.fetch()
 
     assert result.error is None
-    assert result.note == "usage-limits HTTP 404; completions fallback 적용"
-    assert result.source == "completions-fallback"
+    assert result.status == "warning"
+    assert result.note == "usage-limits HTTP 404; fallback 응답 실패"
+    assert result.source == "fallback(probe)"
     assert [(b.label, b.used_pct) for b in result.buckets] == [
         ("requests", 25.0),
         ("tokens", 75.0),
@@ -347,8 +351,8 @@ def test_clinepass_partial_limits_stays_usable_and_marks_invalid_reset(monkeypat
     payload = {
         "data": {
             "limits": [
-                {"type": "weekly", "percentUsed": 42.5, "resetsAt": "2026-08-06T05:00:00Z"},
-                {"type": "monthly", "percentUsed": 55, "resetsAt": "2026-08-30T05:00:00"},
+                {"type": "weekly", "percentUsed": 42.5, "resetsAt": "2099-08-06T05:00:00Z"},
+                {"type": "monthly", "percentUsed": 55, "resetsAt": "2099-08-30T05:00:00"},
             ]
         },
         "success": True,
@@ -366,6 +370,102 @@ def test_clinepass_partial_limits_stays_usable_and_marks_invalid_reset(monkeypat
     assert result.error is None
 
 
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [
+        (101, "percentUsed 100 초과 (101)"),
+        ("12.5", "percentUsed 숫자 문자열 허용 안 함"),
+        (-1, "percentUsed 음수 (-1)"),
+        ("not-a-number", "percentUsed 숫자 문자열 허용 안 함"),
+    ],
+)
+def test_clinepass_percent_used_anomalies_are_explicit_warnings(monkeypatch, value, problem):
+    payload = {
+        "data": {
+            "limits": [
+                {
+                    "type": "five_hour",
+                    "percentUsed": value,
+                    "resetsAt": "2099-07-30T10:00:00Z",
+                }
+            ]
+        },
+        "success": True,
+    }
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (200, json.dumps(payload).encode()))
+
+    result = clinepass.fetch()
+    output = render.table([result], color=False)
+
+    assert result.status == "warning"
+    assert result.error is None
+    assert result.warning == f"데이터 이상 — five_hour: {problem}"
+    assert result.buckets[0].used_pct is None
+    assert result.buckets[0].note == problem
+    assert result.raw and result.raw["data"]["limits"][0]["percentUsed"] is None
+    assert problem in output
+
+
+def test_clinepass_duplicate_type_warns_and_keeps_first_value(monkeypatch):
+    payload = {
+        "data": {
+            "limits": [
+                {
+                    "type": "weekly",
+                    "percentUsed": 11,
+                    "resetsAt": "2099-08-06T05:00:00Z",
+                },
+                {
+                    "type": "weekly",
+                    "percentUsed": 99,
+                    "resetsAt": "2099-08-07T05:00:00Z",
+                },
+            ]
+        },
+        "success": True,
+    }
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (200, json.dumps(payload).encode()))
+
+    result = clinepass.fetch()
+    output = render.table([result], color=False)
+
+    assert result.status == "warning"
+    assert result.error is None
+    assert result.warning == "데이터 이상 — weekly: duplicate type (첫 값 유지)"
+    assert [(bucket.label, bucket.used_pct) for bucket in result.buckets] == [("weekly", 11.0)]
+    assert "duplicate type (첫 값 유지)" in output
+
+
+def test_clinepass_past_reset_is_preserved_and_warns_as_stale(monkeypatch):
+    payload = {
+        "data": {
+            "limits": [
+                {
+                    "type": "monthly",
+                    "percentUsed": 25,
+                    "resetsAt": "2000-01-01T00:00:00Z",
+                }
+            ]
+        },
+        "success": True,
+    }
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (200, json.dumps(payload).encode()))
+
+    result = clinepass.fetch()
+    output = render.table([result], color=False)
+    (bucket,) = result.buckets
+
+    assert result.status == "warning"
+    assert result.error is None
+    assert result.warning == "데이터 이상 — monthly: resetsAt 과거(stale)"
+    assert bucket.resets_at == "2000-01-01T00:00:00+00:00"
+    assert bucket.note == "resetsAt 과거(stale)"
+    assert "resetsAt 과거(stale)" in output
+
+
 def test_clinepass_auth_failures_warn_but_empty_limits_is_no_data(monkeypatch):
     monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
 
@@ -380,9 +480,13 @@ def test_clinepass_auth_failures_warn_but_empty_limits_is_no_data(monkeypatch):
         result = clinepass.fetch()
         outputs[status] = render.table([result], color=False)
 
-    assert outputs[401] == "clinepass  [WARN] 인증 실패 (HTTP 401) — 키를 확인하세요\n"
-    assert outputs[403] == "clinepass  [WARN] 인증 실패 (HTTP 403) — 키를 확인하세요\n"
-    assert outputs[200].startswith("clinepass  [ok] 한도 정보 없음")
+    assert outputs[401] == (
+        "clinepass [primary(usage-limits)]  [WARN] 인증 실패 (HTTP 401) — 키를 확인하세요\n"
+    )
+    assert outputs[403] == (
+        "clinepass [primary(usage-limits)]  [WARN] 인증 실패 (HTTP 403) — 키를 확인하세요\n"
+    )
+    assert outputs[200].startswith("clinepass [primary(usage-limits)]  [ok] 한도 정보 없음")
     assert "no data — usage-limits limits 비어 있음" in outputs[200]
     assert len(set(outputs.values())) == 3
 
@@ -397,7 +501,38 @@ def test_clinepass_fallback_auth_failure_is_warning(monkeypatch):
     assert result.status == "warning"
     assert result.error is None
     assert result.warning == "인증 실패 (HTTP 403) — 키를 확인하세요"
-    assert result.source == "completions-fallback"
+    assert result.source == "fallback(probe)"
+
+
+def test_clinepass_fallback_http_failures_are_warnings_not_false_ok(monkeypatch):
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("synthetic-key", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
+
+    outputs = {}
+    for status in (400, 429, 500, 503):
+        monkeypatch.setattr(
+            clinepass,
+            "_probe",
+            lambda _key, status=status: (status, Message()),
+        )
+        result = clinepass.fetch()
+        outputs[status] = render.table([result], color=False)
+        assert result.status == "warning"
+        assert result.error is None
+        assert result.warning == f"completions fallback HTTP {status} — 정상으로 간주하지 않음"
+        assert result.source == "fallback(probe)"
+        assert result.raw and result.raw["status"] == 404
+        assert result.raw["fallback_status"] == status
+
+    assert outputs[400].startswith(
+        "clinepass [fallback(probe)]  [WARN] completions fallback HTTP 400 — 정상으로 간주하지 않음"
+    )
+    assert outputs[429].startswith(
+        "clinepass [fallback(probe)]  [WARN] completions fallback HTTP 429 — 정상으로 간주하지 않음"
+    )
+    assert outputs[500].startswith(
+        "clinepass [fallback(probe)]  [WARN] completions fallback HTTP 500 — 정상으로 간주하지 않음"
+    )
 
 
 def test_clinepass_sanitizes_primary_value_error(monkeypatch):
@@ -433,6 +568,43 @@ def test_clinepass_sanitizes_fallback_value_error(monkeypatch):
     assert result.error == "invalid credential format"
     assert marker not in output
     assert marker not in serialized
+
+
+def test_clinepass_fallback_reflection_is_absent_from_all_surfaces(monkeypatch, tmp_path, capsys):
+    marker = "ZZSYNTHETICF1MARKERNOTAREALKEY"
+    headers = Message()
+    headers["x-ratelimit-limit-requests"] = "100"
+    headers["x-ratelimit-remaining-requests"] = "75"
+    headers["x-ratelimit-reset-requests"] = marker
+    headers[f"x-ratelimit-limit-{marker}"] = "100"
+    headers[f"x-ratelimit-remaining-{marker}"] = "75"
+    headers[f"x-ratelimit-reset-{marker}"] = "5h"
+    monkeypatch.setattr(clinepass, "_api_key", lambda: (marker, "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
+    monkeypatch.setattr(clinepass, "_probe", lambda _key: (200, headers))
+    cache_file = tmp_path / "snapshots.json"
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(cache_file))
+
+    (result,) = cache.collect(
+        {"clinepass": clinepass.fetch},
+        ["clinepass"],
+        ttl_s=60,
+        use_cache=True,
+        now=1,
+    )
+    surfaces = [
+        render.table([result], color=False),
+        render.brief([result], color=False),
+        json.dumps(result.as_dict(), ensure_ascii=False),
+        json.dumps(result.as_dict(include_raw=True), ensure_ascii=False),
+        cache_file.read_text(),
+        capsys.readouterr().err,
+    ]
+
+    assert result.status == "ok"
+    assert [bucket.label for bucket in result.buckets] == ["requests"]
+    assert all(marker not in surface for surface in surfaces)
+    assert all(marker.lower() not in surface for surface in surfaces)
 
 
 def test_clinepass_sanitizes_unexpected_primary_and_fallback_errors(monkeypatch):
@@ -503,3 +675,87 @@ def test_clinepass_blank_env_falls_through_to_opencode(monkeypatch, tmp_path):
     monkeypatch.setenv("CLINE_API_KEY", " \t ")
 
     assert clinepass._api_key() == ("fallback-synthetic-key", "opencode:cline-pass.key")
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_status"),
+    [
+        ("reflection", "ok"),
+        ("fallback-auth", "warning"),
+        ("fallback-400", "warning"),
+        ("fallback-429", "warning"),
+        ("fallback-500", "warning"),
+        ("percent-over-100", "warning"),
+        ("percent-string", "warning"),
+        ("percent-negative", "warning"),
+        ("duplicate-type", "warning"),
+        ("past-reset", "warning"),
+    ],
+)
+def test_clinepass_bad_inputs_never_stop_other_provider(monkeypatch, scenario, expected_status):
+    marker = "ZZSYNTHETICAC4MARKER"
+    monkeypatch.setattr(clinepass, "_api_key", lambda: (marker, "env:CLINE_API_KEY"))
+
+    if scenario.startswith("fallback") or scenario == "reflection":
+        monkeypatch.setattr(clinepass, "_request_usage", lambda _key: (404, b""))
+        headers = Message()
+        if scenario == "reflection":
+            headers["x-ratelimit-limit-requests"] = "100"
+            headers["x-ratelimit-remaining-requests"] = "75"
+            headers["x-ratelimit-reset-requests"] = marker
+            fallback_status = 200
+        elif scenario == "fallback-auth":
+            fallback_status = 403
+        else:
+            fallback_status = int(scenario.removeprefix("fallback-"))
+        monkeypatch.setattr(
+            clinepass,
+            "_probe",
+            lambda _key, fallback_status=fallback_status, headers=headers: (
+                fallback_status,
+                headers,
+            ),
+        )
+    else:
+        values = {
+            "percent-over-100": [
+                {"type": "five_hour", "percentUsed": 101, "resetsAt": "2099-01-01T00:00:00Z"}
+            ],
+            "percent-string": [
+                {
+                    "type": "five_hour",
+                    "percentUsed": "12.5",
+                    "resetsAt": "2099-01-01T00:00:00Z",
+                }
+            ],
+            "percent-negative": [
+                {"type": "five_hour", "percentUsed": -1, "resetsAt": "2099-01-01T00:00:00Z"}
+            ],
+            "duplicate-type": [
+                {"type": "weekly", "percentUsed": 11, "resetsAt": "2099-01-01T00:00:00Z"},
+                {"type": "weekly", "percentUsed": 99, "resetsAt": "2099-01-02T00:00:00Z"},
+            ],
+            "past-reset": [{"type": "monthly", "percentUsed": 25, "resetsAt": "2000-01-01T00:00:00Z"}],
+        }
+        payload = {"data": {"limits": values[scenario]}, "success": True}
+        monkeypatch.setattr(
+            clinepass,
+            "_request_usage",
+            lambda _key, payload=payload: (200, json.dumps(payload).encode()),
+        )
+
+    healthy = ProviderResult(
+        id="healthy",
+        buckets=[Bucket(label="5h", window="5h", used_pct=10, horizon="now")],
+    )
+    results = cache.collect(
+        {"healthy": lambda: healthy, "clinepass": clinepass.fetch},
+        ["healthy", "clinepass"],
+        use_cache=False,
+    )
+
+    assert [result.id for result in results] == ["healthy", "clinepass"]
+    assert results[0].status == "ok"
+    assert results[0].buckets[0].used_pct == 10
+    assert results[1].status == expected_status
+    assert "healthy" in render.table(results, color=False)

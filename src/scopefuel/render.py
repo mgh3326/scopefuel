@@ -20,6 +20,12 @@ def _pct(value: float | None) -> str:
     return "?" if value is None else f"사용 {value:g}%"
 
 
+def _display_id(result: ProviderResult) -> str:
+    if result.id == "clinepass" and result.source:
+        return f"{result.id} [{result.source}]"
+    return result.id
+
+
 def _pace(bucket: Bucket) -> str:
     value = bucket.pace.ratio
     return "" if value is None else f" {value:.1f}x"
@@ -53,8 +59,9 @@ def _bucket_for(
 def table(results: list[ProviderResult], *, color: bool = True) -> str:
     lines: list[str] = []
     for result in results:
+        display_id = _display_id(result)
         if result.error:
-            lines.append(f"{result.id:<7} -- {result.error}")
+            lines.append(f"{display_id:<7} -- {result.error}")
             if result.hint:
                 lines.append(f"        힌트: {result.hint}")
             lines.append("")
@@ -75,7 +82,7 @@ def table(results: list[ProviderResult], *, color: bool = True) -> str:
             basis = "한도 정보 없음"
         age = format_age(result.age_s)
         stamp = f"  ({age}{', 캐시' if result.stale else ''})" if age else ""
-        lines.append(f"{result.id}{plan}  [{_mark(verdict.mark, color)}] {basis}{stamp}")
+        lines.append(f"{display_id}{plan}  [{_mark(verdict.mark, color)}] {basis}{stamp}")
 
         for bucket in result.buckets:
             tags = [t for t in (bucket.note,) if t]
@@ -115,12 +122,13 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
     chunks: list[str] = []
     worst = overall_mark(results)
     for result in results:
+        display_id = _display_id(result)
         if result.error:
             err_msg = result.error.splitlines()[0]
-            chunks.append(f"{result.id} n/a({err_msg})")
+            chunks.append(f"{display_id} n/a({err_msg})")
             continue
         if result.warning:
-            chunks.append(f"{result.id} warn({result.warning})")
+            chunks.append(f"{display_id} warn({result.warning})")
             continue
         verdict = result.verdict
         parts: list[str] = []
@@ -147,5 +155,5 @@ def brief(results: list[ProviderResult], *, color: bool = True, horizon: str = "
             parts.append("(" + ",".join(f"{b.scope.label}소진" for b in verdict.exhausted) + ")")
         if result.stale:
             parts.append(f"[{format_age(result.age_s)}]")
-        chunks.append(f"{result.id} " + " ".join(parts))
+        chunks.append(f"{display_id} " + " ".join(parts))
     return f"[{_mark(worst, color)}] " + " | ".join(chunks)

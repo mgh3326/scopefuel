@@ -31,12 +31,27 @@ TIMEOUT_S = 20.0
 AUTH_FAILURE_STATUSES = frozenset({401, 403})
 FALLBACK_STATUSES = frozenset({404, 405, 501})
 INVALID_CREDENTIAL = "invalid credential format"
+PRIMARY_SOURCE = "primary(usage-limits)"
+FALLBACK_SOURCE = "fallback(probe)"
 LIMIT_ORDER = ("five_hour", "weekly", "monthly")
 LIMIT_MAP = {
     "five_hour": ("5h", "now"),
     "weekly": ("7d", "week"),
     "monthly": ("30d", "month"),
 }
+_CREDENTIAL_SOURCES = frozenset(
+    {"env:CLINE_API_KEY", "opencode:cline-pass.key", "file:~/.config/cline/api-key"}
+)
+_FALLBACK_RATE_HEADERS = frozenset(
+    {
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+    }
+)
 
 _DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|[smhd])", re.IGNORECASE)
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
@@ -53,27 +68,32 @@ def fetch() -> ProviderResult:
                 "CLINE_API_KEY, ~/.local/share/opencode/auth.json의 cline-pass.key, "
                 "또는 ~/.config/cline/api-key 필요"
             ),
-            source="usage-limits-api",
-            raw={"credential": credential},
+            source=PRIMARY_SOURCE,
+            raw=_safe_raw(credential=credential),
         )
     if not _valid_credential(key):
-        return _invalid_credential(credential)
+        return _invalid_credential(credential, source=PRIMARY_SOURCE)
 
     try:
         status, payload_bytes = _request_usage(key)
     except ValueError:
-        return _invalid_credential(credential)
+        return _invalid_credential(credential, source=PRIMARY_SOURCE)
     except Exception as exc:
         return ProviderResult(
             id="clinepass",
             error=f"usage-limits 조회 실패 ({type(exc).__name__})",
             hint="ClinePass 네트워크/로그인 상태를 확인하세요",
-            source="usage-limits-api",
-            raw={"credential": credential},
+            source=PRIMARY_SOURCE,
+            raw=_safe_raw(credential=credential),
         )
 
     if status in AUTH_FAILURE_STATUSES:
-        return _auth_warning(status, credential, source="usage-limits-api")
+        return _warning_result(
+            warning=f"인증 실패 (HTTP {status}) — 키를 확인하세요",
+            credential=credential,
+            source=PRIMARY_SOURCE,
+            status=status,
+        )
     if status in FALLBACK_STATUSES:
         return _fetch_fallback(key, credential, primary_status=status)
     if status >= 400:
@@ -81,8 +101,8 @@ def fetch() -> ProviderResult:
             id="clinepass",
             error=f"usage-limits HTTP {status}",
             hint="ClinePass 서비스 상태를 확인하세요",
-            source="usage-limits-api",
-            raw={"status": status, "credential": credential},
+            source=PRIMARY_SOURCE,
+            raw=_safe_raw(status=status, credential=credential),
         )
 
     try:
@@ -92,49 +112,58 @@ def fetch() -> ProviderResult:
             id="clinepass",
             error=f"usage-limits 응답 처리 실패 ({type(exc).__name__})",
             hint="ClinePass 응답 JSON 형식을 확인하세요",
-            source="usage-limits-api",
-            raw={"status": status, "credential": credential},
+            source=PRIMARY_SOURCE,
+            raw=_safe_raw(status=status, credential=credential),
         )
 
     if not isinstance(payload, dict):
         return ProviderResult(
             id="clinepass",
             error="usage-limits 응답이 JSON object가 아님",
-            source="usage-limits-api",
-            raw={"status": status, "credential": credential},
+            source=PRIMARY_SOURCE,
+            raw=_safe_raw(status=status, credential=credential),
         )
 
     try:
-        buckets, note, safe_limits = _usage_buckets(payload)
+        buckets, note, safe_limits, validation_warnings = _usage_buckets(payload)
     except Exception as exc:
         return ProviderResult(
             id="clinepass",
             error=f"usage-limits 버킷 처리 실패 ({type(exc).__name__})",
             hint="ClinePass limits 응답 형식을 확인하세요",
-            source="usage-limits-api",
-            raw={"status": status, "credential": credential},
+            source=PRIMARY_SOURCE,
+            raw=_safe_raw(status=status, credential=credential),
         )
 
-    raw: dict[str, object] = {
-        "status": status,
-        "credential": credential,
-        "data": {"limits": safe_limits},
-    }
-    if isinstance(payload.get("success"), bool):
-        raw["success"] = payload["success"]
+    raw = _safe_raw(
+        status=status,
+        credential=credential,
+        limits=safe_limits,
+        success=payload.get("success"),
+    )
     if payload.get("success") is False:
         return ProviderResult(
             id="clinepass",
             error="usage-limits 응답 success=false",
-            source="usage-limits-api",
+            source=PRIMARY_SOURCE,
             raw=raw,
+        )
+    if validation_warnings:
+        return _warning_result(
+            warning=f"데이터 이상 — {'; '.join(validation_warnings)}",
+            credential=credential,
+            source=PRIMARY_SOURCE,
+            status=status,
+            buckets=buckets,
+            note=note,
+            limits=safe_limits,
         )
 
     return ProviderResult(
         id="clinepass",
         buckets=buckets,
         note=note,
-        source="usage-limits-api",
+        source=PRIMARY_SOURCE,
         raw=raw,
     )
 
@@ -157,19 +186,25 @@ def _request_usage(key: str) -> tuple[int, bytes]:
         return exc.code, b""
 
 
-def _usage_buckets(payload: dict) -> tuple[list[Bucket], str | None, list[dict[str, object]]]:
+def _usage_buckets(
+    payload: dict,
+) -> tuple[list[Bucket], str | None, list[dict[str, object]], list[str]]:
     data = payload.get("data")
     raw_limits = data.get("limits") if isinstance(data, dict) else None
     if not isinstance(raw_limits, list):
-        return [], "no data — usage-limits 응답에 limits 배열 없음", []
+        return [], "no data — usage-limits 응답에 limits 배열 없음", [], []
 
     by_type: dict[str, dict] = {}
+    validation_warnings: list[str] = []
     for item in raw_limits:
         if not isinstance(item, dict):
             continue
         kind = item.get("type")
-        if isinstance(kind, str) and kind in LIMIT_MAP and kind not in by_type:
-            by_type[kind] = item
+        if isinstance(kind, str) and kind in LIMIT_MAP:
+            if kind in by_type:
+                validation_warnings.append(f"{kind}: duplicate type (첫 값 유지)")
+            else:
+                by_type[kind] = item
 
     buckets: list[Bucket] = []
     safe_limits: list[dict[str, object]] = []
@@ -178,13 +213,18 @@ def _usage_buckets(payload: dict) -> tuple[list[Bucket], str | None, list[dict[s
         if item is None:
             continue
         window, horizon = LIMIT_MAP[kind]
-        used_pct = _percent_used(item.get("percentUsed"))
+        used_pct, percent_problem = _percent_used(item.get("percentUsed"))
         resets_at = _iso_reset(item.get("resetsAt"))
         problems: list[str] = []
-        if used_pct is None:
-            problems.append("percentUsed 없음/형식 오류")
+        if percent_problem:
+            problems.append(percent_problem)
+            validation_warnings.append(f"{kind}: {percent_problem}")
         if resets_at is None:
             problems.append("resetsAt 없음/비-tz ISO8601")
+        elif _is_past_reset(resets_at):
+            reset_problem = "resetsAt 과거(stale)"
+            problems.append(reset_problem)
+            validation_warnings.append(f"{kind}: {reset_problem}")
         buckets.append(
             Bucket(
                 label=kind,
@@ -200,21 +240,28 @@ def _usage_buckets(payload: dict) -> tuple[list[Bucket], str | None, list[dict[s
 
     if not buckets:
         reason = "limits 비어 있음" if not raw_limits else "알려진 limit type 없음"
-        return [], f"no data — usage-limits {reason}", []
+        return [], f"no data — usage-limits {reason}", [], []
 
     missing = [kind for kind in LIMIT_ORDER if kind not in by_type]
     note = f"partial data — limits 누락: {', '.join(missing)}" if missing else None
-    return buckets, note, safe_limits
+    return buckets, note, safe_limits, validation_warnings
 
 
-def _percent_used(value: object) -> float | None:
+def _percent_used(value: object) -> tuple[float | None, str | None]:
     if isinstance(value, bool):
-        return None
-    try:
-        parsed = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+        return None, "percentUsed 숫자 아님"
+    if isinstance(value, str):
+        return None, "percentUsed 숫자 문자열 허용 안 함"
+    if not isinstance(value, (int, float)):
+        return None, "percentUsed 숫자 아님"
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        return None, "percentUsed 유한 숫자 아님"
+    if parsed < 0:
+        return None, f"percentUsed 음수 ({parsed:g})"
+    if parsed > 100:
+        return None, f"percentUsed 100 초과 ({parsed:g})"
+    return parsed, None
 
 
 def _iso_reset(value: object) -> str | None:
@@ -229,12 +276,34 @@ def _iso_reset(value: object) -> str | None:
     return parsed.astimezone(dt.UTC).isoformat()
 
 
-def _auth_warning(status: int, credential: dict[str, object], *, source: str) -> ProviderResult:
+def _is_past_reset(value: str) -> bool:
+    return dt.datetime.fromisoformat(value) <= dt.datetime.now(dt.UTC)
+
+
+def _warning_result(
+    *,
+    warning: str,
+    credential: dict[str, object],
+    source: str,
+    status: int,
+    fallback_status: int | None = None,
+    buckets: list[Bucket] | None = None,
+    note: str | None = None,
+    limits: list[dict[str, object]] | None = None,
+) -> ProviderResult:
     return ProviderResult(
         id="clinepass",
-        warning=f"인증 실패 (HTTP {status}) — 키를 확인하세요",
+        buckets=buckets or [],
+        warning=warning,
+        note=note,
         source=source,
-        raw={"status": status, "credential": credential},
+        raw=_safe_raw(
+            status=status,
+            fallback_status=fallback_status,
+            credential=credential,
+            limits=limits,
+            buckets=buckets if limits is None else None,
+        ),
     )
 
 
@@ -242,18 +311,24 @@ def _fetch_fallback(key: str, credential: dict[str, object], *, primary_status: 
     try:
         status, headers = _probe(key)
     except ValueError:
-        return _invalid_credential(credential)
+        return _invalid_credential(credential, source=FALLBACK_SOURCE)
     except Exception as exc:
         return ProviderResult(
             id="clinepass",
             error=f"completions fallback 실패 ({type(exc).__name__})",
             hint=f"usage-limits HTTP {primary_status}; ClinePass 서비스 상태를 확인하세요",
-            source="completions-fallback",
-            raw={"status": primary_status, "credential": credential},
+            source=FALLBACK_SOURCE,
+            raw=_safe_raw(status=primary_status, credential=credential),
         )
 
     if status in AUTH_FAILURE_STATUSES:
-        return _auth_warning(status, credential, source="completions-fallback")
+        return _warning_result(
+            warning=f"인증 실패 (HTTP {status}) — 키를 확인하세요",
+            credential=credential,
+            source=FALLBACK_SOURCE,
+            status=primary_status,
+            fallback_status=status,
+        )
 
     try:
         rate_headers = _rate_limit_headers(headers)
@@ -262,16 +337,30 @@ def _fetch_fallback(key: str, credential: dict[str, object], *, primary_status: 
         return ProviderResult(
             id="clinepass",
             error=f"completions fallback 헤더 처리 실패 ({type(exc).__name__})",
-            source="completions-fallback",
-            raw={"status": primary_status, "fallback_status": status, "credential": credential},
+            source=FALLBACK_SOURCE,
+            raw=_safe_raw(
+                status=primary_status,
+                fallback_status=status,
+                credential=credential,
+            ),
         )
 
-    raw = {
-        "status": primary_status,
-        "fallback_status": status,
-        "credential": credential,
-        "rate_limit_headers": rate_headers,
-    }
+    raw = _safe_raw(
+        status=primary_status,
+        fallback_status=status,
+        credential=credential,
+        buckets=buckets,
+    )
+    if status >= 400:
+        return _warning_result(
+            warning=f"completions fallback HTTP {status} — 정상으로 간주하지 않음",
+            credential=credential,
+            source=FALLBACK_SOURCE,
+            status=primary_status,
+            fallback_status=status,
+            buckets=buckets,
+            note=f"usage-limits HTTP {primary_status}; fallback 응답 실패",
+        )
     if not buckets:
         return ProviderResult(
             id="clinepass",
@@ -279,14 +368,14 @@ def _fetch_fallback(key: str, credential: dict[str, object], *, primary_status: 
                 f"no data — usage-limits HTTP {primary_status}; "
                 f"completions fallback rate-limit 헤더 없음 (HTTP {status})"
             ),
-            source="completions-fallback",
+            source=FALLBACK_SOURCE,
             raw=raw,
         )
     return ProviderResult(
         id="clinepass",
         buckets=buckets,
         note=f"usage-limits HTTP {primary_status}; completions fallback 적용",
-        source="completions-fallback",
+        source=FALLBACK_SOURCE,
         raw=raw,
     )
 
@@ -296,13 +385,13 @@ def _valid_credential(key: str) -> bool:
     return bool(key) and all(0x21 <= ord(char) <= 0x7E for char in key)
 
 
-def _invalid_credential(credential: dict[str, object]) -> ProviderResult:
+def _invalid_credential(credential: dict[str, object], *, source: str) -> ProviderResult:
     return ProviderResult(
         id="clinepass",
         error=INVALID_CREDENTIAL,
         hint="ClinePass API key 형식을 확인하세요",
-        source="usage-limits-api",
-        raw={"credential": credential},
+        source=source,
+        raw=_safe_raw(credential=credential),
     )
 
 
@@ -366,7 +455,7 @@ def _rate_limit_headers(headers: Message | None) -> dict[str, str]:
     return {
         name.lower(): value.strip()
         for name, value in headers.items()
-        if "ratelimit" in name.lower() or "rate-limit" in name.lower()
+        if name.lower() in _FALLBACK_RATE_HEADERS
     }
 
 
@@ -411,7 +500,7 @@ def _remaining_marker(name: str) -> tuple[str, str] | None:
 
 
 def _number(value: str | None) -> float | None:
-    if not value or not (match := _NUMBER.search(value.replace(",", ""))):
+    if not value or not (match := _NUMBER.fullmatch(value.replace(",", "").strip())):
         return None
     try:
         return float(match.group())
@@ -458,6 +547,55 @@ def _reset(value: str | None) -> tuple[str | None, float | None]:
         except OverflowError:
             return None, None
     return reset_at.isoformat(), seconds
+
+
+def _safe_raw(
+    *,
+    credential: dict[str, object],
+    status: int | None = None,
+    fallback_status: int | None = None,
+    limits: list[dict[str, object]] | None = None,
+    buckets: list[Bucket] | None = None,
+    success: object = None,
+) -> dict[str, object]:
+    """두 응답 경로 모두 같은 allowlist로 raw를 재구성한다."""
+    credential_source = credential.get("source")
+    safe_credential = {
+        "source": credential_source if credential_source in _CREDENTIAL_SOURCES else None,
+        "present": bool(credential.get("present")),
+    }
+    raw: dict[str, object] = {"credential": safe_credential}
+    if status is not None:
+        raw["status"] = status
+    if fallback_status is not None:
+        raw["fallback_status"] = fallback_status
+    if limits is not None:
+        raw["data"] = {
+            "limits": [
+                {
+                    "type": item["type"],
+                    "percentUsed": item["percentUsed"],
+                    "resetsAt": item["resetsAt"],
+                }
+                for item in limits
+                if item.get("type") in LIMIT_MAP
+            ]
+        }
+    if buckets is not None:
+        raw["data"] = {
+            "buckets": [
+                {
+                    "label": bucket.label,
+                    "window": bucket.window,
+                    "used_pct": bucket.used_pct,
+                    "resets_at": bucket.resets_at,
+                }
+                for bucket in buckets
+            ]
+        }
+    if isinstance(success, bool):
+        raw["success"] = success
+    return raw
 
 
 def _window_label(seconds: float | None) -> str:
