@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Literal
@@ -21,9 +22,12 @@ SCHEMA = "scopefuel.v1"
 ScopeKind = Literal["account", "model", "group"]
 Horizon = Literal["now", "week", "month"]
 Mark = Literal["ok", "warn", "crit", "degraded"]
+PoolClass = Literal["preserve", "spend"]
 
 WARN_PCT = 75.0
 CRIT_PCT = 90.0
+WASTE_PCT = 70.0
+WASTE_WINDOW_S = 24 * 3600
 
 # 이 이하의 창은 "지금"으로 본다 (5h 창 = 21600초).
 NOW_HORIZON_MAX_S = 6 * 3600
@@ -64,9 +68,11 @@ def _parse_reset(iso: str | None) -> dt.datetime | None:
 
 def pace_for(bucket: Bucket, *, now: dt.datetime | None = None) -> Pace:
     """계산할 수 없을 때는 0을 추측하지 않고 모두 None으로 둔다."""
+    if not _is_valid_used_pct(bucket.used_pct):
+        return Pace(None, None, None)
     window_seconds = _window_seconds(bucket.window)
     reset_at = _parse_reset(bucket.resets_at)
-    if bucket.used_pct is None or window_seconds is None or window_seconds <= 0 or reset_at is None:
+    if window_seconds is None or window_seconds <= 0 or reset_at is None:
         return Pace(None, None, None)
 
     now = now or dt.datetime.now(dt.UTC)
@@ -118,7 +124,10 @@ class Bucket:
 
     @property
     def remaining_pct(self) -> float | None:
-        return None if self.used_pct is None else max(0.0, 100.0 - self.used_pct)
+        if not _is_valid_used_pct(self.used_pct):
+            return None
+        assert isinstance(self.used_pct, (int, float))
+        return max(0.0, 100.0 - self.used_pct)
 
     @property
     def mark(self) -> Mark:
@@ -128,27 +137,36 @@ class Bucket:
     def pace(self) -> Pace:
         return pace_for(self)
 
-    def as_dict(self) -> dict:
-        pace = self.pace
+    def pace_at(self, now: dt.datetime | None = None) -> Pace:
+        return pace_for(self, now=now)
+
+    def as_dict(self, pool_class: PoolClass = "preserve", *, now: dt.datetime | None = None) -> dict:
+        pace = self.pace_at(now)
+        used = self.used_pct if _is_valid_used_pct(self.used_pct) else None
         return {
             "label": self.label,
             "window": self.window,
             "horizon": self.horizon,
-            "used_pct": self.used_pct,
-            "remaining_pct": self.remaining_pct,
+            "used_pct": used,
+            "remaining_pct": None if used is None else max(0.0, 100.0 - used),
             "pace": pace.ratio,
             "full_use_rate": pace.full_use_rate,
             "full_use_rate_unit": pace.full_use_rate_unit,
             "resets_at": self.resets_at,
             "scope": self.scope.as_dict(),
-            "severity": self.mark,
+            "severity": mark_for(used, pool_class),
             "note": self.note,
         }
 
 
 @dataclass
 class Verdict:
-    """'실제로 무엇이 막히는가'의 판정."""
+    """'실제로 무엇이 막히는가'의 판정.
+
+    `mark`는 provider 신뢰도 축(실패·stale이면 degraded가 우선). `usage_mark`은
+    scope·pool class를 적용한 사용률 축(ok|warn|crit)으로, 신뢰도 덮어쓰기 전
+    판정을 그대로 보존한다. 두 축은 `--exit-code-on`에서 함께 평가된다.
+    """
 
     now_pct: float | None
     week_pct: float | None
@@ -158,19 +176,31 @@ class Verdict:
     mark: Mark
     exhausted: list[Bucket] = field(default_factory=list)
     groups: dict[str, float] = field(default_factory=dict)
+    waste: bool = False
+    waste_advice: str | None = None
+    usage_mark: Mark | None = None
 
-    def as_dict(self) -> dict:
+    def __post_init__(self) -> None:
+        # legacy 생성자 호환: non-degraded mark는 같은 usage_mark로 유도.
+        if self.usage_mark is None:
+            self.usage_mark = self.mark if self.mark in ("ok", "warn", "crit") else "ok"
+
+    def as_dict(self, *, now: dt.datetime | None = None) -> dict:
         out = {
             "now_pct": self.now_pct,
             "week_pct": self.week_pct,
             "blocking_pct": self.blocking_pct,
             "basis": self.basis,
             "mark": self.mark,
+            "usage_mark": self.usage_mark,
             "groups": self.groups,
-            "exhausted": [b.as_dict() for b in self.exhausted],
+            "exhausted": [b.as_dict(now=now) for b in self.exhausted],
+            "waste": self.waste,
         }
         if self.month_pct is not None:
             out["month_pct"] = self.month_pct
+        if self.waste_advice is not None:
+            out["waste_advice"] = self.waste_advice
         return out
 
 
@@ -188,6 +218,10 @@ class ProviderResult:
     age_s: float | None = None
     stale: bool = False
     raw: dict | None = None
+    pool_class: PoolClass = "preserve"
+
+    def __post_init__(self) -> None:
+        self.pool_class = _normalize_pool_class(self.pool_class)
 
     @property
     def status(self) -> str:
@@ -197,23 +231,45 @@ class ProviderResult:
             return "stale"
         return "warning" if self.warning else "ok"
 
-    @property
-    def verdict(self) -> Verdict:
-        v = verdict_for(self.buckets)
-        if v.mark == "ok" and (self.error or self.stale or self.warning):
+    def verdict_at(self, now: dt.datetime | None = None) -> Verdict:
+        v = verdict_for(self.buckets, self.pool_class, now=now)
+        if self.error or self.stale:
             return Verdict(
                 now_pct=v.now_pct,
                 week_pct=v.week_pct,
                 month_pct=v.month_pct,
                 blocking_pct=v.blocking_pct,
                 basis=v.basis,
-                mark="warn" if self.warning and not self.error and not self.stale else "degraded",
+                mark="degraded",
                 exhausted=v.exhausted,
                 groups=v.groups,
+                waste=False,
+                waste_advice=None,
+                usage_mark=v.usage_mark,
+            )
+        if self.warning:
+            mark = v.mark if v.mark in ("crit", "degraded") else "warn"
+            return Verdict(
+                now_pct=v.now_pct,
+                week_pct=v.week_pct,
+                month_pct=v.month_pct,
+                blocking_pct=v.blocking_pct,
+                basis=v.basis,
+                mark=mark,
+                exhausted=v.exhausted,
+                groups=v.groups,
+                waste=False,
+                waste_advice=None,
+                usage_mark=v.usage_mark,
             )
         return v
 
-    def as_dict(self, include_raw: bool = False) -> dict:
+    @property
+    def verdict(self) -> Verdict:
+        return self.verdict_at()
+
+    def as_dict(self, include_raw: bool = False, *, now: dt.datetime | None = None) -> dict:
+        verdict = self.verdict_at(now)
         out = {
             "id": self.id,
             "status": self.status,
@@ -225,8 +281,9 @@ class ProviderResult:
             "error": self.error,
             "hint": self.hint,
             "note": self.note,
-            "buckets": [b.as_dict() for b in self.buckets],
-            "verdict": self.verdict.as_dict(),
+            "pool_class": self.pool_class,
+            "buckets": [b.as_dict(self.pool_class, now=now) for b in self.buckets],
+            "verdict": verdict.as_dict(now=now),
         }
         if self.warning is not None:
             out["warning"] = self.warning
@@ -235,14 +292,60 @@ class ProviderResult:
         return out
 
 
-def mark_for(used_pct: float | None) -> Mark:
-    if used_pct is None:
+def _normalize_pool_class(value: object) -> PoolClass:
+    if value in ("preserve", "spend"):
+        return value
+    return "preserve"
+
+
+def mark_for(used_pct: float | None, pool_class: PoolClass = "preserve") -> Mark:
+    if not _is_valid_used_pct(used_pct):
+        return "ok"
+    if pool_class == "spend":
         return "ok"
     if used_pct >= CRIT_PCT:
         return "crit"
     if used_pct >= WARN_PCT:
         return "warn"
     return "ok"
+
+
+def _is_valid_used_pct(value: object) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    try:
+        f = float(value)
+    except (TypeError, OverflowError, ValueError):
+        return False
+    return math.isfinite(f) and 0 <= f <= 100
+
+
+def waste_for(
+    buckets: list[Bucket], pool_class: PoolClass = "preserve", *, now: dt.datetime | None = None
+) -> tuple[bool, str | None]:
+    """spend 풀에서 reset 전 24h 미만, 사용률 70% 미만인 버킷이 있으면 WASTE."""
+    if pool_class != "spend":
+        return False, None
+    now = now or dt.datetime.now(dt.UTC)
+    now = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
+    waste_buckets: list[str] = []
+    for bucket in buckets:
+        if not _is_valid_used_pct(bucket.used_pct):
+            continue
+        assert isinstance(bucket.used_pct, (int, float))
+        if bucket.used_pct >= WASTE_PCT:
+            continue
+        reset_at = _parse_reset(bucket.resets_at)
+        if reset_at is None:
+            continue
+        remaining_s = (reset_at - now).total_seconds()
+        if 0 < remaining_s < WASTE_WINDOW_S:
+            waste_buckets.append(f"{bucket.label} 사용 {bucket.used_pct:g}%")
+    if not waste_buckets:
+        return False, None
+    return True, "리셋 전 소진 권장: " + ", ".join(waste_buckets)
 
 
 def horizon_for(window_seconds: float | None) -> Horizon:
@@ -260,15 +363,21 @@ def window_label(seconds: float | None) -> str:
     return f"{seconds / 3600:g}h"
 
 
-def verdict_for(buckets: list[Bucket]) -> Verdict:
+def verdict_for(
+    buckets: list[Bucket],
+    pool_class: PoolClass = "preserve",
+    *,
+    now: dt.datetime | None = None,
+) -> Verdict:
     """차단 판정. account 스코프만 전체를 막는다.
 
     - account 행이 있으면 그 최대치가 blocking (model/group 스코프는 제외).
     - account 행이 없는 provider(예: agy)는 그룹이 서로 독립이므로,
       '가장 여유 있는 그룹'이 얼마나 찼는지를 전체 차단 지표로 본다
       (한 그룹이 막혀도 다른 그룹으로 계속 작업할 수 있으므로).
+    - spend 풀은 고사용을 차단으로 보지 않는다.
     """
-    known = [b for b in buckets if b.used_pct is not None]
+    known = [b for b in buckets if _is_valid_used_pct(b.used_pct)]
     account = [b for b in known if b.scope.kind == "account"]
     groups: dict[str, float] = {}
     for bucket in known:
@@ -289,25 +398,51 @@ def verdict_for(buckets: list[Bucket]) -> Verdict:
         pool = [b.used_pct or 0.0 for b in known if b.horizon == horizon and b.scope.kind != "model"]
         return max(pool) if pool else None
 
-    exhausted = [b for b in known if b.scope.kind != "account" and (b.used_pct or 0.0) >= CRIT_PCT]
+    exhausted = (
+        []
+        if pool_class == "spend"
+        else [b for b in known if b.scope.kind != "account" and (b.used_pct or 0.0) >= CRIT_PCT]
+    )
+    waste, waste_advice = waste_for(buckets, pool_class, now=now)
+    usage_mark = mark_for(blocking, pool_class)
     return Verdict(
         now_pct=axis("now"),
         week_pct=axis("week"),
         month_pct=axis("month"),
         blocking_pct=blocking,
         basis=basis,
-        mark=mark_for(blocking),
+        mark=usage_mark,
         exhausted=exhausted,
         groups=groups,
+        waste=waste,
+        waste_advice=waste_advice,
+        usage_mark=usage_mark,
     )
 
 
-def overall_mark(results: list[ProviderResult]) -> Mark:
+def _result_mark(result: ProviderResult, now: dt.datetime | None, attr: str) -> Mark:
+    verdict = result.verdict if now is None else result.verdict_at(now)
+    return getattr(verdict, attr)
+
+
+def overall_mark(results: list[ProviderResult], *, now: dt.datetime | None = None) -> Mark:
     ranking = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
     worst: Mark = "ok"
     for result in results:
-        mark = result.verdict.mark
+        mark = _result_mark(result, now, "mark")
         if ranking[mark] > ranking[worst]:
+            worst = mark
+    return worst
+
+
+def overall_usage_mark(results: list[ProviderResult], *, now: dt.datetime | None = None) -> Mark:
+    """사용률 축 집계. `usage_mark`은 ok|warn|crit만 사용한다."""
+    ranking = {"ok": 0, "warn": 1, "crit": 2}
+    worst: Mark = "ok"
+    for result in results:
+        mark = _result_mark(result, now, "usage_mark")
+        # degraded는 usage 축에 없으므로 무시(legacy 안전장치).
+        if mark in ranking and ranking[mark] > ranking[worst]:
             worst = mark
     return worst
 

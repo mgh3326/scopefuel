@@ -797,3 +797,58 @@ def test_clinepass_bad_inputs_never_stop_other_provider(monkeypatch, scenario, e
     assert results[0].buckets[0].used_pct == 10
     assert results[1].status == expected_status
     assert "healthy" in render.table(results, color=False)
+
+
+# --------------------------------------------------------- OverflowError in provider converters (Fix 4)
+
+
+class _OverflowNum:
+    def __float__(self):
+        raise OverflowError("too large")
+
+
+def test_claude_num_catches_overflow():
+    assert claude._num(10**1000) is None
+    assert claude._num(2**1024) is None
+    assert claude._num(_OverflowNum()) is None
+    assert claude._num(True) is None
+    assert claude._num(50.0) == 50.0
+    assert claude._num(0) == 0.0
+    assert claude._num(100) == 100.0
+
+
+def test_codex_num_catches_overflow():
+    assert codex._num(10**1000) is None
+    assert codex._num(2**1024) is None
+    assert codex._num(_OverflowNum()) is None
+    assert codex._num(True) is None
+    assert codex._num(50.0) == 50.0
+    assert codex._num(0) == 0.0
+    assert codex._num(100) == 100.0
+
+
+def test_agy_from_local_catches_overflow():
+    raw = {
+        "response": {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [{"window": "5h", "remainingFraction": 10**1000}],
+                }
+            ]
+        }
+    }
+    result = agy._from_local(raw)
+    assert result.buckets[0].used_pct is None
+
+
+def test_agy_cloud_buckets_catches_overflow():
+    raw = {
+        "models": {
+            "gemini-2.5-pro": {
+                "quotaInfo": {"remainingFraction": 10**1000, "resetTime": "2099-01-01T00:00:00Z"}
+            }
+        }
+    }
+    buckets = agy._cloud_buckets(raw)
+    assert len(buckets) == 0

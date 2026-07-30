@@ -17,6 +17,7 @@ local 의 그룹값과 일치). 그래서 여기서도 그룹으로 접어서 �
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import re
 import subprocess
@@ -111,11 +112,19 @@ def _from_local(raw: dict) -> ProviderResult:
         for bucket in group.get("buckets") or []:
             frac = bucket.get("remainingFraction")
             window = bucket.get("window") or "?"
+            used_pct: float | None = None
+            if frac is not None and not isinstance(frac, bool):
+                try:
+                    f = float(frac)
+                    if math.isfinite(f) and 0 <= f <= 1:
+                        used_pct = round((1 - f) * 100, 1)
+                except (TypeError, ValueError, OverflowError):
+                    pass
             buckets.append(
                 Bucket(
                     label=f"{name} {window}",
                     window="7d" if window == "weekly" else window,
-                    used_pct=None if frac is None else round((1 - float(frac)) * 100, 1),
+                    used_pct=used_pct,
                     resets_at=bucket.get("resetTime"),
                     scope=Scope("group", name),
                     horizon="now" if window == "5h" else "week",
@@ -184,9 +193,15 @@ def _cloud_buckets(raw: dict) -> list[Bucket]:
     for name, data in items:
         quota = (data or {}).get("quotaInfo") or {}
         frac, reset = quota.get("remainingFraction"), quota.get("resetTime")
-        if frac is None or not reset:
+        if frac is None or isinstance(frac, bool) or not reset:
             continue  # tab_/chat_ 류의 비-쿼타 항목
-        clusters.setdefault((round(float(frac), 6), str(reset)), []).append(str(name))
+        try:
+            f = float(frac)
+            if not math.isfinite(f) or not (0 <= f <= 1):
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        clusters.setdefault((round(f, 6), str(reset)), []).append(str(name))
 
     buckets: list[Bucket] = []
     for (frac, reset), names in sorted(clusters.items(), key=lambda kv: -kv[0][0]):

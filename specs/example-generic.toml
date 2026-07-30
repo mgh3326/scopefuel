@@ -8,6 +8,7 @@
 
 id = "myplan"
 plan_path = ["plan_type"]
+class = "preserve"   # "preserve" | "spend". 내장 provider 덮어쓸 때 class도 함께 지정.
 
 [credentials]
 file = "~/.myagent/auth.json"

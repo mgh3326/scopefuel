@@ -13,6 +13,7 @@
 ```toml
 id = "myplan"                    # --only myplan 으로 지정하는 이름
 plan_path = ["plan_type"]        # (선택) 응답에서 플랜 이름을 꺼낼 경로
+class = "preserve"               # (선택) "preserve" | "spend". 미지정 시 "preserve"
 
 [credentials]
 file = "~/.myagent/auth.json"          # 또는 token_env = "MYPLAN_TOKEN"
@@ -52,6 +53,15 @@ resets_at_kind = "epoch"
 ```toml
 remaining_fraction_path = ["quotaInfo", "remainingFraction"]   # 0.42 → used 58%
 ```
+
+### pool class — 이 풀을 어떻게 다룰 것인가
+
+| class | 의미 | 예 |
+|---|---|---|
+| `preserve` | 75%/90% 사용률을 WARN/CRIT로 승격. 계정/모델/그룹 차단 판정에 그대로 사용. | claude, codex |
+| `spend` | 고사용을 정상으로 본다. 리셋 전 24시간 미만, 70% 미만 bucket이 있으면 WASTE 권고. | kiro, clinepass, agy |
+
+`class`는 provider 전체(선언형 TOML 스펙 및 Python 플러그인)에 적용된다. 내장 provider를 TOML 스펙으로 완전 교체할 때 같은 `id` 스펙에 `class`를 지정할 수 있다. (단, `class`만 단독으로 덮어쓰는 것은 지원하지 않으며, 같은 `id`의 스펙은 엔드포인트/자격증명/버킷 설정을 모두 포함하는 완전한 대체 스펙이어야 한다.)
 
 ### 스코프를 고르는 기준 (이 도구의 핵심)
 
@@ -108,6 +118,7 @@ myplan = "myscopefuel_plugin:fetch"
 규칙 몇 가지:
 
 - **모르는 값은 `None`으로 두세요.** 0으로 채우면 "여유 있다"는 거짓 신호가 됩니다.
+- pool class는 callable 객체의 `pool_class` 속성(예: `fetch.pool_class = "spend"`)을 부여하거나 반환 `ProviderResult(..., pool_class="spend")`로 지정할 수 있습니다. (우선순위: callable `pool_class` 메타데이터 > 반환 `ProviderResult.pool_class` > 기본값 `preserve`)
 - 실패는 예외를 던지거나 `ProviderResult(id=..., error=..., hint=...)`로 반환하세요. 캐시 폴백과
   종료코드 처리는 코어가 합니다.
 - 토큰을 갱신하거나 파일에 쓰지 마세요. scopefuel은 읽기 전용 계측기입니다.

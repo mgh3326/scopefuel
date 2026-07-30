@@ -14,7 +14,7 @@ import time
 
 from . import render
 from .cache import DEFAULT_TTL_S, collect
-from .model import SCHEMA, ProviderResult, overall_mark
+from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .providers import default_order, registry
 
 MARK_RANK = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
@@ -53,21 +53,24 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     return parser
 
 
-def _render(results: list[ProviderResult], args: argparse.Namespace) -> str:
+def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.datetime) -> str:
     color = not args.no_color and sys.stdout.isatty()
     if args.raw:
         return json.dumps({r.id: r.raw for r in results}, indent=2, ensure_ascii=False)
     if args.json:
         payload = {
             "schema": SCHEMA,
-            "generated_at": dt.datetime.now(dt.UTC).isoformat(),
-            "summary": {"mark": overall_mark(results)},
-            "providers": [r.as_dict() for r in results],
+            "generated_at": now.isoformat(),
+            "summary": {
+                "mark": overall_mark(results, now=now),
+                "usage_mark": overall_usage_mark(results, now=now),
+            },
+            "providers": [r.as_dict(now=now) for r in results],
         }
-        return json.dumps(payload, indent=2, ensure_ascii=False)
+        return json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
     if args.brief:
-        return render.brief(results, color=color, horizon=args.horizon)
-    return render.table(results, color=color)
+        return render.brief(results, color=color, horizon=args.horizon, now=now)
+    return render.table(results, color=color, now=now)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,8 +88,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     while True:
+        now = dt.datetime.now(dt.UTC)
         results = collect(fetchers, names, ttl_s=args.cache_ttl, use_cache=not args.no_cache)
-        print(_render(results, args), flush=True)
+        print(_render(results, args, now), flush=True)
         if not args.watch:
             break
         try:
@@ -97,7 +101,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.exit_code_on != "never":
         threshold = MARK_RANK[args.exit_code_on]
-        if MARK_RANK[overall_mark(results)] >= threshold:
+        if MARK_RANK[overall_mark(results, now=now)] >= threshold:
+            return 2
+        if MARK_RANK[overall_usage_mark(results, now=now)] >= threshold:
             return 2
     return 1 if any(r.error for r in results) else 0
 

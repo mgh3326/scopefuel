@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import tomllib
 from collections.abc import Callable
 
 from .http import dig, request_json
-from .model import Bucket, ProviderResult, Scope, horizon_for
+from .model import Bucket, PoolClass, ProviderResult, Scope, horizon_for
 
 SPEC_DIRS = [
     pathlib.Path(__file__).parent / "specs",
@@ -80,17 +81,23 @@ def _used_pct(source: object, bucket_spec: dict) -> float | None:
     raw = dig(source, bucket_spec.get("used_pct_path"))
     if raw is None and (frac_path := bucket_spec.get("remaining_fraction_path")):
         frac = dig(source, frac_path)
-        if frac is None:
+        if frac is None or isinstance(frac, bool):
             return None
         try:
-            return round((1.0 - float(frac)) * 100, 1)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+            f = float(frac)  # type: ignore[arg-type]
+            if not math.isfinite(f) or not (0 <= f <= 1):
+                return None
+            return round((1.0 - f) * 100, 1)
+        except (TypeError, ValueError, OverflowError):
             return None
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return None
     try:
-        return float(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        f = float(raw)  # type: ignore[arg-type]
+        if not math.isfinite(f) or not (0 <= f <= 100):
+            return None
+        return f
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -112,6 +119,15 @@ def _build_bucket(bucket_spec: dict, source: object, **ctx: object) -> Bucket:
     )
 
 
+def _pool_class(spec: dict) -> PoolClass:
+    value = spec.get("class")
+    if value is None:
+        return "preserve"
+    if value in ("preserve", "spend"):
+        return value  # type: ignore[return-value]
+    raise SpecError(f"class 는 'preserve' 또는 'spend' 여야 합니다: {value!r}")
+
+
 def make_provider(spec: dict) -> Callable[[], ProviderResult]:
     """스펙 dict → fetch 함수."""
     provider_id = spec.get("id")
@@ -120,6 +136,7 @@ def make_provider(spec: dict) -> Callable[[], ProviderResult]:
     request_spec = spec.get("request") or {}
     if not request_spec.get("url"):
         raise SpecError(f"{provider_id}: request.url 이 필요합니다")
+    pool_class = _pool_class(spec)
 
     def fetch() -> ProviderResult:
         token = _resolve_token(spec)
@@ -148,8 +165,10 @@ def make_provider(spec: dict) -> Callable[[], ProviderResult]:
             buckets=buckets,
             source=f"spec:{spec.get('source_file', 'inline')}",
             raw=raw,
+            pool_class=pool_class,
         )
 
+    fetch.pool_class = pool_class  # type: ignore[attr-defined]
     return fetch
 
 
