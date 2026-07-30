@@ -66,18 +66,11 @@ def fetch() -> ProviderResult:
     buckets = _buckets(rate_headers)
     if not buckets:
         status_note = f", HTTP {status}" if status else ""
-        reason = (
-            "rate-limit 헤더 없음"
-            if not rate_headers
-            else "해석 가능한 limit/remaining 헤더 쌍 없음"
-        )
+        reason = "rate-limit 헤더 없음" if not rate_headers else "해석 가능한 limit/remaining 헤더 쌍 없음"
         return ProviderResult(
             id="clinepass",
             buckets=[],
-            note=(
-                f"no data — {reason}{status_note}; "
-                "이 티어는 헤더를 제공하지 않을 수 있음"
-            ),
+            note=(f"no data — {reason}{status_note}; 이 티어는 헤더를 제공하지 않을 수 있음"),
             source="completions-probe",
             raw=raw,
         )
@@ -182,9 +175,7 @@ def _buckets(headers: dict[str, str]) -> list[Bucket]:
                 used_pct=used_pct,
                 resets_at=reset_at,
                 scope=Scope("account"),
-                horizon="now"
-                if reset_seconds is not None and reset_seconds <= NOW_HORIZON_MAX_S
-                else "week",
+                horizon="now" if reset_seconds is not None and reset_seconds <= NOW_HORIZON_MAX_S else "week",
                 note=f"remaining {remaining:g}/{limit:g}",
             )
         )
@@ -213,9 +204,10 @@ def _reset(value: str | None) -> tuple[str | None, float | None]:
     raw = value.strip()
 
     parts = _DURATION_PART.findall(raw)
-    if parts and "".join(f"{amount}{unit}" for amount, unit in parts).lower() == re.sub(
-        r"\s+", "", raw
-    ).lower():
+    if (
+        parts
+        and "".join(f"{amount}{unit}" for amount, unit in parts).lower() == re.sub(r"\s+", "", raw).lower()
+    ):
         factors = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
         seconds = sum(float(amount) * factors[unit.lower()] for amount, unit in parts)
         reset_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)

@@ -188,6 +188,7 @@ def test_clinepass_applies_rate_headers_from_http_error(monkeypatch):
     error = urllib.error.HTTPError(
         clinepass.USAGE_URL, 429, "rate limited", headers, io.BytesIO(b'{"error":"limited"}')
     )
+
     def raise_http_error(*args, **kwargs):
         raise error
 
