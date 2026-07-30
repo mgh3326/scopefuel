@@ -1,0 +1,11 @@
+{
+  "subscriptions": [
+    {
+      "tier": "SUBSCRIPTION_TIER_GROK_PRO",
+      "status": "SUBSCRIPTION_STATUS_ACTIVE",
+      "billingInterval": "BILLING_INTERVAL_MONTHLY",
+      "billingPeriodEnd": "2099-08-31T00:00:00Z",
+      "cancelAtPeriodEnd": false
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "chat": {"allowance": "20", "remaining": "5"},
+  "imagine": {"allowance": "10", "remaining": "10"},
+  "voice": {"allowance": "0", "remaining": "0"},
+  "build": {"allowance": "4", "remaining": "1"}
+}

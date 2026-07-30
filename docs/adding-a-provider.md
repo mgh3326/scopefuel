@@ -59,7 +59,7 @@ remaining_fraction_path = ["quotaInfo", "remainingFraction"]   # 0.42 → used 5
 | class | 의미 | 예 |
 |---|---|---|
 | `preserve` | 75%/90% 사용률을 WARN/CRIT로 승격. 계정/모델/그룹 차단 판정에 그대로 사용. | claude, codex |
-| `spend` | 고사용을 정상으로 본다. 리셋 전 24시간 미만, 70% 미만 bucket이 있으면 WASTE 권고. | kiro, clinepass, agy |
+| `spend` | 고사용을 정상으로 본다. 리셋 전 24시간 미만, 70% 미만 bucket이 있으면 WASTE 권고. | kiro, clinepass, agy, grok |
 
 `class`는 provider 전체(선언형 TOML 스펙 및 Python 플러그인)에 적용된다. 내장 provider를 TOML 스펙으로 완전 교체할 때 같은 `id` 스펙에 `class`를 지정할 수 있다. (단, `class`만 단독으로 덮어쓰는 것은 지원하지 않으며, 같은 `id`의 스펙은 엔드포인트/자격증명/버킷 설정을 모두 포함하는 완전한 대체 스펙이어야 한다.)
 
