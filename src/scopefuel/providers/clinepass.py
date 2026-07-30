@@ -66,11 +66,16 @@ def fetch() -> ProviderResult:
     buckets = _buckets(rate_headers)
     if not buckets:
         status_note = f", HTTP {status}" if status else ""
+        reason = (
+            "rate-limit 헤더 없음"
+            if not rate_headers
+            else "해석 가능한 limit/remaining 헤더 쌍 없음"
+        )
         return ProviderResult(
             id="clinepass",
             buckets=[],
             note=(
-                f"no data — rate-limit 헤더 없음{status_note}; "
+                f"no data — {reason}{status_note}; "
                 "이 티어는 헤더를 제공하지 않을 수 있음"
             ),
             source="completions-probe",
@@ -141,7 +146,9 @@ def _probe(key: str) -> tuple[int, Message]:
         return exc.code, exc.headers
 
 
-def _rate_limit_headers(headers: Message) -> dict[str, str]:
+def _rate_limit_headers(headers: Message | None) -> dict[str, str]:
+    if headers is None:
+        return {}
     return {
         name.lower(): value.strip()
         for name, value in headers.items()
@@ -226,11 +233,17 @@ def _reset(value: str | None) -> tuple[str | None, float | None]:
     if numeric is None:
         return None, None
     if numeric >= 1_000_000_000:
-        reset_at = dt.datetime.fromtimestamp(numeric, dt.UTC)
+        try:
+            reset_at = dt.datetime.fromtimestamp(numeric, dt.UTC)
+        except (OverflowError, OSError, ValueError):
+            return None, None
         seconds = max(0.0, (reset_at - dt.datetime.now(dt.UTC)).total_seconds())
     else:
         seconds = max(0.0, numeric)
-        reset_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)
+        try:
+            reset_at = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)
+        except OverflowError:
+            return None, None
     return reset_at.isoformat(), seconds
 
 

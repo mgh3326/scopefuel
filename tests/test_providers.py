@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
+from email.message import Message
 
-from scopefuel.providers import agy, claude, codex, kiro
+from scopefuel.providers import BUILTIN, agy, claude, clinepass, codex, kiro
 
 
 def test_claude_marks_weekly_scoped_as_model_scope(fixture_json, monkeypatch, tmp_path):
@@ -153,3 +156,83 @@ def test_kiro_expired_token_twice_keeps_error_with_login_hint(monkeypatch):
     result = kiro.fetch()
     assert result.error and "login" in (result.hint or "")
     assert result.buckets == []
+
+
+def test_clinepass_is_appended_after_existing_builtin_providers():
+    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass"]
+
+
+def test_clinepass_key_precedence(monkeypatch, tmp_path):
+    opencode = tmp_path / "auth.json"
+    opencode.write_text(json.dumps({"cline-pass": {"key": "file-secret"}}))
+    cline_file = tmp_path / "api-key"
+    cline_file.write_text("fallback-secret")
+    monkeypatch.setattr(clinepass, "OPENCODE_AUTH", opencode)
+    monkeypatch.setattr(clinepass, "CLINE_API_KEY_FILE", cline_file)
+    monkeypatch.setenv("CLINE_API_KEY", "env-secret")
+
+    assert clinepass._api_key() == ("env-secret", "env:CLINE_API_KEY")
+
+    monkeypatch.delenv("CLINE_API_KEY")
+    assert clinepass._api_key() == ("file-secret", "opencode:cline-pass.key")
+
+    opencode.write_text("{}")
+    assert clinepass._api_key() == ("fallback-secret", "file:~/.config/cline/api-key")
+
+
+def test_clinepass_applies_rate_headers_from_http_error(monkeypatch):
+    headers = Message()
+    headers["x-ratelimit-limit-requests"] = "100"
+    headers["x-ratelimit-remaining-requests"] = "75"
+    headers["x-ratelimit-reset-requests"] = "5h"
+    error = urllib.error.HTTPError(
+        clinepass.USAGE_URL, 429, "rate limited", headers, io.BytesIO(b'{"error":"limited"}')
+    )
+    def raise_http_error(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(clinepass.urllib.request, "urlopen", raise_http_error)
+
+    status, actual = clinepass._probe("not-a-real-key")
+    assert status == 429
+    assert actual["x-ratelimit-remaining-requests"] == "75"
+
+
+def test_clinepass_parses_headers_without_exposing_key(monkeypatch):
+    headers = Message()
+    headers["x-ratelimit-limit-requests"] = "100"
+    headers["x-ratelimit-remaining-requests"] = "75"
+    headers["x-ratelimit-reset-requests"] = "5h"
+    headers["x-ratelimit-limit-tokens"] = "1000"
+    headers["x-ratelimit-remaining-tokens"] = "250"
+    headers["x-ratelimit-reset-tokens"] = "1d"
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("super-secret", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_probe", lambda _key: (400, headers))
+
+    result = clinepass.fetch()
+
+    assert result.error is None
+    assert result.note == "HTTP 400 응답의 rate-limit 헤더 적용"
+    assert [(b.label, b.used_pct) for b in result.buckets] == [
+        ("requests", 25.0),
+        ("tokens", 75.0),
+    ]
+    assert result.raw and result.raw["credential"] == {
+        "source": "env:CLINE_API_KEY",
+        "present": True,
+    }
+    assert "super-secret" not in json.dumps(result.raw)
+
+
+def test_clinepass_missing_rate_headers_is_graceful_no_data(monkeypatch):
+    monkeypatch.setattr(clinepass, "_api_key", lambda: ("super-secret", "env:CLINE_API_KEY"))
+    monkeypatch.setattr(clinepass, "_probe", lambda _key: (200, Message()))
+
+    result = clinepass.fetch()
+
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.buckets == []
+    assert result.note and result.note.startswith("no data — rate-limit 헤더 없음")
+    assert result.raw and result.raw["rate_limit_headers"] == {}
+    assert "super-secret" not in json.dumps(result.as_dict(include_raw=True))
