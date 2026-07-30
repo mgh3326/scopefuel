@@ -124,7 +124,10 @@ class Bucket:
 
     @property
     def remaining_pct(self) -> float | None:
-        return None if self.used_pct is None else max(0.0, 100.0 - self.used_pct)
+        if not _is_valid_used_pct(self.used_pct):
+            return None
+        assert isinstance(self.used_pct, (int, float))
+        return max(0.0, 100.0 - self.used_pct)
 
     @property
     def mark(self) -> Mark:
@@ -139,18 +142,19 @@ class Bucket:
 
     def as_dict(self, pool_class: PoolClass = "preserve", *, now: dt.datetime | None = None) -> dict:
         pace = self.pace_at(now)
+        used = self.used_pct if _is_valid_used_pct(self.used_pct) else None
         return {
             "label": self.label,
             "window": self.window,
             "horizon": self.horizon,
-            "used_pct": self.used_pct,
-            "remaining_pct": self.remaining_pct,
+            "used_pct": used,
+            "remaining_pct": None if used is None else max(0.0, 100.0 - used),
             "pace": pace.ratio,
             "full_use_rate": pace.full_use_rate,
             "full_use_rate_unit": pace.full_use_rate_unit,
             "resets_at": self.resets_at,
             "scope": self.scope.as_dict(),
-            "severity": mark_for(self.used_pct, pool_class),
+            "severity": mark_for(used, pool_class),
             "note": self.note,
         }
 
@@ -170,7 +174,7 @@ class Verdict:
     waste: bool = False
     waste_advice: str | None = None
 
-    def as_dict(self) -> dict:
+    def as_dict(self, *, now: dt.datetime | None = None) -> dict:
         out = {
             "now_pct": self.now_pct,
             "week_pct": self.week_pct,
@@ -178,7 +182,7 @@ class Verdict:
             "basis": self.basis,
             "mark": self.mark,
             "groups": self.groups,
-            "exhausted": [b.as_dict() for b in self.exhausted],
+            "exhausted": [b.as_dict(now=now) for b in self.exhausted],
             "waste": self.waste,
         }
         if self.month_pct is not None:
@@ -203,6 +207,10 @@ class ProviderResult:
     stale: bool = False
     raw: dict | None = None
     pool_class: PoolClass = "preserve"
+
+    def __post_init__(self) -> None:
+        if self.pool_class not in ("preserve", "spend"):
+            self.pool_class = "preserve"
 
     @property
     def status(self) -> str:
@@ -248,7 +256,7 @@ class ProviderResult:
             "note": self.note,
             "pool_class": self.pool_class,
             "buckets": [b.as_dict(self.pool_class, now=now) for b in self.buckets],
-            "verdict": verdict.as_dict(),
+            "verdict": verdict.as_dict(now=now),
         }
         if self.warning is not None:
             out["warning"] = self.warning

@@ -12,7 +12,7 @@ import os
 import pathlib
 import time
 
-from .model import Bucket, PoolClass, ProviderResult, Scope
+from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct
 
 DEFAULT_TTL_S = 60.0
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
@@ -60,13 +60,15 @@ def _from_entry(
     payload = entry.get("result") or {}
     fetched_at = float(entry.get("fetched_at") or 0)
     effective_class: PoolClass = (
-        pool_class if pool_class is not None else payload.get("pool_class") or "preserve"
+        pool_class
+        if pool_class is not None and pool_class in ("preserve", "spend")
+        else (payload.get("pool_class") if payload.get("pool_class") in ("preserve", "spend") else "preserve")
     )
     buckets = [
         Bucket(
             label=b.get("label", "?"),
             window=b.get("window", "?"),
-            used_pct=b.get("used_pct"),
+            used_pct=b.get("used_pct") if _is_valid_used_pct(b.get("used_pct")) else None,
             resets_at=b.get("resets_at"),
             scope=Scope((b.get("scope") or {}).get("kind", "account"), (b.get("scope") or {}).get("name")),
             horizon=b.get("horizon", "week"),

@@ -118,7 +118,7 @@ def _from_local(raw: dict) -> ProviderResult:
                     f = float(frac)
                     if math.isfinite(f) and 0 <= f <= 1:
                         used_pct = round((1 - f) * 100, 1)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
             buckets.append(
                 Bucket(
@@ -199,7 +199,7 @@ def _cloud_buckets(raw: dict) -> list[Bucket]:
             f = float(frac)
             if not math.isfinite(f) or not (0 <= f <= 1):
                 continue
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         clusters.setdefault((round(f, 6), str(reset)), []).append(str(name))
 

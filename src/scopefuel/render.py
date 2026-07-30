@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 from .cache import format_age
-from .model import WARN_PCT, Bucket, ProviderResult, iso_to_local, overall_mark
+from .model import WARN_PCT, Bucket, ProviderResult, _is_valid_used_pct, iso_to_local, overall_mark
 
 MARK_TEXT = {"ok": "ok", "warn": "WARN", "crit": "CRIT", "degraded": "DEGRADED"}
 MARK_COLOR = {"ok": "\033[32m", "warn": "\033[33m", "crit": "\033[31m", "degraded": "\033[33m"}
@@ -24,7 +24,9 @@ def _waste_mark(color: bool) -> str:
 
 def _pct(value: float | None) -> str:
     """사용률 표시. '사용' 접두사로 잔량(남은 %)과 혼동되지 않게 한다."""
-    return "?" if value is None else f"사용 {value:g}%"
+    if value is None or not _is_valid_used_pct(value):
+        return "?"
+    return f"사용 {value:g}%"
 
 
 def _display_id(result: ProviderResult) -> str:
@@ -58,7 +60,7 @@ def _bucket_for(
     matches = [
         b
         for b in result.buckets
-        if b.used_pct is not None
+        if _is_valid_used_pct(b.used_pct)
         and (scope_name is None or b.scope.label == scope_name)
         and (horizon is None or b.horizon == horizon)
     ]
@@ -161,11 +163,13 @@ def brief(
             err_msg = result.error.splitlines()[0]
             chunks.append(f"{display_id} n/a({err_msg})")
             continue
-        if result.warning:
+        if result.warning and not result.stale:
             chunks.append(f"{display_id} warn({result.warning})")
             continue
         verdict = result.verdict_at(now)
         parts: list[str] = []
+        if result.warning:
+            parts.append(f"warn({result.warning})")
         if verdict.basis == "group":
             parts += [
                 f"{g} 사용 {v:g}%{_pace(_bucket_for(result, scope_name=g), now=now)}"

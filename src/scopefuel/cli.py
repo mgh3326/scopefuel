@@ -64,7 +64,7 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
             "summary": {"mark": overall_mark(results)},
             "providers": [r.as_dict(now=now) for r in results],
         }
-        return json.dumps(payload, indent=2, ensure_ascii=False)
+        return json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
     if args.brief:
         return render.brief(results, color=color, horizon=args.horizon, now=now)
     return render.table(results, color=color, now=now)

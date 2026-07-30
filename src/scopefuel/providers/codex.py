@@ -88,5 +88,5 @@ def _num(value: object) -> float | None:
     try:
         f = float(value)  # type: ignore[arg-type]
         return f if math.isfinite(f) and 0 <= f <= 100 else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None

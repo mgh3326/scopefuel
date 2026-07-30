@@ -88,7 +88,7 @@ def _used_pct(source: object, bucket_spec: dict) -> float | None:
             if not math.isfinite(f) or not (0 <= f <= 1):
                 return None
             return round((1.0 - f) * 100, 1)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
     if raw is None or isinstance(raw, bool):
         return None
@@ -97,7 +97,7 @@ def _used_pct(source: object, bucket_spec: dict) -> float | None:
         if not math.isfinite(f) or not (0 <= f <= 100):
             return None
         return f
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
