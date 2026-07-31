@@ -8,3 +8,9 @@ build/
 .ruff_cache/
 uv.lock
 .DS_Store
+
+# 비밀 — 공개 레포다. 실수로도 커밋되지 않게 넓게 막는다.
+.env
+.env.*
+secrets*.toml
+*.api-key
