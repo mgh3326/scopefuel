@@ -70,7 +70,9 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     set_parser = policy_sub.add_parser("set", help="pool 정책 설정")
     set_parser.add_argument("pool", choices=available, help="provider pool 이름")
-    set_parser.add_argument("pool_class", choices=["preserve", "spend"], metavar="class", help="정책 클래스")
+    set_parser.add_argument(
+        "pool_class", choices=["preserve", "spend", "exclude"], metavar="class", help="정책 클래스"
+    )
     set_parser.add_argument("--until", type=_date_arg, required=True, help="YYYY-MM-DD 형식 만료일")
     set_parser.add_argument("--note", help="선택적 메모")
 
@@ -129,7 +131,7 @@ def _policy_command(args: argparse.Namespace, fetchers: dict[str, object]) -> in
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
-    print(recommend.recommend(results, args.recommend, today=now.date()))
+    print(recommend.recommend(results, args.recommend, today=now.date(), now=now))
     return 0
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import pathlib
+from dataclasses import dataclass
 
 from .model import PoolClass
 
@@ -43,7 +44,7 @@ def _parse_date(value: object) -> dt.date | None:
 
 
 def _normalize_class(value: object) -> PoolClass | None:
-    if value in ("preserve", "spend"):
+    if value in ("preserve", "spend", "exclude"):
         return value  # type: ignore[return-value]
     return None
 
@@ -66,7 +67,7 @@ def _write_config(config: dict) -> None:
             lines.append(f"[pools.{name}]")
             raw_class = entry.get("class")
             if raw_class is not None:
-                if raw_class in ("preserve", "spend"):
+                if raw_class in ("preserve", "spend", "exclude"):
                     lines.append(f'class = "{raw_class}"')
                 else:
                     lines.append(f"class = {_toml_string(str(raw_class))}")
@@ -82,39 +83,66 @@ def _write_config(config: dict) -> None:
         path.chmod(0o600)
 
 
+@dataclass(frozen=True)
+class ActiveOverride:
+    """Active (non-expired) pool policy override."""
+
+    pool_class: PoolClass
+    until: dt.date
+    note: str | None = None
+
+
+def _active_override(pool: str, today: dt.date) -> ActiveOverride | None | str:
+    """Return ActiveOverride, None if no entry, or status string if present but unusable."""
+    config = load_config()
+    pools = config.get("pools") or {}
+    entry = pools.get(pool)
+    if not isinstance(entry, dict):
+        return None
+
+    pool_class = _normalize_class(entry.get("class"))
+    if pool_class is None:
+        return f"invalid class {entry.get('class')!r}"
+
+    raw_until = entry.get("until")
+    if not raw_until:
+        return "missing until"
+
+    until = _parse_date(raw_until)
+    if until is None:
+        return f"invalid until {raw_until!r}"
+
+    if until < today:
+        return f"expired {until}"
+
+    note = entry.get("note")
+    return ActiveOverride(pool_class, until, str(note) if note else None)
+
+
 def get_policy(
     pool: str, builtin_class: PoolClass = "preserve", today: dt.date | None = None
 ) -> tuple[PoolClass, str | None]:
     """Return effective pool class and optional status note for a pool."""
     today = today or dt.datetime.now(dt.UTC).date()
-    config = load_config()
-    pools = config.get("pools") or {}
-    entry = pools.get(pool)
-    if not isinstance(entry, dict):
+    override = _active_override(pool, today)
+    if override is None:
         return builtin_class, None
-
-    pool_class = _normalize_class(entry.get("class"))
-    if pool_class is None:
-        return builtin_class, f"invalid class {entry.get('class')!r}"
-
-    raw_until = entry.get("until")
-    if not raw_until:
-        return builtin_class, "missing until"
-
-    until = _parse_date(raw_until)
-    if until is None:
-        return builtin_class, f"invalid until {raw_until!r}"
-
-    if until < today:
-        return builtin_class, f"expired {until}"
+    if isinstance(override, str):
+        return builtin_class, override
 
     notes: list[str] = []
-    if until <= today + dt.timedelta(days=NEAR_EXPIRY_DAYS):
-        notes.append(f"expires {until}")
-    note = entry.get("note")
-    if note:
-        notes.append(str(note))
-    return pool_class, "; ".join(notes) if notes else None
+    if override.until <= today + dt.timedelta(days=NEAR_EXPIRY_DAYS):
+        notes.append(f"expires {override.until}")
+    if override.note:
+        notes.append(override.note)
+    return override.pool_class, "; ".join(notes) if notes else None
+
+
+def get_active_override(pool: str, today: dt.date | None = None) -> ActiveOverride | None:
+    """Return the active override for a pool, or None if none/expired/invalid."""
+    today = today or dt.datetime.now(dt.UTC).date()
+    override = _active_override(pool, today)
+    return override if isinstance(override, ActiveOverride) else None
 
 
 def set_policy(

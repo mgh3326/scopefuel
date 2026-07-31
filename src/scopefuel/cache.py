@@ -55,12 +55,15 @@ def _pool_class(fetcher: object) -> PoolClass | None:
     return getattr(fetcher, "pool_class", None)
 
 
+_VALID_POOL_CLASSES = frozenset({"preserve", "spend", "exclude"})
+
+
 def _effective_class(name: str, fetcher: object, payload_class: PoolClass | None = None) -> PoolClass:
     explicit = _pool_class(fetcher)
     if explicit is not None:
         fallback: PoolClass = _normalize_pool_class(explicit)
-    elif payload_class in ("preserve", "spend"):
-        fallback = payload_class
+    elif payload_class in _VALID_POOL_CLASSES:
+        fallback = payload_class  # type: ignore[assignment]
     else:
         fallback = "preserve"
     return get_policy(name, fallback)[0]
@@ -73,8 +76,8 @@ def _from_entry(
     fetched_at = float(entry.get("fetched_at") or 0)
     effective_class: PoolClass = (
         pool_class
-        if pool_class is not None and pool_class in ("preserve", "spend")
-        else (payload.get("pool_class") if payload.get("pool_class") in ("preserve", "spend") else "preserve")
+        if pool_class is not None and pool_class in _VALID_POOL_CLASSES
+        else (payload.get("pool_class") if payload.get("pool_class") in _VALID_POOL_CLASSES else "preserve")
     )
     buckets = [
         Bucket(
