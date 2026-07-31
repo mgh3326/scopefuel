@@ -18,7 +18,8 @@ from typing import Literal
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset
 from .policy import get_active_override, get_policy
 
-Grade = Literal["S", "A", "B", "C"]
+Grade = Literal["S+", "S", "A+", "A", "B", "C"]
+Gate = Literal["default", "escalation"]
 
 # spend 풀: 이 사용률 미만이면 후보. preserve 는 90.
 PRESERVE_EXCLUDE_PCT = 90.0
@@ -33,6 +34,7 @@ _POOL_LABEL = {
     "grok": "Grok",
     "agy": "AGY",
     "clinepass": "ClinePass",
+    "omniroute": "OmniRoute",
 }
 
 _WINDOW_LABEL = {
@@ -42,42 +44,108 @@ _WINDOW_LABEL = {
     "30d": "월",
 }
 
+# quota-0 free candidate: 측정 불필, 항상 가용.
+_FREE_PROFILES = frozenset({"oc-omni"})
+
+
+@dataclass(frozen=True)
+class GradeInfo:
+    task_class: str
+    decision_question: str
+
+
+GRADE_DISCRIM: dict[Grade, GradeInfo] = {
+    "S+": GradeInfo(
+        "되돌리기 어려운 판단, 설계 분기, 안전장치 설계, 다중 시스템 영향",
+        "틀리면 되돌리는 비용이 큰가?",
+    ),
+    "S": GradeInfo(
+        "복잡한 구현, 새 추상화, 적대검증/급소 찾기",
+        "무엇이 잘못될 수 있는지 스스로 열거해야 하나?",
+    ),
+    "A+": GradeInfo(
+        "일반 기능 구현, 기존 패턴 확장, 다단계 리팩터",
+        "방향은 정해졌고 설계 판단이 좀 남았나?",
+    ),
+    "A": GradeInfo(
+        "명세 확정 구현, 테스트 작성, 국소 수정",
+        "무엇을 만들지 문서에 다 적혀 있나?",
+    ),
+    "B": GradeInfo(
+        "기계적 변경, 리네이밍, 포맷, 문서 반영",
+        "정답이 유일하고 검색·치환에 가까운가?",
+    ),
+    "C": GradeInfo(
+        "단순 변환, 로그 파싱, 대량 생성",
+        "실패해도 버리고 다시 하면 되나?",
+    ),
+}
+
+
+def grade_help_text() -> str:
+    lines = ["판별표:"]
+    for g in ("S+", "S", "A+", "A", "B", "C"):
+        info = GRADE_DISCRIM[g]
+        lines.append(f"  {g:<3} {info.task_class}  |  {info.decision_question}")
+    return "\n".join(lines)
+
 
 @dataclass(frozen=True)
 class Profile:
     name: str
     model: str
     benchmark: float | None
+    gate: Gate = "default"
+    gate_reason: str | None = None
 
 
 GRADE_TABLE: dict[Grade, list[Profile]] = {
-    "S": [
-        Profile("opus", "Opus 5", 60.7),
+    "S+": [
         Profile("kiro-opus", "Opus 5", 60.7),
-        Profile("fable", "Fable 5", 59.9),
-        Profile("codex-max", "GPT-5.6 Sol max", 58.9),
-        Profile("codex-ultra", "GPT-5.6 Sol max", 58.9),
-        Profile("kiro-sol", "GPT-5.6 Sol max", 58.9),
+        Profile("kiro-sol", "GPT-5.6 Sol", 58.9),
+        Profile("codex-max", "GPT-5.6 Sol (max/ultra)", 58.9),
+        Profile("opus", "Opus 5", 60.7),
+        Profile(
+            "fable",
+            "Fable 5",
+            59.9,
+            gate="escalation",
+            gate_reason=(
+                "Opus 5 대비 2배 가격 — 2h+ 자율실행 / Opus5 실패 후 / "
+                "고위험 1회성 / 서브에이전트 다수일 때만"
+            ),
+        ),
+    ],
+    "S": [
+        Profile("codex-terra-max", "Terra (max)", 78.0),
+        Profile("oc-kimi-k3", "Kimi K3", 57.1),
+        Profile("grok-hi", "Grok 4.5", 53.8),
+    ],
+    "A+": [
+        Profile("kiro-sonnet", "Sonnet 5", 53.4),
+        Profile("codex-luna-ultra", "Luna (ultra)", 75.0),
+        Profile("oc-glm", "GLM-5.2", 51.1),
+        Profile("sonnet", "Sonnet 5", 53.4),
     ],
     "A": [
-        Profile("oc-kimi-k3", "Kimi K3", 57.1),
-        Profile("codex-med", "Terra", 55.0),
-        Profile("grok-hi", "Grok 4.5", 53.8),
-        Profile("sonnet", "Sonnet 5", 53.4),
-        Profile("kiro-sonnet", "Sonnet 5", 53.4),
+        Profile("oc-gflash", "Gemini 3.6 Flash", 50.1),
+        Profile("oc-kimi-code", "Kimi K2.7 Code", None),
+        Profile("oc-sonnet46", "Sonnet 4.6", 47.2),
     ],
     "B": [
-        Profile("codex-luna", "Luna", 51.2),
-        Profile("oc-glm", "GLM-5.2", 51.1),
-        Profile("oc-gflash", "Gemini 3.6 Flash", 50.1),
+        Profile("kiro-haiku", "Haiku 4.5", None),
+        Profile("oc-dsflash", "DeepSeek V4 Flash", None),
     ],
     "C": [
-        Profile("oc-sonnet46", "Sonnet 4.6", 47.2),
-        Profile("agy-pro", "Gemini 3.1 Pro", 46.5),
-        Profile("oc-kimi-code", "Kimi K2.7 Code", None),
-        Profile("oc-dsflash", "DeepSeek V4 Flash", None),
-        Profile("oc-oss", "GPT-OSS 120B", None),
+        Profile("oc-omni", "OmniRoute free", None),
         Profile("kiro-cheap", "Qwen3 Coder", None),
+        Profile(
+            "oc-oss",
+            "GPT-OSS 120B",
+            None,
+            gate="escalation",
+            gate_reason="agy 3p 풀 소모 — 다른 C 후보 소진 시에만",
+        ),
     ],
 }
 
@@ -98,6 +166,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "agy", "gemini"
     if profile in ("oc-sonnet46", "oc-oss"):
         return "agy", "3p"
+    if profile == "oc-omni":
+        return "omniroute", None
     if profile.startswith("oc-"):
         return "clinepass", None
     if profile in ("grok", "grok-hi", "grok-med"):
@@ -132,6 +202,15 @@ class _PolicyExcluded:
     provider_label: str
     until: dt.date | None
     note: str | None
+
+
+@dataclass
+class _EscalationEntry:
+    profile: Profile
+    provider_label: str
+    provider_id: str
+    gate_reason: str
+    status_note: str | None
 
 
 def _matching_buckets(result: ProviderResult, group_name: str | None) -> list[tuple[float, str, str | None]]:
@@ -202,6 +281,55 @@ def _policy_reason(item: _PolicyExcluded) -> str:
     return ", ".join(parts) + ")"
 
 
+def _build_escalation_entry(
+    profile: Profile,
+    by_id: dict[str, ProviderResult],
+    today: dt.date,
+) -> _EscalationEntry:
+    provider_id, group_name = profile_pool(profile.name)
+    provider_label = _provider_label(provider_id, group_name)
+    gate_reason = profile.gate_reason or ""
+
+    result = by_id.get(provider_id)
+    fallback_class: PoolClass = (
+        result.pool_class if result and result.pool_class in ("preserve", "spend") else "preserve"
+    )
+    effective_class = get_policy(provider_id, fallback_class, today=today)[0]
+    override = get_active_override(provider_id, today=today)
+
+    status_notes: list[str] = []
+
+    if effective_class == "exclude":
+        reason_parts = [f"정책 제외 ({provider_id}"]
+        if override is not None and override.until:
+            reason_parts.append(f"until {override.until.isoformat()}")
+        if override is not None and override.note:
+            reason_parts.append(override.note)
+        status_notes.append(", ".join(reason_parts) + ")")
+
+    if result is None or result.error or result.warning or result.status != "ok":
+        status_notes.append("측정 불가")
+    else:
+        matches = _matching_buckets(result, group_name)
+        if not matches:
+            status_notes.append("측정 불가")
+        else:
+            used_pct, _window, reset_at = max(matches, key=lambda m: m[0])
+            cutoff = _usage_cutoff(effective_class)
+            if used_pct >= cutoff:
+                status_notes.append(f"{used_pct:g}% 소진 (reset {_reset_display(reset_at)})")
+            else:
+                status_notes.append(f"사용 {used_pct:g}% (reset {_reset_display(reset_at)})")
+
+    return _EscalationEntry(
+        profile=profile,
+        provider_label=provider_label,
+        provider_id=provider_id,
+        gate_reason=gate_reason,
+        status_note=" | ".join(status_notes) if status_notes else None,
+    )
+
+
 def recommend(
     providers: list[ProviderResult],
     grade: Grade,
@@ -216,9 +344,35 @@ def recommend(
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []
     policy_excluded: list[_PolicyExcluded] = []
+    escalation: list[_EscalationEntry] = []
 
     for profile in GRADE_TABLE[grade]:
+        # Escalation profiles → separate section, not in normal ranked candidates.
+        if profile.gate == "escalation":
+            escalation.append(_build_escalation_entry(profile, by_id, today))
+            continue
+
         provider_id, group_name = profile_pool(profile.name)
+        provider_label = _provider_label(provider_id, group_name)
+
+        # quota-0 free candidates: always available, no measurement needed.
+        if profile.name in _FREE_PROFILES:
+            included.append(
+                _Candidate(
+                    profile=profile,
+                    provider_label=provider_label,
+                    provider_id=provider_id,
+                    window="free",
+                    used_pct=0.0,
+                    remaining_pct=100.0,
+                    pool_class="spend",
+                    reset_at=None,
+                    hours_to_reset=None,
+                    urgent=False,
+                )
+            )
+            continue
+
         result = by_id.get(provider_id)
         if result is None or result.error or result.warning or result.status != "ok":
             excluded.append(_Excluded(profile, "측정 불가"))
@@ -237,8 +391,6 @@ def recommend(
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
         override = get_active_override(provider_id, today=today)
-
-        provider_label = _provider_label(provider_id, group_name)
 
         if effective_class == "exclude":
             policy_excluded.append(
@@ -277,16 +429,22 @@ def recommend(
             )
         )
 
-    # reset 임박 → class(spend > preserve) → 잔여율(큰 순) → 표 순서(결정성)
-    def sort_key(c: _Candidate) -> tuple[int, int, float, int]:
+    # free(quota-0) → reset 임박 → class(spend > preserve) → 잔여율(큰 순) → 표 순서(결정성)
+    def sort_key(c: _Candidate) -> tuple[int, int, int, float, int]:
+        free_order = 0 if c.profile.name in _FREE_PROFILES else 1
         imminent = 0 if c.urgent else 1
         class_order = 0 if c.pool_class == "spend" else 1
         profile_order = next((i for i, p in enumerate(GRADE_TABLE[grade]) if p.name == c.profile.name), 0)
-        return (imminent, class_order, -c.remaining_pct, profile_order)
+        return (free_order, imminent, class_order, -c.remaining_pct, profile_order)
 
     included.sort(key=sort_key)
 
     lines: list[str] = []
+
+    # Grade discrimination header — LLM-read table.
+    info = GRADE_DISCRIM[grade]
+    lines.append(f"{grade} | {info.task_class} | {info.decision_question}")
+
     if not included and policy_excluded:
         lines.append("✗ 정책 가용 후보 없음")
         lines.append("⚠ 비상 후보 (정책상 제외 — 사용 시 근거를 이슈에 기록할 것)")
@@ -316,4 +474,13 @@ def recommend(
 
     for item in excluded:
         lines.append(f"✗ {item.profile.name:<12} {item.reason}")
+
+    if escalation:
+        lines.append("⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)")
+        for entry in escalation:
+            lines.append(f"  {entry.profile.name:<12} {entry.provider_label}  pool={entry.provider_id}")
+            lines.append(f"    근거: {entry.gate_reason}")
+            if entry.status_note:
+                lines.append(f"    {entry.status_note}")
+
     return "\n".join(lines)
