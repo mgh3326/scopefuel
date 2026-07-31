@@ -950,7 +950,8 @@ def test_grok_billing_success_maps_weekly_account_and_product_breakdown(fixture_
     assert "GrokBuild" in table
     assert "GrokChat" in table
     assert "grok" in brief
-    assert "uid-must-not-leak" not in table
+    assert "00000000-0000-4000-8000-000000000001" not in table
+    assert "redacted@example.com" not in table
 
 
 def test_grok_billing_missing_config_is_graceful_no_data(tmp_path, monkeypatch):
@@ -1015,6 +1016,7 @@ def test_grok_billing_partial_product_usage_keeps_account_bucket(tmp_path, monke
     result = grok.fetch()
     assert result.error is None
     assert result.note and "partial data" in result.note
+    assert [b.label for b in result.buckets] == ["weekly", "GrokBuild"]
     by_label = {b.label: b for b in result.buckets}
     assert by_label["weekly"].used_pct == 8.0
     assert by_label["GrokBuild"].used_pct == 5.0

@@ -143,7 +143,7 @@ def _from_billing(
             plan=plan,
             warning=f"예상치 못한 주기 유형: {period_type}",
             source=SOURCE_BILLING,
-            raw=_redacted_billing_raw(config),
+            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
         )
 
     resets_at = _parse_iso(current_period.get("end"))
@@ -153,7 +153,7 @@ def _from_billing(
             plan=plan,
             warning="currentPeriod.end 파싱 실패",
             source=SOURCE_BILLING,
-            raw=_redacted_billing_raw(config),
+            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
         )
 
     credit_pct = _num(config.get("creditUsagePercent"))
@@ -163,7 +163,7 @@ def _from_billing(
             plan=plan,
             warning="creditUsagePercent 파싱 실패",
             source=SOURCE_BILLING,
-            raw=_redacted_billing_raw(config),
+            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
         )
     if credit_pct < 0 or credit_pct > 100:
         return ProviderResult(
@@ -171,7 +171,7 @@ def _from_billing(
             plan=plan,
             warning=f"creditUsagePercent 범위 밖 ({credit_pct:g})",
             source=SOURCE_BILLING,
-            raw=_redacted_billing_raw(config),
+            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
         )
 
     is_unified = config.get("isUnifiedBillingUser") is True
@@ -228,16 +228,9 @@ def _from_billing(
 
     note: str | None = None
     if problems:
-        if any(b.used_pct is not None for b in buckets):
-            note = "partial data — " + "; ".join(problems)
-        else:
-            return ProviderResult(
-                id="grok",
-                plan=plan,
-                warning="데이터 이상 — " + "; ".join(problems),
-                source=SOURCE_BILLING,
-                raw=_redacted_billing_raw(config),
-            )
+        # weekly account bucket 은 credit_pct 검증 후 항상 추가되므로
+        # buckets 비어 있음 경로는 도달 불가.
+        note = "partial data — " + "; ".join(problems)
 
     return ProviderResult(
         id="grok",
@@ -245,7 +238,7 @@ def _from_billing(
         buckets=buckets,
         note=note,
         source=SOURCE_BILLING,
-        raw=_redacted_billing_raw(config),
+        raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
     )
 
 
@@ -390,7 +383,7 @@ def _num(value: object) -> float | None:
     return None
 
 
-def _parse_iso(value: str) -> str | None:
+def _parse_iso(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
@@ -406,14 +399,30 @@ def _parse_iso(value: str) -> str | None:
 
 
 def _redacted_billing_raw(config: dict) -> dict:
-    """사용량 관련 필드만 남긴다. 식별자·계정 필드는 버린다."""
-    keep = (
-        "currentPeriod",
-        "creditUsagePercent",
-        "productUsage",
-        "isUnifiedBillingUser",
-    )
-    return {k: config.get(k) for k in keep if k in config}
+    """사용량 관련 필드만 남긴다. 식별자·계정 필드는 버린다.
+
+    currentPeriod/productUsage 는 nested 객체이므로 통째로 복사하지 않고
+    실제로 쓰는 하위 필드만 project 해 미래 identifier 누설을 막는다.
+    """
+    out: dict = {}
+    if "creditUsagePercent" in config:
+        out["creditUsagePercent"] = config["creditUsagePercent"]
+    if "isUnifiedBillingUser" in config:
+        out["isUnifiedBillingUser"] = config["isUnifiedBillingUser"]
+
+    current_period = config.get("currentPeriod")
+    if isinstance(current_period, dict):
+        out["currentPeriod"] = {k: current_period.get(k) for k in ("type", "end") if k in current_period}
+
+    product_usage = config.get("productUsage")
+    if isinstance(product_usage, list):
+        out["productUsage"] = [
+            {k: item.get(k) for k in ("product", "usagePercent") if k in item}
+            for item in product_usage
+            if isinstance(item, dict)
+        ]
+
+    return out
 
 
 def _safe_raw(**parts: object) -> dict:
