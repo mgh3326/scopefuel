@@ -13,6 +13,7 @@ import pathlib
 import time
 
 from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
+from .policy import get_policy
 
 DEFAULT_TTL_S = 60.0
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
@@ -52,6 +53,17 @@ def _to_entry(result: ProviderResult, now: float) -> dict:
 
 def _pool_class(fetcher: object) -> PoolClass | None:
     return getattr(fetcher, "pool_class", None)
+
+
+def _effective_class(name: str, fetcher: object, payload_class: PoolClass | None = None) -> PoolClass:
+    explicit = _pool_class(fetcher)
+    if explicit is not None:
+        fallback: PoolClass = _normalize_pool_class(explicit)
+    elif payload_class in ("preserve", "spend"):
+        fallback = payload_class
+    else:
+        fallback = "preserve"
+    return get_policy(name, fallback)[0]
 
 
 def _from_entry(
@@ -109,9 +121,12 @@ def collect(
     for name in names:
         entry = cache.get(name)
         fetcher = fetchers.get(name)
-        explicit_class = _pool_class(fetcher)
+        cached_class: PoolClass | None = None
+        if isinstance(entry, dict):
+            cached_class = (entry.get("result") or {}).get("pool_class")
+        policy_class = _effective_class(name, fetcher, cached_class)
         if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= ttl_s:
-            fresh = _from_entry(entry, name, now, explicit_class)
+            fresh = _from_entry(entry, name, now, policy_class)
             fresh.stale = False  # TTL 안이면 신선한 값으로 취급
             results.append(fresh)
             continue
@@ -125,15 +140,12 @@ def collect(
             except Exception as exc:
                 result = ProviderResult(id=name, error=str(exc))
 
-        if explicit_class is not None:
-            result.pool_class = _normalize_pool_class(explicit_class)
-        elif not result.pool_class:
-            result.pool_class = "preserve"
+        result.pool_class = _effective_class(name, fetcher, result.pool_class)
 
         if result.error and entry:
             age = now - float(entry.get("fetched_at") or 0)
             if age <= STALE_MAX_S:
-                stale = _from_entry(entry, name, now, explicit_class)
+                stale = _from_entry(entry, name, now, policy_class)
                 stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
                 results.append(stale)
                 continue
