@@ -15,6 +15,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Literal
 
+from .bench import ModelScore
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset
 from .policy import (
     get_active_override,
@@ -105,14 +106,44 @@ class Profile:
     benchmark: float | None
     gate: Gate = "default"
     gate_reason: str | None = None
+    benchmark_source: str | None = None
+    benchmark_metric: str | None = None
+    benchmark_harness: str | None = None
+    benchmark_effort: str | None = None
+    benchmark_model_id: str | None = None
+
+
+def _openrouter_benchmark(score: float, model_id: str) -> dict[str, object]:
+    return {
+        "benchmark_source": "openrouter",
+        "benchmark_metric": "coding",
+        "benchmark_harness": None,
+        "benchmark_effort": None,
+        "benchmark_model_id": model_id,
+    }
+
+
+def _aa_agent_benchmark(score: float, model_id: str, effort: str) -> dict[str, object]:
+    return {
+        "benchmark_source": "AA-agent",
+        "benchmark_metric": "agentic",
+        "benchmark_harness": "codex",
+        "benchmark_effort": effort,
+        "benchmark_model_id": model_id,
+    }
 
 
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
-        Profile("kiro-opus", "Opus 5", 60.7),
-        Profile("kiro-sol", "GPT-5.6 Sol", 58.9),
-        Profile("codex-max", "GPT-5.6 Sol (max/ultra)", 58.9),
-        Profile("opus", "Opus 5", 60.7),
+        Profile("kiro-opus", "Opus 5", 60.7, **_openrouter_benchmark(60.7, "opus-5")),
+        Profile("kiro-sol", "GPT-5.6 Sol", 58.9, **_openrouter_benchmark(58.9, "gpt-5.6-sol")),
+        Profile(
+            "codex-max",
+            "GPT-5.6 Sol (max/ultra)",
+            58.9,
+            **_openrouter_benchmark(58.9, "gpt-5.6-sol"),
+        ),
+        Profile("opus", "Opus 5", 60.7, **_openrouter_benchmark(60.7, "opus-5")),
         Profile(
             "fable",
             "Fable 5",
@@ -122,23 +153,34 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
                 "Opus 5 대비 2배 가격 — 2h+ 자율실행 / Opus5 실패 후 / "
                 "고위험 1회성 / 서브에이전트 다수일 때만"
             ),
+            **_openrouter_benchmark(59.9, "fable-5"),
         ),
     ],
     "S": [
-        Profile("codex-terra-max", "Terra (max)", 78.0),
-        Profile("oc-kimi-k3", "Kimi K3", 57.1),
-        Profile("grok-hi", "Grok 4.5", 53.8),
+        Profile(
+            "codex-terra-max",
+            "Terra (max)",
+            78.0,
+            **_aa_agent_benchmark(78.0, "gpt-5.6-terra", "max"),
+        ),
+        Profile("oc-kimi-k3", "Kimi K3", 57.1, **_openrouter_benchmark(57.1, "kimi-k3")),
+        Profile("grok-hi", "Grok 4.5", 53.8, **_openrouter_benchmark(53.8, "grok-4.5")),
     ],
     "A+": [
-        Profile("kiro-sonnet", "Sonnet 5", 53.4),
-        Profile("codex-luna-ultra", "Luna (ultra)", 75.0),
-        Profile("oc-glm", "GLM-5.2", 51.1),
-        Profile("sonnet", "Sonnet 5", 53.4),
+        Profile("kiro-sonnet", "Sonnet 5", 53.4, **_openrouter_benchmark(53.4, "sonnet-5")),
+        Profile(
+            "codex-luna-ultra",
+            "Luna (ultra)",
+            75.0,
+            **_aa_agent_benchmark(75.0, "gpt-5.6-luna", "ultra"),
+        ),
+        Profile("oc-glm", "GLM-5.2", 51.1, **_openrouter_benchmark(51.1, "glm-5.2")),
+        Profile("sonnet", "Sonnet 5", 53.4, **_openrouter_benchmark(53.4, "sonnet-5")),
     ],
     "A": [
-        Profile("oc-gflash", "Gemini 3.6 Flash", 50.1),
+        Profile("oc-gflash", "Gemini 3.6 Flash", 50.1, **_openrouter_benchmark(50.1, "gemini-3.6-flash")),
         Profile("oc-kimi-code", "Kimi K2.7 Code", None),
-        Profile("oc-sonnet46", "Sonnet 4.6", 47.2),
+        Profile("oc-sonnet46", "Sonnet 4.6", 47.2, **_openrouter_benchmark(47.2, "sonnet-4.6")),
     ],
     "B": [
         Profile("kiro-haiku", "Haiku 4.5", None),
@@ -573,6 +615,28 @@ def gate_check(
     )
 
 
+def _format_benchmark_parts(
+    *,
+    score: float,
+    source: str,
+    metric: str,
+    harness: str | None,
+    effort: str | None,
+) -> str:
+    return f"{score:.1f}({source}; metric={metric}; harness={harness or 'n/a'}; effort={effort or 'n/a'})"
+
+
+def _format_benchmark_score(score: ModelScore) -> str:
+    assert score.score is not None
+    return _format_benchmark_parts(
+        score=score.score,
+        source=score.source,
+        metric=score.metric,
+        harness=score.harness,
+        effort=score.effort,
+    )
+
+
 def recommend(
     providers: list[ProviderResult],
     grade: Grade,
@@ -580,6 +644,7 @@ def recommend(
     now: dt.datetime | None = None,
     *,
     urgency_hours: float | None = None,
+    bench_scores: list[ModelScore] | None = None,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -679,6 +744,29 @@ def recommend(
 
     included.sort(key=sort_key)
 
+    def benchmark_cell(profile: Profile) -> str:
+        dynamic = [
+            score
+            for score in bench_scores or []
+            if profile.benchmark_model_id is not None
+            and score.model_id == profile.benchmark_model_id
+            and score.score is not None
+        ]
+        if dynamic:
+            dynamic.sort(
+                key=lambda score: (score.source, score.metric, score.effort or "", score.harness or "")
+            )
+            return "; ".join(_format_benchmark_score(score) for score in dynamic)
+        if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
+            return ""
+        return _format_benchmark_parts(
+            score=profile.benchmark,
+            source=profile.benchmark_source,
+            metric=profile.benchmark_metric,
+            harness=profile.benchmark_harness,
+            effort=profile.benchmark_effort,
+        )
+
     lines: list[str] = []
 
     # Grade discrimination header — LLM-read table.
@@ -697,7 +785,8 @@ def recommend(
             )
     else:
         for rank, cand in enumerate(included, start=1):
-            bench = f"  벤치 {cand.profile.benchmark}" if cand.profile.benchmark is not None else ""
+            benchmark = benchmark_cell(cand.profile)
+            bench = f"  벤치 {benchmark}" if benchmark else ""
             if cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥 {cand.profile.name:<10} {cand.provider_label} {cand.window} "

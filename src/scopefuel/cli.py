@@ -12,7 +12,7 @@ import json
 import sys
 import time
 
-from . import recommend, render
+from . import bench, recommend, render
 from .cache import DEFAULT_TTL_S, collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policies, set_policy
@@ -33,6 +33,25 @@ def _boost_arg(value: str) -> int | str:
         return int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"boost 는 정수 또는 'none' 이어야 합니다: {value!r}") from exc
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("0 이상의 정수여야 합니다") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("0 이상의 정수여야 합니다")
+    return parsed
+
+
+def _completed_arg(value: str) -> int:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return 1
+    if normalized in {"0", "false", "no"}:
+        return 0
+    raise argparse.ArgumentTypeError("completed 는 0/1 이어야 합니다")
 
 
 def build_parser(available: list[str]) -> argparse.ArgumentParser:
@@ -100,6 +119,32 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
     clear_parser.add_argument("pool", help="provider pool 이름")
+
+    bench_parser = subparsers.add_parser("bench", help="출처별 벤치 점수 SQLite DB")
+    bench_sub = bench_parser.add_subparsers(dest="bench_command", required=True)
+    bench_sub.add_parser("sync", help="공식 Artificial Analysis 모델 점수 동기화")
+
+    bench_show = bench_sub.add_parser("show", help="모델의 출처별 벤치 점수 보기")
+    bench_show.add_argument("model_id", help="정규화 모델 식별자")
+
+    bench_import = bench_sub.add_parser("import", help="수동 벤치 점수 TOML 적재")
+    bench_import.add_argument("file", help="[[scores]] 또는 [[model_scores]] TOML 파일")
+
+    reps_parser = subparsers.add_parser("reps", help="실측 대표 실행 기록")
+    reps_sub = reps_parser.add_subparsers(dest="reps_command", required=True)
+    reps_add = reps_sub.add_parser("add", help="대표 실행 1건 기록")
+    reps_add.add_argument("--profile", required=True, help="herdr-spawn 프로필명")
+    reps_add.add_argument("--model", dest="model_id", required=True, help="실제 실행 모델")
+    reps_add.add_argument("--task", dest="task_ref", required=True, help="Linear 이슈 또는 PR")
+    reps_add.add_argument("--tier", required=True, choices=["T0", "T1", "T2", "T3"])
+    reps_add.add_argument("--role", required=True, choices=["impl", "verify", "fix", "orch"])
+    reps_add.add_argument("--rounds", required=True, type=_nonnegative_int)
+    reps_add.add_argument("--blockers-found", required=True, type=_nonnegative_int)
+    reps_add.add_argument("--completed", required=True, type=_completed_arg, help="0/1")
+    reps_add.add_argument("--notes")
+
+    reps_list = reps_sub.add_parser("list", help="대표 실행 기록 조회")
+    reps_list.add_argument("--limit", type=_nonnegative_int, help="최대 행 수 (1 이상)")
 
     all_profiles = sorted({p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles})
     gate_parser = subparsers.add_parser(
@@ -190,7 +235,15 @@ def _policy_command(
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
-    print(recommend.recommend(results, args.recommend, today=now.date(), now=now))
+    print(
+        recommend.recommend(
+            results,
+            args.recommend,
+            today=now.date(),
+            now=now,
+            bench_scores=bench.read_scores(),
+        )
+    )
     return 0
 
 
@@ -215,10 +268,64 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     return 4 if result.unmeasurable else 3
 
 
+def _bench_command(args: argparse.Namespace) -> int:
+    if args.bench_command == "sync":
+        return bench.run_sync(stderr=sys.stderr)
+    if args.bench_command == "show":
+        print(bench.show_scores(args.model_id))
+        return 0
+    if args.bench_command == "import":
+        try:
+            count = bench.import_scores(args.file)
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"bench import: stored {count} score(s)")
+        return 0
+    return 2
+
+
+def _reps_command(args: argparse.Namespace) -> int:
+    if args.reps_command == "add":
+        try:
+            rep = bench.add_rep(
+                profile=args.profile,
+                model_id=args.model_id,
+                task_ref=args.task_ref,
+                tier=args.tier,
+                role=args.role,
+                rounds=args.rounds,
+                blockers_found=args.blockers_found,
+                completed=args.completed,
+                notes=args.notes,
+            )
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"recorded rep id={rep.id}")
+        return 0
+    if args.reps_command == "list":
+        try:
+            reps = bench.read_reps(limit=args.limit)
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for rep in reps:
+            print(bench.format_rep(rep))
+        return 0
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     fetchers = registry()
     parser = build_parser(list(fetchers))
     args = parser.parse_args(argv)
+
+    if args.command == "bench":
+        return _bench_command(args)
+
+    if args.command == "reps":
+        return _reps_command(args)
 
     if args.command == "policy":
         return _policy_command(args, fetchers, parser)
