@@ -144,3 +144,211 @@ def test_clear_unknown_name_not_in_config_errors(policy_config, capsys, monkeypa
     rc = cli.main(["policy", "clear", "not-a-pool"])
     assert rc == 2
     assert "not-a-pool" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ ROB-1184: numeric boost
+
+
+def test_boost_requires_until(policy_config):
+    with pytest.raises(ValueError, match="until"):
+        policy.set_policy("codex", None, boost=1)
+
+
+def test_boost_set_and_get(policy_config):
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1)
+    boost, status = policy.get_boost("codex", today=TODAY)
+    assert boost == 1
+    assert status is None
+
+
+def test_boost_set_without_class_only_touches_boost(policy_config):
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), note="리셋권")
+    policy.set_policy("codex", None, until=dt.date(2026, 8, 5), boost=1)
+    effective, _ = policy.get_policy("codex", "preserve", today=TODAY)
+    assert effective == "spend"
+    boost, _ = policy.get_boost("codex", today=TODAY)
+    assert boost == 1
+
+
+def test_boost_none_clears_boost_without_touching_class(policy_config):
+    """`policy set codex --boost none` — class/note 는 그대로, boost 만 해제."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), note="리셋권", boost=1)
+    policy.set_policy("codex", None, boost=None)
+    effective, status = policy.get_policy("codex", "preserve", today=TODAY)
+    assert effective == "spend"
+    assert status is not None and "리셋권" in status
+    boost, _ = policy.get_boost("codex", today=TODAY)
+    assert boost is None
+
+
+def test_boost_bool_true_false_are_rejected_not_coerced_to_int(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text('[pools.codex]\nboost = true\nuntil = "2026-08-05"\n')
+    boost, status = policy.get_boost("codex", today=TODAY)
+    assert boost is None
+    assert status is not None and "bool" in status
+
+
+def test_boost_missing_until_falls_back(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text("[pools.codex]\nboost = 1\n")
+    boost, status = policy.get_boost("codex", today=TODAY)
+    assert boost is None
+    assert "missing until" in status
+
+
+def test_boost_expired_falls_back(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text('[pools.codex]\nboost = 1\nuntil = "2026-07-30"\n')
+    boost, status = policy.get_boost("codex", today=TODAY)
+    assert boost is None
+    assert "expired" in status
+
+
+def test_boost_cli_set_and_none_round_trip(policy_config, capsys, monkeypatch):
+    from scopefuel import cli
+    from scopefuel.providers import BUILTIN
+
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    assert (
+        cli.main(
+            ["policy", "set", "codex", "spend", "--until", "2026-08-05", "--boost", "1", "--note", "리셋권"]
+        )
+        == 0
+    )
+    boost, _ = policy.get_boost("codex", today=TODAY)
+    assert boost == 1
+    capsys.readouterr()
+
+    assert cli.main(["policy", "set", "codex", "--boost", "none"]) == 0
+    boost, _ = policy.get_boost("codex", today=TODAY)
+    assert boost is None
+    effective, _ = policy.get_policy("codex", "preserve", today=TODAY)
+    assert effective == "spend"  # class 는 그대로
+
+
+def test_boost_cli_numeric_without_until_errors(policy_config, capsys, monkeypatch):
+    from scopefuel import cli
+    from scopefuel.providers import BUILTIN
+
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["policy", "set", "codex", "--boost", "1"])
+    assert exc.value.code == 2
+    assert "--until" in capsys.readouterr().err
+
+
+def test_boost_cli_rejects_true_false_literal(policy_config, capsys, monkeypatch):
+    from scopefuel import cli
+    from scopefuel.providers import BUILTIN
+
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    with pytest.raises(SystemExit):
+        cli.main(["policy", "set", "codex", "--until", "2026-08-05", "--boost", "true"])
+
+
+# ------------------------------------------------------------------ ROB-1184: [settings] reset_urgency_hours
+
+
+def test_reset_urgency_hours_default_when_unset(policy_config):
+    assert policy.get_reset_urgency_hours() == 12.0
+
+
+def test_reset_urgency_hours_reads_settings(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text("[settings]\nreset_urgency_hours = 6\n")
+    assert policy.get_reset_urgency_hours() == 6.0
+
+
+def test_reset_urgency_hours_invalid_falls_back_to_default(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text('[settings]\nreset_urgency_hours = "nope"\n')
+    assert policy.get_reset_urgency_hours() == 12.0
+
+
+def test_reset_urgency_hours_zero_or_negative_falls_back(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text("[settings]\nreset_urgency_hours = -1\n")
+    assert policy.get_reset_urgency_hours() == 12.0
+
+
+# ------------------------------------------------------------------ ROB-1184: capacity_weight
+
+
+def _use_capacity_fixture(policy_config):
+    import pathlib
+    import shutil
+
+    fixture = pathlib.Path(__file__).parent / "fixtures" / "pool_capacity_weight.toml"
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fixture, policy_config)
+
+
+def test_capacity_weight_explicit_value_wins_over_price_usd(policy_config):
+    """[pools.claude] 는 price_usd=200 만 있음 → weight = 200/20 = 10.0."""
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("claude")
+    assert weight == 10.0
+    assert status is None
+
+
+def test_capacity_weight_explicit_capacity_weight_field(policy_config):
+    """[pools.codex] 는 capacity_weight=3.5 명시 → price_usd 무관하게 그 값 사용."""
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("codex")
+    assert weight == 3.5
+    assert status is None
+
+
+def test_capacity_weight_zero_falls_back_to_default_with_status(policy_config):
+    """[pools.kiro] capacity_weight=0 → 무효 → 1.0 폴백 + status 노출."""
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("kiro")
+    assert weight == 1.0
+    assert status is not None and "invalid capacity_weight" in status
+
+
+def test_capacity_weight_negative_price_usd_falls_back(policy_config):
+    """[pools.grok] price_usd=-10 → 무효 → 1.0 폴백 + status 노출."""
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("grok")
+    assert weight == 1.0
+    assert status is not None and "invalid price_usd" in status
+
+
+def test_capacity_weight_non_numeric_falls_back(policy_config):
+    """[pools.agy] capacity_weight="not-a-number" → 무효 → 1.0 폴백 + status 노출."""
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("agy")
+    assert weight == 1.0
+    assert status is not None and "invalid capacity_weight" in status
+
+
+def test_capacity_weight_defaults_to_1_when_no_pool_entry(policy_config):
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("unconfigured-pool")
+    assert weight == 1.0
+    assert status is None
+
+
+def test_capacity_weight_defaults_to_1_when_pool_has_no_price_fields(policy_config):
+    """[pools.clinepass] 는 plan 만 있고 price_usd/capacity_weight 없음 → 1.0."""
+    _use_capacity_fixture(policy_config)
+    weight, status = policy.get_capacity_weight("clinepass")
+    assert weight == 1.0
+    assert status is None
+
+
+def test_get_pool_plan_reads_config(policy_config):
+    _use_capacity_fixture(policy_config)
+    assert policy.get_pool_plan("clinepass") == "team"
+    assert policy.get_pool_plan("unconfigured-pool") is None
+
+
+def test_capacity_weight_bool_is_rejected_like_boost(policy_config):
+    """bool 은 int/float 의 하위형이지만 capacity_weight/price_usd 에도 숫자로 수용하지 않는다."""
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text("[pools.codex]\ncapacity_weight = true\n")
+    weight, status = policy.get_capacity_weight("codex")
+    assert weight == 1.0
+    assert status is not None and "invalid capacity_weight" in status

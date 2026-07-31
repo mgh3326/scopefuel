@@ -16,7 +16,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset
-from .policy import get_active_override, get_policy
+from .policy import (
+    get_active_override,
+    get_boost,
+    get_capacity_weight,
+    get_policy,
+    get_reset_urgency_hours,
+)
 
 Grade = Literal["S+", "S", "A+", "A", "B", "C"]
 Gate = Literal["default", "escalation"]
@@ -24,7 +30,7 @@ Gate = Literal["default", "escalation"]
 # spend 풀: 이 사용률 미만이면 후보. preserve 는 90.
 PRESERVE_EXCLUDE_PCT = 90.0
 SPEND_EXCLUDE_PCT = 99.0
-# spend 풀이 리셋까지 이 시간 이내이면 정렬 최상위 + 🔥.
+# spend 풀이 리셋까지 이 시간 이내이면 정렬 최상위 + 🔥 (fallback — pace 계산 불가 시에만).
 RESET_URGENCY_HOURS = 12.0
 
 _POOL_LABEL = {
@@ -44,8 +50,10 @@ _WINDOW_LABEL = {
     "30d": "월",
 }
 
-# quota-0 free candidate: 측정 불필, 항상 가용.
-_FREE_PROFILES = frozenset({"oc-omni"})
+OC_OMNI_ESCALATION_REASON = (
+    "비결정적 — 실행 모델이 요청마다 다름(실측: big-pickle 162콜·deepseek-v4-flash 21콜·"
+    "죽은 후보 3종). 다른 C 후보가 전부 소진·측정불가일 때만"
+)
 
 
 @dataclass(frozen=True)
@@ -137,8 +145,14 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile("oc-dsflash", "DeepSeek V4 Flash", None),
     ],
     "C": [
-        Profile("oc-omni", "OmniRoute free", None),
         Profile("kiro-cheap", "Qwen3 Coder", None),
+        Profile(
+            "oc-omni",
+            "OmniRoute free",
+            None,
+            gate="escalation",
+            gate_reason=OC_OMNI_ESCALATION_REASON,
+        ),
         Profile(
             "oc-oss",
             "GPT-OSS 120B",
@@ -187,6 +201,9 @@ class _Candidate:
     reset_at: str | None
     hours_to_reset: float | None
     urgent: bool
+    boost: int | None
+    weight: float
+    effective_remaining: float
 
 
 @dataclass
@@ -247,6 +264,32 @@ def _hours_to_reset(iso: str | None, now: dt.datetime) -> float | None:
     now_utc = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
     hours = (reset_at - now_utc).total_seconds() / 3600.0
     return hours if hours > 0 else None
+
+
+def _burn_rate_pct_per_hour(window: str, used_pct: float, hours_to_reset: float) -> float | None:
+    """실측 소모속도(%/h) = used_pct / 경과시간(h). 창 길이·리셋 파싱 불가 시 None."""
+    from .model import _window_seconds
+
+    window_seconds = _window_seconds(window)
+    if window_seconds is None or window_seconds <= 0:
+        return None
+    elapsed_hours = (window_seconds / 3600.0) - hours_to_reset
+    if elapsed_hours <= 0:
+        return None
+    if used_pct <= 0:
+        return 0.0
+    return used_pct / elapsed_hours
+
+
+def _is_pace_urgent(remaining_pct: float, burn_rate: float | None, hours_to_reset: float) -> bool | None:
+    """잔여%/소모속도 > reset까지 남은 시간 → 리셋 전에 다 못 쓴다 → 상향 대상.
+
+    반환: True/False = pace 로 결정, None = pace 계산 불가(폴백 필요).
+    """
+    if burn_rate is None or burn_rate <= 0:
+        return None
+    time_to_exhaust = remaining_pct / burn_rate
+    return time_to_exhaust > hours_to_reset
 
 
 def _format_hours(hours: float) -> str:
@@ -330,16 +373,217 @@ def _build_escalation_entry(
     )
 
 
+@dataclass(frozen=True)
+class GateResult:
+    """``scopefuel gate`` 판정 결과."""
+
+    ok: bool
+    profile: str
+    provider_id: str
+    grade: Grade | None
+    reason: str  # exit 0 이면 사람이 읽는 요약, 아니면 차단/측정불가 사유
+    used_pct: float | None = None
+    pool_class: PoolClass | None = None
+    unmeasurable: bool = False
+    alternatives: tuple[str, ...] = ()
+
+
+def _find_profile(profile_name: str) -> tuple[Grade, Profile] | None:
+    for grade, profiles in GRADE_TABLE.items():
+        for profile in profiles:
+            if profile.name == profile_name:
+                return grade, profile
+    return None
+
+
+def _alt_candidates(
+    providers: list[ProviderResult],
+    grade: Grade,
+    exclude_profile: str,
+    today: dt.date,
+    now: dt.datetime,
+    urgency_hours: float,
+) -> tuple[str, ...]:
+    """같은 grade 안에서 exclude_profile 을 뺀 사용 가능한 정상(비-escalation) 후보 이름."""
+    out = recommend(providers, grade, today=today, now=now, urgency_hours=urgency_hours)
+    names: list[str] = []
+    for line in out.splitlines():
+        if not line[:1].isdigit():
+            continue
+        # "N. [🔥] name  label ..." 또는 "N. name  label ..."
+        rest = line.split(".", 1)[1].strip()
+        token = rest.split()[1] if rest.startswith("🔥") else rest.split()[0]
+        if token != exclude_profile:
+            names.append(token)
+    return tuple(names)
+
+
+# escalation 자격 충족 후에도 quota provider 측정을 요구하지 않고 즉시 통과시키는 프로필.
+# 명시적 무료 레인(oc-omni)에 한정 — 다른 escalation 프로필로 일반화하지 않는다.
+_ESCALATION_SKIPS_QUOTA_CHECK = frozenset({"oc-omni"})
+
+
+def gate_check(
+    providers: list[ProviderResult],
+    profile_name: str,
+    today: dt.date | None = None,
+    now: dt.datetime | None = None,
+    *,
+    urgency_hours: float | None = None,
+) -> GateResult:
+    """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
+
+    escalation 프로필은 "같은 grade 정상 대안이 전부 비가용"이라는 자격을 먼저 확인한다.
+    자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
+    (``oc-omni`` 같은 명시적 무료 레인을 제외하고) 해당 프로필 자체의 provider 측정·
+    유효 class·exclude·raw cutoff 를 정상 프로필과 동일하게 검사한다.
+    """
+    today = today or dt.datetime.now(dt.UTC).date()
+    now = now or dt.datetime.now(dt.UTC)
+    urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
+
+    found = _find_profile(profile_name)
+    provider_id, group_name = profile_pool(profile_name)
+    if found is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=f"unknown profile: {profile_name}",
+            unmeasurable=True,
+        )
+    grade, profile = found
+    by_id = {r.id: r for r in providers}
+    result = by_id.get(provider_id)
+
+    if profile.gate == "escalation":
+        # 1) escalation 자격: 같은 grade 의 다른 정상 후보가 전부 소진·측정불가일 때만 진행.
+        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        if alts:
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=grade,
+                reason=(
+                    f"{profile_name} 은 escalation 후보 — {profile.gate_reason or ''} "
+                    f"(다른 {grade} 후보가 아직 가용하므로 사용 불가)"
+                ),
+                alternatives=alts,
+            )
+        # 2) 명시적 무료 레인만 quota provider 측정 없이 즉시 통과. 나머지는 아래 일반
+        #    검사(측정불가/exclude/cutoff)를 그대로 통과해야 한다 — escalation 은 게이트를
+        #    우회하지 않는, 정상 후보 소진 시에만 열리는 "추가 자격"이다.
+        if profile_name in _ESCALATION_SKIPS_QUOTA_CHECK:
+            return GateResult(
+                ok=True,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=grade,
+                reason=f"{profile_name} escalation 자격 충족 — {profile.gate_reason or ''}",
+            )
+
+    if result is None or result.error or result.warning or result.status != "ok":
+        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=f"{provider_id} 측정 불가 (provider error/degraded)",
+            unmeasurable=True,
+            alternatives=alts,
+        )
+
+    matches = _matching_buckets(result, group_name)
+    if not matches:
+        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)",
+            unmeasurable=True,
+            alternatives=alts,
+        )
+
+    used_pct, _window, _reset_at = max(matches, key=lambda m: m[0])
+    fallback_class: PoolClass = (
+        result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
+    )
+    effective_class = get_policy(provider_id, fallback_class, today=today)[0]
+    override = get_active_override(provider_id, today=today)
+
+    if effective_class == "exclude":
+        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        reason_parts = [f"정책 제외 ({provider_id}"]
+        if override is not None and override.until:
+            reason_parts.append(f"until {override.until.isoformat()}")
+        if override is not None and override.note:
+            reason_parts.append(override.note)
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=", ".join(reason_parts) + ")",
+            used_pct=used_pct,
+            pool_class=effective_class,
+            alternatives=alts,
+        )
+
+    cutoff = _usage_cutoff(effective_class)
+    if used_pct >= cutoff:
+        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=f"{used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
+            used_pct=used_pct,
+            pool_class=effective_class,
+            alternatives=alts,
+        )
+
+    if profile.gate == "escalation":
+        return GateResult(
+            ok=True,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=(
+                f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
+                f"class={effective_class} — {profile.gate_reason or ''}"
+            ),
+            used_pct=used_pct,
+            pool_class=effective_class,
+        )
+
+    return GateResult(
+        ok=True,
+        profile=profile_name,
+        provider_id=provider_id,
+        grade=grade,
+        reason=f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}",
+        used_pct=used_pct,
+        pool_class=effective_class,
+    )
+
+
 def recommend(
     providers: list[ProviderResult],
     grade: Grade,
     today: dt.date | None = None,
     now: dt.datetime | None = None,
     *,
-    urgency_hours: float = RESET_URGENCY_HOURS,
+    urgency_hours: float | None = None,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
+    urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
     by_id = {r.id: r for r in providers}
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []
@@ -354,24 +598,6 @@ def recommend(
 
         provider_id, group_name = profile_pool(profile.name)
         provider_label = _provider_label(provider_id, group_name)
-
-        # quota-0 free candidates: always available, no measurement needed.
-        if profile.name in _FREE_PROFILES:
-            included.append(
-                _Candidate(
-                    profile=profile,
-                    provider_label=provider_label,
-                    provider_id=provider_id,
-                    window="free",
-                    used_pct=0.0,
-                    remaining_pct=100.0,
-                    pool_class="spend",
-                    reset_at=None,
-                    hours_to_reset=None,
-                    urgent=False,
-                )
-            )
-            continue
 
         result = by_id.get(provider_id)
         if result is None or result.error or result.warning or result.status != "ok":
@@ -411,9 +637,18 @@ def recommend(
 
         remaining_pct = 100.0 - used_pct
         hours = _hours_to_reset(reset_at, now)
-        urgent = (
-            effective_class == "spend" and remaining_pct > 0 and hours is not None and hours <= urgency_hours
-        )
+
+        urgent = False
+        if effective_class == "spend" and remaining_pct > 0 and hours is not None:
+            burn_rate = _burn_rate_pct_per_hour(window, used_pct, hours)
+            pace_urgent = _is_pace_urgent(remaining_pct, burn_rate, hours)
+            # pace 계산 가능하면 그 값을 쓰고, 소모속도 0/부재/파싱불가면 시간 임계값 폴백.
+            urgent = pace_urgent if pace_urgent is not None else hours <= urgency_hours
+
+        boost, _boost_status = get_boost(provider_id, today=today)
+        weight, _weight_status = get_capacity_weight(provider_id)
+        effective_remaining = weight * remaining_pct
+
         included.append(
             _Candidate(
                 profile=profile,
@@ -426,16 +661,21 @@ def recommend(
                 reset_at=reset_at,
                 hours_to_reset=hours,
                 urgent=urgent,
+                boost=boost,
+                weight=weight,
+                effective_remaining=effective_remaining,
             )
         )
 
-    # free(quota-0) → reset 임박 → class(spend > preserve) → 잔여율(큰 순) → 표 순서(결정성)
-    def sort_key(c: _Candidate) -> tuple[int, int, int, float, int]:
-        free_order = 0 if c.profile.name in _FREE_PROFILES else 1
+    # 1) numeric boost(작을수록 먼저, 없으면 최하위) → 2) pace/fallback urgency →
+    # 3) class(spend > preserve) → 4) capacity_weight 반영 실효잔여(큰 순) → 표 순서(결정성)
+    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int]:
+        boost_present = 0 if c.boost is not None else 1
+        boost_value = c.boost if c.boost is not None else 0
         imminent = 0 if c.urgent else 1
         class_order = 0 if c.pool_class == "spend" else 1
         profile_order = next((i for i, p in enumerate(GRADE_TABLE[grade]) if p.name == c.profile.name), 0)
-        return (free_order, imminent, class_order, -c.remaining_pct, profile_order)
+        return (boost_present, boost_value, imminent, class_order, -c.effective_remaining, profile_order)
 
     included.sort(key=sort_key)
 

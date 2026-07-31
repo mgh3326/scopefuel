@@ -26,6 +26,15 @@ def _date_arg(value: str) -> dt.date:
     return dt.date.fromisoformat(value)
 
 
+def _boost_arg(value: str) -> int | str:
+    if value.strip().lower() == "none":
+        return "none"
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"boost 는 정수 또는 'none' 이어야 합니다: {value!r}") from exc
+
+
 def build_parser(available: list[str]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scopefuel",
@@ -72,13 +81,36 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     set_parser = policy_sub.add_parser("set", help="pool 정책 설정")
     set_parser.add_argument("pool", choices=available, help="provider pool 이름")
     set_parser.add_argument(
-        "pool_class", choices=["preserve", "spend", "exclude"], metavar="class", help="정책 클래스"
+        "pool_class",
+        nargs="?",
+        choices=["preserve", "spend", "exclude"],
+        metavar="class",
+        help="정책 클래스 (boost만 바꿀 때는 생략 가능)",
     )
-    set_parser.add_argument("--until", type=_date_arg, required=True, help="YYYY-MM-DD 형식 만료일")
+    set_parser.add_argument(
+        "--until", type=_date_arg, help="YYYY-MM-DD 형식 만료일 (class 또는 boost 설정 시 필수)"
+    )
     set_parser.add_argument("--note", help="선택적 메모")
+    set_parser.add_argument(
+        "--boost",
+        type=_boost_arg,
+        metavar="N|none",
+        help="정수 boost (작을수록 먼저). 'none' 이면 boost만 해제. 숫자 설정 시 --until 필수",
+    )
 
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
     clear_parser.add_argument("pool", help="provider pool 이름")
+
+    all_profiles = sorted({p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles})
+    gate_parser = subparsers.add_parser(
+        "gate",
+        help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가)",
+    )
+    gate_parser.add_argument(
+        "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
+    )
+    gate_parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
+    gate_parser.add_argument("--cache-ttl", type=float, default=DEFAULT_TTL_S, help="캐시 TTL(초)")
 
     return parser
 
@@ -103,7 +135,9 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
     return render.table(results, color=color, now=now)
 
 
-def _policy_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
+def _policy_command(
+    args: argparse.Namespace, fetchers: dict[str, object], parser: argparse.ArgumentParser
+) -> int:
     today = dt.datetime.now(dt.UTC).date()
     known_classes = {name: getattr(fetcher, "pool_class", "preserve") for name, fetcher in fetchers.items()}
 
@@ -114,9 +148,33 @@ def _policy_command(args: argparse.Namespace, fetchers: dict[str, object]) -> in
         return 0
 
     if args.policy_command == "set":
-        set_policy(args.pool, args.pool_class, until=args.until, note=args.note)
-        note_s = f" (until {args.until})" if args.until else ""
-        print(f"{args.pool} -> {args.pool_class}{note_s}")
+        if args.pool_class is not None and args.until is None:
+            parser.error("--until 은 class 를 지정할 때 필수입니다")
+        boost_arg: int | None | str = "__unset__"
+        if args.boost is not None:
+            if args.boost == "none":
+                boost_arg = None
+            else:
+                boost_arg = args.boost
+                if args.until is None:
+                    parser.error("--until 은 --boost 로 값을 지정할 때 필수입니다")
+        if args.pool_class is None and boost_arg == "__unset__":
+            parser.error("class 또는 --boost 중 하나는 지정해야 합니다")
+
+        set_policy(
+            args.pool,
+            args.pool_class,
+            until=args.until,
+            note=args.note,
+            boost=boost_arg,
+        )
+        parts = []
+        if args.pool_class is not None:
+            until_s = f" (until {args.until})" if args.until else ""
+            parts.append(f"{args.pool_class}{until_s}")
+        if boost_arg != "__unset__":
+            parts.append("boost cleared" if boost_arg is None else f"boost={boost_arg}")
+        print(f"{args.pool} -> {', '.join(parts)}")
         return 0
 
     if args.policy_command == "clear":
@@ -136,12 +194,37 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     return 0
 
 
+def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
+    now = dt.datetime.now(dt.UTC)
+    results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    result = recommend.gate_check(results, args.profile, today=now.date(), now=now)
+
+    if result.ok:
+        print(
+            f"profile={result.profile} pool={result.provider_id} "
+            f"used_pct={result.used_pct} class={result.pool_class}"
+        )
+        print(result.reason)
+        return 0
+
+    print(result.reason, file=sys.stderr)
+    if result.alternatives:
+        print(f"대안({result.grade}): {', '.join(result.alternatives)}", file=sys.stderr)
+    else:
+        print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)
+    return 4 if result.unmeasurable else 3
+
+
 def main(argv: list[str] | None = None) -> int:
     fetchers = registry()
-    args = build_parser(list(fetchers)).parse_args(argv)
+    parser = build_parser(list(fetchers))
+    args = parser.parse_args(argv)
 
     if args.command == "policy":
-        return _policy_command(args, fetchers)
+        return _policy_command(args, fetchers, parser)
+
+    if args.command == "gate":
+        return _gate_command(args, fetchers)
 
     if args.list_providers:
         for name in default_order(list(fetchers)):
