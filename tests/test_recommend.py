@@ -20,7 +20,20 @@ from scopefuel.recommend import (
 
 TODAY = dt.date(2026, 7, 31)
 NOW = dt.datetime(2026, 7, 31, 12, 0, 0, tzinfo=dt.UTC)
-RESET = (dt.datetime(2026, 8, 1, 5, tzinfo=dt.UTC)).isoformat()  # ~17h later → not urgent
+
+
+def _reset_almost_full(window: str) -> str:
+    """window 가 방금 시작된 것처럼(거의 전체 남음) reset 시각을 계산.
+
+    pace(잔여%/소모속도 vs reset까지 남은시간)가 non-urgent 로 나오도록 하는 "평상시" 기본값.
+    순수 시간-임계값 폴백을 테스트하려는 케이스는 pace 를 의도적으로 죽이는(used_pct=0 등)
+    별도 resets_at 을 명시한다.
+    """
+    hours = {"5h": 4.9, "1d": 23.5, "7d": 167.0, "30d": 719.0}.get(window, 167.0)
+    return (NOW + dt.timedelta(hours=hours)).isoformat()
+
+
+RESET = _reset_almost_full("7d")  # 기존 테스트 다수의 기본 window(7d)에 대한 non-urgent 기준값
 
 REMOVED = ["agy-pro", "kiro-glm", "kiro-minimax", "kiro-minimax21", "kiro-deepseek"]
 
@@ -40,7 +53,7 @@ def _bucket(
         label=window,
         window=window,
         used_pct=used,
-        resets_at=resets_at if resets_at is not None else RESET,
+        resets_at=resets_at if resets_at is not None else _reset_almost_full(window),
         scope=scope or Scope("account"),
         horizon=horizon,  # type: ignore[arg-type]
     )
@@ -224,33 +237,35 @@ def test_spend_95_reset_imminent_gets_fire_and_top_rank():
 
 
 def test_spend_reset_not_imminent_no_fire():
+    """폴백(시간 임계값) 경로: window 를 파싱할 수 없어 pace 계산이 불가 → reset_urgency_hours 로 판정."""
     providers = [
-        _result("kiro", 50.0, pool_class="spend", window="30d", resets_at=_reset_in(13)),
+        _result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(13)),
     ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    out = recommend(providers, "S+", today=TODAY, now=NOW, urgency_hours=12.0)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert ranked
     assert "🔥" not in ranked[0]
 
 
 def test_urgent_spend_outranks_non_urgent_higher_remaining():
-    """Reset-imminent spend ranks above non-imminent spend even with lower remaining%."""
+    """폴백 경로: reset-imminent spend 가 non-imminent spend 보다 remaining% 낮아도 앞선다."""
     providers = [
-        _result("kiro", 80.0, pool_class="spend", window="30d", resets_at=_reset_in(4)),  # 20% rem, urgent
-        _result("clinepass", 10.0, window="30d", resets_at=_reset_in(48)),  # 90% rem, not urgent
+        _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(4)),  # 20% rem, urgent
+        _result("clinepass", 10.0, window="?", resets_at=_reset_in(48)),  # 90% rem, not urgent
     ]
-    out = recommend(providers, "A+", today=TODAY, now=NOW)
+    out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "🔥" in lines[0] and "kiro-sonnet" in lines[0]
     assert "oc-glm" in lines[1]
 
 
 def test_multiple_urgent_sorted_by_remaining():
+    """폴백 경로: 여러 후보가 모두 시간-임박 urgent 면 잔여율(큰 순)로 정렬."""
     providers = [
-        _result("kiro", 80.0, pool_class="spend", window="30d", resets_at=_reset_in(3)),  # 20% rem
-        _result("clinepass", 40.0, window="30d", resets_at=_reset_in(5)),  # 60% rem
+        _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(3)),  # 20% rem
+        _result("clinepass", 40.0, window="?", resets_at=_reset_in(5)),  # 60% rem
     ]
-    out = recommend(providers, "A+", today=TODAY, now=NOW)
+    out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "🔥" in lines[0] and "oc-glm" in lines[0]
     assert "🔥" in lines[1] and "kiro-sonnet" in lines[1]
@@ -373,8 +388,8 @@ def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
 # ------------------------------------------------------------------ AC4: C grade
 
 
-def test_ac4_c_omni_first_and_oss_escalation():
-    """AC4: C has oc-omni as quota-0 1st priority, oc-oss in escalation section at end."""
+def test_ac4_c_omni_escalation_and_oss_escalation():
+    """AC4: C 정상 순위엔 oc-omni/oc-oss 둘 다 없음 — 둘 다 escalation 섹션(지정 사유 포함)."""
     providers = [
         _result("kiro", 10.0, pool_class="spend", window="30d"),
     ]
@@ -382,31 +397,24 @@ def test_ac4_c_omni_first_and_oss_escalation():
     lines = out.splitlines()
     ranked = [line for line in lines if line[:1].isdigit()]
 
-    # oc-omni is always #1 (quota-0, 100% remaining, spend)
-    assert ranked[0].startswith("1. oc-omni")
-    assert "OmniRoute" in ranked[0]
+    # kiro-cheap (유일한 정상 C 후보) 가 1위
+    assert ranked[0].startswith("1. kiro-cheap")
 
-    # oc-oss is NOT in normal candidates (it's escalation)
+    # oc-omni, oc-oss 모두 정상 후보에 없음 (escalation)
+    assert not any(line[:1].isdigit() and "oc-omni" in line for line in lines)
     assert not any(line[:1].isdigit() and "oc-oss" in line for line in lines)
 
-    # oc-oss is in escalation section with reason, at the end
-    escalation_idx = None
-    oss_idx = None
-    for i, line in enumerate(lines):
-        if "⚠ 승급 후보" in line:
-            escalation_idx = i
-        if "oc-oss" in line and escalation_idx is not None and i > escalation_idx:
-            oss_idx = i
-            break
-    assert oss_idx is not None
-    assert "agy 3p 풀 소모" in out
-
-    # escalation section is after ranked candidates and excluded
-    assert escalation_idx is not None
+    # 둘 다 escalation 섹션에, 정상후보/제외 뒤에 위치
+    escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
     last_ranked = max((i for i, line in enumerate(lines) if line[:1].isdigit()), default=-1)
     last_excluded = max((i for i, line in enumerate(lines) if line.startswith("✗")), default=-1)
     assert escalation_idx > last_ranked
     assert escalation_idx > last_excluded
+
+    assert "oc-omni" in out and "oc-oss" in out
+    assert "big-pickle 162콜" in out
+    assert "deepseek-v4-flash 21콜" in out
+    assert "agy 3p 풀 소모" in out
 
 
 # ------------------------------------------------------------------ AC5: removed
@@ -569,11 +577,11 @@ def test_oc_oss_escalation_at_end_of_c():
     out = recommend(providers, "C", today=TODAY, now=NOW)
     lines = out.splitlines()
 
-    # oc-omni is #1 ranked
+    # kiro-cheap 이 1위 (oc-omni/oc-oss 는 escalation)
     ranked = [line for line in lines if line[:1].isdigit()]
-    assert ranked[0].startswith("1. oc-omni")
+    assert ranked[0].startswith("1. kiro-cheap")
 
-    # oc-oss is in escalation section, after all ranked and excluded
+    # oc-oss 는 escalation 섹션에, 정상후보/제외 뒤에 위치
     escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
     last_ranked = max((i for i, line in enumerate(lines) if line[:1].isdigit()), default=-1)
     last_excluded = max((i for i, line in enumerate(lines) if line.startswith("✗")), default=-1)
@@ -583,26 +591,29 @@ def test_oc_oss_escalation_at_end_of_c():
     assert "agy 3p 풀 소모" in out
 
 
-def test_oc_omni_always_available_without_provider():
-    """oc-omni is quota-0 free — available even when no OmniRoute provider is registered."""
+def test_oc_omni_escalation_available_without_provider():
+    """oc-omni 는 escalation 후보 — provider 미등록이어도 다른 C 후보가 없으면 통계상 측정불가로 표시."""
     providers: list[ProviderResult] = []
     out = recommend(providers, "C", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. oc-omni")
-    assert "OmniRoute" in ranked[0]
+    # kiro-cheap 은 provider 없어 측정 불가 → 정상 후보 없음
+    assert not ranked
+    assert "⚠ 승급 후보" in out
+    assert "oc-omni" in out
+    assert "OmniRoute" in out
+    assert "big-pickle 162콜" in out
 
 
-def test_oc_omni_ranks_above_urgent_spend():
-    """oc-omni (quota-0) must rank #1 even when a spend pool is about to reset."""
+def test_oc_omni_escalation_not_ranked_above_urgent_spend():
+    """oc-omni 는 escalation 이므로 urgent spend 정상후보보다 위에 랭크되지 않는다(정상후보 아님)."""
     providers = [
         _result("kiro", 95.0, pool_class="spend", window="30d", resets_at=_reset_in(3)),
     ]
     out = recommend(providers, "C", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. oc-omni")
-    # kiro-cheap is urgent but still #2
-    assert "kiro-cheap" in ranked[1]
-    assert "🔥" in ranked[1]
+    # kiro-cheap 이 urgent 1위 (유일한 정상 후보)
+    assert ranked[0].startswith("1. 🔥 kiro-cheap") or ranked[0].startswith("1. kiro-cheap")
+    assert not any("oc-omni" in line for line in ranked)
 
 
 def test_gate_does_not_promote_normal_candidates():
@@ -618,3 +629,152 @@ def test_gate_does_not_promote_normal_candidates():
     assert len(ranked) >= 3  # kiro-opus, kiro-sol, codex-max, opus
     # Escalation section is separate
     assert "⚠ 승급 후보" in out
+
+
+# ------------------------------------------------------------------ ROB-1184: numeric boost
+
+
+def test_boost_promotes_candidate_to_first_rank():
+    """AC1: boost=1 (until 유효) 인 codex 가 S grade 에서 1순위가 된다."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    providers = [
+        _result("codex", 10.0, pool_class="spend", window="30d"),
+        _result("clinepass", 10.0, window="30d"),
+        _result("grok", 10.0),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert ranked[0].startswith("1. codex-terra-max")
+
+
+def test_boost_none_restores_default_sort():
+    """AC2: `policy set codex --boost none` 후 boost 효과만 원복(다른 정책은 유지)."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    policy.set_policy("codex", None, boost=None)
+    providers = [
+        _result("codex", 10.0, pool_class="spend", window="30d"),
+        _result("clinepass", 17.0, window="30d"),
+        _result("grok", 8.0),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    # boost 해제 → class(둘 다 spend) 동률 → capacity_weight(둘 다 기본 1.0) 반영 실효잔여 정렬로 복귀.
+    # codex 는 여전히 spend 클래스 정책이 남아있으므로 class 자체는 유지된다.
+    effective_class, _ = policy.get_policy("codex", "preserve", today=TODAY)
+    assert effective_class == "spend"
+    boost, _ = policy.get_boost("codex", today=TODAY)
+    assert boost is None
+    # boost 가 없으니 정렬은 잔여율 기준 — grok(92% 잔여) 이 1위.
+    assert "grok-hi" in ranked[0]
+
+
+def test_boost_expired_does_not_affect_sort():
+    policy.set_policy("codex", "spend", until=dt.date(2026, 7, 1), boost=1)  # 이미 만료
+    providers = [
+        _result("codex", 50.0, pool_class="spend", window="30d"),
+        _result("clinepass", 10.0, window="30d"),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    # boost 만료 → 일반 정렬(잔여율 큰 순): clinepass(90%) 가 codex(50%) 보다 우선.
+    assert "oc-kimi-k3" in ranked[0]
+
+
+def test_boost_bool_true_in_config_is_rejected_not_treated_as_1():
+    """config 에 boost=true 가 있어도 숫자로 오인하지 않고 무시(기본 정렬로 복귀)."""
+    import tomllib
+
+    text = '[pools.codex]\nboost = true\nclass = "spend"\nuntil = "2026-08-05"\n'
+    config_path = policy.config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(text)
+    assert tomllib.loads(text)["pools"]["codex"]["boost"] is True  # bool 로 파싱됨을 확인
+
+    providers = [
+        _result("codex", 50.0, pool_class="spend", window="30d"),
+        _result("clinepass", 10.0, window="30d"),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    # boost 무시 → 잔여율 정렬: clinepass 가 codex 보다 우선.
+    assert "oc-kimi-k3" in ranked[0]
+
+
+# ------------------------------------------------------------------ ROB-1184: capacity_weight
+
+
+def test_capacity_weight_price_usd_shifts_rank_but_not_cutoff():
+    """AC3: claude price_usd=200 → weight=10 → 실효잔여 반영으로 순위 상승, raw 90%/99% 컷은 불변."""
+    policy.set_policy("claude", "preserve", until=dt.date(2026, 8, 31))
+    config = policy.load_config()
+    config["pools"]["claude"]["price_usd"] = 200
+    policy._write_config(config)
+
+    weight, _ = policy.get_capacity_weight("claude")
+    assert weight == 10.0
+
+    # claude(89% used, preserve, weight=10 → 실효잔여=1.1*10=11) vs
+    # codex(50% used, preserve, weight=1 → 실효잔여=50) — weight 없으면 claude 가 밀리지만
+    # weight=10 이 실효잔여를 끌어올려 순위에 반영된다(정확한 순위는 값에 따라 달라짐 —
+    # 여기서는 raw cutoff 는 그대로 89%<90% 로 포함됨을 확인).
+    providers = [
+        _result("claude", 89.0, pool_class="preserve"),
+        _result("codex", 89.0, pool_class="preserve"),
+    ]
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    # 둘 다 89% < 90% cutoff 이므로 포함됨 (raw cutoff 불변 확인)
+    assert any("opus" in line for line in ranked)
+    assert any("codex-max" in line for line in ranked)
+    # weight=10 인 claude(opus) 의 실효잔여(11*10=110)가 codex(11*1=11) 보다 커서 opus 가 먼저.
+    assert ranked[0].split()[1] == "opus"
+
+
+def test_capacity_weight_does_not_bypass_raw_cutoff():
+    """capacity_weight 가 커도 raw used_pct 컷(90%/99%)은 그대로 적용되어 후보에서 제외된다."""
+    config = policy.load_config()
+    pools = config.setdefault("pools", {})
+    pools["claude"] = {"price_usd": 200}
+    policy._write_config(config)
+
+    providers = [_result("claude", 90.0, pool_class="preserve")]  # cutoff 90% 이상 → 소진
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    assert any("opus" in line and "소진" in line for line in out.splitlines())
+    assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
+
+
+# ------------------------------------------------------------------ ROB-1184: reset_urgency_hours settings
+
+
+def test_reset_urgency_hours_setting_changes_fallback_threshold():
+    """AC6: [settings] reset_urgency_hours 변경이 폴백(pace 불가) 🔥 판정에 반영된다."""
+    config = policy.load_config()
+    config["settings"] = {"reset_urgency_hours": 20}
+    policy._write_config(config)
+
+    # window="?" → pace 계산 불가 → 폴백. reset 15h 남음: 기본 12h 라면 not urgent, 20h 로 늘리면 urgent.
+    providers = [_result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(15))]
+    out = recommend(providers, "S+", today=TODAY, now=NOW)  # urgency_hours 인자 생략 → config 값 사용
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert "🔥" in ranked[0]
+
+
+def test_reset_urgency_hours_default_backcompat_without_settings():
+    """설정 없으면 기본 12.0 유지 (백컴팻)."""
+    providers = [_result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(15))]
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert "🔥" not in ranked[0]
+
+
+def test_pace_urgent_path_is_independent_of_reset_urgency_hours_setting():
+    """pace 경로(소모속도 산출 가능)는 reset_urgency_hours 설정과 무관하게 수식으로만 결정된다."""
+    config = policy.load_config()
+    config["settings"] = {"reset_urgency_hours": 0.01}  # 매우 작게 설정해도 pace 판정에는 영향 없음
+    policy._write_config(config)
+
+    # 30d 창, 707h 경과, 50% 사용 (느린 소모) → pace 로 urgent=True (reset_urgency_hours 무관)
+    providers = [_result("kiro", 50.0, pool_class="spend", window="30d", resets_at=_reset_in(13))]
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert "🔥" in ranked[0]

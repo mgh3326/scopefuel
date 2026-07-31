@@ -11,10 +11,12 @@ import datetime as dt
 import os
 import pathlib
 from dataclasses import dataclass
+from typing import Literal
 
 from .model import PoolClass
 
 NEAR_EXPIRY_DAYS = 3
+DEFAULT_RESET_URGENCY_HOURS = 12.0
 
 
 def config_path() -> pathlib.Path:
@@ -58,6 +60,18 @@ def _write_config(config: dict) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
+    settings = config.get("settings")
+    if isinstance(settings, dict) and settings:
+        lines.append("[settings]")
+        for key in sorted(settings):
+            value = settings[key]
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                lines.append(f"{key} = {value!r}")
+            else:
+                lines.append(f"{key} = {_toml_string(str(value))}")
+        lines.append("")
     pools = config.get("pools")
     if isinstance(pools, dict):
         for name in sorted(pools):
@@ -76,6 +90,16 @@ def _write_config(config: dict) -> None:
 
             if "note" in entry and entry["note"] is not None:
                 lines.append(f"note = {_toml_string(str(entry['note']))}")
+
+            if "boost" in entry and entry["boost"] is not None:
+                lines.append(f"boost = {int(entry['boost'])}")
+
+            if "plan" in entry and entry["plan"] is not None:
+                lines.append(f"plan = {_toml_string(str(entry['plan']))}")
+            if "price_usd" in entry and entry["price_usd"] is not None:
+                lines.append(f"price_usd = {entry['price_usd']!r}")
+            if "capacity_weight" in entry and entry["capacity_weight"] is not None:
+                lines.append(f"capacity_weight = {entry['capacity_weight']!r}")
             lines.append("")
     text = "\n".join(lines).rstrip() + "\n" if lines else ""
     path.write_text(text, encoding="utf-8")
@@ -90,6 +114,84 @@ class ActiveOverride:
     pool_class: PoolClass
     until: dt.date
     note: str | None = None
+
+
+class BoostError(ValueError):
+    """Raised when a boost value in config is invalid (fail-closed)."""
+
+
+def _normalize_boost(value: object) -> int | None:
+    """int 만 허용. bool 은 int 하위형이지만 명시적으로 거부한다."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise BoostError(f"boost 는 정수여야 합니다 (bool 불가): {value!r}")
+    if isinstance(value, int):
+        return value
+    raise BoostError(f"boost 는 정수여야 합니다: {value!r}")
+
+
+@dataclass(frozen=True)
+class ActiveBoost:
+    """Active (non-expired) numeric boost override."""
+
+    boost: int
+    until: dt.date
+
+
+def _active_boost(pool: str, today: dt.date) -> ActiveBoost | None | str:
+    """Return ActiveBoost, None if no boost entry, or status string if present but unusable.
+
+    boost 만료는 별도 필드가 아니라 기존 pool-level ``until`` 을 재사용한다
+    (승인된 CLI 표면: ``policy set <pool> [class] --until <date> --boost <N|none>``).
+    """
+    config = load_config()
+    pools = config.get("pools") or {}
+    entry = pools.get(pool)
+    if not isinstance(entry, dict):
+        return None
+
+    raw_boost = entry.get("boost")
+    if raw_boost is None:
+        return None
+
+    try:
+        boost = _normalize_boost(raw_boost)
+    except BoostError as exc:
+        return str(exc)
+    if boost is None:
+        return None
+
+    raw_until = entry.get("until")
+    if not raw_until:
+        return "boost missing until"
+
+    until = _parse_date(raw_until)
+    if until is None:
+        return f"invalid until {raw_until!r}"
+
+    if until < today:
+        return f"boost expired {until}"
+
+    return ActiveBoost(boost, until)
+
+
+def get_boost(pool: str, today: dt.date | None = None) -> tuple[int | None, str | None]:
+    """Return effective numeric boost and optional status note for a pool.
+
+    Expired/missing/invalid boost -> (None, status) so callers fall back to default sort.
+    """
+    today = today or dt.datetime.now(dt.UTC).date()
+    result = _active_boost(pool, today)
+    if result is None:
+        return None, None
+    if isinstance(result, str):
+        return None, result
+
+    notes: list[str] = []
+    if result.until <= today + dt.timedelta(days=NEAR_EXPIRY_DAYS):
+        notes.append(f"expires {result.until}")
+    return result.boost, "; ".join(notes) if notes else None
 
 
 def _active_override(pool: str, today: dt.date) -> ActiveOverride | None | str:
@@ -147,18 +249,45 @@ def get_active_override(pool: str, today: dt.date | None = None) -> ActiveOverri
 
 def set_policy(
     pool: str,
-    pool_class: PoolClass,
+    pool_class: PoolClass | None,
     *,
     until: dt.date | None = None,
     note: str | None = None,
+    boost: int | None | Literal["__unset__"] = "__unset__",
 ) -> None:
-    if until is None:
+    """Set pool class and/or numeric boost.
+
+    ``pool_class`` may be None when the call only touches boost (``policy set
+    <pool> --boost N``/``--boost none`` without a class positional). ``boost``
+    left at the sentinel default leaves any existing boost untouched; pass an
+    explicit ``int`` to set it (requires ``until``, shared with the pool-level
+    class expiry — there is no separate boost-until field) or ``None`` to
+    clear it. ``plan``/``price_usd``/``capacity_weight`` are read-only from
+    this module's perspective — they are config.toml-only fields with no CLI
+    setter (operator-edited).
+    """
+    if pool_class is not None and until is None:
         raise ValueError("until(만료일)은 필수입니다")
+    if boost is not None and boost != "__unset__" and until is None:
+        raise ValueError("boost 설정에는 --until(만료일)이 필요합니다")
+
     config = load_config()
     pools = config.setdefault("pools", {})
-    entry: dict[str, object] = {"class": pool_class, "until": until.isoformat()}
-    if note is not None:
-        entry["note"] = note
+    entry: dict[str, object] = dict(pools.get(pool) or {})
+
+    if pool_class is not None:
+        entry["class"] = pool_class
+        entry["until"] = until.isoformat() if until else None
+        if note is not None:
+            entry["note"] = note
+
+    if boost != "__unset__":
+        if boost is None:
+            entry.pop("boost", None)
+        else:
+            entry["boost"] = boost
+            entry["until"] = until.isoformat() if until else None
+
     pools[pool] = entry
     _write_config(config)
 
@@ -173,6 +302,84 @@ def clear_policy(pool: str) -> bool:
         config.pop("pools", None)
     _write_config(config)
     return True
+
+
+def get_reset_urgency_hours() -> float:
+    """``[settings] reset_urgency_hours`` — back-compat default 12.0 when unset/invalid."""
+    config = load_config()
+    settings = config.get("settings")
+    if not isinstance(settings, dict):
+        return DEFAULT_RESET_URGENCY_HOURS
+    value = settings.get("reset_urgency_hours")
+    if value is None or isinstance(value, bool):
+        return DEFAULT_RESET_URGENCY_HOURS
+    try:
+        hours = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_RESET_URGENCY_HOURS
+    if hours <= 0:
+        return DEFAULT_RESET_URGENCY_HOURS
+    return hours
+
+
+class CapacityWeightError(ValueError):
+    """Raised by config-writers; readers use ``get_capacity_weight`` status instead."""
+
+
+def _positive_number(value: object, field: str, pool: str) -> float | None:
+    """None 반환 = 유효하지 않음(호출자가 폴백 여부를 status 로 판단)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    f = float(value)
+    if not _finite(f) or f <= 0:
+        return None
+    return f
+
+
+def _finite(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def get_capacity_weight(pool: str) -> tuple[float, str | None]:
+    """capacity_weight > price_usd/20 > 1.0.
+
+    기존 config 오류 관례(``get_policy``의 invalid class/until)와 동일하게,
+    잘못된·0 이하 값은 예외를 올리지 않고 1.0(builtin)으로 안전 폴백하며
+    status 문자열로 원인을 노출한다 — 가중치 오류가 조용히 순위만 바꾸지 않게 한다.
+    """
+    config = load_config()
+    pools = config.get("pools") or {}
+    entry = pools.get(pool)
+    if not isinstance(entry, dict):
+        return 1.0, None
+
+    if "capacity_weight" in entry and entry["capacity_weight"] is not None:
+        raw = entry["capacity_weight"]
+        value = _positive_number(raw, "capacity_weight", pool)
+        if value is None:
+            return 1.0, f"invalid capacity_weight {raw!r} (1.0 으로 폴백)"
+        return value, None
+
+    if "price_usd" in entry and entry["price_usd"] is not None:
+        raw = entry["price_usd"]
+        price = _positive_number(raw, "price_usd", pool)
+        if price is None:
+            return 1.0, f"invalid price_usd {raw!r} (1.0 으로 폴백)"
+        return price / 20.0, None
+
+    return 1.0, None
+
+
+def get_pool_plan(pool: str) -> str | None:
+    config = load_config()
+    pools = config.get("pools") or {}
+    entry = pools.get(pool)
+    if not isinstance(entry, dict):
+        return None
+    plan = entry.get("plan")
+    return str(plan) if isinstance(plan, str) else None
 
 
 def list_policies(
