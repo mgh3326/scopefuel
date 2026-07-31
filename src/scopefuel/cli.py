@@ -12,12 +12,17 @@ import json
 import sys
 import time
 
-from . import render
+from . import recommend, render
 from .cache import DEFAULT_TTL_S, collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
+from .policy import clear_policy, list_policies, set_policy
 from .providers import default_order, registry
 
 MARK_RANK = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
+
+
+def _date_arg(value: str) -> dt.date:
+    return dt.date.fromisoformat(value)
 
 
 def build_parser(available: list[str]) -> argparse.ArgumentParser:
@@ -35,6 +40,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     out.add_argument("--raw", action="store_true", help="provider 원본 응답")
     out.add_argument("--brief", action="store_true", help="한 줄 요약 (pane/statusline용)")
     parser.add_argument(
+        "--recommend",
+        choices=["S", "A", "B", "C"],
+        metavar="GRADE",
+        help="해당 급의 모델 사용 우선순위 추천",
+    )
+    parser.add_argument(
         "--horizon", choices=["now", "week", "both"], default="both", help="--brief 에 표시할 지평"
     )
     parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
@@ -50,6 +61,22 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--watch", type=float, metavar="SECONDS", help="주기적으로 다시 그린다 (herdr pane용)"
     )
     parser.add_argument("--list-providers", action="store_true", help="사용 가능한 provider 목록")
+
+    subparsers = parser.add_subparsers(dest="command")
+    policy_parser = subparsers.add_parser("policy", help="pool-level policy config")
+    policy_sub = policy_parser.add_subparsers(dest="policy_command", required=True)
+
+    policy_sub.add_parser("list", help="정책 목록 보기")
+
+    set_parser = policy_sub.add_parser("set", help="pool 정책 설정")
+    set_parser.add_argument("pool", choices=available, help="provider pool 이름")
+    set_parser.add_argument("pool_class", choices=["preserve", "spend"], metavar="class", help="정책 클래스")
+    set_parser.add_argument("--until", type=_date_arg, required=True, help="YYYY-MM-DD 형식 만료일")
+    set_parser.add_argument("--note", help="선택적 메모")
+
+    clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
+    clear_parser.add_argument("pool", choices=available, help="provider pool 이름")
+
     return parser
 
 
@@ -73,14 +100,53 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
     return render.table(results, color=color, now=now)
 
 
+def _policy_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
+    today = dt.datetime.now(dt.UTC).date()
+    known_classes = {name: getattr(fetcher, "pool_class", "preserve") for name, fetcher in fetchers.items()}
+
+    if args.policy_command == "list":
+        for name, effective, status in list_policies(known_classes, today=today):
+            status_s = f"  [{status}]" if status else ""
+            print(f"{name:<12} {effective:<9}{status_s}")
+        return 0
+
+    if args.policy_command == "set":
+        set_policy(args.pool, args.pool_class, until=args.until, note=args.note)
+        note_s = f" (until {args.until})" if args.until else ""
+        print(f"{args.pool} -> {args.pool_class}{note_s}")
+        return 0
+
+    if args.policy_command == "clear":
+        if clear_policy(args.pool):
+            print(f"{args.pool} policy cleared")
+            return 0
+        print(f"error: {args.pool} 에 설정된 정책이 없습니다", file=sys.stderr)
+        return 2
+
+    return 2
+
+
+def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
+    now = dt.datetime.now(dt.UTC)
+    results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    print(recommend.recommend(results, args.recommend, today=now.date()))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     fetchers = registry()
     args = build_parser(list(fetchers)).parse_args(argv)
+
+    if args.command == "policy":
+        return _policy_command(args, fetchers)
 
     if args.list_providers:
         for name in default_order(list(fetchers)):
             print(name)
         return 0
+
+    if args.recommend:
+        return _recommend_command(args, fetchers)
 
     names = [n.strip() for n in args.only.split(",") if n.strip()]
     if unknown := [n for n in names if n not in fetchers]:
