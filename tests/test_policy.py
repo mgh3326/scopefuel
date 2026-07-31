@@ -87,6 +87,18 @@ def test_set_and_clear_command_round_trip(policy_config, capsys, monkeypatch):
     assert policy.get_policy("claude", "preserve", today=TODAY)[0] == "preserve"
 
 
+def test_set_exclude_class_round_trip(policy_config, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    assert (
+        cli.main(["policy", "set", "claude", "exclude", "--until", "2026-08-31", "--note", "Pro 요금제"]) == 0
+    )
+    assert policy.get_policy("claude", "preserve", today=TODAY)[0] == "exclude"
+    out = capsys.readouterr().out
+    assert "claude -> exclude" in out
+    assert cli.main(["policy", "clear", "claude"]) == 0
+    assert policy.get_policy("claude", "preserve", today=TODAY)[0] == "preserve"
+
+
 def test_invalid_class_in_config_is_ignored(policy_config):
     policy_config.parent.mkdir(parents=True, exist_ok=True)
     policy_config.write_text('[pools.claude]\nclass = "gold"\nuntil = "2026-08-03"\n')

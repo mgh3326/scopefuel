@@ -22,7 +22,7 @@ SCHEMA = "scopefuel.v1"
 ScopeKind = Literal["account", "model", "group"]
 Horizon = Literal["now", "week", "month"]
 Mark = Literal["ok", "warn", "crit", "degraded"]
-PoolClass = Literal["preserve", "spend"]
+PoolClass = Literal["preserve", "spend", "exclude"]
 
 WARN_PCT = 75.0
 CRIT_PCT = 90.0
@@ -293,8 +293,8 @@ class ProviderResult:
 
 
 def _normalize_pool_class(value: object) -> PoolClass:
-    if value in ("preserve", "spend"):
-        return value
+    if value in ("preserve", "spend", "exclude"):
+        return value  # type: ignore[return-value]
     return "preserve"
 
 
