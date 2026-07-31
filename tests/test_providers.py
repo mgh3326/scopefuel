@@ -62,6 +62,29 @@ def test_agy_local_groups_weekly_and_5h(fixture_json, monkeypatch):
     assert result.verdict.basis == "group"
 
 
+def test_agy_local_quota_note_identifies_shared_antigravity_pool(fixture_json, monkeypatch):
+    monkeypatch.setattr(agy, "_fetch_local", lambda: fixture_json("agy_local"))
+
+    result = agy.fetch()
+
+    assert result.note == (
+        "Antigravity 계정 풀 — CLIProxy 경유 oc-gflash·oc-sonnet46·oc-oss도 같은 pool/group을 소모"
+    )
+
+
+def test_agy_local_quota_keeps_existing_group_values_and_verdict(fixture_json):
+    result = agy._from_local(fixture_json("agy_local"))
+
+    values = {(bucket.scope.name, bucket.window): bucket.used_pct for bucket in result.buckets}
+    assert values == {
+        ("gemini", "5h"): 0.2,
+        ("gemini", "7d"): 0.9,
+        ("3p", "5h"): 57.3,
+        ("3p", "7d"): 19.1,
+    }
+    assert result.verdict.groups == {"gemini": 0.9, "3p": 57.3}
+
+
 def test_agy_cloud_fallback_collapses_models_into_groups(fixture_json, monkeypatch):
     monkeypatch.setattr(agy, "_fetch_local", lambda: None)
     monkeypatch.setattr(agy, "_cloud_token", lambda: "token")
@@ -86,6 +109,18 @@ def test_agy_reports_error_when_both_paths_fail(monkeypatch):
     monkeypatch.setattr(agy, "_cloud_token", lambda: (_ for _ in ()).throw(RuntimeError("no token")))
     result = agy.fetch()
     assert result.error and "no token" in result.error
+
+
+def test_agy_absent_beacon_error_explains_oc_workers_may_consume_pool(monkeypatch):
+    monkeypatch.setattr(agy, "_fetch_local", lambda: None)
+    monkeypatch.setattr(agy, "_cloud_token", lambda: (_ for _ in ()).throw(RuntimeError("no token")))
+
+    result = agy.fetch()
+
+    assert result.error == (
+        "agy 세션이 실행 중이 아님 — CLIProxy 경유 oc-gflash·oc-sonnet46·oc-oss가 같은 "
+        "Antigravity pool/group을 소모 중일 수 있으나 quota beacon이 없어 읽지 못함 / cloud: no token"
+    )
 
 
 def test_kiro_parses_plan_credits(fixture_text):

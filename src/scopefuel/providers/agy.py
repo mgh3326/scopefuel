@@ -40,6 +40,11 @@ RPC_BODY = {
     }
 }
 GROUP_ALIASES = {"Gemini Models": "gemini", "Claude and GPT models": "3p"}
+POOL_NOTE = "Antigravity 계정 풀 — CLIProxy 경유 oc-gflash·oc-sonnet46·oc-oss도 같은 pool/group을 소모"
+BEACON_UNAVAILABLE = (
+    "agy 세션이 실행 중이 아님 — CLIProxy 경유 oc-gflash·oc-sonnet46·oc-oss가 같은 "
+    "Antigravity pool/group을 소모 중일 수 있으나 quota beacon이 없어 읽지 못함"
+)
 
 
 def fetch() -> ProviderResult:
@@ -48,7 +53,7 @@ def fetch() -> ProviderResult:
         raw = _fetch_local()
         if raw is not None:
             return _from_local(raw)
-        local_error = "agy 세션이 실행 중이 아님"
+        local_error = BEACON_UNAVAILABLE
     except Exception as exc:  # 로컬 실패는 치명적이지 않다 — 클라우드로 넘어간다
         local_error = f"local: {exc}"
 
@@ -130,7 +135,7 @@ def _from_local(raw: dict) -> ProviderResult:
                     horizon="now" if window == "5h" else "week",
                 )
             )
-    return ProviderResult(id="agy", buckets=buckets, source="local-server", raw=raw)
+    return ProviderResult(id="agy", buckets=buckets, note=POOL_NOTE, source="local-server", raw=raw)
 
 
 # ------------------------------------------------------------------ cloud
@@ -176,7 +181,7 @@ def _from_cloud(local_error: str | None) -> ProviderResult:
             return ProviderResult(
                 id="agy",
                 buckets=_cloud_buckets(raw),
-                note=f"cloud 경로 — 5h 창만 제공{f' ({local_error})' if local_error else ''}",
+                note=f"{POOL_NOTE}; cloud 경로 — 5h 창만 제공{f' ({local_error})' if local_error else ''}",
                 source="cloud",
                 raw=raw,
             )
