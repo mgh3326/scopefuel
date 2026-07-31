@@ -17,6 +17,7 @@ from .cache import DEFAULT_TTL_S, collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policies, set_policy
 from .providers import default_order, registry
+from .recommend import grade_help_text
 
 MARK_RANK = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
 
@@ -41,9 +42,9 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     out.add_argument("--brief", action="store_true", help="한 줄 요약 (pane/statusline용)")
     parser.add_argument(
         "--recommend",
-        choices=["S", "A", "B", "C"],
+        choices=["S+", "S", "A+", "A", "B", "C"],
         metavar="GRADE",
-        help="해당 급의 모델 사용 우선순위 추천",
+        help="해당 급의 모델 사용 우선순위 추천. " + grade_help_text(),
     )
     parser.add_argument(
         "--horizon", choices=["now", "week", "both"], default="both", help="--brief 에 표시할 지평"
