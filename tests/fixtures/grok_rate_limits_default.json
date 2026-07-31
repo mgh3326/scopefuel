@@ -1,9 +1,0 @@
-{
-  "windowSizeSeconds": 7200,
-  "remainingQueries": 75,
-  "waitTimeSeconds": 1800,
-  "totalQueries": 100,
-  "remainingTokens": null,
-  "totalTokens": null,
-  "preGenerationDelayMs": 0
-}
