@@ -1024,6 +1024,59 @@ def test_grok_billing_partial_product_usage_keeps_account_bucket(tmp_path, monke
     assert "duplicate product" in result.note
 
 
+def test_grok_billing_missing_product_usage_is_partial_data(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_request_billing",
+        lambda _token: (
+            200,
+            {
+                "config": {
+                    "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2099-08-06T19:58:08Z"},
+                    "creditUsagePercent": 8.0,
+                    "isUnifiedBillingUser": True,
+                    # productUsage key intentionally missing
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
+
+    result = grok.fetch()
+    assert result.error is None
+    assert result.warning is None
+    assert result.note and "productUsage" in result.note and "누락" in result.note
+    assert [b.label for b in result.buckets] == ["weekly"]
+    assert result.buckets[0].used_pct == 8.0
+
+
+def test_grok_billing_empty_product_usage_is_normal(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_request_billing",
+        lambda _token: (
+            200,
+            {
+                "config": {
+                    "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2099-08-06T19:58:08Z"},
+                    "creditUsagePercent": 8.0,
+                    "isUnifiedBillingUser": True,
+                    "productUsage": [],
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
+
+    result = grok.fetch()
+    assert result.error is None
+    assert result.warning is None
+    assert result.note is None
+    assert [b.label for b in result.buckets] == ["weekly"]
+
+
 def test_grok_billing_percent_anomalies_are_explicit_warnings(tmp_path, monkeypatch):
     _grok_auth(tmp_path, monkeypatch)
     monkeypatch.setattr(

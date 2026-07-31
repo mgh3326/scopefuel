@@ -192,7 +192,9 @@ def _from_billing(
     product_usage = config.get("productUsage")
     problems: list[str] = []
     seen_products: set[str] = set()
-    if isinstance(product_usage, list):
+    if "productUsage" not in config:
+        problems.append("productUsage 필드 누락")
+    elif isinstance(product_usage, list):
         for item in product_usage:
             if not isinstance(item, dict):
                 problems.append("productUsage 항목이 객체가 아님")
