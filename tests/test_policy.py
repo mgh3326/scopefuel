@@ -101,3 +101,34 @@ def test_missing_until_in_config_is_ignored(policy_config):
     effective, status = policy.get_policy("claude", "preserve", today=TODAY)
     assert effective == "preserve"
     assert "missing until" in status
+
+
+def test_write_config_missing_class_no_reuse_or_corruption(policy_config):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text(
+        '[pools.claude]\nclass = "preserve"\nuntil = "2026-08-03"\n'
+        '[pools.orphan]\nuntil = "2026-08-03"\nnote = "no class"\n'
+    )
+    config = policy.load_config()
+    # Must not raise and must keep both entries intact.
+    assert "claude" in config["pools"]
+    assert "orphan" in config["pools"]
+    assert config["pools"]["orphan"].get("class") is None
+
+
+def test_clear_orphan_configured_pool(policy_config, capsys, monkeypatch):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    policy_config.write_text('[pools.orphan]\nclass = "spend"\nuntil = "2026-08-03"\n')
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    assert cli.main(["policy", "clear", "orphan"]) == 0
+    out = capsys.readouterr().out
+    assert "orphan policy cleared" in out
+    assert "orphan" not in policy.load_config().get("pools", {})
+
+
+def test_clear_unknown_name_not_in_config_errors(policy_config, capsys, monkeypatch):
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    rc = cli.main(["policy", "clear", "not-a-pool"])
+    assert rc == 2
+    assert "not-a-pool" in capsys.readouterr().err

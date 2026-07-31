@@ -64,12 +64,12 @@ def _write_config(config: dict) -> None:
             if not isinstance(entry, dict):
                 continue
             lines.append(f"[pools.{name}]")
-            if "class" in entry:
-                pool_class = entry["class"]
-            if pool_class in ("preserve", "spend"):
-                lines.append(f'class = "{pool_class}"')
-            else:
-                lines.append(f"class = {_toml_string(str(pool_class))}")
+            raw_class = entry.get("class")
+            if raw_class is not None:
+                if raw_class in ("preserve", "spend"):
+                    lines.append(f'class = "{raw_class}"')
+                else:
+                    lines.append(f"class = {_toml_string(str(raw_class))}")
             if "until" in entry and entry["until"]:
                 lines.append(f"until = {entry['until']}")
 

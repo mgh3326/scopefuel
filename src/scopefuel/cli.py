@@ -75,7 +75,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     set_parser.add_argument("--note", help="선택적 메모")
 
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
-    clear_parser.add_argument("pool", choices=available, help="provider pool 이름")
+    clear_parser.add_argument("pool", help="provider pool 이름")
 
     return parser
 
