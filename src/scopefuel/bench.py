@@ -94,6 +94,8 @@ _REP_COLUMNS = (
     "rounds",
     "blockers_found",
     "completed",
+    "input_tokens",
+    "output_tokens",
     "notes",
     "recorded_at",
 )
@@ -129,6 +131,8 @@ class RepRecord:
     rounds: int | None
     blockers_found: int | None
     completed: int | None
+    input_tokens: int | None
+    output_tokens: int | None
     notes: str | None
     recorded_at: str
 
@@ -173,11 +177,17 @@ def _schema(conn: sqlite3.Connection) -> None:
           rounds         INTEGER,
           blockers_found INTEGER,
           completed      INTEGER,
+          input_tokens   INTEGER,
+          output_tokens  INTEGER,
           notes          TEXT,
           recorded_at    TEXT NOT NULL
         );
         """
     )
+    existing_rep_columns = {row[1] for row in conn.execute("PRAGMA table_info(reps)").fetchall()}
+    for column in ("input_tokens", "output_tokens"):
+        if column not in existing_rep_columns:
+            conn.execute(f"ALTER TABLE reps ADD COLUMN {column} INTEGER")
 
 
 def connect(path: pathlib.Path | str | None = None) -> sqlite3.Connection:
@@ -386,7 +396,14 @@ def _seed_scores() -> list[ModelScore]:
     unique: dict[tuple[object, ...], ModelScore] = {}
     for profiles in GRADE_TABLE.values():
         for profile in profiles:
-            if profile.benchmark is None:
+            # AA-model values and estimates are display references. They are
+            # shown from the local bench DB when present, but are not seeded
+            # into a new DB as agent measurements.
+            if (
+                profile.benchmark is None
+                or profile.benchmark_source == "AA-model"
+                or (profile.benchmark_source is None and profile.benchmark_annotation)
+            ):
                 continue
             if (
                 profile.benchmark_source is None
@@ -894,6 +911,8 @@ def add_rep(
     rounds: int,
     blockers_found: int,
     completed: int,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
     notes: str | None = None,
     recorded_at: str | None = None,
     path: pathlib.Path | str | None = None,
@@ -912,6 +931,9 @@ def add_rep(
             raise BenchError(f"{field} must be a non-negative integer")
     if isinstance(completed, bool) or completed not in (0, 1):
         raise BenchError("completed must be 0 or 1")
+    for value, field in ((input_tokens, "input_tokens"), (output_tokens, "output_tokens")):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise BenchError(f"{field} must be a non-negative integer")
     notes = _optional_text(notes, "notes")
     recorded_at = _captured_at(recorded_at or _utc_now())
 
@@ -919,16 +941,29 @@ def add_rep(
     try:
         cursor = conn.execute(
             "INSERT INTO reps "
-            "(profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, notes, "
-            "recorded_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, notes, recorded_at),
+            "(profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
+            "input_tokens, output_tokens, notes, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                profile,
+                model_id,
+                task_ref,
+                tier,
+                role,
+                rounds,
+                blockers_found,
+                completed,
+                input_tokens,
+                output_tokens,
+                notes,
+                recorded_at,
+            ),
         )
         conn.commit()
         rep_id = int(cursor.lastrowid)
         row = conn.execute(
-            "SELECT id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, notes, "
-            "recorded_at "
+            "SELECT id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
+            "input_tokens, output_tokens, notes, recorded_at "
             "FROM reps WHERE id = ?",
             (rep_id,),
         ).fetchone()
@@ -947,13 +982,18 @@ def read_reps(*, path: pathlib.Path | str | None = None, limit: int | None = Non
     target = pathlib.Path(path) if path is not None else db_path()
     if str(target) != ":memory:" and not target.expanduser().exists():
         return []
-    conn = connect(target)
+    conn = connect(target) if str(target) == ":memory:" else _readonly_connect(target)
     try:
-        query = (
-            "SELECT id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, notes, "
-            "recorded_at "
-            "FROM reps ORDER BY id DESC"
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reps'"
+        ).fetchone()
+        if table_exists is None:
+            return []
+        available_columns = {row[1] for row in conn.execute("PRAGMA table_info(reps)").fetchall()}
+        select_columns = ", ".join(
+            column if column in available_columns else f"NULL AS {column}" for column in _REP_COLUMNS
         )
+        query = f"SELECT {select_columns} FROM reps ORDER BY id DESC"
         params: tuple[object, ...] = ()
         if limit is not None:
             query += " LIMIT ?"
@@ -977,6 +1017,10 @@ def format_rep(rep: RepRecord) -> str:
         f"completed={rep.completed if rep.completed is not None else '-'}",
         f"recorded_at={rep.recorded_at}",
     ]
+    if rep.input_tokens is not None:
+        fields.append(f"input-tokens={rep.input_tokens}")
+    if rep.output_tokens is not None:
+        fields.append(f"output-tokens={rep.output_tokens}")
     if rep.notes:
         fields.append(f"notes={rep.notes}")
     return " ".join(fields)

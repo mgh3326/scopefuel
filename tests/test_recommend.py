@@ -9,9 +9,15 @@ import pytest
 from scopefuel import cli, policy
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
+    CODEX_SOL_XHIGH_ESCALATION_REASON,
+    ESTIMATED_ANNOTATION,
+    GRADE_BOUNDARIES,
     GRADE_DISCRIM,
     GRADE_TABLE,
+    HAIKU_ESTIMATE_ANNOTATION,
+    OPUS_MAX_ESCALATION_REASON,
     PRESERVE_EXCLUDE_PCT,
+    PROFILE_ALIASES,
     SPEND_EXCLUDE_PCT,
     grade_help_text,
     profile_pool,
@@ -91,6 +97,7 @@ def test_profile_pool_matches_quota_guard():
     assert profile_pool("kiro-sol") == ("kiro", None)
     assert profile_pool("kiro-haiku") == ("kiro", None)
     assert profile_pool("oc-omni") == ("omniroute", None)
+    assert profile_pool("haiku") == ("claude", None)
 
 
 # ------------------------------------------------------------------ sort/ranking
@@ -108,7 +115,7 @@ def test_recommend_s_spend_sorts_by_remaining():
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert lines[0].startswith("1. grok-hi")
     assert "Grok" in lines[0]
-    assert any(line.startswith("2. oc-kimi-k3") for line in lines)
+    assert any("oc-kimi-k3" in line for line in lines)
 
 
 def test_recommend_preserves_spend_before_preserve():
@@ -148,7 +155,8 @@ def test_recommend_excludes_unmeasurable_provider():
 
 def test_grade_table_has_expected_a_profiles():
     names = [p.name for p in GRADE_TABLE["A"]]
-    assert names == ["oc-gflash", "oc-kimi-code", "oc-sonnet46"]
+    assert {"oc-gflash", "oc-kimi-code", "oc-sonnet46"}.issubset(names)
+    assert {"codex-sol", "codex-luna", "codex-terra"}.issubset(names)
 
 
 # ------------------------------------------------------------------ ROB-1182
@@ -164,9 +172,9 @@ def test_exclude_policy_removes_claude_from_sp_candidates():
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     lines = out.splitlines()
     ranked = [line for line in lines if line[:1].isdigit()]
-    # kiro-opus/kiro-sol spend, codex-max preserve → kiro first
+    # kiro-opus/kiro-sol spend, codex-sol preserve → kiro first
     assert any("kiro-opus" in line for line in ranked)
-    assert any("codex-max" in line for line in ranked)
+    assert any("codex-sol" in line for line in ranked)
     # opus is default gate but policy-excluded (ROB-1191: folded per pool)
     assert any(line.startswith("✗ claude 풀 제외") and "opus" in line for line in lines)
     assert "until 2026-08-31" in out
@@ -200,7 +208,7 @@ def test_preserve_cutoff_90():
     ]
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
-    assert any("codex-max" in line and "소진" in line for line in out.splitlines())
+    assert any("codex-sol" in line and "소진" in line for line in out.splitlines())
 
 
 def test_spend_cutoff_95_is_candidate_99_is_excluded():
@@ -268,7 +276,9 @@ def test_multiple_urgent_sorted_by_remaining():
     out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "🔥" in lines[0] and "oc-glm" in lines[0]
-    assert "🔥" in lines[1] and "kiro-sonnet" in lines[1]
+    assert "🔥" in lines[1] and "oc-minimax-m3" in lines[1]
+    kiro_line = next(line for line in lines if "kiro-sonnet" in line)
+    assert "🔥" in kiro_line
 
 
 def test_all_policy_excluded_shows_emergency_block():
@@ -283,7 +293,7 @@ def test_all_policy_excluded_shows_emergency_block():
     assert "✗ 정책 가용 후보 없음" in out
     assert "⚠ 비상 후보 (정책상 제외 — 사용 시 근거를 이슈에 기록할 것)" in out
     assert "pool=claude" in out and "until=2026-08-31" in out
-    assert "opus" in out and "fable" in out and "codex-max" in out
+    assert "opus" in out and "fable" in out and "codex-sol" in out
     # no ranked normal candidates
     assert not any(line[:1].isdigit() for line in out.splitlines())
 
@@ -308,7 +318,7 @@ def test_no_config_backcompat_sort_and_output():
 
 
 def test_ac1_sp_recommend_with_claude_exclude():
-    """AC1: --recommend S+ shows kiro-opus/codex-max as normal, fable in escalation+reason+exclude."""
+    """AC1: --recommend S+ shows kiro-opus/codex-sol as normal, fable in escalation+reason+exclude."""
     policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
@@ -322,14 +332,14 @@ def test_ac1_sp_recommend_with_claude_exclude():
     assert lines[0].startswith("S+ |")
 
     ranked = [line for line in lines if line[:1].isdigit()]
-    # kiro-opus and codex-max are normal candidates
+    # kiro-opus and codex-sol are normal candidates
     assert any("kiro-opus" in line for line in ranked)
-    assert any("codex-max" in line for line in ranked)
+    assert any("codex-sol" in line for line in ranked)
 
-    # codex Sol recommendation row is exactly 1 (codex-max only, no codex-ultra)
-    codex_sol_lines = [line for line in ranked if "codex-max" in line or "codex-ultra" in line]
+    # codex Sol recommendation row is exactly 1 (canonical codex-sol only, no ultra)
+    codex_sol_lines = [line for line in ranked if "codex-sol" in line or "codex-ultra" in line]
     assert len(codex_sol_lines) == 1
-    assert "codex-max" in codex_sol_lines[0]
+    assert "codex-sol" in codex_sol_lines[0]
     assert "codex-ultra" not in out
 
     # kiro-sol is also a normal candidate (different pool fallback)
@@ -364,19 +374,19 @@ def test_ac1_sp_recommend_with_claude_exclude():
 
 
 def test_ac2_s_grade_profiles():
-    """AC2: S grade has exactly codex-terra-max, oc-kimi-k3, grok-hi."""
+    """AC2: S keeps the original profiles and adds unmeasured Grok effort variants."""
     names = [p.name for p in GRADE_TABLE["S"]]
-    assert names == ["codex-terra-max", "oc-kimi-k3", "grok-hi"]
+    assert {"codex-terra-max", "oc-kimi-k3", "grok-hi", "grok"}.issubset(names)
 
 
 # ------------------------------------------------------------------ AC3: A+/A/C
 
 
 def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
-    """AC3: A+ has exactly 4 profiles, A includes oc-sonnet46, C does not."""
+    """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
-    assert aplus_names == ["kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"]
-    assert len(aplus_names) == 4
+    assert {"kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"}.issubset(aplus_names)
+    assert {"codex-terra", "codex-luna", "opus", "oc-minimax-m3"}.issubset(aplus_names)
 
     a_names = [p.name for p in GRADE_TABLE["A"]]
     assert "oc-sonnet46" in a_names
@@ -385,13 +395,153 @@ def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
     assert "oc-sonnet46" not in c_names
 
 
-def test_codex_max_gate_reason_is_operator_exact_string():
-    codex_max = next(profile for profile in GRADE_TABLE["S+"] if profile.name == "codex-max")
-    assert codex_max.gate_reason == (
-        "지연 최적화 모드로 추정(미검증) — 품질 게이트와 무관. "
-        "서브에이전트 병렬로 토큰 소모가 늘 수 있음. "
-        "orch 장기 오케스트레이션 전용, reps 로 검증 예정"
-    )
+def test_rob1193_splus_default_and_escalation_efforts_have_exact_reasons():
+    defaults = [p for p in GRADE_TABLE["S+"] if p.gate == "default"]
+    escalations = [p for p in GRADE_TABLE["S+"] if p.gate == "escalation"]
+    opus_default = next(p for p in defaults if p.name == "opus")
+    sol_default = next(p for p in defaults if p.name == "codex-sol")
+    opus_escalation = next(p for p in escalations if p.name == "opus")
+    sol_escalation = next(p for p in escalations if p.name == "codex-sol")
+    assert opus_default.launcher_effort == "xhigh"
+    assert sol_default.launcher_effort == "max"
+    assert opus_escalation.launcher_effort == "max"
+    assert opus_escalation.gate_reason == OPUS_MAX_ESCALATION_REASON
+    assert sol_escalation.launcher_effort == "xhigh"
+    assert sol_escalation.gate_reason == CODEX_SOL_XHIGH_ESCALATION_REASON
+
+
+def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
+    assert GRADE_BOUNDARIES == {"S+": 65, "S": 61, "A+": 55, "A": 48, "B": 40}
+    assert "S+≥65" in grade_help_text()
+    assert "S≥61" in grade_help_text()
+    assert "A+≥55" in grade_help_text()
+    assert "A≥48" in grade_help_text()
+    assert "B≥40" in grade_help_text()
+    assert "C<40" in grade_help_text()
+    assert PROFILE_ALIASES == {"codex-max": "codex-sol"}
+
+    s_profiles = GRADE_TABLE["S"]
+    for effort in ("medium", "low"):
+        profile = next(p for p in s_profiles if p.name == "grok" and p.launcher_effort == effort)
+        assert profile.benchmark_annotation == "미측정"
+
+    aplus_profiles = GRADE_TABLE["A+"]
+    qwen = next(p for p in GRADE_TABLE["S+"] if p.name == "oc-qwen37-max")
+    minimax = next(p for p in aplus_profiles if p.name == "oc-minimax-m3")
+    assert qwen.benchmark_source == minimax.benchmark_source == "AA-model"
+    assert qwen.benchmark == 66.0
+    assert minimax.benchmark == 58.6
+    assert qwen.benchmark_annotation == minimax.benchmark_annotation == "모델지수만 있음(에이전트 미측정)"
+
+    providers = [
+        _result("claude", 10.0, pool_class="preserve"),
+        _result("codex", 10.0, pool_class="preserve"),
+        _result("clinepass", 10.0, window="30d"),
+    ]
+    for grade in ("A", "B", "C"):
+        ranked = [
+            line
+            for line in recommend(providers, grade, today=TODAY, now=NOW).splitlines()
+            if line[:1].isdigit()
+        ]
+        assert ranked, grade
+    c_output = recommend(providers, "C", today=TODAY, now=NOW)
+    assert "haiku --effort low" in c_output
+    assert "codex-luna --effort low" in c_output
+
+
+def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
+    providers = [
+        _result("claude", 10.0, pool_class="preserve"),
+        _result("codex", 10.0, pool_class="preserve"),
+        _result("clinepass", 10.0, window="30d"),
+    ]
+
+    s_output = recommend(providers, "S", today=TODAY, now=NOW)
+    assert "opus --effort high" in s_output
+    assert "opus --effort medium" in s_output
+
+    aplus_output = recommend(providers, "A+", today=TODAY, now=NOW)
+    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in aplus_output.splitlines())
+    assert "sonnet --effort xhigh" in aplus_output
+    assert "opus --effort low" in aplus_output
+    assert "벤치 55.0(추정)" in aplus_output
+    assert not any(line[:1].isdigit() and "opus --effort low" in line for line in aplus_output.splitlines())
+
+    a_output = recommend(providers, "A", today=TODAY, now=NOW)
+    assert any(line[:1].isdigit() and "codex-luna --effort high" in line for line in a_output.splitlines())
+    assert "codex-sol --effort low" in a_output
+    assert "비용효율" in a_output
+    assert not any(line[:1].isdigit() and "codex-sol --effort low" in line for line in a_output.splitlines())
+
+    b_output = recommend(providers, "B", today=TODAY, now=NOW)
+    assert "haiku --effort low" in b_output
+    assert f"벤치 35.0({ESTIMATED_ANNOTATION})" in b_output
+
+    c_output = recommend(providers, "C", today=TODAY, now=NOW)
+    assert f"벤치 35.0({HAIKU_ESTIMATE_ANNOTATION})" in c_output
+    assert "codex-luna --effort low" in c_output
+    assert "미측정" in c_output
+
+    all_profiles = {profile.name for profiles in GRADE_TABLE.values() for profile in profiles}
+    assert "gpt-5.4-mini" not in all_profiles
+
+
+def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
+    from scopefuel.bench import ModelScore
+
+    scores = [
+        ModelScore(
+            model_id="qwen3-7-max",
+            effort=None,
+            harness=None,
+            source="AA-model",
+            metric="intelligence",
+            score=46.0,
+            rank=2,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="qwen3-7-max",
+            effort=None,
+            harness=None,
+            source="AA-model",
+            metric="coding_index",
+            score=66.0,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="minimax-m3",
+            effort=None,
+            harness=None,
+            source="AA-model",
+            metric="intelligence",
+            score=44.4,
+            rank=2,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="minimax-m3",
+            effort=None,
+            harness=None,
+            source="AA-model",
+            metric="coding_index",
+            score=58.6,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+    ]
+    providers = [_result("clinepass", 10.0, window="30d")]
+    splus = recommend(providers, "S+", today=TODAY, now=NOW, bench_scores=scores)
+    aplus = recommend(providers, "A+", today=TODAY, now=NOW, bench_scores=scores)
+    qwen_line = next(line for line in splus.splitlines() if "oc-qwen37-max" in line and line[:1].isdigit())
+    minimax_line = next(line for line in aplus.splitlines() if "oc-minimax-m3" in line and line[:1].isdigit())
+    assert "66.0(AA-model/unspecified)" in qwen_line
+    assert "58.6(AA-model/unspecified)" in minimax_line
+    assert "모델지수만 있음(에이전트 미측정)" in qwen_line
+    assert "모델지수만 있음(에이전트 미측정)" in minimax_line
+    assert "46.0" not in qwen_line and "44.4" not in minimax_line
 
 
 # ------------------------------------------------------------------ AC4: C grade
@@ -514,7 +664,7 @@ def test_ac7_no_config_no_regression():
     ]
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     # 89% < 90% preserve cutoff → included
-    assert any(line[:1].isdigit() and "codex-max" in line for line in out.splitlines())
+    assert any(line[:1].isdigit() and "codex-sol" in line for line in out.splitlines())
     # no policy exclude, no emergency
     assert "정책 제외" not in out
     assert "비상 후보" not in out
@@ -527,8 +677,8 @@ def test_ac7_preserve_cutoff_at_90_excludes():
         _result("codex", 90.0, pool_class="preserve"),
     ]
     out = recommend(providers, "S+", today=TODAY, now=NOW)
-    assert any("codex-max" in line and "소진" in line for line in out.splitlines())
-    assert not any(line[:1].isdigit() and "codex-max" in line for line in out.splitlines())
+    assert any("codex-sol" in line and "소진" in line for line in out.splitlines())
+    assert not any(line[:1].isdigit() and "codex-sol" in line for line in out.splitlines())
 
 
 # ------------------------------------------------------------------ gate/escalation
@@ -635,7 +785,7 @@ def test_gate_does_not_promote_normal_candidates():
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     # Normal candidates are present (gate didn't remove them)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert len(ranked) >= 3  # kiro-opus, kiro-sol, codex-max, opus
+    assert len(ranked) >= 3  # kiro-opus, kiro-sol, codex-sol, opus
     # Escalation section is separate
     assert "⚠ 승급 후보" in out
 
@@ -822,7 +972,7 @@ def test_capacity_weight_price_usd_shifts_rank_but_not_cutoff():
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     # 둘 다 89% < 90% cutoff 이므로 포함됨 (raw cutoff 불변 확인)
     assert any("opus" in line for line in ranked)
-    assert any("codex-max" in line for line in ranked)
+    assert any("codex-sol" in line for line in ranked)
     # weight=10 인 claude(opus) 의 실효잔여(11*10=110)가 codex(11*1=11) 보다 커서 opus 가 먼저.
     assert ranked[0].split()[1] == "opus"
 
@@ -989,7 +1139,7 @@ def test_rob1191_any_window_over_cutoff_excludes_candidate():
     assert any("claude 풀 소진" in line and "opus" in line and "95%" in line for line in out.splitlines())
     # negative: must not keep opus as a ranked candidate via the lower 7d window
     assert not any(line[:1].isdigit() and "opus" in line and "46%" in line for line in out.splitlines())
-    assert any(line[:1].isdigit() and "codex-max" in line for line in ranked)
+    assert any(line[:1].isdigit() and "codex-sol" in line for line in ranked)
 
 
 def test_rob1191_recommend_shows_all_windows_and_constraint():
@@ -1111,7 +1261,7 @@ def test_rob1191_excluded_kiro_pool_folds_and_hide_excluded():
 
 
 def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
-    """AC7: codex-max → max 1점; opus → xhigh 1점; multi-effort unknown → 미지정 (no best-pick)."""
+    """AC7: codex-sol → max 1점; opus → xhigh 1점; multi-effort unknown → 미지정 (no best-pick)."""
     from scopefuel.bench import ModelScore
 
     scores = [
@@ -1200,7 +1350,7 @@ def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
         bench_scores=scores,
     )
 
-    codex_line = next(line for line in sp.splitlines() if "codex-max" in line and line[:1].isdigit())
+    codex_line = next(line for line in sp.splitlines() if "codex-sol" in line and line[:1].isdigit())
     opus_line = next(line for line in sp.splitlines() if line[:1].isdigit() and "opus" in line.split())
     kimi_line = next(line for line in s.splitlines() if "oc-kimi-k3" in line and line[:1].isdigit())
 

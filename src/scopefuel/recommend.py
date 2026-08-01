@@ -33,6 +33,11 @@ from .policy import (
 Grade = Literal["S+", "S", "A+", "A", "B", "C"]
 Gate = Literal["default", "escalation"]
 
+# AA-agent 지수(33~67)의 새 급 경계: S+ / S / A+ / A / B / C.
+GRADE_BOUNDARIES: dict[Grade, int] = {"S+": 65, "S": 61, "A+": 55, "A": 48, "B": 40}
+# 상위 경계(65·61·55)는 임의값 — 해당 구간 12개가 1점 간격이라 자연 절단점이 없음.
+# 하위(48·40)만 최대 간격과 일치.
+
 # spend 풀: 이 사용률 미만이면 후보. preserve 는 90.
 PRESERVE_EXCLUDE_PCT = 90.0
 SPEND_EXCLUDE_PCT = 99.0
@@ -113,7 +118,10 @@ GRADE_DISCRIM: dict[Grade, GradeInfo] = {
 
 
 def grade_help_text() -> str:
-    lines = ["판별표:"]
+    boundary_text = (
+        " · ".join(f"{grade}≥{minimum}" for grade, minimum in GRADE_BOUNDARIES.items()) + " · C<40"
+    )
+    lines = [f"AA-agent 경계: {boundary_text}", "판별표:"]
     for g in ("S+", "S", "A+", "A", "B", "C"):
         info = GRADE_DISCRIM[g]
         lines.append(f"  {g:<3} {info.task_class}  |  {info.decision_question}")
@@ -127,6 +135,8 @@ class Profile:
     benchmark: float | None
     gate: Gate = "default"
     gate_reason: str | None = None
+    launcher_effort: str | None = None
+    benchmark_annotation: str | None = None
     benchmark_source: str | None = None
     benchmark_metric: str | None = None
     benchmark_harness: str | None = None
@@ -146,6 +156,13 @@ _HARNESS_LABELS = {
     "opencode": "OpenCode",
 }
 
+OPUS_MAX_ESCALATION_REASON = "더 깊은 탐색이 필요하거나 xhigh 실패 후 재시도할 때"
+CODEX_SOL_XHIGH_ESCALATION_REASON = "쿼타 절약·속도 우선"
+UNMEASURED_ANNOTATION = "미측정"
+ESTIMATED_ANNOTATION = "추정"
+HAIKU_ESTIMATE_ANNOTATION = "추정 · 미측정"
+MODEL_ONLY_ANNOTATION = "모델지수만 있음(에이전트 미측정)"
+
 
 def _profile_actual_harness(profile: Profile) -> str | None:
     """Return the execution harness known from the profile route."""
@@ -154,7 +171,7 @@ def _profile_actual_harness(profile: Profile) -> str | None:
         return "opencode"
     if profile.name.startswith("codex-"):
         return "codex"
-    if profile.name in {"opus", "sonnet", "fable"}:
+    if profile.name in {"opus", "sonnet", "fable", "haiku"}:
         return "claude-code"
     if profile.name.startswith("grok"):
         return "grok-build"
@@ -187,6 +204,16 @@ def _aa_agent_benchmark(
     }
 
 
+def _aa_model_benchmark(score: float, model_id: str, metric: str = "coding_index") -> dict[str, object]:
+    return {
+        "benchmark_source": "AA-model",
+        "benchmark_metric": metric,
+        "benchmark_harness": None,
+        "benchmark_effort": None,
+        "benchmark_model_id": model_id,
+    }
+
+
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
@@ -206,26 +233,52 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_model_id="gpt-5-6-sol",
         ),
         Profile(
-            "codex-max",
+            "codex-sol",
             "GPT-5.6 Sol (max)",
             67.0,
-            gate_reason=(
-                "지연 최적화 모드로 추정(미검증) — 품질 게이트와 무관. "
-                "서브에이전트 병렬로 토큰 소모가 늘 수 있음. "
-                "orch 장기 오케스트레이션 전용, reps 로 검증 예정"
-            ),
             **_aa_agent_benchmark(67.0, "gpt-5.6-sol", "max"),
+            launcher_effort="max",
             aa_agent_model_id="gpt-5.6-sol",
             aa_model_id="gpt-5-6-sol",
         ),
         Profile(
             "opus",
-            "Opus 5",
-            60.7,
-            # Operator intent: advertised/default effort is xhigh (wrk + AA-agent).
-            **{**_openrouter_benchmark(60.7, "opus-5"), "benchmark_effort": "xhigh"},
+            "Opus 5 (xhigh)",
+            67.0,
+            **_aa_agent_benchmark(67.0, "claude-opus-5", "xhigh", harness="claude-code"),
+            launcher_effort="xhigh",
             aa_agent_model_id="claude-opus-5",
             aa_model_id="claude-opus-5",
+        ),
+        Profile(
+            "opus",
+            "Opus 5 (max)",
+            66.0,
+            gate="escalation",
+            gate_reason=OPUS_MAX_ESCALATION_REASON,
+            **_aa_agent_benchmark(66.0, "claude-opus-5", "max", harness="claude-code"),
+            launcher_effort="max",
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
+        Profile(
+            "codex-sol",
+            "GPT-5.6 Sol (xhigh)",
+            65.0,
+            gate="escalation",
+            gate_reason=CODEX_SOL_XHIGH_ESCALATION_REASON,
+            **_aa_agent_benchmark(65.0, "gpt-5.6-sol", "xhigh"),
+            launcher_effort="xhigh",
+            aa_agent_model_id="gpt-5.6-sol",
+            aa_model_id="gpt-5-6-sol",
+        ),
+        Profile(
+            "oc-qwen37-max",
+            "qwen3.7-max",
+            66.0,
+            **_aa_model_benchmark(66.0, "qwen3-7-max"),
+            benchmark_annotation=MODEL_ONLY_ANNOTATION,
+            aa_model_id="qwen3-7-max",
         ),
         Profile(
             "fable",
@@ -242,6 +295,24 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
     ],
     "S": [
+        Profile(
+            "opus",
+            "Opus 5 (high)",
+            63.0,
+            **_aa_agent_benchmark(63.0, "claude-opus-5", "high", harness="claude-code"),
+            launcher_effort="high",
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
+        Profile(
+            "opus",
+            "Opus 5 (medium)",
+            62.0,
+            **_aa_agent_benchmark(62.0, "claude-opus-5", "medium", harness="claude-code"),
+            launcher_effort="medium",
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
         Profile(
             "codex-terra-max",
             "Terra (max)",
@@ -261,10 +332,28 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile(
             "grok-hi",
             "Grok 4.5",
-            53.8,
-            **_openrouter_benchmark(53.8, "grok-4.5"),
+            64.0,
+            **_aa_agent_benchmark(64.0, "grok-4.5", "high", harness="grok-build"),
             aa_agent_model_id="grok-4.5",
             aa_model_id="grok-4-5",
+        ),
+        Profile(
+            "grok",
+            "Grok 4.5 (medium)",
+            None,
+            launcher_effort="medium",
+            benchmark_effort="medium",
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+            aa_agent_model_id="grok-4.5",
+        ),
+        Profile(
+            "grok",
+            "Grok 4.5 (low)",
+            None,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+            aa_agent_model_id="grok-4.5",
         ),
     ],
     "A+": [
@@ -284,6 +373,62 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_model_id="gpt-5-6-luna",
         ),
         Profile(
+            "codex-terra",
+            "Terra (xhigh)",
+            57.0,
+            **_aa_agent_benchmark(57.0, "gpt-5.6-terra", "xhigh"),
+            launcher_effort="xhigh",
+            aa_agent_model_id="gpt-5.6-terra",
+            aa_model_id="gpt-5-6-terra",
+        ),
+        Profile(
+            "opus",
+            "Opus 5 (low)",
+            57.0,
+            gate="escalation",
+            gate_reason="비용효율 — Sonnet high(추정) 우선; 쿼타 여유 시",
+            **_aa_agent_benchmark(57.0, "claude-opus-5", "low", harness="claude-code"),
+            launcher_effort="low",
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
+        Profile(
+            "sonnet",
+            "Sonnet 5 (high)",
+            55.0,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=ESTIMATED_ANNOTATION,
+        ),
+        Profile(
+            "sonnet",
+            "Sonnet 5 (xhigh)",
+            58.0,
+            gate="escalation",
+            gate_reason="쿼타 여유 시",
+            launcher_effort="xhigh",
+            benchmark_effort="xhigh",
+            benchmark_annotation=ESTIMATED_ANNOTATION,
+        ),
+        Profile(
+            "codex-terra",
+            "Terra (high)",
+            56.0,
+            **_aa_agent_benchmark(56.0, "gpt-5.6-terra", "high"),
+            launcher_effort="high",
+            aa_agent_model_id="gpt-5.6-terra",
+            aa_model_id="gpt-5-6-terra",
+        ),
+        Profile(
+            "codex-luna",
+            "Luna (xhigh)",
+            55.0,
+            **_aa_agent_benchmark(55.0, "gpt-5.6-luna", "xhigh"),
+            launcher_effort="xhigh",
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
+        ),
+        Profile(
             "oc-glm",
             "GLM-5.2",
             51.1,
@@ -292,18 +437,60 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_model_id="glm-5-2",
         ),
         Profile(
-            "sonnet",
-            "Sonnet 5",
-            53.4,
-            # Align with wrk DEFAULT_EFFORT=high and ~/.claude/settings.json effortLevel.
-            **{
-                **_openrouter_benchmark(53.4, "sonnet-5"),
-                "benchmark_effort": "high",
-            },
-            aa_model_id="claude-sonnet-5",
+            "oc-minimax-m3",
+            "minimax-m3",
+            58.6,
+            **_aa_model_benchmark(58.6, "minimax-m3"),
+            benchmark_annotation=MODEL_ONLY_ANNOTATION,
+            aa_model_id="minimax-m3",
         ),
     ],
     "A": [
+        Profile(
+            "codex-sol",
+            "Sol (low)",
+            54.0,
+            gate="escalation",
+            gate_reason="비용효율 — Luna high(51)은 Sol low(54)와 3점 차이 이내이며 25배 저렴",
+            **_aa_agent_benchmark(54.0, "gpt-5.6-sol", "low"),
+            launcher_effort="low",
+            aa_agent_model_id="gpt-5.6-sol",
+            aa_model_id="gpt-5-6-sol",
+        ),
+        Profile(
+            "codex-luna",
+            "Luna (high)",
+            51.0,
+            **_aa_agent_benchmark(51.0, "gpt-5.6-luna", "high"),
+            launcher_effort="high",
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
+        ),
+        Profile(
+            "codex-terra",
+            "Terra (medium)",
+            48.0,
+            **_aa_agent_benchmark(48.0, "gpt-5.6-terra", "medium"),
+            launcher_effort="medium",
+            aa_agent_model_id="gpt-5.6-terra",
+            aa_model_id="gpt-5-6-terra",
+        ),
+        Profile(
+            "sonnet",
+            "Sonnet 5 (medium)",
+            52.0,
+            launcher_effort="medium",
+            benchmark_effort="medium",
+            benchmark_annotation=ESTIMATED_ANNOTATION,
+        ),
+        Profile(
+            "sonnet",
+            "Sonnet 5 (low)",
+            48.0,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=ESTIMATED_ANNOTATION,
+        ),
         Profile(
             "oc-gflash",
             "Gemini 3.6 Flash",
@@ -322,10 +509,49 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
     ],
     "B": [
-        Profile("kiro-haiku", "Haiku 4.5", None, aa_model_id="claude-4-5-haiku"),
+        Profile(
+            "haiku",
+            "Claude Haiku 4.5",
+            35.0,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=ESTIMATED_ANNOTATION,
+        ),
+        Profile(
+            "codex-luna",
+            "Luna (medium)",
+            42.0,
+            **_aa_agent_benchmark(42.0, "gpt-5.6-luna", "medium"),
+            launcher_effort="medium",
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
+        ),
+        Profile(
+            "kiro-haiku",
+            "Haiku 4.5",
+            35.0,
+            benchmark_annotation=ESTIMATED_ANNOTATION,
+        ),
         Profile("oc-dsflash", "DeepSeek V4 Flash", None, aa_model_id="deepseek-v4-flash"),
     ],
     "C": [
+        Profile(
+            "haiku",
+            "Claude Haiku 4.5",
+            35.0,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
+        ),
+        Profile(
+            "codex-luna",
+            "Luna (low)",
+            None,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+            aa_agent_model_id="gpt-5.6-luna",
+        ),
         Profile("kiro-cheap", "Qwen3 Coder", None, aa_model_id="qwen3-coder-next"),
         Profile(
             "oc-omni",
@@ -345,10 +571,25 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
     ],
 }
 
+# wrk의 기존 codex-max 표기는 계속 gate에서 받되, 급표의 정본 표기는 canonical codex-sol로 둔다.
+PROFILE_ALIASES: dict[str, str] = {"codex-max": "codex-sol"}
+
+
+def _profile_label(profile: Profile) -> str:
+    if profile.launcher_effort:
+        return f"{profile.name} --effort {profile.launcher_effort}"
+    return profile.name
+
+
+def _benchmark_annotation(profile: Profile) -> str | None:
+    if profile.benchmark_annotation == MODEL_ONLY_ANNOTATION:
+        return f"{profile.model} · {profile.benchmark_annotation}"
+    return profile.benchmark_annotation
+
 
 def profile_pool(profile: str) -> tuple[str, str | None]:
     """Return (provider_id, group_name_if_group_scope)."""
-    if profile in ("opus", "sonnet", "fable"):
+    if profile in ("opus", "sonnet", "fable", "haiku"):
         return "claude", None
     if profile.startswith("codex") or profile == "claudex":
         return "codex", None
@@ -757,6 +998,7 @@ class GateResult:
 
 
 def _find_profile(profile_name: str) -> tuple[Grade, Profile] | None:
+    profile_name = PROFILE_ALIASES.get(profile_name, profile_name)
     for grade, profiles in GRADE_TABLE.items():
         for profile in profiles:
             if profile.name == profile_name:
@@ -1129,6 +1371,10 @@ def recommend(
         else:
             rendered = f"{score:.1f}({source}/{effort_s})"
 
+        annotation = _benchmark_annotation(profile)
+        if annotation:
+            rendered += f" · {annotation}"
+
         actual_harness = _profile_actual_harness(profile)
         if (
             source == "AA-agent"
@@ -1167,6 +1413,9 @@ def recommend(
                 profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
             )
             codex_profile = profile_pool(profile.name)[0] == "codex"
+            registered_model_metric = (
+                profile.benchmark_metric if profile.benchmark_source == "AA-model" else None
+            )
             return [
                 score
                 for score in bench_scores or []
@@ -1174,6 +1423,7 @@ def recommend(
                 and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
                 and score.score is not None
                 and score.source == "AA-model"
+                and (registered_model_metric is None or score.metric == registered_model_metric)
                 and not (codex_profile and score.effort is None)
                 and _not_retired(score)
             ]
@@ -1215,6 +1465,16 @@ def recommend(
             picked = _pick_single(pool())
             if picked is not None:
                 return picked
+
+        if profile.benchmark is None and profile.benchmark_annotation:
+            return _benchmark_annotation(profile) or "미지정"
+
+        if (
+            profile.benchmark is not None
+            and profile.benchmark_source is None
+            and profile.benchmark_annotation
+        ):
+            return f"{profile.benchmark:.1f}({profile.benchmark_annotation})"
 
         if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
             return "미지정" if target_effort is None else ""
@@ -1300,24 +1560,24 @@ def recommend(
         for rank, cand in enumerate(included, start=1):
             benchmark = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
+            profile_label = _profile_label(cand.profile)
             usage = cand.windows_display
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
                 lines.append(
-                    f"{rank}. 🔥🔥 {cand.profile.name:<10} {cand.provider_label} {usage}  "
+                    f"{rank}. 🔥🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
                     f"  소멸 임박 우선 (boost 역전){bench}"
                 )
             elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
-                    f"{rank}. 🔥 {cand.profile.name:<10} {cand.provider_label} {usage}  "
+                    f"{rank}. 🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}{bench}"
                 )
             else:
                 lines.append(
-                    f"{rank}. {cand.profile.name:<12} {cand.provider_label} "
-                    f"{usage}  {cand.pool_class:<7}{bench}"
+                    f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}{bench}"
                 )
             if explain:
                 lines.append(
@@ -1336,7 +1596,9 @@ def recommend(
     if escalation:
         lines.append("⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)")
         for entry in escalation:
-            lines.append(f"  {entry.profile.name:<12} {entry.provider_label}  pool={entry.provider_id}")
+            lines.append(
+                f"  {_profile_label(entry.profile):<24} {entry.provider_label}  pool={entry.provider_id}"
+            )
             lines.append(f"    근거: {entry.gate_reason}")
             if entry.status_note:
                 lines.append(f"    {entry.status_note}")
