@@ -28,6 +28,7 @@ SEED_CAPTURED_AT = "2026-07-31T00:00:00+00:00"
 MANUAL_SOURCES = frozenset({"AA-agent", "benchlm", "openrouter"})
 SOURCES = MANUAL_SOURCES | {"AA-model"}
 METRICS = frozenset({"coding_index", "intelligence", "agentic", "coding"})
+APPROVED_EFFORTS = frozenset({"default", "low", "medium", "high", "xhigh", "max", "non-reasoning"})
 
 # ROB-1190 ②-1: AA-model slug 의 effort 접미사. 순서가 중요하다 — "non-reasoning" 이
 # "-high"/"-low" 등 다른 접미사의 부분열이 아니므로 순서 무관하지만, 길이가 긴 접미사부터
@@ -59,6 +60,18 @@ def parse_effort_suffix(model_id: str) -> tuple[str, str | None]:
             effort = suffix[1:]  # "-xhigh" -> "xhigh"
             return base, effort
     return model_id, None
+
+
+def normalize_aa_model_id(model_id: str) -> str:
+    """Normalize AA-model source slugs for profile-to-row comparisons."""
+
+    return model_id.strip().lower().replace(".", "-")
+
+
+def display_effort(effort: str | None) -> str:
+    """Render a missing effort explicitly instead of silently hiding it."""
+
+    return effort or "unspecified"
 
 
 _MODEL_SCORE_COLUMNS = (
@@ -251,6 +264,8 @@ def _validate_score(
     if metric not in METRICS:
         raise BenchError(f"unsupported metric: {metric}")
     effort = _optional_text(value.effort, "effort")
+    if effort is not None and effort not in APPROVED_EFFORTS:
+        raise BenchError(f"unsupported effort: {effort}")
     harness = _optional_text(value.harness, "harness")
     if source == "AA-agent" and (effort is None or harness is None):
         raise BenchError("AA-agent rows require effort and harness")
@@ -444,6 +459,13 @@ def _recompute_rank(conn: sqlite3.Connection, source: str, metric: str) -> None:
     )
 
 
+def _captured_at_key(value: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
 def upsert_scores(scores: Iterable[ModelScore], *, path: pathlib.Path | str | None = None) -> int:
     """Validate and atomically upsert scores, preserving source/metric keys."""
 
@@ -568,7 +590,15 @@ def migrate_aa_model_effort_suffixes(*, path: pathlib.Path | str | None = None) 
                     captured_at=row["captured_at"],
                 )
             )
-            _upsert(conn, new_score)
+            target = conn.execute(
+                "SELECT captured_at FROM model_scores "
+                "WHERE model_id = ? AND source = ? AND metric = ? AND effort IS ? AND harness IS ?",
+                (base_model_id, row["source"], row["metric"], effort, row["harness"]),
+            ).fetchone()
+            if target is None or _captured_at_key(target["captured_at"]) < _captured_at_key(
+                row["captured_at"]
+            ):
+                _upsert(conn, new_score)
             conn.execute(
                 "DELETE FROM model_scores WHERE model_id = ? AND effort IS NULL AND harness IS ? "
                 "AND source = ? AND metric = ?",
@@ -735,25 +765,44 @@ def coverage_report(*, path: pathlib.Path | str | None = None) -> str:
 
     seed_scores(path=path)
     all_scores = read_scores(path=path)
-    by_model: dict[str, set[str]] = {}
+    by_source_model: set[tuple[str, str]] = set()
     for score in all_scores:
         if score.score is None:
             continue
-        by_model.setdefault(score.model_id, set()).add(score.source)
+        lookup_id = (
+            normalize_aa_model_id(score.model_id) if score.source == "AA-model" else score.model_id.lower()
+        )
+        by_source_model.add((score.source, lookup_id))
 
     lines = ["profile       AA-agent  AA-model  openrouter"]
     no_score_profiles: list[str] = []
     for profiles in GRADE_TABLE.values():
         for profile in profiles:
-            agent_id = profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+            agent_id = profile.aa_agent_model_id or (
+                profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+            )
             model_id = profile.aa_model_id or (
                 profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
             )
             openrouter_id = profile.benchmark_model_id if profile.benchmark_source == "openrouter" else None
 
-            has_agent = agent_id is not None and "AA-agent" in by_model.get(agent_id, set())
-            has_model = model_id is not None and "AA-model" in by_model.get(model_id, set())
-            has_openrouter = openrouter_id is not None and "openrouter" in by_model.get(openrouter_id, set())
+            has_agent = agent_id is not None and ("AA-agent", agent_id.lower()) in by_source_model
+            has_model = (
+                model_id is not None
+                and (
+                    "AA-model",
+                    normalize_aa_model_id(model_id),
+                )
+                in by_source_model
+            )
+            has_openrouter = (
+                openrouter_id is not None
+                and (
+                    "openrouter",
+                    openrouter_id.lower(),
+                )
+                in by_source_model
+            )
 
             def mark(has: bool, checked: bool) -> str:
                 if not checked:
@@ -790,7 +839,7 @@ def show_scores(model_id: str, *, path: pathlib.Path | str | None = None) -> str
     for score in scores:
         score_text = "없음/미측정" if score.score is None else f"{score.score:.1f}"
         lines.append(
-            f"{score.source:<11} {score.metric:<15} {score.effort or '-':<7} "
+            f"{score.source:<11} {score.metric:<15} {display_effort(score.effort):<7} "
             f"{score.harness or '-':<8} {score_text:<6} {score.rank or '-':<5} {score.captured_at}"
         )
     return "\n".join(lines)

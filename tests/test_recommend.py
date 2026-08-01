@@ -385,6 +385,11 @@ def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
     assert "oc-sonnet46" not in c_names
 
 
+def test_codex_max_gate_reason_is_operator_exact_string():
+    codex_max = next(profile for profile in GRADE_TABLE["S+"] if profile.name == "codex-max")
+    assert codex_max.gate_reason == "측정 없음 — 장기 오케스트레이션 전용, reps 로 검증 예정"
+
+
 # ------------------------------------------------------------------ AC4: C grade
 
 
@@ -903,3 +908,42 @@ def test_benchmark_cell_filters_out_ultra_effort_scores():
     luna_line = next(line for line in out.splitlines() if "codex-luna-max" in line)
     assert "ultra" not in luna_line
     assert "effort=max" in luna_line
+
+
+def test_benchmark_cell_filters_ultra_from_model_and_other_sources():
+    """폐기된 ultra 는 AA-model/other dynamic source에서도 추천에 다시 나오지 않는다."""
+    from scopefuel.bench import ModelScore
+    from scopefuel.recommend import recommend as recommend_fn
+
+    scores = [
+        ModelScore(
+            model_id="claude-sonnet-5",
+            effort="ultra",
+            harness=None,
+            source="AA-model",
+            metric="coding_index",
+            score=75.0,
+            rank=1,
+            captured_at="2026-07-31T12:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="sonnet-5",
+            effort="ultra",
+            harness=None,
+            source="openrouter",
+            metric="coding",
+            score=75.0,
+            rank=1,
+            captured_at="2026-07-31T12:00:00+00:00",
+        ),
+    ]
+    out = recommend_fn(
+        [_result("kiro", 10.0, pool_class="spend", window="30d")],
+        "A+",
+        today=TODAY,
+        now=NOW,
+        bench_scores=scores,
+    )
+    kiro_line = next(line for line in out.splitlines() if "kiro-sonnet" in line)
+    assert "ultra" not in kiro_line
+    assert "effort=unspecified" in kiro_line

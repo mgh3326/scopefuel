@@ -438,7 +438,7 @@ def list_policies(
 
 @dataclass(frozen=True)
 class PolicyRow:
-    """``policy list`` 한 행 — class/boost/capacity_weight 와 그 출처([기본]/[설정])."""
+    """``policy list`` 한 행 — configured pool fields와 그 출처([기본]/[설정])."""
 
     pool: str
     effective_class: PoolClass
@@ -453,9 +453,9 @@ class PolicyRow:
 def list_policy_rows(known_pools: dict[str, PoolClass], today: dt.date | None = None) -> list[PolicyRow]:
     """``list_policies`` 확장 — boost·capacity_weight·설정 출처를 함께 반환한다.
 
-    ``class_configured``/``capacity_weight_configured`` 는 config.toml 에 해당 필드가
-    (만료 여부와 무관하게) 명시적으로 존재하는지를 나타낸다 — 만료된 override 도
-    "운영자가 한 번은 설정했다"는 사실은 그대로이므로 [설정] 표시가 맞다.
+    ``class_configured`` 는 class 하나만이 아니라 해당 pool table이 config.toml에
+    명시적으로 존재하는지를 나타낸다. 따라서 boost/capacity_weight/price_usd/note
+    등 class 이외의 설정만 있어도 [설정]으로 표시한다.
     """
     today = today or dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 -- avoid dt.UTC (py<3.11 AttributeError, ROB-1188)
     config = load_config()
@@ -474,7 +474,7 @@ def list_policy_rows(known_pools: dict[str, PoolClass], today: dt.date | None = 
         if name not in known_pools:
             status = f"unknown pool{'; ' + status if status else ''}"
         entry = pools.get(name)
-        class_configured = isinstance(entry, dict) and entry.get("class") is not None
+        class_configured = isinstance(entry, dict)
         boost, boost_status = get_boost(name, today=today)
         boost_configured = isinstance(entry, dict) and entry.get("boost") is not None
         weight, weight_status = get_capacity_weight(name)

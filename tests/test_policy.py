@@ -425,4 +425,4 @@ def test_policy_list_shows_capacity_weight_when_configured(policy_config, capsys
     assert "[설정]" in claude_line  # fixture 는 claude class=preserve 를 명시
     codex_line = next(line for line in out.splitlines() if line.startswith("codex"))
     assert "capacity_weight=3.5" in codex_line
-    assert "[기본]" in codex_line  # codex 는 capacity_weight 만 있고 class 는 미설정
+    assert "[설정]" in codex_line  # class 가 없어도 capacity_weight 명시 설정이면 [설정]

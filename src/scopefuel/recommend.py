@@ -15,7 +15,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Literal
 
-from .bench import ModelScore
+from .bench import ModelScore, display_effort, normalize_aa_model_id
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset
 from .policy import (
     get_active_override,
@@ -113,8 +113,9 @@ class Profile:
     benchmark_harness: str | None = None
     benchmark_effort: str | None = None
     benchmark_model_id: str | None = None
-    # ROB-1190 ②-3/②-4: AA-model DB 조회용 폴백 키(정규화된 slug, bench.db 실측 기준).
-    # AA-agent 실측이 있으면 그걸 우선 표시하고, 없을 때만 이 키로 AA-model 을 폴백 조회한다.
+    # ROB-1190 ②-3/②-4: source-specific AA lookup keys. AA-agent wins when present;
+    # AA-model is queried only when the mapped AA-agent has no score.
+    aa_agent_model_id: str | None = None
     aa_model_id: str | None = None
 
 
@@ -128,11 +129,13 @@ def _openrouter_benchmark(score: float, model_id: str) -> dict[str, object]:
     }
 
 
-def _aa_agent_benchmark(score: float, model_id: str, effort: str) -> dict[str, object]:
+def _aa_agent_benchmark(
+    score: float, model_id: str, effort: str, *, harness: str = "codex"
+) -> dict[str, object]:
     return {
         "benchmark_source": "AA-agent",
         "benchmark_metric": "agentic",
-        "benchmark_harness": "codex",
+        "benchmark_harness": harness,
         "benchmark_effort": effort,
         "benchmark_model_id": model_id,
     }
@@ -144,27 +147,35 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "kiro-opus",
             "Opus 5 (xhigh)",
             67.0,
-            **_aa_agent_benchmark(67.0, "claude-opus-5", "xhigh"),
-            aa_model_id="claude-opus-5-xhigh",
+            **_aa_agent_benchmark(67.0, "claude-opus-5", "xhigh", harness="claude-code"),
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
         ),
         Profile(
             "kiro-sol",
             "GPT-5.6 Sol",
             58.9,
             **_openrouter_benchmark(58.9, "gpt-5.6-sol"),
+            aa_agent_model_id="gpt-5.6-sol",
             aa_model_id="gpt-5-6-sol",
         ),
         Profile(
             "codex-max",
             "GPT-5.6 Sol (max)",
             67.0,
-            gate_reason=(
-                "orch 전용 예외 — 측정 없음(에이전트 지수는 단일 작업 성공률만 측정, "
-                "장기 다중 워커 조율은 미측정). 장기 오케스트레이션 전용, reps 로 검증 예정"
-            ),
+            gate_reason="측정 없음 — 장기 오케스트레이션 전용, reps 로 검증 예정",
             **_aa_agent_benchmark(67.0, "gpt-5.6-sol", "max"),
+            aa_agent_model_id="gpt-5.6-sol",
+            aa_model_id="gpt-5-6-sol",
         ),
-        Profile("opus", "Opus 5", 60.7, **_openrouter_benchmark(60.7, "opus-5"), aa_model_id="claude-opus-5"),
+        Profile(
+            "opus",
+            "Opus 5",
+            60.7,
+            **_openrouter_benchmark(60.7, "opus-5"),
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
         Profile(
             "fable",
             "Fable 5",
@@ -175,6 +186,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
                 "고위험 1회성 / 서브에이전트 다수일 때만"
             ),
             **_openrouter_benchmark(59.9, "fable-5"),
+            aa_agent_model_id="claude-fable-5",
             aa_model_id="claude-fable-5",
         ),
     ],
@@ -184,12 +196,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "Terra (max)",
             62.0,
             **_aa_agent_benchmark(62.0, "gpt-5.6-terra", "max"),
+            aa_agent_model_id="gpt-5.6-terra",
+            aa_model_id="gpt-5-6-terra",
         ),
         Profile(
             "oc-kimi-k3",
             "Kimi K3",
             57.1,
             **_openrouter_benchmark(57.1, "kimi-k3"),
+            aa_agent_model_id="kimi-k3",
             aa_model_id="kimi-k3",
         ),
         Profile(
@@ -197,6 +212,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "Grok 4.5",
             53.8,
             **_openrouter_benchmark(53.8, "grok-4.5"),
+            aa_agent_model_id="grok-4.5",
             aa_model_id="grok-4-5",
         ),
     ],
@@ -213,12 +229,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "Luna (max)",
             59.0,
             **_aa_agent_benchmark(59.0, "gpt-5.6-luna", "max"),
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
         ),
         Profile(
             "oc-glm",
             "GLM-5.2",
             51.1,
             **_openrouter_benchmark(51.1, "glm-5.2"),
+            aa_agent_model_id="glm-5.2",
             aa_model_id="glm-5-2",
         ),
         Profile(
@@ -243,6 +262,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "Sonnet 4.6",
             47.2,
             **_openrouter_benchmark(47.2, "sonnet-4.6"),
+            aa_agent_model_id="claude-sonnet-4.6",
             aa_model_id="claude-sonnet-4-6",
         ),
     ],
@@ -689,7 +709,9 @@ def _format_benchmark_parts(
     harness: str | None,
     effort: str | None,
 ) -> str:
-    return f"{score:.1f}({source}; metric={metric}; harness={harness or 'n/a'}; effort={effort or 'n/a'})"
+    return (
+        f"{score:.1f}({source}; metric={metric}; harness={harness or 'n/a'}; effort={display_effort(effort)})"
+    )
 
 
 def _format_benchmark_score(score: ModelScore) -> str:
@@ -834,31 +856,37 @@ def recommend(
         # ROB-1190 ③-1: ultra 폐기 — 어느 벤치도 ultra 를 공식 측정하지 않으므로(AA 모델=xhigh
         # 까지, AA 에이전트=max 까지) 과거에 수집된 ultra 실측이 DB에 남아있어도 추천 벤치 셀에는
         # 표시하지 않는다(추천 카탈로그에서 폐기된 effort 를 다시 노출하지 않기 위함).
-        def _not_ultra(score: ModelScore) -> bool:
+        def _not_retired(score: ModelScore) -> bool:
             return score.effort != "ultra"
 
         # ROB-1190 ②-4: AA-agent(모델×하네스 실사용에 더 가까움) 우선, 없을 때만 AA-model 폴백.
+        agent_lookup_id = profile.aa_agent_model_id or (
+            profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+        )
         agent_dynamic = [
             score
             for score in bench_scores or []
-            if profile.benchmark_model_id is not None
-            and score.model_id == profile.benchmark_model_id
+            if agent_lookup_id is not None
+            and score.model_id == agent_lookup_id
             and score.score is not None
             and score.source == "AA-agent"
-            and _not_ultra(score)
+            and _not_retired(score)
         ]
         if agent_dynamic:
             agent_dynamic.sort(key=lambda score: (score.effort or "", score.harness or ""))
             return "; ".join(_format_benchmark_score(score) for score in agent_dynamic)
 
-        model_fallback_id = profile.aa_model_id or profile.benchmark_model_id
+        model_fallback_id = profile.aa_model_id or (
+            profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
+        )
         model_dynamic = [
             score
             for score in bench_scores or []
             if model_fallback_id is not None
-            and score.model_id == model_fallback_id
+            and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
             and score.score is not None
             and score.source == "AA-model"
+            and _not_retired(score)
         ]
         if model_dynamic:
             model_dynamic.sort(key=lambda score: (score.metric, score.effort or ""))
@@ -871,6 +899,7 @@ def recommend(
             and score.model_id == profile.benchmark_model_id
             and score.score is not None
             and score.source not in ("AA-agent", "AA-model")
+            and _not_retired(score)
         ]
         if other_dynamic:
             other_dynamic.sort(key=lambda score: (score.source, score.metric, score.effort or ""))
