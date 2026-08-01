@@ -264,9 +264,10 @@ def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, cap
     bench_cells = [line.split("벤치 ", 1)[1] for line in out.splitlines() if "벤치 " in line]
     assert bench_cells
     assert all("(" in cell for cell in bench_cells)
+    # ROB-1191 ④ compact single-effort cells
     assert "78.0(AA-agent; metric=agentic; harness=codex; effort=max)" not in out
-    assert "62.0(AA-agent; metric=agentic; harness=codex; effort=max)" in out
-    assert "57.1(openrouter; metric=coding; harness=n/a; effort=unspecified)" in out
+    assert "62.0(AA-agent/codex/max)" in out
+    assert "57.1(openrouter/unspecified)" in out
 
 
 def test_import_validation_is_atomic_and_rejects_mixed_sources(bench_home, tmp_path):
@@ -351,7 +352,7 @@ def test_missing_db_recommend_does_not_treat_missing_scores_as_low(monkeypatch, 
     assert cli.main(["--recommend", "S", "--no-cache"]) == 0
     out = capsys.readouterr().out
     codex_line = next(line for line in out.splitlines() if "codex-terra-max" in line)
-    assert "벤치 62.0(AA-agent; metric=agentic; harness=codex; effort=max)" in codex_line
+    assert "벤치 62.0(AA-agent/codex/max)" in codex_line
     assert not (tmp_path / "empty-data" / "scopefuel" / "bench.db").exists()
 
 
@@ -378,8 +379,8 @@ def test_recommend_does_not_rank_by_raw_scores_across_sources_or_metrics(bench_h
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert ranked[0].startswith("1. codex-terra-max")
     assert ranked[1].startswith("2. oc-kimi-k3")
-    assert "1.0(AA-agent; metric=agentic; harness=codex; effort=max)" in ranked[0]
-    assert "99.0(openrouter; metric=coding; harness=n/a; effort=unspecified)" in ranked[1]
+    assert "1.0(AA-agent/codex/max)" in ranked[0]
+    assert "99.0(openrouter/unspecified)" in ranked[1]
 
 
 def test_no_secret_like_response_body_is_printed(bench_home, monkeypatch, capsys):
@@ -630,7 +631,7 @@ def test_source_specific_aa_agent_mapping_wins_over_openrouter(bench_home):
             source="AA-agent",
             metric="agentic",
             score=66.0,
-            effort="max",
+            effort="xhigh",  # matches Profile.benchmark_effort for opus (ROB-1191)
             harness="claude-code",
         ),
         _score(
@@ -654,6 +655,7 @@ def test_source_specific_aa_agent_mapping_wins_over_openrouter(bench_home):
     )
     assert "AA-agent" in opus_line
     assert "AA-model" not in opus_line
+    assert "xhigh" in opus_line
 
 
 def test_coverage_uses_source_specific_aa_agent_id(bench_home):
@@ -707,4 +709,4 @@ def test_aa_model_fallback_normalizes_dot_dash_slug(bench_home, monkeypatch):
         if line[:1].isdigit() and len(line.split()) > 1 and line.split()[1] == "kiro-sol"
     )
     assert "AA-model" in kiro_line
-    assert "effort=unspecified" in kiro_line
+    assert "unspecified" in kiro_line

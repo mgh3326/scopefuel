@@ -75,6 +75,16 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help="해당 급의 모델 사용 우선순위 추천. " + grade_help_text(),
     )
     parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="--recommend 시 연속 점수 구성요소(capacity/waste/throughput·제약 창)를 함께 표시",
+    )
+    parser.add_argument(
+        "--hide-excluded",
+        action="store_true",
+        help="--recommend 시 제외(정책/소진/측정불가) 접힌 줄을 숨김",
+    )
+    parser.add_argument(
         "--horizon", choices=["now", "week", "both"], default="both", help="--brief 에 표시할 지평"
     )
     parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
@@ -258,6 +268,8 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             today=now.date(),
             now=now,
             bench_scores=bench.read_scores(),
+            explain=bool(getattr(args, "explain", False)),
+            hide_excluded=bool(getattr(args, "hide_excluded", False)),
         )
     )
     return 0

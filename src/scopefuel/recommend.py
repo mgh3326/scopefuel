@@ -12,11 +12,14 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
+import pathlib
 from dataclasses import dataclass
 from typing import Literal
 
 from .bench import ModelScore, display_effort, normalize_aa_model_id
-from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset
+from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset, _window_seconds
 from .policy import (
     get_active_override,
     get_boost,
@@ -36,6 +39,19 @@ SPEND_EXCLUDE_PCT = 99.0
 # spend 풀이 리셋까지 이 시간 이내이면 정렬 최상위 + 🔥 (fallback — pace 계산 불가 시에만).
 RESET_URGENCY_HOURS = 12.0
 
+# ROB-1191 ② continuous score component weights (explainable fixed constants).
+# total = capacity_term + WASTE_WEIGHT * waste_term + THRU_WEIGHT * throughput_term
+# Waste is weighted above capacity so reset-expiry risk outranks raw remaining%
+# (otherwise a nearly-full far-reset pool always beats a soon-to-expire remainder).
+SCORE_WASTE_WEIGHT = 50.0
+SCORE_THRU_WEIGHT = 0.25
+# Short windows (≤6h) contribute the throughput-margin term.
+SHORT_WINDOW_MAX_S = 6 * 3600
+# Pace-unknown constraint fallback: treat as less constraining than any finite TTE,
+# ordered by used_pct (higher usage = more constrained). Deterministic & conservative.
+_TTE_UNKNOWN_RANK = 1
+_TTE_KNOWN_RANK = 0
+
 _POOL_LABEL = {
     "claude": "Claude",
     "codex": "Codex",
@@ -47,11 +63,14 @@ _POOL_LABEL = {
 }
 
 _WINDOW_LABEL = {
-    "5h": "시",
+    "5h": "5h",
     "1d": "일",
     "7d": "주",
     "30d": "월",
 }
+
+# Claude settings.json (read-only). Overridable for tests via CLAUDE_SETTINGS_PATH.
+_DEFAULT_CLAUDE_SETTINGS = pathlib.Path.home() / ".claude" / "settings.json"
 
 OC_OMNI_ESCALATION_REASON = (
     "비결정적 — 실행 모델이 요청마다 다름(실측: big-pickle 162콜·deepseek-v4-flash 21콜·"
@@ -172,7 +191,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "opus",
             "Opus 5",
             60.7,
-            **_openrouter_benchmark(60.7, "opus-5"),
+            # Operator intent: advertised/default effort is xhigh (wrk + AA-agent).
+            **{**_openrouter_benchmark(60.7, "opus-5"), "benchmark_effort": "xhigh"},
             aa_agent_model_id="claude-opus-5",
             aa_model_id="claude-opus-5",
         ),
@@ -244,7 +264,11 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "sonnet",
             "Sonnet 5",
             53.4,
-            **_openrouter_benchmark(53.4, "sonnet-5"),
+            # Align with wrk DEFAULT_EFFORT=high and ~/.claude/settings.json effortLevel.
+            **{
+                **_openrouter_benchmark(53.4, "sonnet-5"),
+                "benchmark_effort": "high",
+            },
             aa_model_id="claude-sonnet-5",
         ),
     ],
@@ -316,13 +340,32 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     return "", None
 
 
+@dataclass(frozen=True)
+class _WindowState:
+    """Per-window usage snapshot used for multi-window cutoff + constraint selection."""
+
+    window: str  # raw provider window id, e.g. "5h", "7d"
+    used_pct: float
+    remaining_pct: float
+    reset_at: str | None
+    hours_to_reset: float | None
+    burn_rate: float | None  # %/h when measurable
+    time_to_exhaust: float | None  # hours; None when completely unmeasurable
+
+    @property
+    def display_window(self) -> str:
+        return _WINDOW_LABEL.get(self.window, self.window)
+
+
 @dataclass
 class _Candidate:
     profile: Profile
     provider_label: str
     provider_id: str
-    window: str
-    used_pct: float
+    windows: list[_WindowState]
+    constraint: _WindowState
+    windows_display: str
+    used_pct: float  # constraining window
     remaining_pct: float
     pool_class: PoolClass
     reset_at: str | None
@@ -331,6 +374,11 @@ class _Candidate:
     boost: int | None
     weight: float
     effective_remaining: float
+    # Continuous score components (ROB-1191 ②) — higher total ranks first under boost.
+    capacity_term: float = 0.0
+    waste_term: float = 0.0
+    throughput_term: float = 0.0
+    score: float = 0.0
     imminent_exhaustion: bool = False
 
 
@@ -338,6 +386,8 @@ class _Candidate:
 class _Excluded:
     profile: Profile
     reason: str
+    provider_id: str = ""
+    kind: str = "other"  # "exhausted" | "unmeasurable" | "other"
 
 
 @dataclass
@@ -396,8 +446,6 @@ def _hours_to_reset(iso: str | None, now: dt.datetime) -> float | None:
 
 def _burn_rate_pct_per_hour(window: str, used_pct: float, hours_to_reset: float) -> float | None:
     """실측 소모속도(%/h) = used_pct / 경과시간(h). 창 길이·리셋 파싱 불가 시 None."""
-    from .model import _window_seconds
-
     window_seconds = _window_seconds(window)
     if window_seconds is None or window_seconds <= 0:
         return None
@@ -407,6 +455,28 @@ def _burn_rate_pct_per_hour(window: str, used_pct: float, hours_to_reset: float)
     if used_pct <= 0:
         return 0.0
     return used_pct / elapsed_hours
+
+
+def _time_to_exhaust_hours(
+    remaining_pct: float,
+    burn_rate: float | None,
+    hours_to_reset: float | None,
+) -> float | None:
+    """Hours until the window is exhausted at current burn rate.
+
+    Fallback when pace is unmeasurable (conservative + deterministic):
+    - remaining ≤ 0 → already exhausted (0)
+    - hours_to_reset known → use that as an upper bound on usable time
+      (assumes quota is gone by reset even without a measured burn rate)
+    - otherwise None (completely unknown; ranked after any known TTE)
+    """
+    if remaining_pct <= 0:
+        return 0.0
+    if burn_rate is not None and burn_rate > 0:
+        return remaining_pct / burn_rate
+    if hours_to_reset is not None:
+        return hours_to_reset
+    return None
 
 
 def _is_pace_urgent(remaining_pct: float, burn_rate: float | None, hours_to_reset: float) -> bool | None:
@@ -443,6 +513,141 @@ def _provider_label(provider_id: str, group_name: str | None) -> str:
     return label
 
 
+def _window_states(
+    matches: list[tuple[float, str, str | None]],
+    now: dt.datetime,
+) -> list[_WindowState]:
+    states: list[_WindowState] = []
+    for used_pct, window, reset_at in matches:
+        remaining = 100.0 - used_pct
+        hours = _hours_to_reset(reset_at, now)
+        burn = _burn_rate_pct_per_hour(window, used_pct, hours) if hours is not None else None
+        tte = _time_to_exhaust_hours(remaining, burn, hours)
+        states.append(
+            _WindowState(
+                window=window,
+                used_pct=used_pct,
+                remaining_pct=remaining,
+                reset_at=reset_at,
+                hours_to_reset=hours,
+                burn_rate=burn,
+                time_to_exhaust=tte,
+            )
+        )
+    return states
+
+
+def _constraint_sort_key(state: _WindowState) -> tuple[int, float, float, str]:
+    """Smaller key = more constraining. Known TTE first; fallback by used_pct desc."""
+    if state.time_to_exhaust is not None:
+        return (_TTE_KNOWN_RANK, state.time_to_exhaust, -state.used_pct, state.window)
+    # Pace/reset unknown: higher used_pct is more constrained; never invent a TTE.
+    return (_TTE_UNKNOWN_RANK, 0.0, -state.used_pct, state.window)
+
+
+def _select_constraint(states: list[_WindowState]) -> _WindowState:
+    return min(states, key=_constraint_sort_key)
+
+
+def _any_window_over_cutoff(states: list[_WindowState], cutoff: float) -> _WindowState | None:
+    """Return the worst over-cutoff window (highest used_pct), or None if all under."""
+    over = [s for s in states if s.used_pct >= cutoff]
+    if not over:
+        return None
+    return max(over, key=lambda s: (s.used_pct, s.window))
+
+
+def _format_windows_display(states: list[_WindowState], constraint: _WindowState) -> str:
+    """e.g. '5h 31% · 주 46% · 제약=5h'"""
+    # Stable display order: short windows first, then by window id.
+    ordered = sorted(
+        states,
+        key=lambda s: (
+            _window_seconds(s.window) if _window_seconds(s.window) is not None else 10**12,
+            s.window,
+        ),
+    )
+    parts = [f"{s.display_window} {s.used_pct:g}%" for s in ordered]
+    parts.append(f"제약={constraint.display_window}")
+    return " · ".join(parts)
+
+
+def _score_components(
+    *,
+    states: list[_WindowState],
+    constraint: _WindowState,
+    weight: float,
+    pool_class: PoolClass,
+    urgency_hours: float,
+) -> tuple[float, float, float, float]:
+    """Return (capacity, waste, throughput, total) continuous score terms.
+
+    (a) capacity — constraining-window remaining × capacity_weight
+    (b) waste — spend-only unused remainder that current pace will not consume before reset
+        (pace unknown + reset within urgency_hours → entire remainder counted as at-risk)
+    (c) throughput — remaining on the tightest short window (draw-rate headroom)
+    """
+    capacity = weight * constraint.remaining_pct
+
+    waste = 0.0
+    if pool_class == "spend":
+        br = constraint.burn_rate
+        hours = constraint.hours_to_reset
+        if br is not None and br > 0 and hours is not None:
+            waste = max(0.0, constraint.remaining_pct - br * hours)
+        elif hours is not None and br == 0.0:
+            # Measured zero burn with remaining → entire remainder at risk of expiry.
+            waste = constraint.remaining_pct
+        elif hours is not None and br is None and hours <= urgency_hours:
+            # Pace unmeasurable: conservative fallback matches 🔥 threshold.
+            waste = constraint.remaining_pct
+
+    short = [
+        s for s in states if (secs := _window_seconds(s.window)) is not None and secs <= SHORT_WINDOW_MAX_S
+    ]
+    # Tightest short window by remaining (lower remaining = less throughput headroom).
+    throughput = min(s.remaining_pct for s in short) if short else constraint.remaining_pct
+
+    total = capacity + SCORE_WASTE_WEIGHT * waste + SCORE_THRU_WEIGHT * throughput
+    return capacity, waste, throughput, total
+
+
+def _read_claude_settings_effort() -> str | None:
+    """Read-only Claude settings effortLevel. Never writes. Returns None if unreadable."""
+    path_raw = os.environ.get("CLAUDE_SETTINGS_PATH")
+    path = pathlib.Path(path_raw) if path_raw else _DEFAULT_CLAUDE_SETTINGS
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    level = data.get("effortLevel")
+    if isinstance(level, str) and level.strip():
+        return level.strip()
+    return None
+
+
+def resolve_display_effort(profile: Profile) -> tuple[str | None, str]:
+    """Resolve the single effort row to display for a profile.
+
+    Order:
+    1. Profile.benchmark_effort (declared)
+    2. Claude profiles: read-only settings.json effortLevel
+    3. Unconfirmable → (None, "unknown") — caller must show 미지정, no best-score pick
+
+    Returns (effort_or_None, provenance) where provenance is profile|settings|unknown.
+    """
+    if profile.benchmark_effort:
+        return profile.benchmark_effort, "profile"
+    provider_id, _ = profile_pool(profile.name)
+    if provider_id == "claude":
+        settings_effort = _read_claude_settings_effort()
+        if settings_effort:
+            return settings_effort, "settings"
+    return None, "unknown"
+
+
 def _policy_reason(item: _PolicyExcluded) -> str:
     parts = [f"정책 제외 ({item.provider_id}"]
     if item.until is not None:
@@ -456,10 +661,12 @@ def _build_escalation_entry(
     profile: Profile,
     by_id: dict[str, ProviderResult],
     today: dt.date,
+    now: dt.datetime | None = None,
 ) -> _EscalationEntry:
     provider_id, group_name = profile_pool(profile.name)
     provider_label = _provider_label(provider_id, group_name)
     gate_reason = profile.gate_reason or ""
+    now = now or dt.datetime.now(dt.UTC)
 
     result = by_id.get(provider_id)
     fallback_class: PoolClass = (
@@ -485,12 +692,14 @@ def _build_escalation_entry(
         if not matches:
             status_notes.append("측정 불가")
         else:
-            used_pct, _window, reset_at = max(matches, key=lambda m: m[0])
+            states = _window_states(matches, now)
+            constraint = _select_constraint(states)
             cutoff = _usage_cutoff(effective_class)
-            if used_pct >= cutoff:
-                status_notes.append(f"{used_pct:g}% 소진 (reset {_reset_display(reset_at)})")
+            over = _any_window_over_cutoff(states, cutoff)
+            if over is not None:
+                status_notes.append(f"{over.used_pct:g}% 소진 (reset {_reset_display(over.reset_at)})")
             else:
-                status_notes.append(f"사용 {used_pct:g}% (reset {_reset_display(reset_at)})")
+                status_notes.append(f"사용 {_format_windows_display(states, constraint)}")
 
     return _EscalationEntry(
         profile=profile,
@@ -637,7 +846,9 @@ def gate_check(
             alternatives=alts,
         )
 
-    used_pct, _window, _reset_at = max(matches, key=lambda m: m[0])
+    states = _window_states(matches, now)
+    constraint = _select_constraint(states)
+    used_pct = constraint.used_pct
     fallback_class: PoolClass = (
         result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
     )
@@ -663,15 +874,16 @@ def gate_check(
         )
 
     cutoff = _usage_cutoff(effective_class)
-    if used_pct >= cutoff:
+    over = _any_window_over_cutoff(states, cutoff)
+    if over is not None:
         alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=f"{used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
-            used_pct=used_pct,
+            reason=f"{over.used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
+            used_pct=over.used_pct,
             pool_class=effective_class,
             alternatives=alts,
         )
@@ -733,6 +945,8 @@ def recommend(
     *,
     urgency_hours: float | None = None,
     bench_scores: list[ModelScore] | None = None,
+    explain: bool = False,
+    hide_excluded: bool = False,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -746,7 +960,7 @@ def recommend(
     for profile in GRADE_TABLE[grade]:
         # Escalation profiles → separate section, not in normal ranked candidates.
         if profile.gate == "escalation":
-            escalation.append(_build_escalation_entry(profile, by_id, today))
+            escalation.append(_build_escalation_entry(profile, by_id, today, now=now))
             continue
 
         provider_id, group_name = profile_pool(profile.name)
@@ -754,15 +968,16 @@ def recommend(
 
         result = by_id.get(provider_id)
         if result is None or result.error or result.warning or result.status != "ok":
-            excluded.append(_Excluded(profile, "측정 불가"))
+            excluded.append(_Excluded(profile, "측정 불가", provider_id=provider_id, kind="unmeasurable"))
             continue
 
         matches = _matching_buckets(result, group_name)
         if not matches:
-            excluded.append(_Excluded(profile, "측정 불가"))
+            excluded.append(_Excluded(profile, "측정 불가", provider_id=provider_id, kind="unmeasurable"))
             continue
 
-        used_pct, window, reset_at = max(matches, key=lambda m: m[0])
+        states = _window_states(matches, now)
+        constraint = _select_constraint(states)
         # result.pool_class may already include a policy stamp from cache; only preserve/spend
         # are valid builtins. get_policy re-reads XDG config for the effective class.
         fallback_class: PoolClass = (
@@ -784,16 +999,26 @@ def recommend(
             continue
 
         cutoff = _usage_cutoff(effective_class)
-        if used_pct >= cutoff:
-            excluded.append(_Excluded(profile, f"{used_pct:g}% 소진 (reset {_reset_display(reset_at)})"))
+        over = _any_window_over_cutoff(states, cutoff)
+        if over is not None:
+            excluded.append(
+                _Excluded(
+                    profile,
+                    f"{over.used_pct:g}% 소진 (reset {_reset_display(over.reset_at)})",
+                    provider_id=provider_id,
+                    kind="exhausted",
+                )
+            )
             continue
 
-        remaining_pct = 100.0 - used_pct
-        hours = _hours_to_reset(reset_at, now)
+        used_pct = constraint.used_pct
+        remaining_pct = constraint.remaining_pct
+        reset_at = constraint.reset_at
+        hours = constraint.hours_to_reset
+        burn_rate = constraint.burn_rate
 
         urgent = False
         if effective_class == "spend" and remaining_pct > 0 and hours is not None:
-            burn_rate = _burn_rate_pct_per_hour(window, used_pct, hours)
             pace_urgent = _is_pace_urgent(remaining_pct, burn_rate, hours)
             # pace 계산 가능하면 그 값을 쓰고, 소모속도 0/부재/파싱불가면 시간 임계값 폴백.
             urgent = pace_urgent if pace_urgent is not None else hours <= urgency_hours
@@ -801,6 +1026,13 @@ def recommend(
         boost, _boost_status = get_boost(provider_id, today=today)
         weight, _weight_status = get_capacity_weight(provider_id)
         effective_remaining = weight * remaining_pct
+        capacity_term, waste_term, throughput_term, score = _score_components(
+            states=states,
+            constraint=constraint,
+            weight=weight,
+            pool_class=effective_class,
+            urgency_hours=urgency_hours,
+        )
 
         # ROB-1188 fix 4: 리셋까지 아주 짧게(기본 1h) 남았고 잔여가 유의미한 임계(기본 5%)
         # 이상이면 "확실히 소멸"이 "며칠 단위 의도(boost)"보다 시급하다 — boost 를 역전.
@@ -816,7 +1048,9 @@ def recommend(
                 profile=profile,
                 provider_label=provider_label,
                 provider_id=provider_id,
-                window=_WINDOW_LABEL.get(window, window),
+                windows=states,
+                constraint=constraint,
+                windows_display=_format_windows_display(states, constraint),
                 used_pct=used_pct,
                 remaining_pct=remaining_pct,
                 pool_class=effective_class,
@@ -826,94 +1060,169 @@ def recommend(
                 boost=boost,
                 weight=weight,
                 effective_remaining=effective_remaining,
+                capacity_term=capacity_term,
+                waste_term=waste_term,
+                throughput_term=throughput_term,
+                score=score,
                 imminent_exhaustion=imminent_exhaustion,
             )
         )
 
-    # 0) 소멸 임박 역전(리셋 임박 + 잔여 유의미) → 1) numeric boost(작을수록 먼저, 없으면
-    # 최하위) → 2) pace/fallback urgency → 3) class(spend > preserve) →
-    # 4) capacity_weight 반영 실효잔여(큰 순) → 표 순서(결정성)
-    def sort_key(c: _Candidate) -> tuple[int, int, int, int, int, float, int]:
+    # 0) 소멸 임박 역전 → 1) numeric boost(하드 오버라이드) → 2) continuous score(큰 순)
+    # → 3) 표 순서(결정성). Binary 🔥 urgency 정렬 키는 연속 점수로 대체(표시는 유지).
+    def sort_key(c: _Candidate) -> tuple[int, int, int, float, int]:
         imminent_first = 0 if c.imminent_exhaustion else 1
         boost_present = 0 if c.boost is not None else 1
         boost_value = c.boost if c.boost is not None else 0
-        imminent = 0 if c.urgent else 1
-        class_order = 0 if c.pool_class == "spend" else 1
         profile_order = next((i for i, p in enumerate(GRADE_TABLE[grade]) if p.name == c.profile.name), 0)
         return (
             imminent_first,
             boost_present,
             boost_value,
-            imminent,
-            class_order,
-            -c.effective_remaining,
+            -c.score,
             profile_order,
         )
 
     included.sort(key=sort_key)
 
+    def _compact_bench(score: float, source: str, harness: str | None, effort: str | None) -> str:
+        effort_s = display_effort(effort)
+        if harness:
+            return f"{score:.1f}({source}/{harness}/{effort_s})"
+        return f"{score:.1f}({source}/{effort_s})"
+
     def benchmark_cell(profile: Profile) -> str:
-        # ROB-1190 ③-1: ultra 폐기 — 어느 벤치도 ultra 를 공식 측정하지 않으므로(AA 모델=xhigh
-        # 까지, AA 에이전트=max 까지) 과거에 수집된 ultra 실측이 DB에 남아있어도 추천 벤치 셀에는
-        # 표시하지 않는다(추천 카탈로그에서 폐기된 effort 를 다시 노출하지 않기 위함).
+        # ROB-1191 ④: single effort row only. No best-of multi-effort guess.
         def _not_retired(score: ModelScore) -> bool:
             return score.effort != "ultra"
 
-        # ROB-1190 ②-4: AA-agent(모델×하네스 실사용에 더 가까움) 우선, 없을 때만 AA-model 폴백.
-        agent_lookup_id = profile.aa_agent_model_id or (
-            profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
-        )
-        agent_dynamic = [
-            score
-            for score in bench_scores or []
-            if agent_lookup_id is not None
-            and score.model_id == agent_lookup_id
-            and score.score is not None
-            and score.source == "AA-agent"
-            and _not_retired(score)
-        ]
-        if agent_dynamic:
-            agent_dynamic.sort(key=lambda score: (score.effort or "", score.harness or ""))
-            return "; ".join(_format_benchmark_score(score) for score in agent_dynamic)
+        def _agent_candidates() -> list[ModelScore]:
+            agent_lookup_id = profile.aa_agent_model_id or (
+                profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+            )
+            return [
+                score
+                for score in bench_scores or []
+                if agent_lookup_id is not None
+                and score.model_id == agent_lookup_id
+                and score.score is not None
+                and score.source == "AA-agent"
+                and _not_retired(score)
+            ]
 
-        model_fallback_id = profile.aa_model_id or (
-            profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
-        )
-        model_dynamic = [
-            score
-            for score in bench_scores or []
-            if model_fallback_id is not None
-            and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
-            and score.score is not None
-            and score.source == "AA-model"
-            and _not_retired(score)
-        ]
-        if model_dynamic:
-            model_dynamic.sort(key=lambda score: (score.metric, score.effort or ""))
-            return "; ".join(_format_benchmark_score(score) for score in model_dynamic)
+        def _model_candidates() -> list[ModelScore]:
+            model_fallback_id = profile.aa_model_id or (
+                profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
+            )
+            return [
+                score
+                for score in bench_scores or []
+                if model_fallback_id is not None
+                and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
+                and score.score is not None
+                and score.source == "AA-model"
+                and _not_retired(score)
+            ]
 
-        other_dynamic = [
-            score
-            for score in bench_scores or []
-            if profile.benchmark_model_id is not None
-            and score.model_id == profile.benchmark_model_id
-            and score.score is not None
-            and score.source not in ("AA-agent", "AA-model")
-            and _not_retired(score)
-        ]
-        if other_dynamic:
-            other_dynamic.sort(key=lambda score: (score.source, score.metric, score.effort or ""))
-            return "; ".join(_format_benchmark_score(score) for score in other_dynamic)
+        def _other_candidates() -> list[ModelScore]:
+            return [
+                score
+                for score in bench_scores or []
+                if profile.benchmark_model_id is not None
+                and score.model_id == profile.benchmark_model_id
+                and score.score is not None
+                and score.source not in ("AA-agent", "AA-model")
+                and _not_retired(score)
+            ]
+
+        target_effort, _provenance = resolve_display_effort(profile)
+
+        def _pick_single(scores: list[ModelScore]) -> str | None:
+            if not scores:
+                return None
+            if target_effort is not None:
+                matched = [s for s in scores if (s.effort or "") == target_effort]
+                if not matched:
+                    return None
+                matched.sort(key=lambda s: (s.harness or "", s.metric or ""))
+                s = matched[0]
+                assert s.score is not None
+                return _compact_bench(s.score, s.source, s.harness, s.effort)
+            # Effort unconfirmed: only show when a single effort value exists (no best-of).
+            efforts = {s.effort for s in scores}
+            if len(efforts) != 1:
+                return "미지정"
+            scores_sorted = sorted(scores, key=lambda s: (s.harness or "", s.metric or "", s.source))
+            s = scores_sorted[0]
+            assert s.score is not None
+            return _compact_bench(s.score, s.source, s.harness, s.effort)
+
+        for pool in (_agent_candidates, _model_candidates, _other_candidates):
+            picked = _pick_single(pool())
+            if picked is not None:
+                return picked
 
         if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
-            return ""
-        return _format_benchmark_parts(
-            score=profile.benchmark,
-            source=profile.benchmark_source,
-            metric=profile.benchmark_metric,
-            harness=profile.benchmark_harness,
-            effort=profile.benchmark_effort,
+            return "미지정" if target_effort is None else ""
+        if target_effort is not None and (profile.benchmark_effort or "") not in ("", target_effort):
+            return "미지정"
+        if target_effort is None and profile.benchmark_effort is None:
+            # Static single openrouter-style row with no effort dimension → show unspecified once.
+            return _compact_bench(
+                profile.benchmark,
+                profile.benchmark_source,
+                profile.benchmark_harness,
+                profile.benchmark_effort,
+            )
+        if target_effort is None:
+            return "미지정"
+        return _compact_bench(
+            profile.benchmark,
+            profile.benchmark_source,
+            profile.benchmark_harness,
+            profile.benchmark_effort,
         )
+
+    def _fold_policy_excluded(items: list[_PolicyExcluded]) -> list[str]:
+        """③ fold policy-excluded profiles by pool into one line per pool."""
+        by_pool: dict[str, list[_PolicyExcluded]] = {}
+        for item in items:
+            by_pool.setdefault(item.provider_id, []).append(item)
+        lines_out: list[str] = []
+        for provider_id, group in by_pool.items():
+            names = "·".join(i.profile.name for i in group)
+            sample = group[0]
+            until_s = f"until {sample.until.isoformat()}" if sample.until is not None else ""
+            note_s = sample.note or ""
+            tail_parts = [p for p in (until_s, note_s) if p]
+            tail = (": " + " — ".join(tail_parts)) if tail_parts else ""
+            lines_out.append(f"✗ {provider_id} 풀 제외 — 이 급에서 {len(group)}개({names}){tail}")
+        return lines_out
+
+    def _fold_excluded(items: list[_Excluded]) -> list[str]:
+        """③ fold exhausted/unmeasurable by pool; keep kinds separate."""
+        # Group key: (kind, provider_id, reason) so different cutoffs don't merge incorrectly.
+        groups: dict[tuple[str, str, str], list[_Excluded]] = {}
+        for item in items:
+            key = (item.kind, item.provider_id or item.profile.name, item.reason)
+            groups.setdefault(key, []).append(item)
+        lines_out: list[str] = []
+        for (kind, provider_id, reason), group in groups.items():
+            if len(group) == 1 and not group[0].provider_id:
+                lines_out.append(f"✗ {group[0].profile.name:<12} {reason}")
+                continue
+            names = "·".join(i.profile.name for i in group)
+            if kind == "exhausted":
+                label = f"{provider_id} 풀 소진"
+            elif kind == "unmeasurable":
+                label = f"{provider_id} 측정 불가"
+            else:
+                label = provider_id or group[0].profile.name
+            if kind == "unmeasurable":
+                lines_out.append(f"✗ {label} — 이 급에서 {len(group)}개({names})")
+            else:
+                lines_out.append(f"✗ {label} — 이 급에서 {len(group)}개({names}). {reason}")
+        return lines_out
 
     lines: list[str] = []
 
@@ -935,29 +1244,38 @@ def recommend(
         for rank, cand in enumerate(included, start=1):
             benchmark = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
+            usage = cand.windows_display
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
                 lines.append(
-                    f"{rank}. 🔥🔥 {cand.profile.name:<10} {cand.provider_label} {cand.window} "
-                    f"{cand.used_pct:g}%  {cand.pool_class:<7}"
+                    f"{rank}. 🔥🔥 {cand.profile.name:<10} {cand.provider_label} {usage}  "
+                    f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
                     f"  소멸 임박 우선 (boost 역전){bench}"
                 )
             elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
-                    f"{rank}. 🔥 {cand.profile.name:<10} {cand.provider_label} {cand.window} "
-                    f"{cand.used_pct:g}%  {cand.pool_class:<7}"
+                    f"{rank}. 🔥 {cand.profile.name:<10} {cand.provider_label} {usage}  "
+                    f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}{bench}"
                 )
             else:
                 lines.append(
                     f"{rank}. {cand.profile.name:<12} {cand.provider_label} "
-                    f"{cand.window} {cand.used_pct:g}%  {cand.pool_class:<7}{bench}"
+                    f"{usage}  {cand.pool_class:<7}{bench}"
                 )
-        for item in policy_excluded:
-            lines.append(f"✗ {item.profile.name:<12} {_policy_reason(item)}")
+            if explain:
+                lines.append(
+                    f"    score={cand.score:.2f} "
+                    f"(capacity={cand.capacity_term:.2f}=w{cand.weight:g}×rem{cand.remaining_pct:g} "
+                    f"+ waste×{SCORE_WASTE_WEIGHT:g}={cand.waste_term:.2f} "
+                    f"+ thru×{SCORE_THRU_WEIGHT:g}={cand.throughput_term:.2f}; "
+                    f"제약={cand.constraint.display_window})"
+                )
+        if not hide_excluded:
+            lines.extend(_fold_policy_excluded(policy_excluded))
 
-    for item in excluded:
-        lines.append(f"✗ {item.profile.name:<12} {item.reason}")
+    if not hide_excluded:
+        lines.extend(_fold_excluded(excluded))
 
     if escalation:
         lines.append("⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)")

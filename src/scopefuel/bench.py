@@ -845,6 +845,37 @@ def show_scores(model_id: str, *, path: pathlib.Path | str | None = None) -> str
     return "\n".join(lines)
 
 
+def delete_score_exact(
+    *,
+    model_id: str,
+    effort: str,
+    harness: str | None,
+    source: str,
+    metric: str,
+    path: pathlib.Path | str | None = None,
+) -> int:
+    """Delete exactly one model_scores row by full key. Returns changes count.
+
+    ROB-1191 ⑤: intended for temp/fixture DBs and post-merge orch handoff only.
+    Never call against the real user DB from implementation tests.
+    """
+    normalized = _model_id(model_id)
+    target = pathlib.Path(path) if path is not None else db_path()
+    if str(target) != ":memory:" and not target.expanduser().exists():
+        return 0
+    conn = connect(target)
+    try:
+        cur = conn.execute(
+            "DELETE FROM model_scores WHERE model_id = ? AND effort IS ? AND harness IS ? "
+            "AND source = ? AND metric = ?",
+            (normalized, effort, harness, source, metric),
+        )
+        conn.commit()
+        return int(cur.rowcount)
+    finally:
+        conn.close()
+
+
 def add_rep(
     *,
     profile: str,
