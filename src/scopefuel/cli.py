@@ -141,6 +141,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     bench_sub.add_parser(
         "migrate-effort", help="기존 AA-model 행의 model_id effort 접미사를 effort 컬럼으로 백필"
     )
+    bench_sub.add_parser("backfill-aa-metrics", help="승인된 AA-agent 26행의 실행시간·비용 메타데이터 백필")
 
     bench_show = bench_sub.add_parser("show", help="모델의 출처별 벤치 점수 보기")
     bench_show.add_argument("model_id", help="정규화 모델 식별자")
@@ -307,6 +308,10 @@ def _bench_command(args: argparse.Namespace) -> int:
     if args.bench_command == "migrate-effort":
         count = bench.migrate_aa_model_effort_suffixes()
         print(f"bench migrate-effort: migrated {count} row(s)")
+        return 0
+    if args.bench_command == "backfill-aa-metrics":
+        count = bench.backfill_aa_agent_metrics()
+        print(f"bench backfill-aa-metrics: updated {count} row(s)")
         return 0
     if args.bench_command == "coverage":
         print(bench.coverage_report())

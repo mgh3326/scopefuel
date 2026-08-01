@@ -83,6 +83,8 @@ _MODEL_SCORE_COLUMNS = (
     "score",
     "rank",
     "captured_at",
+    "time_per_task_min",
+    "cost_per_task_usd",
 )
 _REP_COLUMNS = (
     "id",
@@ -100,6 +102,45 @@ _REP_COLUMNS = (
     "recorded_at",
 )
 
+# ROB-1194: operator-approved AA-agent measurements.  The complete key is
+# intentional: model, effort, harness, source, and metric identify one row.
+# These values are display metadata only; recommendation ranking never reads
+# them.
+AA_AGENT_MEASUREMENTS: tuple[tuple[str, str, str, str, str, float, float | None], ...] = (
+    ("gpt-5.6-luna", "medium", "codex", "AA-agent", "agentic", 3.4, None),
+    ("gpt-5.6-sol", "low", "codex", "AA-agent", "agentic", 3.7, None),
+    ("gpt-5.6-terra", "medium", "codex", "AA-agent", "agentic", 4.3, None),
+    ("gpt-5.6-sol", "medium", "codex", "AA-agent", "agentic", 5.2, 2.99),
+    ("gpt-5.6-luna", "high", "codex", "AA-agent", "agentic", 5.7, None),
+    ("gpt-5.6-terra", "high", "codex", "AA-agent", "agentic", 6.2, None),
+    ("gpt-5.6-sol", "high", "codex", "AA-agent", "agentic", 6.3, 4.14),
+    ("gpt-5.6-luna", "xhigh", "codex", "AA-agent", "agentic", 6.6, None),
+    ("gpt-5.6-terra", "xhigh", "codex", "AA-agent", "agentic", 6.9, None),
+    ("gpt-5.6-sol", "xhigh", "codex", "AA-agent", "agentic", 7.4, 5.24),
+    ("gpt-5.6-luna", "max", "codex", "AA-agent", "agentic", 8.0, None),
+    ("gpt-5.6-terra", "max", "codex", "AA-agent", "agentic", 8.4, None),
+    ("claude-opus-5", "low", "claude-code", "AA-agent", "agentic", 9.5, None),
+    ("gpt-5.6-sol", "max", "codex", "AA-agent", "agentic", 10.2, 7.08),
+    ("claude-opus-4.7", "medium", "opencode", "AA-agent", "agentic", 12.2, 2.93),
+    ("claude-opus-5", "medium", "claude-code", "AA-agent", "agentic", 12.2, 3.14),
+    ("muse-spark-1.1", "xhigh", "opencode", "AA-agent", "agentic", 12.6, None),
+    ("claude-opus-5", "high", "claude-code", "AA-agent", "agentic", 13.4, 3.80),
+    ("claude-sonnet-4.6", "medium", "claude-code", "AA-agent", "agentic", 13.5, None),
+    ("grok-4.5", "high", "grok-build", "AA-agent", "agentic", 16.5, None),
+    ("claude-fable-5", "max", "claude-code", "AA-agent", "agentic", 23.4, 11.7),
+    ("claude-opus-5", "xhigh", "claude-code", "AA-agent", "agentic", 23.6, 8.23),
+    ("claude-opus-5", "max", "claude-code", "AA-agent", "agentic", 23.7, 8.95),
+    ("kimi-k3", "default", "kimi-code-cli", "AA-agent", "agentic", 23.8, 3.18),
+    ("glm-5.2", "default", "claude-code", "AA-agent", "agentic", 25.1, 6.51),
+    ("kimi-k2.6", "default", "claude-code", "AA-agent", "agentic", 41.0, None),
+)
+
+_AA_AGENT_MEASUREMENT_BY_KEY: dict[tuple[str, str, str, str, str], tuple[float, float | None]] = {
+    row[:5]: (row[5], row[6]) for row in AA_AGENT_MEASUREMENTS
+}
+if len(_AA_AGENT_MEASUREMENT_BY_KEY) != len(AA_AGENT_MEASUREMENTS):  # pragma: no cover - static guard
+    raise RuntimeError("duplicate ROB-1194 AA-agent measurement key")
+
 
 class BenchError(ValueError):
     """A user-facing validation or upstream-data error."""
@@ -115,6 +156,8 @@ class ModelScore:
     score: float | None
     rank: int | None
     captured_at: str
+    time_per_task_min: float | None = None
+    cost_per_task_usd: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _MODEL_SCORE_COLUMNS}
@@ -164,6 +207,8 @@ def _schema(conn: sqlite3.Connection) -> None:
           score       REAL,
           rank        INTEGER,
           captured_at TEXT NOT NULL,
+          time_per_task_min REAL,
+          cost_per_task_usd REAL,
           PRIMARY KEY (model_id, effort, harness, source, metric)
         );
 
@@ -184,6 +229,10 @@ def _schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    existing_score_columns = {row[1] for row in conn.execute("PRAGMA table_info(model_scores)").fetchall()}
+    for column in ("time_per_task_min", "cost_per_task_usd"):
+        if column not in existing_score_columns:
+            conn.execute(f"ALTER TABLE model_scores ADD COLUMN {column} REAL")
     existing_rep_columns = {row[1] for row in conn.execute("PRAGMA table_info(reps)").fetchall()}
     for column in ("input_tokens", "output_tokens"):
         if column not in existing_rep_columns:
@@ -240,6 +289,17 @@ def _score(value: object, *, allow_none: bool) -> float | None:
     return result
 
 
+def _measurement(value: object, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchError(f"{field} must be a finite non-negative number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise BenchError(f"{field} must be a finite non-negative number")
+    return result
+
+
 def _rank(value: object) -> int | None:
     if value is None:
         return None
@@ -288,6 +348,8 @@ def _validate_score(
         score=_score(value.score, allow_none=allow_none_score),
         rank=_rank(value.rank),
         captured_at=_captured_at(value.captured_at),
+        time_per_task_min=_measurement(value.time_per_task_min, "time_per_task_min"),
+        cost_per_task_usd=_measurement(value.cost_per_task_usd, "cost_per_task_usd"),
     )
 
 
@@ -305,6 +367,15 @@ def _readonly_connect(target: pathlib.Path | str) -> sqlite3.Connection:
     return conn
 
 
+def _model_score_select_columns(conn: sqlite3.Connection) -> str:
+    """Select the current score shape without migrating a legacy read target."""
+
+    available = {row[1] for row in conn.execute("PRAGMA table_info(model_scores)").fetchall()}
+    return ", ".join(
+        column if column in available else f"NULL AS {column}" for column in _MODEL_SCORE_COLUMNS
+    )
+
+
 def read_scores(model_id: str | None = None, *, path: pathlib.Path | str | None = None) -> list[ModelScore]:
     """Read scores without creating a DB when the target does not exist."""
 
@@ -314,21 +385,30 @@ def read_scores(model_id: str | None = None, *, path: pathlib.Path | str | None 
     normalized = _model_id(model_id) if model_id is not None else None
     conn = _readonly_connect(target)
     try:
+        select_columns = _model_score_select_columns(conn)
         if normalized is None:
             rows = conn.execute(
-                "SELECT model_id, effort, harness, source, metric, score, rank, captured_at "
-                "FROM model_scores ORDER BY source, metric, model_id, effort, harness"
+                f"SELECT {select_columns} FROM model_scores "
+                "ORDER BY source, metric, model_id, effort, harness"
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT model_id, effort, harness, source, metric, score, rank, captured_at "
-                "FROM model_scores WHERE model_id = ? "
+                f"SELECT {select_columns} FROM model_scores WHERE model_id = ? "
                 "ORDER BY source, metric, effort, harness",
                 (normalized,),
             ).fetchall()
         return [_score_from_row(row) for row in rows]
     finally:
         conn.close()
+
+
+def _measurement_values(score: ModelScore) -> tuple[float | None, float | None]:
+    approved = _AA_AGENT_MEASUREMENT_BY_KEY.get(
+        (score.model_id, score.effort, score.harness, score.source, score.metric)
+    )
+    if approved is not None:
+        return approved
+    return score.time_per_task_min, score.cost_per_task_usd
 
 
 def _upsert(conn: sqlite3.Connection, score: ModelScore) -> None:
@@ -338,6 +418,7 @@ def _upsert(conn: sqlite3.Connection, score: ModelScore) -> None:
     )
     key = (score.model_id, score.source, score.metric, score.effort, score.harness)
     found = conn.execute(where, key).fetchone()
+    time_per_task_min, cost_per_task_usd = _measurement_values(score)
     values = (
         score.model_id,
         score.effort,
@@ -347,17 +428,21 @@ def _upsert(conn: sqlite3.Connection, score: ModelScore) -> None:
         score.score,
         score.rank,
         score.captured_at,
+        time_per_task_min,
+        cost_per_task_usd,
     )
     if found:
         conn.execute(
-            "UPDATE model_scores SET score = ?, rank = ?, captured_at = ? "
+            "UPDATE model_scores SET score = ?, rank = ?, captured_at = ?, "
+            "time_per_task_min = ?, cost_per_task_usd = ? "
             "WHERE model_id = ? AND source = ? AND metric = ? AND effort IS ? AND harness IS ?",
-            (score.score, score.rank, score.captured_at, *key),
+            (score.score, score.rank, score.captured_at, time_per_task_min, cost_per_task_usd, *key),
         )
     else:
         conn.execute(
-            "INSERT INTO model_scores (model_id, effort, harness, source, metric, score, rank, captured_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO model_scores "
+            "(model_id, effort, harness, source, metric, score, rank, captured_at, "
+            "time_per_task_min, cost_per_task_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             values,
         )
 
@@ -371,9 +456,11 @@ def _insert_if_missing(conn: sqlite3.Connection, score: ModelScore) -> bool:
     ).fetchone()
     if found:
         return False
+    time_per_task_min, cost_per_task_usd = _measurement_values(score)
     conn.execute(
-        "INSERT INTO model_scores (model_id, effort, harness, source, metric, score, rank, captured_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO model_scores "
+        "(model_id, effort, harness, source, metric, score, rank, captured_at, "
+        "time_per_task_min, cost_per_task_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             score.model_id,
             score.effort,
@@ -383,6 +470,8 @@ def _insert_if_missing(conn: sqlite3.Connection, score: ModelScore) -> bool:
             score.score,
             score.rank,
             score.captured_at,
+            time_per_task_min,
+            cost_per_task_usd,
         ),
     )
     return True
@@ -439,12 +528,81 @@ def _seed_conn(conn: sqlite3.Connection) -> int:
     return inserted
 
 
+def _apply_known_aa_agent_measurements(conn: sqlite3.Connection) -> int:
+    """Fill approved metadata for matching rows without creating new rows."""
+
+    rows = conn.execute(
+        "SELECT model_id, effort, harness, source, metric, time_per_task_min, cost_per_task_usd "
+        "FROM model_scores WHERE source = 'AA-agent' AND metric = 'agentic'"
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        key = (row["model_id"], row["effort"], row["harness"], row["source"], row["metric"])
+        approved = _AA_AGENT_MEASUREMENT_BY_KEY.get(key)
+        if approved is None or (row["time_per_task_min"], row["cost_per_task_usd"]) == approved:
+            continue
+        conn.execute(
+            "UPDATE model_scores SET time_per_task_min = ?, cost_per_task_usd = ? "
+            "WHERE model_id = ? AND source = ? AND metric = ? AND effort IS ? AND harness IS ?",
+            (*approved, row["model_id"], row["source"], row["metric"], row["effort"], row["harness"]),
+        )
+        changed += 1
+    return changed
+
+
+def _strict_aa_agent_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        "SELECT model_id, effort, harness, source, metric, time_per_task_min, cost_per_task_usd "
+        "FROM model_scores WHERE source = 'AA-agent' AND metric = 'agentic' "
+        "ORDER BY model_id, effort, harness"
+    ).fetchall()
+    keys = [(row["model_id"], row["effort"], row["harness"], row["source"], row["metric"]) for row in rows]
+    expected = set(_AA_AGENT_MEASUREMENT_BY_KEY)
+    actual = set(keys)
+
+    def sort_key(key: tuple[object, ...]) -> tuple[str, ...]:
+        return tuple("" if value is None else str(value) for value in key)
+
+    duplicates = sorted({key for key in keys if keys.count(key) > 1}, key=sort_key)
+    missing = sorted(expected - actual, key=sort_key)
+    extra = sorted(actual - expected, key=sort_key)
+    if missing or extra or duplicates:
+        raise BenchError(
+            "AA-agent/agentic key mismatch: "
+            f"expected={len(expected)} actual={len(keys)} "
+            f"missing={missing} extra={extra} duplicates={duplicates}"
+        )
+    return rows
+
+
+def backfill_aa_agent_metrics(*, path: pathlib.Path | str | None = None) -> int:
+    """Backfill the exact approved 26-row AA-agent metadata set.
+
+    This is an explicit write operation.  It fails closed unless the target
+    contains exactly the approved full keys, so a partial or ambiguous source
+    cannot receive guessed updates.
+    """
+
+    conn = connect(path)
+    try:
+        _strict_aa_agent_rows(conn)
+        changed = _apply_known_aa_agent_measurements(conn)
+        conn.commit()
+        return changed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def seed_scores(*, path: pathlib.Path | str | None = None) -> int:
     """Persist missing GRADE_TABLE seed rows without overwriting existing rows."""
 
     conn = connect(path)
     try:
         inserted = _seed_conn(conn)
+        _apply_known_aa_agent_measurements(conn)
         conn.commit()
         return inserted
     except Exception:
@@ -663,6 +821,7 @@ def sync_scores(
     conn = connect(path)
     try:
         _seed_conn(conn)
+        _apply_known_aa_agent_measurements(conn)
         for score in scores:
             _upsert(conn, score)
         for metric in {score.metric for score in scores}:
@@ -697,7 +856,17 @@ def run_sync(*, stderr: TextIO) -> int:
     return 0
 
 
-_IMPORT_DEFAULT_FIELDS = frozenset({"source", "metric", "effort", "harness", "captured_at"})
+_IMPORT_DEFAULT_FIELDS = frozenset(
+    {
+        "source",
+        "metric",
+        "effort",
+        "harness",
+        "captured_at",
+        "time_per_task_min",
+        "cost_per_task_usd",
+    }
+)
 _IMPORT_ROW_FIELDS = _IMPORT_DEFAULT_FIELDS | frozenset({"model_id", "score", "rank"})
 
 
@@ -744,6 +913,8 @@ def _import_rows(payload: object) -> list[ModelScore]:
                 score=_score(merged.get("score"), allow_none=False),
                 rank=_rank(merged.get("rank")),
                 captured_at=_captured_at(merged.get("captured_at")),
+                time_per_task_min=_measurement(merged.get("time_per_task_min"), "time_per_task_min"),
+                cost_per_task_usd=_measurement(merged.get("cost_per_task_usd"), "cost_per_task_usd"),
             ),
             allow_aa_model=False,
             allow_none_score=False,
@@ -771,6 +942,7 @@ def import_scores(path: pathlib.Path | str, *, db: pathlib.Path | str | None = N
         _seed_conn(conn)
         for row in rows:
             _upsert(conn, row)
+        _apply_known_aa_agent_measurements(conn)
         for source, metric in {(row.source, row.metric) for row in rows}:
             _recompute_rank(conn, source, metric)
         conn.commit()
@@ -860,12 +1032,18 @@ def show_scores(model_id: str, *, path: pathlib.Path | str | None = None) -> str
     if not scores:
         lines.append("없음/미측정")
         return "\n".join(lines)
-    lines.append("source      metric          effort  harness  score  rank  captured_at")
+    lines.append(
+        "source      metric          effort  harness  score  rank  "
+        "time_per_task_min  cost_per_task_usd  captured_at"
+    )
     for score in scores:
         score_text = "없음/미측정" if score.score is None else f"{score.score:.1f}"
+        time_text = "-" if score.time_per_task_min is None else f"{score.time_per_task_min:.1f}"
+        cost_text = "-" if score.cost_per_task_usd is None else f"${score.cost_per_task_usd:g}"
         lines.append(
             f"{score.source:<11} {score.metric:<15} {display_effort(score.effort):<7} "
-            f"{score.harness or '-':<8} {score_text:<6} {score.rank or '-':<5} {score.captured_at}"
+            f"{score.harness or '-':<8} {score_text:<6} {score.rank or '-':<5} "
+            f"{time_text:<17} {cost_text:<18} {score.captured_at}"
         )
     return "\n".join(lines)
 
