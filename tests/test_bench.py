@@ -243,8 +243,35 @@ def test_fresh_show_uses_normalized_luna_model_id_and_preserves_display_name(ben
     luna = next(profile for profile in GRADE_TABLE["A+"] if profile.name == "codex-luna-max")
     assert luna.model == "Luna (max)"
     assert luna.benchmark_model_id == "gpt-5.6-luna"
+    bench.seed_scores()
     shown = bench.show_scores("gpt-5.6-luna")
     assert "59.0" in shown and "max" in shown
+
+
+def test_read_scores_missing_db_has_no_filesystem_side_effect(bench_home):
+    path = bench.db_path()
+    assert not path.exists()
+    assert bench.read_scores() == []
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_show_missing_db_has_no_filesystem_side_effect(bench_home):
+    path = bench.db_path()
+    assert bench.show_scores("gpt-5.6-luna") == "model_id=gpt-5.6-luna\n없음/미측정"
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_read_scores_and_show_keep_existing_db_mtime(bench_home):
+    path = bench.db_path()
+    bench.seed_scores()
+    before = path.stat().st_mtime_ns
+
+    assert bench.read_scores()
+    assert "59.0" in bench.show_scores("gpt-5.6-luna")
+
+    assert path.stat().st_mtime_ns == before
 
 
 def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, capsys):
@@ -601,14 +628,18 @@ def test_recommend_prefers_aa_agent_over_aa_model_fallback(monkeypatch, bench_ho
 
 
 def test_coverage_report_marks_unlisted_profiles_without_implying_low(bench_home):
+    path = bench.db_path()
     report = bench.coverage_report()
     assert "kiro-cheap" in report
     assert "⚠" in report
     assert "'낮음'으로 취급 금지" in report
     assert "kiro-cheap" in report.rsplit("⚠", 1)[1]
+    assert not path.exists()
+    assert not path.parent.exists()
 
 
 def test_coverage_report_shows_hit_for_codex_terra_max(bench_home):
+    bench.seed_scores()
     report = bench.coverage_report()
     terra_line = next(line for line in report.splitlines() if line.startswith("codex-terra-max"))
     assert "있음" in terra_line  # AA-agent 열에 있음(시드 데이터)
@@ -656,6 +687,37 @@ def test_source_specific_aa_agent_mapping_wins_over_openrouter(bench_home):
     assert "AA-agent" in opus_line
     assert "AA-model" not in opus_line
     assert "xhigh" in opus_line
+
+
+def test_codex_aa_model_matching_ignores_unspecified_effort(bench_home):
+    from scopefuel.recommend import recommend
+
+    scores = [
+        _score(
+            model_id="gpt-5-6-luna",
+            source="AA-model",
+            metric="coding_index",
+            score=99.0,
+            effort=None,
+            harness=None,
+        ),
+        _score(
+            model_id="gpt-5-6-luna",
+            source="AA-model",
+            metric="coding_index",
+            score=62.0,
+            effort="max",
+            harness=None,
+        ),
+    ]
+    out = recommend(
+        [ProviderResult(id="codex", buckets=[Bucket(label="7d", window="7d", used_pct=10.0)])],
+        "A+",
+        bench_scores=scores,
+    )
+    luna_line = next(line for line in out.splitlines() if "codex-luna-max" in line and line[:1].isdigit())
+    assert "62.0(AA-model/max)" in luna_line
+    assert "99.0" not in luna_line
 
 
 def test_coverage_uses_source_specific_aa_agent_id(bench_home):

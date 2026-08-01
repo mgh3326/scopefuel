@@ -285,14 +285,24 @@ def _score_from_row(row: sqlite3.Row) -> ModelScore:
     return ModelScore(**{column: row[column] for column in _MODEL_SCORE_COLUMNS})
 
 
+def _readonly_connect(target: pathlib.Path | str) -> sqlite3.Connection:
+    """Open an existing bench DB without allowing schema or data writes."""
+
+    path = pathlib.Path(os.path.expanduser(str(target))).absolute()
+    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def read_scores(model_id: str | None = None, *, path: pathlib.Path | str | None = None) -> list[ModelScore]:
     """Read scores without creating a DB when the target does not exist."""
 
     target = pathlib.Path(path) if path is not None else db_path()
-    if str(target) != ":memory:" and not target.expanduser().exists():
+    if str(target) == ":memory:" or not target.expanduser().exists():
         return []
     normalized = _model_id(model_id) if model_id is not None else None
-    conn = connect(target)
+    conn = _readonly_connect(target)
     try:
         if normalized is None:
             rows = conn.execute(
@@ -759,11 +769,10 @@ def coverage_report(*, path: pathlib.Path | str | None = None) -> str:
     """ROB-1190 ②-5 — 프로필별 출처 커버리지. "점수 없음" != "낮음"(경고를 함께 낸다).
 
     GRADE_TABLE 의 모든 프로필을 순회하며 AA-agent/AA-model/openrouter 각 출처에 대해
-    (있음|없음) 을 표시한다. 이 리포트는 DB 를 새로 만들지 않고 seed 만 보장한다.
+    (있음|없음) 을 표시한다. 표시 전용 경로이므로 DB를 seed하거나 변경하지 않는다.
     """
     from .recommend import GRADE_TABLE
 
-    seed_scores(path=path)
     all_scores = read_scores(path=path)
     by_source_model: set[tuple[str, str]] = set()
     for score in all_scores:
@@ -829,7 +838,6 @@ def show_scores(model_id: str, *, path: pathlib.Path | str | None = None) -> str
     """Render only source-separated rows for one normalized model id."""
 
     normalized = _model_id(model_id)
-    seed_scores(path=path)
     scores = read_scores(normalized, path=path)
     lines = [f"model_id={normalized}"]
     if not scores:
