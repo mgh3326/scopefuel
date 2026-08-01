@@ -32,6 +32,20 @@ def _score(
     )
 
 
+def _insert_approved_aa_rows(path):
+    conn = bench.connect(path)
+    try:
+        conn.executemany(
+            "INSERT INTO model_scores "
+            "(model_id, effort, harness, source, metric, score, rank, captured_at, "
+            "time_per_task_min, cost_per_task_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+            [(*row[:5], 50.0, None, "2026-08-01T00:00:00+00:00") for row in bench.AA_AGENT_MEASUREMENTS],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def bench_home(tmp_path, monkeypatch):
     data_home = tmp_path / "xdg-data"
@@ -60,6 +74,8 @@ def test_schema_and_xdg_path_are_exact(bench_home):
         "score",
         "rank",
         "captured_at",
+        "time_per_task_min",
+        "cost_per_task_usd",
     ]
     assert tables["reps"] == [
         "id",
@@ -77,6 +93,92 @@ def test_schema_and_xdg_path_are_exact(bench_home):
         "recorded_at",
     ]
     assert ".cache" not in str(path)
+
+
+def test_rob1194_approved_26_row_backfill_and_cost_coverage(bench_home):
+    path = bench.db_path()
+    _insert_approved_aa_rows(path)
+
+    before = bench.read_scores(path=path)
+    assert len(before) == 26
+    assert all(row.time_per_task_min is None and row.cost_per_task_usd is None for row in before)
+
+    assert bench.backfill_aa_agent_metrics(path=path) == 26
+    assert bench.backfill_aa_agent_metrics(path=path) == 0
+
+    rows = bench.read_scores(path=path)
+    measurements = {
+        (row.model_id, row.effort, row.harness, row.source, row.metric): (
+            row.time_per_task_min,
+            row.cost_per_task_usd,
+        )
+        for row in rows
+    }
+    expected = {row[:5]: (row[5], row[6]) for row in bench.AA_AGENT_MEASUREMENTS}
+    assert measurements == expected
+    assert len(measurements) == 26
+    assert sum(cost is not None for _, cost in measurements.values()) == 12
+    assert measurements[("gpt-5.6-sol", "xhigh", "codex", "AA-agent", "agentic")] == (7.4, 5.24)
+
+
+def test_rob1194_backfill_fails_closed_on_partial_key_set(bench_home):
+    path = bench.db_path()
+    bench.upsert_scores([_score()])
+    with pytest.raises(bench.BenchError, match="key mismatch"):
+        bench.backfill_aa_agent_metrics(path=path)
+
+
+def test_rob1194_time_cost_mutation_is_detected_and_repaired(bench_home):
+    path = bench.db_path()
+    _insert_approved_aa_rows(path)
+    assert bench.backfill_aa_agent_metrics(path=path) == 26
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE model_scores SET time_per_task_min = ?, cost_per_task_usd = ? "
+            "WHERE model_id = ? AND effort = ? AND harness = ? AND source = ? AND metric = ?",
+            (7.5, 99.0, "gpt-5.6-sol", "xhigh", "codex", "AA-agent", "agentic"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    mutated = next(
+        row for row in bench.read_scores(path=path) if row.model_id == "gpt-5.6-sol" and row.effort == "xhigh"
+    )
+    assert (mutated.time_per_task_min, mutated.cost_per_task_usd) != (7.4, 5.24)
+    assert bench.backfill_aa_agent_metrics(path=path) == 1
+    repaired = next(
+        row for row in bench.read_scores(path=path) if row.model_id == "gpt-5.6-sol" and row.effort == "xhigh"
+    )
+    assert (repaired.time_per_task_min, repaired.cost_per_task_usd) == (7.4, 5.24)
+
+
+def test_rob1194_read_scores_keeps_legacy_db_read_only(tmp_path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE model_scores ("
+            "model_id TEXT NOT NULL, effort TEXT, harness TEXT, source TEXT NOT NULL, "
+            "metric TEXT NOT NULL, score REAL, rank INTEGER, captured_at TEXT NOT NULL, "
+            "PRIMARY KEY (model_id, effort, harness, source, metric))"
+        )
+        conn.execute(
+            "INSERT INTO model_scores VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("gpt-5.6-luna", "medium", "codex", "AA-agent", "agentic", 42.0, 25, "2026-08-01"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before_mtime = path.stat().st_mtime_ns
+
+    rows = bench.read_scores(path=path)
+
+    assert rows[0].time_per_task_min is None
+    assert rows[0].cost_per_task_usd is None
+    assert path.stat().st_mtime_ns == before_mtime
 
 
 def test_sync_with_fake_key_uses_official_endpoint_and_upserts(bench_home, monkeypatch):
@@ -211,6 +313,19 @@ def test_show_keeps_source_metric_harness_effort_rows_separate(bench_home, capsy
     assert "codex" in out and "57.1" in out
     assert "unspecified" in out
     assert "2026-07-31T12:00:00+00:00" in out
+
+
+def test_rob1194_bench_show_exposes_time_and_cost(bench_home):
+    path = bench.db_path()
+    _insert_approved_aa_rows(path)
+    assert bench.backfill_aa_agent_metrics(path=path) == 26
+
+    shown = bench.show_scores("gpt-5.6-luna", path=path)
+
+    assert "time_per_task_min" in shown
+    assert "cost_per_task_usd" in shown
+    assert "3.4" in shown and "8.0" in shown
+    assert "$5.24" not in shown
 
 
 def test_fresh_show_persists_grade_seed_idempotently_and_preserves_newer_value(bench_home):

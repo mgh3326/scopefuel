@@ -499,14 +499,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_model_id="gemini-3-6-flash",
         ),
         Profile("oc-kimi-code", "Kimi K2.7 Code", None),
-        Profile(
-            "oc-sonnet46",
-            "Sonnet 4.6",
-            47.2,
-            **_openrouter_benchmark(47.2, "sonnet-4.6"),
-            aa_agent_model_id="claude-sonnet-4.6",
-            aa_model_id="claude-sonnet-4-6",
-        ),
     ],
     "B": [
         Profile(
@@ -518,15 +510,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=ESTIMATED_ANNOTATION,
         ),
         Profile(
-            "codex-luna",
-            "Luna (medium)",
-            42.0,
-            **_aa_agent_benchmark(42.0, "gpt-5.6-luna", "medium"),
-            launcher_effort="medium",
-            aa_agent_model_id="gpt-5.6-luna",
-            aa_model_id="gpt-5-6-luna",
-        ),
-        Profile(
             "kiro-haiku",
             "Haiku 4.5",
             35.0,
@@ -535,13 +518,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile("oc-dsflash", "DeepSeek V4 Flash", None, aa_model_id="deepseek-v4-flash"),
     ],
     "C": [
+        # ROB-1194: measured Luna medium/low are the default C-tier route.
         Profile(
-            "haiku",
-            "Claude Haiku 4.5",
-            35.0,
-            launcher_effort="low",
-            benchmark_effort="low",
-            benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
+            "codex-luna",
+            "Luna (medium)",
+            42.0,
+            **_aa_agent_benchmark(42.0, "gpt-5.6-luna", "medium"),
+            launcher_effort="medium",
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
         ),
         Profile(
             "codex-luna",
@@ -553,6 +538,22 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gpt-5.6-luna",
         ),
         Profile("kiro-cheap", "Qwen3 Coder", None, aa_model_id="qwen3-coder-next"),
+        Profile(
+            "oc-sonnet46",
+            "Sonnet 4.6",
+            38.0,
+            **_aa_agent_benchmark(38.0, "claude-sonnet-4.6", "medium", harness="claude-code"),
+            aa_agent_model_id="claude-sonnet-4.6",
+            aa_model_id="claude-sonnet-4-6",
+        ),
+        Profile(
+            "haiku",
+            "Claude Haiku 4.5",
+            35.0,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
+        ),
         Profile(
             "oc-omni",
             "OmniRoute free",
@@ -1199,15 +1200,31 @@ def _format_benchmark_parts(
     )
 
 
+def _format_benchmark_measurements(
+    *, time_per_task_min: float | None, cost_per_task_usd: float | None
+) -> str:
+    parts: list[str] = []
+    if time_per_task_min is not None:
+        parts.append(f"{time_per_task_min:.1f}분")
+    if cost_per_task_usd is not None:
+        parts.append(f"${cost_per_task_usd:g}/작업")
+    return " · ".join(parts)
+
+
 def _format_benchmark_score(score: ModelScore) -> str:
     assert score.score is not None
-    return _format_benchmark_parts(
+    rendered = _format_benchmark_parts(
         score=score.score,
         source=score.source,
         metric=score.metric,
         harness=score.harness,
         effort=score.effort,
     )
+    measurements = _format_benchmark_measurements(
+        time_per_task_min=score.time_per_task_min,
+        cost_per_task_usd=score.cost_per_task_usd,
+    )
+    return f"{rendered} · {measurements}" if measurements else rendered
 
 
 def recommend(
@@ -1364,6 +1381,8 @@ def recommend(
         source: str,
         harness: str | None,
         effort: str | None,
+        time_per_task_min: float | None = None,
+        cost_per_task_usd: float | None = None,
     ) -> str:
         effort_s = display_effort(effort)
         if harness:
@@ -1374,6 +1393,13 @@ def recommend(
         annotation = _benchmark_annotation(profile)
         if annotation:
             rendered += f" · {annotation}"
+
+        measurements = _format_benchmark_measurements(
+            time_per_task_min=time_per_task_min,
+            cost_per_task_usd=cost_per_task_usd,
+        )
+        if measurements:
+            rendered += f" · {measurements}"
 
         actual_harness = _profile_actual_harness(profile)
         if (
@@ -1451,7 +1477,15 @@ def recommend(
                 matched.sort(key=lambda s: (s.harness or "", s.metric or ""))
                 s = matched[0]
                 assert s.score is not None
-                return _compact_bench(profile, s.score, s.source, s.harness, s.effort)
+                return _compact_bench(
+                    profile,
+                    s.score,
+                    s.source,
+                    s.harness,
+                    s.effort,
+                    s.time_per_task_min,
+                    s.cost_per_task_usd,
+                )
             # Effort unconfirmed: only show when a single effort value exists (no best-of).
             efforts = {s.effort for s in scores}
             if len(efforts) != 1:
@@ -1459,7 +1493,15 @@ def recommend(
             scores_sorted = sorted(scores, key=lambda s: (s.harness or "", s.metric or "", s.source))
             s = scores_sorted[0]
             assert s.score is not None
-            return _compact_bench(profile, s.score, s.source, s.harness, s.effort)
+            return _compact_bench(
+                profile,
+                s.score,
+                s.source,
+                s.harness,
+                s.effort,
+                s.time_per_task_min,
+                s.cost_per_task_usd,
+            )
 
         for pool in (_agent_candidates, _model_candidates, _other_candidates):
             picked = _pick_single(pool())

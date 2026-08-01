@@ -6,7 +6,7 @@ import datetime as dt
 
 import pytest
 
-from scopefuel import cli, policy
+from scopefuel import bench, cli, policy
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     CODEX_SOL_XHIGH_ESCALATION_REASON,
@@ -155,8 +155,9 @@ def test_recommend_excludes_unmeasurable_provider():
 
 def test_grade_table_has_expected_a_profiles():
     names = [p.name for p in GRADE_TABLE["A"]]
-    assert {"oc-gflash", "oc-kimi-code", "oc-sonnet46"}.issubset(names)
+    assert {"oc-gflash", "oc-kimi-code"}.issubset(names)
     assert {"codex-sol", "codex-luna", "codex-terra"}.issubset(names)
+    assert "oc-sonnet46" not in names
 
 
 # ------------------------------------------------------------------ ROB-1182
@@ -382,17 +383,52 @@ def test_ac2_s_grade_profiles():
 # ------------------------------------------------------------------ AC3: A+/A/C
 
 
-def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
+def test_ac3_aplus_has_four_and_c_relocates_sonnet46_and_luna_medium():
     """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"}.issubset(aplus_names)
     assert {"codex-terra", "codex-luna", "opus", "oc-minimax-m3"}.issubset(aplus_names)
 
     a_names = [p.name for p in GRADE_TABLE["A"]]
-    assert "oc-sonnet46" in a_names
+    assert "oc-sonnet46" not in a_names
 
     c_names = [p.name for p in GRADE_TABLE["C"]]
-    assert "oc-sonnet46" not in c_names
+    assert c_names[:2] == ["codex-luna", "codex-luna"]
+    assert "oc-sonnet46" in c_names
+    assert c_names.index("oc-sonnet46") > 1
+
+
+def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    measured = [
+        bench.ModelScore(
+            model_id="gpt-5.6-luna",
+            effort="max",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=59.0,
+            rank=14,
+            captured_at="2026-08-01T00:00:00+00:00",
+            time_per_task_min=8.0,
+        )
+    ]
+    unmeasured = [bench.ModelScore(**{**score.as_dict(), "time_per_task_min": None}) for score in measured]
+
+    with_measurement = recommend(providers, "A+", today=TODAY, now=NOW, bench_scores=measured)
+    without_measurement = recommend(providers, "A+", today=TODAY, now=NOW, bench_scores=unmeasured)
+
+    def prefix(output: str) -> list[str]:
+        return [line.split("벤치", 1)[0] for line in output.splitlines() if line[:1].isdigit()]
+
+    assert prefix(with_measurement) == prefix(without_measurement)
+    assert "8.0분" in with_measurement
+    assert "8.0분" not in without_measurement
+
+    c_names = [profile.model for profile in GRADE_TABLE["C"][:4]]
+    assert c_names[:2] == ["Luna (medium)", "Luna (low)"]
+    assert c_names[2] == "Qwen3 Coder"
+    assert c_names[3] == "Sonnet 4.6"
 
 
 def test_rob1193_splus_default_and_escalation_efforts_have_exact_reasons():
