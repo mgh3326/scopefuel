@@ -387,7 +387,11 @@ def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
 
 def test_codex_max_gate_reason_is_operator_exact_string():
     codex_max = next(profile for profile in GRADE_TABLE["S+"] if profile.name == "codex-max")
-    assert codex_max.gate_reason == "측정 없음 — 장기 오케스트레이션 전용, reps 로 검증 예정"
+    assert codex_max.gate_reason == (
+        "지연 최적화 모드로 추정(미검증) — 품질 게이트와 무관. "
+        "서브에이전트 병렬로 토큰 소모가 늘 수 있음. "
+        "orch 장기 오케스트레이션 전용, reps 로 검증 예정"
+    )
 
 
 # ------------------------------------------------------------------ AC4: C grade
@@ -1219,6 +1223,71 @@ def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
     assert "대표" not in kimi_line
     assert "AA-agent" not in kimi_bench
     assert "(" not in kimi_bench  # no score-bearing parenthetical
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "grade", "model_id", "score_harness", "score_effort", "expected_label"),
+    [
+        ("oc-kimi-k3", "S", "kimi-k3", "kimi-code-cli", "max", "Kimi K3"),
+        ("oc-glm", "A+", "glm-5.2", "claude-code", "max", "GLM-5.2"),
+    ],
+)
+def test_opencode_harness_mismatch_is_display_only_with_native_hint(
+    profile_name, grade, model_id, score_harness, score_effort, expected_label
+):
+    from scopefuel.bench import ModelScore
+
+    scores = [
+        ModelScore(
+            model_id=model_id,
+            effort=score_effort,
+            harness=score_harness,
+            source="AA-agent",
+            metric="agentic",
+            score=61.0,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        )
+    ]
+    provider_id = "clinepass"
+    out = recommend(
+        [_result(provider_id, 10.0, pool_class="spend")],
+        grade,
+        today=TODAY,
+        now=NOW,
+        bench_scores=scores,
+    )
+    line = next(line for line in out.splitlines() if profile_name in line and line[:1].isdigit())
+    assert f"61.0(AA-agent/{score_harness}/{score_effort}) ⚠️ 다른 하네스 참고치" in line
+    assert f"💡 {expected_label} 는 " in line
+    assert "네이티브 하네스 검토 권장" in line
+
+
+def test_matching_opencode_harness_has_no_warning_or_native_hint():
+    from scopefuel.bench import ModelScore
+
+    out = recommend(
+        [_result("clinepass", 10.0, pool_class="spend")],
+        "S",
+        today=TODAY,
+        now=NOW,
+        bench_scores=[
+            ModelScore(
+                model_id="kimi-k3",
+                effort="max",
+                harness="opencode",
+                source="AA-agent",
+                metric="agentic",
+                score=61.0,
+                rank=1,
+                captured_at="2026-08-01T00:00:00+00:00",
+            )
+        ],
+    )
+    kimi_line = next(line for line in out.splitlines() if "oc-kimi-k3" in line and line[:1].isdigit())
+    assert "61.0(AA-agent/opencode/max)" in kimi_line
+    assert "⚠️" not in kimi_line
+    assert "💡" not in kimi_line
 
 
 def test_rob1191_stale_ultra_exact_delete_on_temp_db(tmp_path, monkeypatch):

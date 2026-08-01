@@ -138,6 +138,33 @@ class Profile:
     aa_model_id: str | None = None
 
 
+_HARNESS_LABELS = {
+    "claude-code": "Claude Code",
+    "codex": "Codex",
+    "grok-build": "Grok Build",
+    "kimi-code-cli": "Kimi Code CLI",
+    "opencode": "OpenCode",
+}
+
+
+def _profile_actual_harness(profile: Profile) -> str | None:
+    """Return the execution harness known from the profile route."""
+
+    if profile.name.startswith("oc-"):
+        return "opencode"
+    if profile.name.startswith("codex-"):
+        return "codex"
+    if profile.name in {"opus", "sonnet", "fable"}:
+        return "claude-code"
+    if profile.name.startswith("grok"):
+        return "grok-build"
+    return None
+
+
+def _harness_label(harness: str) -> str:
+    return _HARNESS_LABELS.get(harness.casefold(), harness)
+
+
 def _openrouter_benchmark(score: float, model_id: str) -> dict[str, object]:
     return {
         "benchmark_source": "openrouter",
@@ -182,7 +209,11 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "codex-max",
             "GPT-5.6 Sol (max)",
             67.0,
-            gate_reason="측정 없음 — 장기 오케스트레이션 전용, reps 로 검증 예정",
+            gate_reason=(
+                "지연 최적화 모드로 추정(미검증) — 품질 게이트와 무관. "
+                "서브에이전트 병렬로 토큰 소모가 늘 수 있음. "
+                "orch 장기 오케스트레이션 전용, reps 로 검증 예정"
+            ),
             **_aa_agent_benchmark(67.0, "gpt-5.6-sol", "max"),
             aa_agent_model_id="gpt-5.6-sol",
             aa_model_id="gpt-5-6-sol",
@@ -1085,11 +1116,32 @@ def recommend(
 
     included.sort(key=sort_key)
 
-    def _compact_bench(score: float, source: str, harness: str | None, effort: str | None) -> str:
+    def _compact_bench(
+        profile: Profile,
+        score: float,
+        source: str,
+        harness: str | None,
+        effort: str | None,
+    ) -> str:
         effort_s = display_effort(effort)
         if harness:
-            return f"{score:.1f}({source}/{harness}/{effort_s})"
-        return f"{score:.1f}({source}/{effort_s})"
+            rendered = f"{score:.1f}({source}/{harness}/{effort_s})"
+        else:
+            rendered = f"{score:.1f}({source}/{effort_s})"
+
+        actual_harness = _profile_actual_harness(profile)
+        if (
+            source == "AA-agent"
+            and actual_harness is not None
+            and harness is not None
+            and harness.casefold() != actual_harness.casefold()
+        ):
+            rendered += (
+                " ⚠️ 다른 하네스 참고치"
+                f" · 💡 {profile.model} 는 {_harness_label(harness)} 에서 측정됨"
+                " — 네이티브 하네스 검토 권장"
+            )
+        return rendered
 
     def benchmark_cell(profile: Profile) -> str:
         # ROB-1191 ④: single effort row only. No best-of multi-effort guess.
@@ -1114,6 +1166,7 @@ def recommend(
             model_fallback_id = profile.aa_model_id or (
                 profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
             )
+            codex_profile = profile_pool(profile.name)[0] == "codex"
             return [
                 score
                 for score in bench_scores or []
@@ -1121,6 +1174,7 @@ def recommend(
                 and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
                 and score.score is not None
                 and score.source == "AA-model"
+                and not (codex_profile and score.effort is None)
                 and _not_retired(score)
             ]
 
@@ -1147,7 +1201,7 @@ def recommend(
                 matched.sort(key=lambda s: (s.harness or "", s.metric or ""))
                 s = matched[0]
                 assert s.score is not None
-                return _compact_bench(s.score, s.source, s.harness, s.effort)
+                return _compact_bench(profile, s.score, s.source, s.harness, s.effort)
             # Effort unconfirmed: only show when a single effort value exists (no best-of).
             efforts = {s.effort for s in scores}
             if len(efforts) != 1:
@@ -1155,7 +1209,7 @@ def recommend(
             scores_sorted = sorted(scores, key=lambda s: (s.harness or "", s.metric or "", s.source))
             s = scores_sorted[0]
             assert s.score is not None
-            return _compact_bench(s.score, s.source, s.harness, s.effort)
+            return _compact_bench(profile, s.score, s.source, s.harness, s.effort)
 
         for pool in (_agent_candidates, _model_candidates, _other_candidates):
             picked = _pick_single(pool())
@@ -1169,6 +1223,7 @@ def recommend(
         if target_effort is None and profile.benchmark_effort is None:
             # Static single openrouter-style row with no effort dimension → show unspecified once.
             return _compact_bench(
+                profile,
                 profile.benchmark,
                 profile.benchmark_source,
                 profile.benchmark_harness,
@@ -1177,6 +1232,7 @@ def recommend(
         if target_effort is None:
             return "미지정"
         return _compact_bench(
+            profile,
             profile.benchmark,
             profile.benchmark_source,
             profile.benchmark_harness,
