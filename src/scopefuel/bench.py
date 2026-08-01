@@ -28,6 +28,51 @@ SEED_CAPTURED_AT = "2026-07-31T00:00:00+00:00"
 MANUAL_SOURCES = frozenset({"AA-agent", "benchlm", "openrouter"})
 SOURCES = MANUAL_SOURCES | {"AA-model"}
 METRICS = frozenset({"coding_index", "intelligence", "agentic", "coding"})
+APPROVED_EFFORTS = frozenset({"default", "low", "medium", "high", "xhigh", "max", "non-reasoning"})
+
+# ROB-1190 ②-1: AA-model slug 의 effort 접미사. 순서가 중요하다 — "non-reasoning" 이
+# "-high"/"-low" 등 다른 접미사의 부분열이 아니므로 순서 무관하지만, 길이가 긴 접미사부터
+# 검사해 예를 들어 "-xhigh" 를 "-high" 로 오매칭하지 않게 한다.
+_EFFORT_SUFFIXES: tuple[str, ...] = (
+    "-xhigh",
+    "-non-reasoning",
+    "-high",
+    "-medium",
+    "-low",
+)
+
+
+def parse_effort_suffix(model_id: str) -> tuple[str, str | None]:
+    """AA-model slug 에서 effort 접미사를 분리한다.
+
+    반환: (정규화된 base model_id, effort or None). 접미사가 없으면 effort=None —
+    "무접미사가 무슨 effort 인지"는 AA 공식 문서/API 필드로 확정할 수 없으므로(ROB-1190 ②-2,
+    확인: /api/v2/language/models 응답 스키마에 reasoning effort 레벨 필드가 없고,
+    "GPT-5.4" 무접미사와 "GPT-5.4 (xhigh)" 가 사이트에서 별개 페이지로 존재하며 실측
+    스코어 방향이 모델마다 다르다 — Sol 은 무접미사(77.4) < xhigh(78.3) 인데 Terra/Luna 는
+    반대), 이 함수는 effort=None 을 반환하고 호출자가 그 의미를 ``"unspecified"`` 로
+    명시하며 추측하지 않는다.
+    """
+    lowered = model_id.lower()
+    for suffix in _EFFORT_SUFFIXES:
+        if lowered.endswith(suffix):
+            base = model_id[: -len(suffix)]
+            effort = suffix[1:]  # "-xhigh" -> "xhigh"
+            return base, effort
+    return model_id, None
+
+
+def normalize_aa_model_id(model_id: str) -> str:
+    """Normalize AA-model source slugs for profile-to-row comparisons."""
+
+    return model_id.strip().lower().replace(".", "-")
+
+
+def display_effort(effort: str | None) -> str:
+    """Render a missing effort explicitly instead of silently hiding it."""
+
+    return effort or "unspecified"
+
 
 _MODEL_SCORE_COLUMNS = (
     "model_id",
@@ -219,6 +264,8 @@ def _validate_score(
     if metric not in METRICS:
         raise BenchError(f"unsupported metric: {metric}")
     effort = _optional_text(value.effort, "effort")
+    if effort is not None and effort not in APPROVED_EFFORTS:
+        raise BenchError(f"unsupported effort: {effort}")
     harness = _optional_text(value.harness, "harness")
     if source == "AA-agent" and (effort is None or harness is None):
         raise BenchError("AA-agent rows require effort and harness")
@@ -412,6 +459,13 @@ def _recompute_rank(conn: sqlite3.Connection, source: str, metric: str) -> None:
     )
 
 
+def _captured_at_key(value: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.astimezone(dt.UTC)
+
+
 def upsert_scores(scores: Iterable[ModelScore], *, path: pathlib.Path | str | None = None) -> int:
     """Validate and atomically upsert scores, preserving source/metric keys."""
 
@@ -488,11 +542,12 @@ def _aa_scores(payload: object, *, captured_at: str) -> list[ModelScore]:
                 continue
             if evaluations[field] is None:
                 continue
+            base_model_id, effort = parse_effort_suffix(model_id)
             scores.append(
                 _validate_score(
                     ModelScore(
-                        model_id=model_id,
-                        effort=None,
+                        model_id=base_model_id,
+                        effort=effort,
                         harness=None,
                         source="AA-model",
                         metric=metric,
@@ -503,6 +558,63 @@ def _aa_scores(payload: object, *, captured_at: str) -> list[ModelScore]:
                 )
             )
     return scores
+
+
+def migrate_aa_model_effort_suffixes(*, path: pathlib.Path | str | None = None) -> int:
+    """ROB-1190 ②-1 백필 — 기존 AA-model 행의 model_id 접미사를 effort 컬럼으로 분리한다.
+
+    새 스키마(파싱된 base model_id + effort)로 삽입하고, 접미사가 붙은 옛 model_id 행은
+    제거한다. 이미 파싱된 행(effort NOT NULL)이나 접미사 없는 model_id 는 그대로 둔다.
+    idempotent: 이미 마이그레이션된 DB에서 재실행해도 0을 반환한다.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT model_id, effort, harness, source, metric, score, rank, captured_at "
+            "FROM model_scores WHERE source = 'AA-model' AND effort IS NULL"
+        ).fetchall()
+        migrated = 0
+        for row in rows:
+            base_model_id, effort = parse_effort_suffix(row["model_id"])
+            if effort is None:
+                continue
+            new_score = _validate_score(
+                ModelScore(
+                    model_id=base_model_id,
+                    effort=effort,
+                    harness=row["harness"],
+                    source=row["source"],
+                    metric=row["metric"],
+                    score=row["score"],
+                    rank=row["rank"],
+                    captured_at=row["captured_at"],
+                )
+            )
+            target = conn.execute(
+                "SELECT captured_at FROM model_scores "
+                "WHERE model_id = ? AND source = ? AND metric = ? AND effort IS ? AND harness IS ?",
+                (base_model_id, row["source"], row["metric"], effort, row["harness"]),
+            ).fetchone()
+            if target is None or _captured_at_key(target["captured_at"]) < _captured_at_key(
+                row["captured_at"]
+            ):
+                _upsert(conn, new_score)
+            conn.execute(
+                "DELETE FROM model_scores WHERE model_id = ? AND effort IS NULL AND harness IS ? "
+                "AND source = ? AND metric = ?",
+                (row["model_id"], row["harness"], row["source"], row["metric"]),
+            )
+            migrated += 1
+        if migrated:
+            for metric in {row["metric"] for row in rows}:
+                _recompute_rank(conn, "AA-model", metric)
+        conn.commit()
+        return migrated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def sync_scores(
@@ -643,6 +755,76 @@ def import_scores(path: pathlib.Path | str, *, db: pathlib.Path | str | None = N
         conn.close()
 
 
+def coverage_report(*, path: pathlib.Path | str | None = None) -> str:
+    """ROB-1190 ②-5 — 프로필별 출처 커버리지. "점수 없음" != "낮음"(경고를 함께 낸다).
+
+    GRADE_TABLE 의 모든 프로필을 순회하며 AA-agent/AA-model/openrouter 각 출처에 대해
+    (있음|없음) 을 표시한다. 이 리포트는 DB 를 새로 만들지 않고 seed 만 보장한다.
+    """
+    from .recommend import GRADE_TABLE
+
+    seed_scores(path=path)
+    all_scores = read_scores(path=path)
+    by_source_model: set[tuple[str, str]] = set()
+    for score in all_scores:
+        if score.score is None:
+            continue
+        lookup_id = (
+            normalize_aa_model_id(score.model_id) if score.source == "AA-model" else score.model_id.lower()
+        )
+        by_source_model.add((score.source, lookup_id))
+
+    lines = ["profile       AA-agent  AA-model  openrouter"]
+    no_score_profiles: list[str] = []
+    for profiles in GRADE_TABLE.values():
+        for profile in profiles:
+            agent_id = profile.aa_agent_model_id or (
+                profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+            )
+            model_id = profile.aa_model_id or (
+                profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
+            )
+            openrouter_id = profile.benchmark_model_id if profile.benchmark_source == "openrouter" else None
+
+            has_agent = agent_id is not None and ("AA-agent", agent_id.lower()) in by_source_model
+            has_model = (
+                model_id is not None
+                and (
+                    "AA-model",
+                    normalize_aa_model_id(model_id),
+                )
+                in by_source_model
+            )
+            has_openrouter = (
+                openrouter_id is not None
+                and (
+                    "openrouter",
+                    openrouter_id.lower(),
+                )
+                in by_source_model
+            )
+
+            def mark(has: bool, checked: bool) -> str:
+                if not checked:
+                    return "-"
+                return "있음" if has else "없음"
+
+            lines.append(
+                f"{profile.name:<13} {mark(has_agent, agent_id is not None):<9} "
+                f"{mark(has_model, model_id is not None):<9} "
+                f"{mark(has_openrouter, openrouter_id is not None)}"
+            )
+            if not has_agent and not has_model and not has_openrouter:
+                no_score_profiles.append(profile.name)
+
+    if no_score_profiles:
+        lines.append("")
+        lines.append(
+            "⚠ AA 미수록(점수 없음) — '낮음'으로 취급 금지, reps 로만 판정: " + ", ".join(no_score_profiles)
+        )
+    return "\n".join(lines)
+
+
 def show_scores(model_id: str, *, path: pathlib.Path | str | None = None) -> str:
     """Render only source-separated rows for one normalized model id."""
 
@@ -657,7 +839,7 @@ def show_scores(model_id: str, *, path: pathlib.Path | str | None = None) -> str
     for score in scores:
         score_text = "없음/미측정" if score.score is None else f"{score.score:.1f}"
         lines.append(
-            f"{score.source:<11} {score.metric:<15} {score.effort or '-':<7} "
+            f"{score.source:<11} {score.metric:<15} {display_effort(score.effort):<7} "
             f"{score.harness or '-':<8} {score_text:<6} {score.rank or '-':<5} {score.captured_at}"
         )
     return "\n".join(lines)

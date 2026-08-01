@@ -17,6 +17,8 @@ from .model import PoolClass
 
 NEAR_EXPIRY_DAYS = 3
 DEFAULT_RESET_URGENCY_HOURS = 12.0
+DEFAULT_IMMINENT_RESET_HOURS = 1.0
+DEFAULT_IMMINENT_REMAINING_PCT = 5.0
 
 
 def config_path() -> pathlib.Path:
@@ -181,7 +183,7 @@ def get_boost(pool: str, today: dt.date | None = None) -> tuple[int | None, str 
 
     Expired/missing/invalid boost -> (None, status) so callers fall back to default sort.
     """
-    today = today or dt.datetime.now(dt.UTC).date()
+    today = today or dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 -- avoid dt.UTC (py<3.11 AttributeError, ROB-1188)
     result = _active_boost(pool, today)
     if result is None:
         return None, None
@@ -225,7 +227,7 @@ def get_policy(
     pool: str, builtin_class: PoolClass = "preserve", today: dt.date | None = None
 ) -> tuple[PoolClass, str | None]:
     """Return effective pool class and optional status note for a pool."""
-    today = today or dt.datetime.now(dt.UTC).date()
+    today = today or dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 -- avoid dt.UTC (py<3.11 AttributeError, ROB-1188)
     override = _active_override(pool, today)
     if override is None:
         return builtin_class, None
@@ -242,7 +244,7 @@ def get_policy(
 
 def get_active_override(pool: str, today: dt.date | None = None) -> ActiveOverride | None:
     """Return the active override for a pool, or None if none/expired/invalid."""
-    today = today or dt.datetime.now(dt.UTC).date()
+    today = today or dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 -- avoid dt.UTC (py<3.11 AttributeError, ROB-1188)
     override = _active_override(pool, today)
     return override if isinstance(override, ActiveOverride) else None
 
@@ -322,6 +324,34 @@ def get_reset_urgency_hours() -> float:
     return hours
 
 
+def _positive_setting(name: str, default: float) -> float:
+    """``[settings]`` 의 양수 float 설정 하나를 읽는다. 미설정/무효/0 이하는 default 로 폴백."""
+    config = load_config()
+    settings = config.get("settings")
+    if not isinstance(settings, dict):
+        return default
+    value = settings.get(name)
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def get_imminent_reset_hours() -> float:
+    """``[settings] imminent_reset_hours`` — 이 시간 이내 리셋이면 소멸 임박 후보(기본 1h)."""
+    return _positive_setting("imminent_reset_hours", DEFAULT_IMMINENT_RESET_HOURS)
+
+
+def get_imminent_remaining_pct() -> float:
+    """``[settings] imminent_remaining_pct`` — 이 잔여율 이상이면 소멸이 유의미(기본 5%)."""
+    return _positive_setting("imminent_remaining_pct", DEFAULT_IMMINENT_REMAINING_PCT)
+
+
 class CapacityWeightError(ValueError):
     """Raised by config-writers; readers use ``get_capacity_weight`` status instead."""
 
@@ -386,7 +416,7 @@ def list_policies(
     known_pools: dict[str, PoolClass], today: dt.date | None = None
 ) -> list[tuple[str, PoolClass, str | None]]:
     """Return (pool, effective_class, status) for known pools plus unknown config entries."""
-    today = today or dt.datetime.now(dt.UTC).date()
+    today = today or dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 -- avoid dt.UTC (py<3.11 AttributeError, ROB-1188)
     config = load_config()
     pools = config.get("pools") or {}
 
@@ -404,3 +434,68 @@ def list_policies(
             status = f"unknown pool{'; ' + status if status else ''}"
         out.append((name, effective, status))
     return out
+
+
+@dataclass(frozen=True)
+class PolicyRow:
+    """``policy list`` 한 행 — configured pool fields와 그 출처([기본]/[설정])."""
+
+    pool: str
+    effective_class: PoolClass
+    status: str | None
+    class_configured: bool
+    boost: int | None
+    boost_status: str | None
+    capacity_weight: float
+    capacity_weight_configured: bool
+
+
+def list_policy_rows(known_pools: dict[str, PoolClass], today: dt.date | None = None) -> list[PolicyRow]:
+    """``list_policies`` 확장 — boost·capacity_weight·설정 출처를 함께 반환한다.
+
+    ``class_configured`` 는 class 하나만이 아니라 해당 pool table이 config.toml에
+    명시적으로 존재하는지를 나타낸다. 따라서 boost/capacity_weight/price_usd/note
+    등 class 이외의 설정만 있어도 [설정]으로 표시한다.
+    """
+    today = today or dt.datetime.now(dt.timezone.utc).date()  # noqa: UP017 -- avoid dt.UTC (py<3.11 AttributeError, ROB-1188)
+    config = load_config()
+    pools = config.get("pools") or {}
+
+    order = list(known_pools)
+    seen = set(order)
+    for name in sorted(pools):
+        if name not in seen:
+            order.append(name)
+
+    rows: list[PolicyRow] = []
+    for name in order:
+        builtin = known_pools.get(name, "preserve")
+        effective, status = get_policy(name, builtin, today=today)
+        if name not in known_pools:
+            status = f"unknown pool{'; ' + status if status else ''}"
+        entry = pools.get(name)
+        class_configured = isinstance(entry, dict)
+        boost, boost_status = get_boost(name, today=today)
+        boost_configured = isinstance(entry, dict) and entry.get("boost") is not None
+        weight, weight_status = get_capacity_weight(name)
+        weight_configured = isinstance(entry, dict) and (
+            entry.get("capacity_weight") is not None or entry.get("price_usd") is not None
+        )
+        # boost 무효(만료 등)라도 "설정한 적 있음"은 유지하되, get_boost 의 실패 사유를 status 에 병합.
+        merged_boost_status = boost_status
+        if boost_configured and boost is None and boost_status is None:
+            merged_boost_status = None
+        rows.append(
+            PolicyRow(
+                pool=name,
+                effective_class=effective,
+                status=status,
+                class_configured=class_configured,
+                boost=boost,
+                boost_status=merged_boost_status if boost_configured else None,
+                capacity_weight=weight,
+                capacity_weight_configured=weight_configured,
+            )
+        )
+        _ = weight_status  # weight_status 는 get_capacity_weight 폴백 사유; 열 표시는 값만 사용.
+    return rows

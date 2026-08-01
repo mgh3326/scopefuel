@@ -352,3 +352,77 @@ def test_capacity_weight_bool_is_rejected_like_boost(policy_config):
     weight, status = policy.get_capacity_weight("codex")
     assert weight == 1.0
     assert status is not None and "invalid capacity_weight" in status
+
+
+# ------------------------------------------------------------------ ROB-1188: dt.UTC AttributeError
+
+
+def test_get_boost_no_args_does_not_raise(policy_config):
+    """dt.UTC 대신 dt.timezone.utc 를 써서 3.11 미만/일부 경로에서도 AttributeError 가 나지 않는다."""
+    boost, status = policy.get_boost("codex")
+    assert boost is None
+    assert status is None
+
+
+def test_operator_reproduction_exact_call_does_not_raise(policy_config):
+    """운영자가 직접 재현한 정확한 호출 형태 — dt.datetime.now(dt.UTC) AttributeError 재현 대상."""
+    from scopefuel.policy import get_boost
+
+    result = get_boost("codex")  # noqa: F841 -- 예외가 안 나는 것 자체가 회귀 검증
+    assert result == (None, None)
+
+
+def test_get_capacity_weight_no_args_does_not_raise(policy_config):
+    weight, status = policy.get_capacity_weight("codex")
+    assert weight == 1.0
+    assert status is None
+
+
+def test_get_policy_no_args_does_not_raise(policy_config):
+    effective, status = policy.get_policy("codex")
+    assert effective == "preserve"
+    assert status is None
+
+
+# ------------------------------------------------------------------ ROB-1188: policy list boost/weight
+
+
+def test_policy_list_shows_builtin_tag_when_unconfigured(policy_config, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    assert cli.main(["policy", "list"]) == 0
+    out = capsys.readouterr().out
+    for pool in BUILTIN:
+        line = next(line_ for line_ in out.splitlines() if line_.startswith(pool))
+        assert "[기본]" in line
+        assert "spend" in line  # ROB-1188: 6개 풀 기본값은 spend
+
+
+def test_policy_list_shows_configured_tag_and_boost_and_weight(policy_config, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    assert cli.main(["policy", "list"]) == 0
+    out = capsys.readouterr().out
+    codex_line = next(line for line in out.splitlines() if line.startswith("codex"))
+    assert "[설정]" in codex_line
+    assert "boost=1" in codex_line
+    claude_line = next(line for line in out.splitlines() if line.startswith("claude"))
+    assert "[기본]" in claude_line
+    assert "boost=-" in claude_line
+
+
+def test_policy_list_shows_capacity_weight_when_configured(policy_config, capsys, monkeypatch):
+    import pathlib
+    import shutil
+
+    fixture = pathlib.Path(__file__).parent / "fixtures" / "pool_capacity_weight.toml"
+    policy_config.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fixture, policy_config)
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    assert cli.main(["policy", "list"]) == 0
+    out = capsys.readouterr().out
+    claude_line = next(line for line in out.splitlines() if line.startswith("claude"))
+    assert "capacity_weight=10" in claude_line  # price_usd=200 -> 200/20=10.0
+    assert "[설정]" in claude_line  # fixture 는 claude class=preserve 를 명시
+    codex_line = next(line for line in out.splitlines() if line.startswith("codex"))
+    assert "capacity_weight=3.5" in codex_line
+    assert "[설정]" in codex_line  # class 가 없어도 capacity_weight 명시 설정이면 [설정]

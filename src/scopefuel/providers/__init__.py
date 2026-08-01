@@ -41,8 +41,8 @@ def _with_class(fn: object, pool_class: PoolClass) -> Fetcher:
 
 
 BUILTIN: dict[str, Fetcher] = {
-    "claude": _with_class(claude.fetch, "preserve"),
-    "codex": _with_class(codex.fetch, "preserve"),
+    "claude": _with_class(claude.fetch, "spend"),
+    "codex": _with_class(codex.fetch, "spend"),
     "agy": _with_class(agy.fetch, "spend"),
     "kiro": _with_class(kiro.fetch, "spend"),
     "clinepass": _with_class(clinepass.fetch, "spend"),

@@ -87,7 +87,7 @@ def test_profile_pool_matches_quota_guard():
     assert profile_pool("codex-med") == ("codex", None)
     assert profile_pool("grok-hi") == ("grok", None)
     assert profile_pool("codex-terra-max") == ("codex", None)
-    assert profile_pool("codex-luna-ultra") == ("codex", None)
+    assert profile_pool("codex-luna-max") == ("codex", None)
     assert profile_pool("kiro-sol") == ("kiro", None)
     assert profile_pool("kiro-haiku") == ("kiro", None)
     assert profile_pool("oc-omni") == ("omniroute", None)
@@ -375,7 +375,7 @@ def test_ac2_s_grade_profiles():
 def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
     """AC3: A+ has exactly 4 profiles, A includes oc-sonnet46, C does not."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
-    assert aplus_names == ["kiro-sonnet", "codex-luna-ultra", "oc-glm", "sonnet"]
+    assert aplus_names == ["kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"]
     assert len(aplus_names) == 4
 
     a_names = [p.name for p in GRADE_TABLE["A"]]
@@ -383,6 +383,11 @@ def test_ac3_aplus_has_four_and_a_has_sonnet46_and_c_no_sonnet46():
 
     c_names = [p.name for p in GRADE_TABLE["C"]]
     assert "oc-sonnet46" not in c_names
+
+
+def test_codex_max_gate_reason_is_operator_exact_string():
+    codex_max = next(profile for profile in GRADE_TABLE["S+"] if profile.name == "codex-max")
+    assert codex_max.gate_reason == "측정 없음 — 장기 오케스트레이션 전용, reps 로 검증 예정"
 
 
 # ------------------------------------------------------------------ AC4: C grade
@@ -700,6 +705,94 @@ def test_boost_bool_true_in_config_is_rejected_not_treated_as_1():
     assert "oc-kimi-k3" in ranked[0]
 
 
+# ------------------------------------------------------------------ ROB-1188: imminent-reset boost 역전
+
+
+def test_imminent_reset_outranks_boost():
+    """리셋 1h 이내 + 잔여 5% 초과인 spend 풀이 boost 걸린 풀보다 앞선다."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    providers = [
+        _result("codex", 10.0, pool_class="spend", window="30d"),  # boost=1, 리셋 08-05(안 임박)
+        _result(
+            "clinepass",
+            97.64,  # 잔여 2.36% -> 유의미 임계(기본 5%) 미달이면 역전 안 함 확인용 대조가 아니라
+            pool_class="spend",
+            window="7d",
+            resets_at=_reset_in(0.5),  # 30분 뒤 소멸 -> 임박
+        ),
+        _result("grok", 88.0, window="7d", resets_at=_reset_in(0.5)),  # 잔여 12% -> 유의미 + 임박
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    # grok(잔여 12%, 30분 뒤 소멸)이 boost=1 인 codex 보다 앞서야 한다.
+    assert "grok-hi" in ranked[0]
+    assert "소멸 임박 우선" in ranked[0]
+    assert "🔥🔥" in ranked[0]
+
+
+def test_imminent_reset_does_not_reverse_when_remaining_is_trivial():
+    """잔여가 사소하면(기본 임계 5% 미만) 역전하지 않는다 — 실측 사례(잔여 2.36%)."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    providers = [
+        _result("codex", 10.0, pool_class="spend", window="30d"),  # boost=1
+        _result(
+            "clinepass",
+            97.64,  # 잔여 2.36% < 기본 임계 5% -> 역전 대상 아님
+            pool_class="spend",
+            window="7d",
+            resets_at=_reset_in(0.47),  # 28분 뒤
+        ),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    # boost 가 여전히 최우선 — codex 가 1위.
+    assert ranked[0].startswith("1. codex-terra-max")
+    assert "소멸 임박 우선" not in ranked[0]
+
+
+def test_imminent_reset_does_not_apply_when_reset_not_imminent():
+    """리셋까지 시간이 아직 넉넉하면(기본 1h 초과) 역전하지 않는다."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    providers = [
+        _result("codex", 10.0, pool_class="spend", window="30d"),  # boost=1
+        _result(
+            "clinepass",
+            50.0,  # 잔여 50% (유의미) 이지만 리셋까지 2시간 -> 기본 임계(1h) 초과
+            pool_class="spend",
+            window="7d",
+            resets_at=_reset_in(2.0),
+        ),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert ranked[0].startswith("1. codex-terra-max")
+    assert "소멸 임박 우선" not in ranked[0]
+
+
+def test_imminent_reset_thresholds_configurable_via_settings():
+    """[settings] imminent_reset_hours/imminent_remaining_pct 로 조정 가능."""
+    config_path = policy.config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[settings]\nimminent_reset_hours = 3\nimminent_remaining_pct = 1\n\n"
+        '[pools.codex]\nclass = "spend"\nuntil = "2026-08-05"\nboost = 1\n'
+    )
+    providers = [
+        _result("codex", 10.0, pool_class="spend", window="30d"),
+        _result(
+            "clinepass",
+            98.5,  # 잔여 1.5% -> 조정된 임계 1% 이상이면 유의미
+            pool_class="spend",
+            window="7d",
+            resets_at=_reset_in(2.5),  # 조정된 임계 3h 이내
+        ),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert "oc-kimi-k3" in ranked[0]
+    assert "소멸 임박 우선" in ranked[0]
+
+
 # ------------------------------------------------------------------ ROB-1184: capacity_weight
 
 
@@ -778,3 +871,79 @@ def test_pace_urgent_path_is_independent_of_reset_urgency_hours_setting():
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "🔥" in ranked[0]
+
+
+# ------------------------------------------------------------------ ROB-1190 ③-1: ultra 폐기 — 벤치 셀 필터
+
+
+def test_benchmark_cell_filters_out_ultra_effort_scores():
+    """DB 에 과거 ultra 실측이 남아있어도 추천 벤치 셀에는 표시하지 않는다."""
+    from scopefuel.bench import ModelScore
+    from scopefuel.recommend import recommend as recommend_fn
+
+    scores = [
+        ModelScore(
+            model_id="gpt-5.6-luna",
+            effort="ultra",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=75.0,
+            rank=1,
+            captured_at="2026-07-31T12:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="gpt-5.6-luna",
+            effort="max",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=59.0,
+            rank=2,
+            captured_at="2026-07-31T12:00:00+00:00",
+        ),
+    ]
+    providers = [_result("codex", 10.0, pool_class="spend", window="30d")]
+    out = recommend_fn(providers, "A+", today=TODAY, now=NOW, bench_scores=scores)
+    luna_line = next(line for line in out.splitlines() if "codex-luna-max" in line)
+    assert "ultra" not in luna_line
+    assert "effort=max" in luna_line
+
+
+def test_benchmark_cell_filters_ultra_from_model_and_other_sources():
+    """폐기된 ultra 는 AA-model/other dynamic source에서도 추천에 다시 나오지 않는다."""
+    from scopefuel.bench import ModelScore
+    from scopefuel.recommend import recommend as recommend_fn
+
+    scores = [
+        ModelScore(
+            model_id="claude-sonnet-5",
+            effort="ultra",
+            harness=None,
+            source="AA-model",
+            metric="coding_index",
+            score=75.0,
+            rank=1,
+            captured_at="2026-07-31T12:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="sonnet-5",
+            effort="ultra",
+            harness=None,
+            source="openrouter",
+            metric="coding",
+            score=75.0,
+            rank=1,
+            captured_at="2026-07-31T12:00:00+00:00",
+        ),
+    ]
+    out = recommend_fn(
+        [_result("kiro", 10.0, pool_class="spend", window="30d")],
+        "A+",
+        today=TODAY,
+        now=NOW,
+        bench_scores=scores,
+    )
+    kiro_line = next(line for line in out.splitlines() if "kiro-sonnet" in line)
+    assert "ultra" not in kiro_line
+    assert "effort=unspecified" in kiro_line

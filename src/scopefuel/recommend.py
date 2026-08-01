@@ -15,12 +15,14 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Literal
 
-from .bench import ModelScore
+from .bench import ModelScore, display_effort, normalize_aa_model_id
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset
 from .policy import (
     get_active_override,
     get_boost,
     get_capacity_weight,
+    get_imminent_remaining_pct,
+    get_imminent_reset_hours,
     get_policy,
     get_reset_urgency_hours,
 )
@@ -111,6 +113,10 @@ class Profile:
     benchmark_harness: str | None = None
     benchmark_effort: str | None = None
     benchmark_model_id: str | None = None
+    # ROB-1190 ②-3/②-4: source-specific AA lookup keys. AA-agent wins when present;
+    # AA-model is queried only when the mapped AA-agent has no score.
+    aa_agent_model_id: str | None = None
+    aa_model_id: str | None = None
 
 
 def _openrouter_benchmark(score: float, model_id: str) -> dict[str, object]:
@@ -123,11 +129,13 @@ def _openrouter_benchmark(score: float, model_id: str) -> dict[str, object]:
     }
 
 
-def _aa_agent_benchmark(score: float, model_id: str, effort: str) -> dict[str, object]:
+def _aa_agent_benchmark(
+    score: float, model_id: str, effort: str, *, harness: str = "codex"
+) -> dict[str, object]:
     return {
         "benchmark_source": "AA-agent",
         "benchmark_metric": "agentic",
-        "benchmark_harness": "codex",
+        "benchmark_harness": harness,
         "benchmark_effort": effort,
         "benchmark_model_id": model_id,
     }
@@ -135,15 +143,39 @@ def _aa_agent_benchmark(score: float, model_id: str, effort: str) -> dict[str, o
 
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
-        Profile("kiro-opus", "Opus 5", 60.7, **_openrouter_benchmark(60.7, "opus-5")),
-        Profile("kiro-sol", "GPT-5.6 Sol", 58.9, **_openrouter_benchmark(58.9, "gpt-5.6-sol")),
         Profile(
-            "codex-max",
-            "GPT-5.6 Sol (max/ultra)",
+            "kiro-opus",
+            "Opus 5 (xhigh)",
+            67.0,
+            **_aa_agent_benchmark(67.0, "claude-opus-5", "xhigh", harness="claude-code"),
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
+        Profile(
+            "kiro-sol",
+            "GPT-5.6 Sol",
             58.9,
             **_openrouter_benchmark(58.9, "gpt-5.6-sol"),
+            aa_agent_model_id="gpt-5.6-sol",
+            aa_model_id="gpt-5-6-sol",
         ),
-        Profile("opus", "Opus 5", 60.7, **_openrouter_benchmark(60.7, "opus-5")),
+        Profile(
+            "codex-max",
+            "GPT-5.6 Sol (max)",
+            67.0,
+            gate_reason="측정 없음 — 장기 오케스트레이션 전용, reps 로 검증 예정",
+            **_aa_agent_benchmark(67.0, "gpt-5.6-sol", "max"),
+            aa_agent_model_id="gpt-5.6-sol",
+            aa_model_id="gpt-5-6-sol",
+        ),
+        Profile(
+            "opus",
+            "Opus 5",
+            60.7,
+            **_openrouter_benchmark(60.7, "opus-5"),
+            aa_agent_model_id="claude-opus-5",
+            aa_model_id="claude-opus-5",
+        ),
         Profile(
             "fable",
             "Fable 5",
@@ -154,40 +186,92 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
                 "고위험 1회성 / 서브에이전트 다수일 때만"
             ),
             **_openrouter_benchmark(59.9, "fable-5"),
+            aa_agent_model_id="claude-fable-5",
+            aa_model_id="claude-fable-5",
         ),
     ],
     "S": [
         Profile(
             "codex-terra-max",
             "Terra (max)",
-            78.0,
-            **_aa_agent_benchmark(78.0, "gpt-5.6-terra", "max"),
+            62.0,
+            **_aa_agent_benchmark(62.0, "gpt-5.6-terra", "max"),
+            aa_agent_model_id="gpt-5.6-terra",
+            aa_model_id="gpt-5-6-terra",
         ),
-        Profile("oc-kimi-k3", "Kimi K3", 57.1, **_openrouter_benchmark(57.1, "kimi-k3")),
-        Profile("grok-hi", "Grok 4.5", 53.8, **_openrouter_benchmark(53.8, "grok-4.5")),
+        Profile(
+            "oc-kimi-k3",
+            "Kimi K3",
+            57.1,
+            **_openrouter_benchmark(57.1, "kimi-k3"),
+            aa_agent_model_id="kimi-k3",
+            aa_model_id="kimi-k3",
+        ),
+        Profile(
+            "grok-hi",
+            "Grok 4.5",
+            53.8,
+            **_openrouter_benchmark(53.8, "grok-4.5"),
+            aa_agent_model_id="grok-4.5",
+            aa_model_id="grok-4-5",
+        ),
     ],
     "A+": [
-        Profile("kiro-sonnet", "Sonnet 5", 53.4, **_openrouter_benchmark(53.4, "sonnet-5")),
         Profile(
-            "codex-luna-ultra",
-            "Luna (ultra)",
-            75.0,
-            **_aa_agent_benchmark(75.0, "gpt-5.6-luna", "ultra"),
+            "kiro-sonnet",
+            "Sonnet 5",
+            53.4,
+            **_openrouter_benchmark(53.4, "sonnet-5"),
+            aa_model_id="claude-sonnet-5",
         ),
-        Profile("oc-glm", "GLM-5.2", 51.1, **_openrouter_benchmark(51.1, "glm-5.2")),
-        Profile("sonnet", "Sonnet 5", 53.4, **_openrouter_benchmark(53.4, "sonnet-5")),
+        Profile(
+            "codex-luna-max",
+            "Luna (max)",
+            59.0,
+            **_aa_agent_benchmark(59.0, "gpt-5.6-luna", "max"),
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
+        ),
+        Profile(
+            "oc-glm",
+            "GLM-5.2",
+            51.1,
+            **_openrouter_benchmark(51.1, "glm-5.2"),
+            aa_agent_model_id="glm-5.2",
+            aa_model_id="glm-5-2",
+        ),
+        Profile(
+            "sonnet",
+            "Sonnet 5",
+            53.4,
+            **_openrouter_benchmark(53.4, "sonnet-5"),
+            aa_model_id="claude-sonnet-5",
+        ),
     ],
     "A": [
-        Profile("oc-gflash", "Gemini 3.6 Flash", 50.1, **_openrouter_benchmark(50.1, "gemini-3.6-flash")),
+        Profile(
+            "oc-gflash",
+            "Gemini 3.6 Flash",
+            50.1,
+            **_openrouter_benchmark(50.1, "gemini-3.6-flash"),
+            aa_model_id="gemini-3-6-flash",
+        ),
         Profile("oc-kimi-code", "Kimi K2.7 Code", None),
-        Profile("oc-sonnet46", "Sonnet 4.6", 47.2, **_openrouter_benchmark(47.2, "sonnet-4.6")),
+        Profile(
+            "oc-sonnet46",
+            "Sonnet 4.6",
+            47.2,
+            **_openrouter_benchmark(47.2, "sonnet-4.6"),
+            aa_agent_model_id="claude-sonnet-4.6",
+            aa_model_id="claude-sonnet-4-6",
+        ),
     ],
     "B": [
-        Profile("kiro-haiku", "Haiku 4.5", None),
-        Profile("oc-dsflash", "DeepSeek V4 Flash", None),
+        Profile("kiro-haiku", "Haiku 4.5", None, aa_model_id="claude-4-5-haiku"),
+        Profile("oc-dsflash", "DeepSeek V4 Flash", None, aa_model_id="deepseek-v4-flash"),
     ],
     "C": [
-        Profile("kiro-cheap", "Qwen3 Coder", None),
+        Profile("kiro-cheap", "Qwen3 Coder", None, aa_model_id="qwen3-coder-next"),
         Profile(
             "oc-omni",
             "OmniRoute free",
@@ -201,6 +285,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             None,
             gate="escalation",
             gate_reason="agy 3p 풀 소모 — 다른 C 후보 소진 시에만",
+            aa_model_id="gpt-oss-120b",
         ),
     ],
 }
@@ -246,6 +331,7 @@ class _Candidate:
     boost: int | None
     weight: float
     effective_remaining: float
+    imminent_exhaustion: bool = False
 
 
 @dataclass
@@ -623,7 +709,9 @@ def _format_benchmark_parts(
     harness: str | None,
     effort: str | None,
 ) -> str:
-    return f"{score:.1f}({source}; metric={metric}; harness={harness or 'n/a'}; effort={effort or 'n/a'})"
+    return (
+        f"{score:.1f}({source}; metric={metric}; harness={harness or 'n/a'}; effort={display_effort(effort)})"
+    )
 
 
 def _format_benchmark_score(score: ModelScore) -> str:
@@ -714,6 +802,15 @@ def recommend(
         weight, _weight_status = get_capacity_weight(provider_id)
         effective_remaining = weight * remaining_pct
 
+        # ROB-1188 fix 4: 리셋까지 아주 짧게(기본 1h) 남았고 잔여가 유의미한 임계(기본 5%)
+        # 이상이면 "확실히 소멸"이 "며칠 단위 의도(boost)"보다 시급하다 — boost 를 역전.
+        imminent_exhaustion = (
+            effective_class == "spend"
+            and hours is not None
+            and hours <= get_imminent_reset_hours()
+            and remaining_pct >= get_imminent_remaining_pct()
+        )
+
         included.append(
             _Candidate(
                 profile=profile,
@@ -729,34 +826,85 @@ def recommend(
                 boost=boost,
                 weight=weight,
                 effective_remaining=effective_remaining,
+                imminent_exhaustion=imminent_exhaustion,
             )
         )
 
-    # 1) numeric boost(작을수록 먼저, 없으면 최하위) → 2) pace/fallback urgency →
-    # 3) class(spend > preserve) → 4) capacity_weight 반영 실효잔여(큰 순) → 표 순서(결정성)
-    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int]:
+    # 0) 소멸 임박 역전(리셋 임박 + 잔여 유의미) → 1) numeric boost(작을수록 먼저, 없으면
+    # 최하위) → 2) pace/fallback urgency → 3) class(spend > preserve) →
+    # 4) capacity_weight 반영 실효잔여(큰 순) → 표 순서(결정성)
+    def sort_key(c: _Candidate) -> tuple[int, int, int, int, int, float, int]:
+        imminent_first = 0 if c.imminent_exhaustion else 1
         boost_present = 0 if c.boost is not None else 1
         boost_value = c.boost if c.boost is not None else 0
         imminent = 0 if c.urgent else 1
         class_order = 0 if c.pool_class == "spend" else 1
         profile_order = next((i for i, p in enumerate(GRADE_TABLE[grade]) if p.name == c.profile.name), 0)
-        return (boost_present, boost_value, imminent, class_order, -c.effective_remaining, profile_order)
+        return (
+            imminent_first,
+            boost_present,
+            boost_value,
+            imminent,
+            class_order,
+            -c.effective_remaining,
+            profile_order,
+        )
 
     included.sort(key=sort_key)
 
     def benchmark_cell(profile: Profile) -> str:
-        dynamic = [
+        # ROB-1190 ③-1: ultra 폐기 — 어느 벤치도 ultra 를 공식 측정하지 않으므로(AA 모델=xhigh
+        # 까지, AA 에이전트=max 까지) 과거에 수집된 ultra 실측이 DB에 남아있어도 추천 벤치 셀에는
+        # 표시하지 않는다(추천 카탈로그에서 폐기된 effort 를 다시 노출하지 않기 위함).
+        def _not_retired(score: ModelScore) -> bool:
+            return score.effort != "ultra"
+
+        # ROB-1190 ②-4: AA-agent(모델×하네스 실사용에 더 가까움) 우선, 없을 때만 AA-model 폴백.
+        agent_lookup_id = profile.aa_agent_model_id or (
+            profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+        )
+        agent_dynamic = [
+            score
+            for score in bench_scores or []
+            if agent_lookup_id is not None
+            and score.model_id == agent_lookup_id
+            and score.score is not None
+            and score.source == "AA-agent"
+            and _not_retired(score)
+        ]
+        if agent_dynamic:
+            agent_dynamic.sort(key=lambda score: (score.effort or "", score.harness or ""))
+            return "; ".join(_format_benchmark_score(score) for score in agent_dynamic)
+
+        model_fallback_id = profile.aa_model_id or (
+            profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
+        )
+        model_dynamic = [
+            score
+            for score in bench_scores or []
+            if model_fallback_id is not None
+            and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
+            and score.score is not None
+            and score.source == "AA-model"
+            and _not_retired(score)
+        ]
+        if model_dynamic:
+            model_dynamic.sort(key=lambda score: (score.metric, score.effort or ""))
+            return "; ".join(_format_benchmark_score(score) for score in model_dynamic)
+
+        other_dynamic = [
             score
             for score in bench_scores or []
             if profile.benchmark_model_id is not None
             and score.model_id == profile.benchmark_model_id
             and score.score is not None
+            and score.source not in ("AA-agent", "AA-model")
+            and _not_retired(score)
         ]
-        if dynamic:
-            dynamic.sort(
-                key=lambda score: (score.source, score.metric, score.effort or "", score.harness or "")
-            )
-            return "; ".join(_format_benchmark_score(score) for score in dynamic)
+        if other_dynamic:
+            other_dynamic.sort(key=lambda score: (score.source, score.metric, score.effort or ""))
+            return "; ".join(_format_benchmark_score(score) for score in other_dynamic)
+
         if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
             return ""
         return _format_benchmark_parts(
@@ -787,7 +935,14 @@ def recommend(
         for rank, cand in enumerate(included, start=1):
             benchmark = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
-            if cand.urgent and cand.hours_to_reset is not None:
+            if cand.imminent_exhaustion and cand.hours_to_reset is not None:
+                lines.append(
+                    f"{rank}. 🔥🔥 {cand.profile.name:<10} {cand.provider_label} {cand.window} "
+                    f"{cand.used_pct:g}%  {cand.pool_class:<7}"
+                    f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
+                    f"  소멸 임박 우선 (boost 역전){bench}"
+                )
+            elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥 {cand.profile.name:<10} {cand.provider_label} {cand.window} "
                     f"{cand.used_pct:g}%  {cand.pool_class:<7}"

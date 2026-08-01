@@ -15,7 +15,7 @@ import time
 from . import bench, recommend, render
 from .cache import DEFAULT_TTL_S, collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
-from .policy import clear_policy, list_policies, set_policy
+from .policy import clear_policy, list_policy_rows, set_policy
 from .providers import default_order, registry
 from .recommend import grade_help_text
 
@@ -90,6 +90,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--watch", type=float, metavar="SECONDS", help="주기적으로 다시 그린다 (herdr pane용)"
     )
     parser.add_argument("--list-providers", action="store_true", help="사용 가능한 provider 목록")
+    parser.add_argument(
+        "--list-recommend-profiles",
+        action="store_true",
+        help="GRADE_TABLE 의 모든 추천 프로필 이름(기계 판독 가능, 한 줄에 하나) — wrk 교차검증용",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
     policy_parser = subparsers.add_parser("policy", help="pool-level policy config")
@@ -123,12 +128,17 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     bench_parser = subparsers.add_parser("bench", help="출처별 벤치 점수 SQLite DB")
     bench_sub = bench_parser.add_subparsers(dest="bench_command", required=True)
     bench_sub.add_parser("sync", help="공식 Artificial Analysis 모델 점수 동기화")
+    bench_sub.add_parser(
+        "migrate-effort", help="기존 AA-model 행의 model_id effort 접미사를 effort 컬럼으로 백필"
+    )
 
     bench_show = bench_sub.add_parser("show", help="모델의 출처별 벤치 점수 보기")
     bench_show.add_argument("model_id", help="정규화 모델 식별자")
 
     bench_import = bench_sub.add_parser("import", help="수동 벤치 점수 TOML 적재")
     bench_import.add_argument("file", help="[[scores]] 또는 [[model_scores]] TOML 파일")
+
+    bench_sub.add_parser("coverage", help="프로필별 출처(AA-agent/AA-model/openrouter) 커버리지")
 
     reps_parser = subparsers.add_parser("reps", help="실측 대표 실행 기록")
     reps_sub = reps_parser.add_subparsers(dest="reps_command", required=True)
@@ -187,9 +197,15 @@ def _policy_command(
     known_classes = {name: getattr(fetcher, "pool_class", "preserve") for name, fetcher in fetchers.items()}
 
     if args.policy_command == "list":
-        for name, effective, status in list_policies(known_classes, today=today):
-            status_s = f"  [{status}]" if status else ""
-            print(f"{name:<12} {effective:<9}{status_s}")
+        for row in list_policy_rows(known_classes, today=today):
+            class_tag = "[설정]" if row.class_configured else "[기본]"
+            boost_s = str(row.boost) if row.boost is not None else "-"
+            weight_s = f"{row.capacity_weight:g}" if row.capacity_weight_configured else "-"
+            status_s = f"  [{row.status}]" if row.status else ""
+            print(
+                f"{row.pool:<12} {row.effective_class:<9} {class_tag:<6} "
+                f"boost={boost_s:<4} capacity_weight={weight_s:<6}{status_s}"
+            )
         return 0
 
     if args.policy_command == "set":
@@ -271,6 +287,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
 def _bench_command(args: argparse.Namespace) -> int:
     if args.bench_command == "sync":
         return bench.run_sync(stderr=sys.stderr)
+    if args.bench_command == "migrate-effort":
+        count = bench.migrate_aa_model_effort_suffixes()
+        print(f"bench migrate-effort: migrated {count} row(s)")
+        return 0
+    if args.bench_command == "coverage":
+        print(bench.coverage_report())
+        return 0
     if args.bench_command == "show":
         print(bench.show_scores(args.model_id))
         return 0
@@ -335,6 +358,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_providers:
         for name in default_order(list(fetchers)):
+            print(name)
+        return 0
+
+    if args.list_recommend_profiles:
+        for name in sorted({p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}):
             print(name)
         return 0
 

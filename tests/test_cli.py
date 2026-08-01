@@ -173,3 +173,20 @@ def test_json_adds_null_pace_instead_of_misleading_zero(capsys):
     bucket = payload["providers"][0]["buckets"][0]
     assert bucket["pace"] is None
     assert bucket["full_use_rate"] is None
+
+
+# ------------------------------------------------------------------ ROB-1190 ④-3: --list-recommend-profiles
+
+
+def test_list_recommend_profiles_includes_oc_omni_and_excludes_ultra(capsys):
+    from scopefuel.recommend import GRADE_TABLE
+
+    assert cli.main(["--list-recommend-profiles"]) == 0
+    out = capsys.readouterr().out
+    names = out.splitlines()
+    assert names == sorted(names)  # 결정적 출력(교차검증 스크립트가 순서에 의존하지 않게)
+    expected = {p.name for profiles in GRADE_TABLE.values() for p in profiles}
+    assert set(names) == expected
+    assert "oc-omni" in names
+    assert "codex-ultra" not in names
+    assert "codex-luna-ultra" not in names

@@ -51,8 +51,10 @@ def bucket(
 
 
 def test_builtin_providers_have_pool_class_metadata():
-    assert BUILTIN["claude"].pool_class == "preserve"
-    assert BUILTIN["codex"].pool_class == "preserve"
+    # ROB-1188: 6개 풀 전부 use-it-or-lose-it 특성이라 기본값은 전부 spend.
+    # preserve 는 "남겨야 한다"는 운영자 의도가 있을 때만 config override 로 표현한다.
+    assert BUILTIN["claude"].pool_class == "spend"
+    assert BUILTIN["codex"].pool_class == "spend"
     assert BUILTIN["kiro"].pool_class == "spend"
     assert BUILTIN["clinepass"].pool_class == "spend"
     assert BUILTIN["agy"].pool_class == "spend"
