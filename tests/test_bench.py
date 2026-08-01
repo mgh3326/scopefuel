@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from scopefuel import bench, cli
@@ -69,6 +71,8 @@ def test_schema_and_xdg_path_are_exact(bench_home):
         "rounds",
         "blockers_found",
         "completed",
+        "input_tokens",
+        "output_tokens",
         "notes",
         "recorded_at",
     ]
@@ -217,7 +221,9 @@ def test_fresh_show_persists_grade_seed_idempotently_and_preserves_newer_value(b
     second_insert = bench.seed_scores()
     assert first_insert > 0
     assert second_insert == 0
-    seeded = next(row for row in bench.read_scores("gpt-5.6-terra") if row.source == "AA-agent")
+    seeded = next(
+        row for row in bench.read_scores("gpt-5.6-terra") if row.source == "AA-agent" and row.effort == "max"
+    )
     assert seeded.score == 62.0
     assert seeded.metric == "agentic"
     assert seeded.harness == "codex"
@@ -229,7 +235,9 @@ def test_fresh_show_persists_grade_seed_idempotently_and_preserves_newer_value(b
         ]
     )
     assert bench.seed_scores() == 0
-    current = next(row for row in bench.read_scores("gpt-5.6-terra") if row.source == "AA-agent")
+    current = next(
+        row for row in bench.read_scores("gpt-5.6-terra") if row.source == "AA-agent" and row.effort == "max"
+    )
     assert current.score == 99.0
 
     shown = bench.show_scores("gpt-5.6-terra")
@@ -290,7 +298,10 @@ def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, cap
     out = capsys.readouterr().out
     bench_cells = [line.split("벤치 ", 1)[1] for line in out.splitlines() if "벤치 " in line]
     assert bench_cells
-    assert all("(" in cell for cell in bench_cells)
+    assert all(
+        "(" in cell or "모델지수만 있음(에이전트 미측정)" in cell or cell in {"미측정", "미지정"}
+        for cell in bench_cells
+    )
     # ROB-1191 ④ compact single-effort cells
     assert "78.0(AA-agent; metric=agentic; harness=codex; effort=max)" not in out
     assert "62.0(AA-agent/codex/max)" in out
@@ -355,10 +366,92 @@ def test_reps_add_and_list_round_trip(bench_home, capsys):
     assert len(reps) == 1
     assert reps[0].task_ref == "ROB-1187"
     assert reps[0].completed == 1
+    assert reps[0].input_tokens is None
+    assert reps[0].output_tokens is None
     assert reps[0].notes == "fixture"
 
     assert cli.main(["reps", "list"]) == 0
     assert "profile=codex-terra-max" in capsys.readouterr().out
+
+
+def test_reps_tokens_round_trip_and_legacy_read_compat(bench_home, capsys, tmp_path):
+    assert (
+        cli.main(
+            [
+                "reps",
+                "add",
+                "--profile",
+                "codex-luna",
+                "--model",
+                "gpt-5.6-luna",
+                "--task",
+                "ROB-1193",
+                "--tier",
+                "T1",
+                "--role",
+                "impl",
+                "--rounds",
+                "1",
+                "--blockers-found",
+                "0",
+                "--completed",
+                "1",
+                "--input-tokens",
+                "3975",
+                "--output-tokens",
+                "10292",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    recorded = bench.read_reps()[0]
+    assert recorded.input_tokens == 3975
+    assert recorded.output_tokens == 10292
+    assert cli.main(["reps", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert "input-tokens=3975" in listed and "output-tokens=10292" in listed
+
+    legacy_path = tmp_path / "legacy-reps.db"
+    legacy = sqlite3.connect(legacy_path)
+    try:
+        legacy.execute(
+            "CREATE TABLE reps ("
+            "id INTEGER PRIMARY KEY, profile TEXT NOT NULL, model_id TEXT, task_ref TEXT, "
+            "tier TEXT, role TEXT, rounds INTEGER, blockers_found INTEGER, completed INTEGER, "
+            "notes TEXT, recorded_at TEXT NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO reps (profile, model_id, task_ref, tier, role, rounds, blockers_found, "
+            "completed, notes, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("opus", "claude-opus-5", "ROB-1187", "T1", "impl", 1, 0, 1, None, "2026-08-01T00:00:00Z"),
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+    before_mtime = legacy_path.stat().st_mtime_ns
+
+    old_rows = bench.read_reps(path=legacy_path)
+    assert old_rows[0].input_tokens is None and old_rows[0].output_tokens is None
+    assert legacy_path.stat().st_mtime_ns == before_mtime
+
+    bench.add_rep(
+        profile="haiku",
+        model_id="claude-haiku-4.5",
+        task_ref="ROB-1193",
+        tier="T1",
+        role="verify",
+        rounds=1,
+        blockers_found=0,
+        completed=1,
+        input_tokens=10,
+        output_tokens=20,
+        path=legacy_path,
+    )
+    migrated_rows = bench.read_reps(path=legacy_path)
+    assert migrated_rows[0].input_tokens == 10
+    assert migrated_rows[0].output_tokens == 20
+    assert migrated_rows[1].input_tokens is None
 
 
 def test_missing_db_recommend_does_not_treat_missing_scores_as_low(monkeypatch, tmp_path, capsys):

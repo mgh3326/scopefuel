@@ -161,12 +161,17 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_add.add_argument("--rounds", required=True, type=_nonnegative_int)
     reps_add.add_argument("--blockers-found", required=True, type=_nonnegative_int)
     reps_add.add_argument("--completed", required=True, type=_completed_arg, help="0/1")
+    reps_add.add_argument("--input-tokens", type=_nonnegative_int, help="입력 토큰 수")
+    reps_add.add_argument("--output-tokens", type=_nonnegative_int, help="출력 토큰 수")
     reps_add.add_argument("--notes")
 
     reps_list = reps_sub.add_parser("list", help="대표 실행 기록 조회")
     reps_list.add_argument("--limit", type=_nonnegative_int, help="최대 행 수 (1 이상)")
 
-    all_profiles = sorted({p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles})
+    all_profiles = sorted(
+        {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
+        | set(recommend.PROFILE_ALIASES)
+    )
     gate_parser = subparsers.add_parser(
         "gate",
         help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가)",
@@ -332,6 +337,8 @@ def _reps_command(args: argparse.Namespace) -> int:
                 rounds=args.rounds,
                 blockers_found=args.blockers_found,
                 completed=args.completed,
+                input_tokens=args.input_tokens,
+                output_tokens=args.output_tokens,
                 notes=args.notes,
             )
         except bench.BenchError as exc:
