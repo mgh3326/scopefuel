@@ -325,27 +325,55 @@ def _is_valid_used_pct(value: object) -> bool:
 def waste_for(
     buckets: list[Bucket], pool_class: PoolClass = "preserve", *, now: dt.datetime | None = None
 ) -> tuple[bool, str | None]:
-    """spend 풀에서 reset 전 24h 미만, 사용률 70% 미만인 버킷이 있으면 WASTE."""
+    """spend 풀의 가장 제약적인 창이 reset 전 24h 미만·70% 미만이면 WASTE.
+
+    여러 창을 가진 provider는 임의의 5h 창이 아니라 전체 account/group 한도 중
+    가장 많이 사용된 창을 headline 기준으로 삼는다. 예를 들어 weekly 99%와
+    five_hour 0%가 함께 있으면 weekly가 제약 창이므로 소진 권고를 내지 않는다.
+    """
     if pool_class != "spend":
         return False, None
     now = now or dt.datetime.now(dt.UTC)
     now = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
-    waste_buckets: list[str] = []
-    for bucket in buckets:
-        if not _is_valid_used_pct(bucket.used_pct):
-            continue
-        assert isinstance(bucket.used_pct, (int, float))
-        if bucket.used_pct >= WASTE_PCT:
-            continue
-        reset_at = _parse_reset(bucket.resets_at)
-        if reset_at is None:
-            continue
-        remaining_s = (reset_at - now).total_seconds()
-        if 0 < remaining_s < WASTE_WINDOW_S:
-            waste_buckets.append(f"{bucket.label} 사용 {bucket.used_pct:g}%")
-    if not waste_buckets:
+    known = [b for b in buckets if _is_valid_used_pct(b.used_pct)]
+    if not known:
         return False, None
-    return True, "리셋 전 소진 권장: " + ", ".join(waste_buckets)
+    account = [b for b in known if b.scope.kind == "account"]
+    if account:
+        scoped = account
+    else:
+        groups: dict[str, list[Bucket]] = {}
+        for bucket in known:
+            if bucket.scope.kind == "group":
+                groups.setdefault(bucket.scope.label, []).append(bucket)
+        if groups:
+            # Group pools are independent: preserve the existing "most available
+            # group" semantics and then choose that group's tightest window.
+            selected_group = min(
+                groups,
+                key=lambda name: max(float(b.used_pct or 0.0) for b in groups[name]),
+            )
+            scoped = groups[selected_group]
+        else:
+            scoped = [b for b in known if b.scope.kind != "model"] or known
+    constraint = max(
+        scoped or known,
+        key=lambda b: (
+            float(b.used_pct or 0.0),
+            -(_window_seconds(b.window) or float("inf")),
+            b.label,
+        ),
+    )
+    assert isinstance(constraint.used_pct, (int, float))
+    if constraint.used_pct >= WASTE_PCT:
+        return False, None
+    reset_at = _parse_reset(constraint.resets_at)
+    if reset_at is None:
+        return False, None
+    remaining_s = (reset_at - now).total_seconds()
+    if not 0 < remaining_s < WASTE_WINDOW_S:
+        return False, None
+    return True, f"리셋 전 소진 권장: {constraint.label} 사용 {constraint.used_pct:g}%"
 
 
 def horizon_for(window_seconds: float | None) -> Horizon:

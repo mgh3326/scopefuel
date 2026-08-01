@@ -305,22 +305,23 @@ def test_table_failure_not_relabeled_waste():
 # ------------------------------------------------------------------ multi-axis / group
 
 
-def test_clinepass_multi_axis_waste_per_bucket():
+def test_clinepass_headline_uses_most_constraining_window():
     result = ProviderResult(
         id="clinepass",
         pool_class="spend",
         buckets=[
-            bucket(69.9, label="five_hour", window="5h", horizon="now", reset_delta_s=3600),
-            bucket(95.0, label="weekly", window="7d", horizon="week", reset_delta_s=3600),
+            bucket(0.0, label="five_hour", window="5h", horizon="now", reset_delta_s=3600),
+            bucket(99.0, label="weekly", window="7d", horizon="week", reset_delta_s=3600),
             bucket(20.0, label="monthly", window="30d", horizon="month", reset_delta_s=WASTE_WINDOW_S + 1),
         ],
     )
     v = result.verdict_at(NOW)
-    assert v.waste is True
-    advice = v.waste_advice or ""
-    assert "five_hour" in advice
-    assert "weekly" not in advice
-    assert "monthly" not in advice
+    assert v.blocking_pct == 99.0
+    assert v.waste is False
+    assert v.waste_advice is None
+    output = render.table([result], color=False, now=NOW) + render.brief([result], color=False, now=NOW)
+    assert "WASTE" not in output
+    assert "weekly" in output
 
 
 def test_agy_group_independent_waste():
