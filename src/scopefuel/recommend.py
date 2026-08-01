@@ -501,13 +501,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile("oc-kimi-code", "Kimi K2.7 Code", None),
     ],
     "B": [
+        # ROB-1201: measured Luna medium (42) belongs to B (40–47).
         Profile(
-            "haiku",
-            "Claude Haiku 4.5",
-            35.0,
-            launcher_effort="low",
-            benchmark_effort="low",
-            benchmark_annotation=ESTIMATED_ANNOTATION,
+            "codex-luna",
+            "Luna (medium)",
+            42.0,
+            **_aa_agent_benchmark(42.0, "gpt-5.6-luna", "medium"),
+            launcher_effort="medium",
+            aa_agent_model_id="gpt-5.6-luna",
+            aa_model_id="gpt-5-6-luna",
         ),
         Profile(
             "kiro-haiku",
@@ -518,16 +520,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile("oc-dsflash", "DeepSeek V4 Flash", None, aa_model_id="deepseek-v4-flash"),
     ],
     "C": [
-        # ROB-1194: measured Luna medium/low are the default C-tier route.
-        Profile(
-            "codex-luna",
-            "Luna (medium)",
-            42.0,
-            **_aa_agent_benchmark(42.0, "gpt-5.6-luna", "medium"),
-            launcher_effort="medium",
-            aa_agent_model_id="gpt-5.6-luna",
-            aa_model_id="gpt-5-6-luna",
-        ),
         Profile(
             "codex-luna",
             "Luna (low)",
@@ -546,6 +538,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="claude-sonnet-4.6",
             aa_model_id="claude-sonnet-4-6",
         ),
+        # ROB-1201: estimated Haiku low is a C-tier exception, not a B candidate.
         Profile(
             "haiku",
             "Claude Haiku 4.5",
@@ -571,6 +564,64 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
     ],
 }
+
+
+_GRADE_ORDER: tuple[Grade, ...] = ("S+", "S", "A+", "A", "B", "C")
+_GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
+    {UNMEASURED_ANNOTATION, ESTIMATED_ANNOTATION, HAIKU_ESTIMATE_ANNOTATION, MODEL_ONLY_ANNOTATION}
+)
+
+
+def _grade_range(grade: Grade) -> tuple[float | None, float | None]:
+    """Return the inclusive lower/exclusive upper score range for a grade."""
+    if grade == "C":
+        return None, float(GRADE_BOUNDARIES["B"])
+    lower = float(GRADE_BOUNDARIES[grade])
+    index = _GRADE_ORDER.index(grade)
+    upper = None if index == 0 else float(GRADE_BOUNDARIES[_GRADE_ORDER[index - 1]])
+    return lower, upper
+
+
+def _boundary_checked(profile: Profile) -> bool:
+    """Only measured AA-agent scores are comparable to the operational grade cuts.
+
+    Estimated, unmeasured, and model-only rows are explicit exceptions. OpenRouter
+    and AA-model values are reference scores, not the AA-agent execution scores
+    used for these cuts.
+    """
+    return (
+        profile.benchmark is not None
+        and profile.benchmark_source == "AA-agent"
+        and profile.benchmark_annotation not in _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS
+    )
+
+
+def validate_grade_table(table: dict[Grade, list[Profile]] | None = None) -> None:
+    """Fail loudly when a measured profile is placed outside its grade range."""
+    table = GRADE_TABLE if table is None else table
+    violations: list[str] = []
+    for grade, profiles in table.items():
+        lower, upper = _grade_range(grade)
+        for profile in profiles:
+            if not _boundary_checked(profile):
+                continue
+            assert profile.benchmark is not None
+            in_range = (lower is None or profile.benchmark >= lower) and (
+                upper is None or profile.benchmark < upper
+            )
+            if not in_range:
+                violations.append(
+                    f"{profile.name} --effort {profile.launcher_effort or '-'} "
+                    f"score={profile.benchmark:g} in {grade} "
+                    f"(expected {lower if lower is not None else '-inf'}"
+                    f"–{upper if upper is not None else 'inf'})"
+                )
+    if violations:
+        raise ValueError("measured grade boundary violation: " + "; ".join(violations))
+
+
+validate_grade_table()
+
 
 # wrk의 기존 codex-max 표기는 계속 gate에서 받되, 급표의 정본 표기는 canonical codex-sol로 둔다.
 PROFILE_ALIASES: dict[str, str] = {"codex-max": "codex-sol"}

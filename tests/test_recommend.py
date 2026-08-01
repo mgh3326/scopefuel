@@ -10,7 +10,6 @@ from scopefuel import bench, cli, policy
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     CODEX_SOL_XHIGH_ESCALATION_REASON,
-    ESTIMATED_ANNOTATION,
     GRADE_BOUNDARIES,
     GRADE_DISCRIM,
     GRADE_TABLE,
@@ -19,9 +18,11 @@ from scopefuel.recommend import (
     PRESERVE_EXCLUDE_PCT,
     PROFILE_ALIASES,
     SPEND_EXCLUDE_PCT,
+    Profile,
     grade_help_text,
     profile_pool,
     recommend,
+    validate_grade_table,
 )
 
 TODAY = dt.date(2026, 7, 31)
@@ -383,7 +384,7 @@ def test_ac2_s_grade_profiles():
 # ------------------------------------------------------------------ AC3: A+/A/C
 
 
-def test_ac3_aplus_has_four_and_c_relocates_sonnet46_and_luna_medium():
+def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"}.issubset(aplus_names)
@@ -392,8 +393,14 @@ def test_ac3_aplus_has_four_and_c_relocates_sonnet46_and_luna_medium():
     a_names = [p.name for p in GRADE_TABLE["A"]]
     assert "oc-sonnet46" not in a_names
 
+    b_profiles = GRADE_TABLE["B"]
+    assert any(p.name == "codex-luna" and p.launcher_effort == "medium" for p in b_profiles)
+    assert not any(p.name == "haiku" and p.launcher_effort == "low" for p in b_profiles)
+
     c_names = [p.name for p in GRADE_TABLE["C"]]
-    assert c_names[:2] == ["codex-luna", "codex-luna"]
+    assert c_names[0] == "codex-luna"
+    assert not any(p.name == "codex-luna" and p.launcher_effort == "medium" for p in GRADE_TABLE["C"])
+    assert any(p.name == "haiku" and p.launcher_effort == "low" for p in GRADE_TABLE["C"])
     assert "oc-sonnet46" in c_names
     assert c_names.index("oc-sonnet46") > 1
 
@@ -426,9 +433,7 @@ def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     assert "8.0분" not in without_measurement
 
     c_names = [profile.model for profile in GRADE_TABLE["C"][:4]]
-    assert c_names[:2] == ["Luna (medium)", "Luna (low)"]
-    assert c_names[2] == "Qwen3 Coder"
-    assert c_names[3] == "Sonnet 4.6"
+    assert c_names == ["Luna (low)", "Qwen3 Coder", "Sonnet 4.6", "Claude Haiku 4.5"]
 
 
 def test_rob1193_splus_default_and_escalation_efforts_have_exact_reasons():
@@ -486,6 +491,32 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     assert "codex-luna --effort low" in c_output
 
 
+def test_rob1201_measured_grade_boundaries_and_explicit_exceptions():
+    validate_grade_table()
+    assert any(
+        p.name == "codex-luna" and p.launcher_effort == "medium" and p.benchmark == 42.0
+        for p in GRADE_TABLE["B"]
+    )
+    assert not any(p.name == "codex-luna" and p.launcher_effort == "medium" for p in GRADE_TABLE["C"])
+    assert any(p.name == "haiku" and p.launcher_effort == "low" for p in GRADE_TABLE["C"])
+    assert not any(p.name == "haiku" and p.launcher_effort == "low" for p in GRADE_TABLE["B"])
+
+    invalid = {grade: list(profiles) for grade, profiles in GRADE_TABLE.items()}
+    invalid["B"].append(
+        Profile(
+            "bad-measured",
+            "bad",
+            39.0,
+            benchmark_source="AA-agent",
+            benchmark_metric="agentic",
+            benchmark_harness="codex",
+            benchmark_effort="medium",
+        )
+    )
+    with pytest.raises(ValueError, match="grade boundary violation"):
+        validate_grade_table(invalid)
+
+
 def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
@@ -511,13 +542,14 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert not any(line[:1].isdigit() and "codex-sol --effort low" in line for line in a_output.splitlines())
 
     b_output = recommend(providers, "B", today=TODAY, now=NOW)
-    assert "haiku --effort low" in b_output
-    assert f"벤치 35.0({ESTIMATED_ANNOTATION})" in b_output
+    assert "codex-luna --effort medium" in b_output
+    assert "haiku --effort low" not in b_output
 
     c_output = recommend(providers, "C", today=TODAY, now=NOW)
     assert f"벤치 35.0({HAIKU_ESTIMATE_ANNOTATION})" in c_output
     assert "codex-luna --effort low" in c_output
     assert "미측정" in c_output
+    assert "codex-luna --effort medium" not in c_output
 
     all_profiles = {profile.name for profiles in GRADE_TABLE.values() for profile in profiles}
     assert "gpt-5.4-mini" not in all_profiles
