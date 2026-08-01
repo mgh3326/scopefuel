@@ -167,8 +167,8 @@ def test_exclude_policy_removes_claude_from_sp_candidates():
     # kiro-opus/kiro-sol spend, codex-max preserve → kiro first
     assert any("kiro-opus" in line for line in ranked)
     assert any("codex-max" in line for line in ranked)
-    # opus is default gate but policy-excluded
-    assert any(line.startswith("✗ opus") and "정책 제외" in line for line in lines)
+    # opus is default gate but policy-excluded (ROB-1191: folded per pool)
+    assert any(line.startswith("✗ claude 풀 제외") and "opus" in line for line in lines)
     assert "until 2026-08-31" in out
     assert "Pro 요금제" in out
     assert not any(line[:1].isdigit() and "opus" in line.split() for line in lines)
@@ -356,8 +356,8 @@ def test_ac1_sp_recommend_with_claude_exclude():
             break
     assert fable_section
 
-    # opus is default-gate, policy-excluded → shows as ✗ not in escalation
-    assert any(line.startswith("✗ opus") and "정책 제외" in line for line in lines)
+    # opus is default-gate, policy-excluded → folded pool line, not in escalation
+    assert any(line.startswith("✗ claude 풀 제외") and "opus" in line for line in lines)
 
 
 # ------------------------------------------------------------------ AC2: S grade
@@ -556,8 +556,8 @@ def test_fable_escalation_shows_reason_and_pool_status():
     assert "⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)" in out
     assert any("fable" in line for line in lines)
     assert "Opus 5 대비 2배 가격" in out
-    # fable pool is available → status shows usage
-    assert any("사용 10%" in line for line in lines)
+    # fable pool is available → status shows usage (multi-window display after ROB-1191)
+    assert any("사용 " in line and "10%" in line for line in lines)
 
 
 def test_fable_escalation_with_policy_exclude_shows_both():
@@ -907,7 +907,8 @@ def test_benchmark_cell_filters_out_ultra_effort_scores():
     out = recommend_fn(providers, "A+", today=TODAY, now=NOW, bench_scores=scores)
     luna_line = next(line for line in out.splitlines() if "codex-luna-max" in line)
     assert "ultra" not in luna_line
-    assert "effort=max" in luna_line
+    assert "max" in luna_line
+    assert "59.0" in luna_line
 
 
 def test_benchmark_cell_filters_ultra_from_model_and_other_sources():
@@ -945,5 +946,409 @@ def test_benchmark_cell_filters_ultra_from_model_and_other_sources():
         bench_scores=scores,
     )
     kiro_line = next(line for line in out.splitlines() if "kiro-sonnet" in line)
+    # ultra retired: never re-surface as best/representative score
     assert "ultra" not in kiro_line
-    assert "effort=unspecified" in kiro_line
+    assert "75.0" not in kiro_line
+    assert "대표" not in kiro_line
+
+
+# ---------------------------------------------------------- ROB-1191 AC: multi-window / score / fold / effort
+
+
+def _result_windows(
+    provider_id: str,
+    windows: list[tuple[float, str]],
+    pool_class: str = "preserve",
+) -> ProviderResult:
+    """Build a provider with multiple account-scope windows: [(used_pct, window), ...]."""
+    buckets = []
+    for used, window in windows:
+        horizon = "now" if window in ("5h",) else "week"
+        buckets.append(_bucket(used, window=window, horizon=horizon))
+    return ProviderResult(
+        id=provider_id,
+        pool_class=pool_class,  # type: ignore[arg-type]
+        buckets=buckets,
+    )
+
+
+def test_rob1191_any_window_over_cutoff_excludes_candidate():
+    """AC1: 5h 95% + 7d 46% preserve → 5h exceeds 90% cutoff → excluded (not max-only)."""
+    providers = [
+        _result_windows("claude", [(95.0, "5h"), (46.0, "7d")], pool_class="preserve"),
+        _result("codex", 20.0, pool_class="preserve"),
+    ]
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert not any("opus" in line for line in ranked)
+    # positive: folded exhausted line names the over-cutoff window usage
+    assert any("claude 풀 소진" in line and "opus" in line and "95%" in line for line in out.splitlines())
+    # negative: must not keep opus as a ranked candidate via the lower 7d window
+    assert not any(line[:1].isdigit() and "opus" in line and "46%" in line for line in out.splitlines())
+    assert any(line[:1].isdigit() and "codex-max" in line for line in ranked)
+
+
+def test_rob1191_recommend_shows_all_windows_and_constraint():
+    """AC2: --recommend lists every measurable window plus 제약=."""
+    providers = [
+        _result_windows("claude", [(31.0, "5h"), (46.0, "7d")], pool_class="preserve"),
+    ]
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
+    opus_line = next(line for line in out.splitlines() if line[:1].isdigit() and "opus" in line)
+    assert "5h 31%" in opus_line
+    assert "주 46%" in opus_line or "7d 46%" in opus_line
+    assert "제약=5h" in opus_line
+    # constraint must be the short window (lower TTE), not the higher used_pct week window alone
+    assert "제약=주" not in opus_line
+
+
+def test_rob1191_explain_shows_score_components():
+    """AC3: --explain exposes numeric score parts + constraint window."""
+    providers = [
+        _result("grok", 10.0),
+        _result("clinepass", 20.0, window="30d"),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW, explain=True)
+    explain_lines = [line for line in out.splitlines() if line.strip().startswith("score=")]
+    assert explain_lines, "expected at least one score= explain line"
+    sample = explain_lines[0]
+    assert "capacity=" in sample
+    assert "waste" in sample
+    assert "thru" in sample or "throughput" in sample
+    assert "제약=" in sample
+    # components must be numeric, not opaque magic-only
+    assert any(ch.isdigit() for ch in sample)
+
+
+def test_rob1191_rotation_when_top_pool_remaining_drops():
+    """AC4: same grade — depleting rank-1 pool remaining promotes former rank-2."""
+
+    def _name(line: str) -> str:
+        rest = line.split(".", 1)[1].strip()
+        tok = rest.split()[1] if rest.startswith("🔥") else rest.split()[0]
+        return tok
+
+    # oc-kimi at 10% rem90 ranks above grok at 40% rem60 (capacity term).
+    before = recommend(
+        [
+            _result("grok", 40.0),
+            _result("clinepass", 10.0, window="30d"),
+            _result("codex", 70.0, pool_class="preserve"),
+        ],
+        "S",
+        today=TODAY,
+        now=NOW,
+    )
+    after = recommend(
+        [
+            _result("grok", 40.0),
+            _result("clinepass", 85.0, window="30d"),  # deplete former #1 pool
+            _result("codex", 70.0, pool_class="preserve"),
+        ],
+        "S",
+        today=TODAY,
+        now=NOW,
+    )
+    before_names = [_name(line) for line in before.splitlines() if line[:1].isdigit()]
+    after_names = [_name(line) for line in after.splitlines() if line[:1].isdigit()]
+    assert before_names[0] == "oc-kimi-k3"
+    assert before_names.index("oc-kimi-k3") < before_names.index("grok-hi")
+    # After depleting clinepass/oc-kimi remaining, grok-hi becomes #1
+    assert after_names[0] == "grok-hi"
+    assert after_names.index("grok-hi") < after_names.index("oc-kimi-k3")
+
+
+def test_rob1191_boost_hard_override_stays_first():
+    """AC5: numeric boost pool is always rank 1 under continuous score."""
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 5), boost=1, note="리셋권")
+    providers = [
+        _result("codex", 80.0, pool_class="spend", window="30d"),  # low remaining
+        _result("clinepass", 5.0, window="30d"),  # high remaining
+        _result("grok", 5.0),
+    ]
+    out = recommend(providers, "S", today=TODAY, now=NOW, explain=True)
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert ranked[0].startswith("1. codex-terra-max")
+    # negative: higher-remaining pools must not overtake boost
+    assert not ranked[0].startswith("1. grok-hi")
+    assert not ranked[0].startswith("1. oc-kimi-k3")
+
+
+def test_rob1191_excluded_kiro_pool_folds_and_hide_excluded():
+    """AC6: same-grade kiro policy excludes fold to one pool line; --hide-excluded removes it."""
+    policy.set_policy(
+        "kiro",
+        "exclude",
+        until=dt.date(2026, 9, 1),
+        note="무료 전환(구독 종료 2026-08-01)",
+    )
+    providers = [
+        _result("kiro", 10.0, pool_class="spend", window="30d"),
+        _result("codex", 20.0, pool_class="preserve"),
+        _result("claude", 10.0, pool_class="preserve"),
+    ]
+    shown = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=False)
+    hidden = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=True)
+
+    fold_lines = [line for line in shown.splitlines() if "kiro 풀 제외" in line]
+    assert len(fold_lines) == 1
+    fold = fold_lines[0]
+    assert "2개" in fold
+    assert "kiro-opus" in fold and "kiro-sol" in fold
+    assert "until 2026-09-01" in fold
+    assert "무료 전환" in fold
+    # negative: must not emit one long line per profile for the same pool
+    assert not any(line.startswith("✗ kiro-opus") for line in shown.splitlines())
+    assert not any(line.startswith("✗ kiro-sol") for line in shown.splitlines())
+
+    assert "kiro 풀 제외" not in hidden
+    assert "kiro-opus" not in hidden or "승급" in hidden  # names only if elsewhere; fold gone
+    assert not any("풀 제외" in line and "kiro" in line for line in hidden.splitlines())
+
+
+def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
+    """AC7: codex-max → max 1점; opus → xhigh 1점; multi-effort unknown → 미지정 (no best-pick)."""
+    from scopefuel.bench import ModelScore
+
+    scores = [
+        ModelScore(
+            model_id="gpt-5.6-sol",
+            effort="max",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=67.0,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="gpt-5.6-sol",
+            effort="high",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=60.0,
+            rank=2,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="claude-opus-5",
+            effort="xhigh",
+            harness="claude-code",
+            source="AA-agent",
+            metric="agentic",
+            score=67.0,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="claude-opus-5",
+            effort="high",
+            harness="claude-code",
+            source="AA-agent",
+            metric="agentic",
+            score=63.0,
+            rank=2,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        # oc-kimi-k3 has no Profile.benchmark_effort → multi-effort must not pick best
+        ModelScore(
+            model_id="kimi-k3",
+            effort="high",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=50.0,
+            rank=2,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+        ModelScore(
+            model_id="kimi-k3",
+            effort="max",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            score=57.0,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
+    ]
+    sp = recommend(
+        [
+            _result("claude", 10.0, pool_class="preserve"),
+            _result("codex", 10.0, pool_class="preserve"),
+            _result("kiro", 10.0, pool_class="spend", window="30d"),
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+        bench_scores=scores,
+    )
+    s = recommend(
+        [
+            _result("clinepass", 10.0, window="30d"),
+            _result("grok", 10.0),
+            _result("codex", 10.0, pool_class="preserve"),
+        ],
+        "S",
+        today=TODAY,
+        now=NOW,
+        bench_scores=scores,
+    )
+
+    codex_line = next(line for line in sp.splitlines() if "codex-max" in line and line[:1].isdigit())
+    opus_line = next(line for line in sp.splitlines() if line[:1].isdigit() and "opus" in line.split())
+    kimi_line = next(line for line in s.splitlines() if "oc-kimi-k3" in line and line[:1].isdigit())
+
+    # positive: single declared-effort cell
+    codex_bench = codex_line.split("벤치", 1)[1].strip()
+    opus_bench = opus_line.split("벤치", 1)[1].strip()
+    kimi_bench = kimi_line.split("벤치", 1)[1].strip()
+    assert codex_bench == "67.0(AA-agent/codex/max)"
+    assert "60.0" not in codex_line  # non-declared high row must not appear
+    assert "; " not in codex_bench  # not multi-effort list
+    assert opus_bench == "67.0(AA-agent/claude-code/xhigh)"
+    assert "63.0" not in opus_line
+    assert "; " not in opus_bench
+    assert "/high)" not in opus_bench  # high≠xhigh
+
+    # positive + negative for unknown multi-effort (no best-pick / 대표)
+    assert kimi_bench == "미지정"
+    assert "57.0" not in kimi_line
+    assert "50.0" not in kimi_line
+    assert "대표" not in kimi_line
+    assert "AA-agent" not in kimi_bench
+    assert "(" not in kimi_bench  # no score-bearing parenthetical
+
+
+def test_rob1191_stale_ultra_exact_delete_on_temp_db(tmp_path, monkeypatch):
+    """AC8: temp DB exact-predicate delete of luna|ultra returns changes=1; other rows intact.
+
+    ultra is outside APPROVED_EFFORTS (cannot upsert via public API) — insert raw like the
+    legacy real-DB residue, then prove delete_score_exact predicate.
+    """
+    import sqlite3
+
+    from scopefuel import bench
+
+    data_home = tmp_path / "xdg-data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setattr(bench, "DOTENV_PATH", tmp_path / "missing.env")
+    path = bench.db_path()
+
+    keep = bench.ModelScore(
+        model_id="gpt-5.6-luna",
+        effort="max",
+        harness="codex",
+        source="AA-agent",
+        metric="agentic",
+        score=59.0,
+        rank=1,
+        captured_at="2026-08-01T00:00:00+00:00",
+    )
+    other = bench.ModelScore(
+        model_id="gpt-5.6-terra",
+        effort="max",
+        harness="codex",
+        source="AA-agent",
+        metric="agentic",
+        score=62.0,
+        rank=1,
+        captured_at="2026-08-01T00:00:00+00:00",
+    )
+    assert bench.upsert_scores([keep, other], path=path) == 2
+    # Legacy residue row (mirrors real bench.db content) — bypass effort allow-list.
+    conn = bench.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO model_scores "
+            "(model_id, effort, harness, source, metric, score, rank, captured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "gpt-5.6-luna",
+                "ultra",
+                "codex",
+                "AA-agent",
+                "agentic",
+                75.0,
+                1,
+                "2026-07-31T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        before_rows = conn.execute(
+            "SELECT model_id, effort, score FROM model_scores ORDER BY model_id, effort"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert ("gpt-5.6-luna", "ultra", 75.0) in before_rows
+    assert len(before_rows) == 3
+
+    deleted = bench.delete_score_exact(
+        model_id="gpt-5.6-luna",
+        effort="ultra",
+        harness="codex",
+        source="AA-agent",
+        metric="agentic",
+        path=path,
+    )
+    assert deleted == 1
+
+    conn = sqlite3.connect(path)
+    try:
+        after_rows = conn.execute(
+            "SELECT model_id, effort, score FROM model_scores ORDER BY model_id, effort"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert ("gpt-5.6-luna", "ultra", 75.0) not in after_rows
+    assert ("gpt-5.6-luna", "max", 59.0) in after_rows
+    assert ("gpt-5.6-terra", "max", 62.0) in after_rows
+    assert len(after_rows) == 2
+    shown = bench.show_scores("gpt-5.6-luna", path=path)
+    assert "ultra" not in shown
+    assert "59.0" in shown
+    # second delete is no-op (exact changes=0)
+    assert (
+        bench.delete_score_exact(
+            model_id="gpt-5.6-luna",
+            effort="ultra",
+            harness="codex",
+            source="AA-agent",
+            metric="agentic",
+            path=path,
+        )
+        == 0
+    )
+
+
+def test_rob1191_cli_explain_and_hide_excluded_flags(monkeypatch, capsys):
+    """CLI wires --explain / --hide-excluded into recommend()."""
+    from scopefuel import cli
+
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {
+            name: (
+                lambda provider_id=name: ProviderResult(
+                    id=provider_id,
+                    buckets=[_bucket(10.0)],
+                )
+            )
+            for name in ("codex", "clinepass", "grok", "claude", "kiro")
+        },
+    )
+    policy.set_policy("kiro", "exclude", until=dt.date(2026, 9, 1), note="fold-me")
+    assert cli.main(["--recommend", "S+", "--explain", "--no-cache"]) == 0
+    out = capsys.readouterr().out
+    assert "score=" in out and "capacity=" in out
+
+    assert cli.main(["--recommend", "S+", "--hide-excluded", "--no-cache"]) == 0
+    hidden = capsys.readouterr().out
+    assert "kiro 풀 제외" not in hidden
