@@ -376,9 +376,10 @@ def test_ac1_sp_recommend_with_claude_exclude():
 
 
 def test_ac2_s_grade_profiles():
-    """AC2: S keeps the original profiles and adds unmeasured Grok effort variants."""
+    """AC2: S keeps the original profiles; measured Grok high only (medium/low moved out)."""
     names = [p.name for p in GRADE_TABLE["S"]]
-    assert {"codex-terra-max", "oc-kimi-k3", "grok-hi", "grok"}.issubset(names)
+    assert {"codex-terra-max", "oc-kimi-k3", "grok-hi"}.issubset(names)
+    assert "grok" not in names
 
 
 # ------------------------------------------------------------------ AC3: A+/A/C
@@ -461,10 +462,14 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     assert "C<40" in grade_help_text()
     assert PROFILE_ALIASES == {"codex-max": "codex-sol"}
 
-    s_profiles = GRADE_TABLE["S"]
-    for effort in ("medium", "low"):
-        profile = next(p for p in s_profiles if p.name == "grok" and p.launcher_effort == effort)
-        assert profile.benchmark_annotation == "미측정"
+    # ROB-1202: Grok medium/low relocated out of S (measured Grok high only stays there).
+    # Both are estimated AND unmeasured — combined annotation with an interpolation/extrapolation reason.
+    aplus_grok = next(p for p in GRADE_TABLE["A+"] if p.name == "grok" and p.launcher_effort == "medium")
+    b_grok = next(p for p in GRADE_TABLE["B"] if p.name == "grok" and p.launcher_effort == "low")
+    assert aplus_grok.benchmark_annotation == "추정(외삽·미측정)"
+    assert b_grok.benchmark_annotation == "추정(외삽·미측정)"
+    assert aplus_grok.estimate_reason and "미측정" in aplus_grok.estimate_reason
+    assert b_grok.estimate_reason and "미측정" in b_grok.estimate_reason
 
     aplus_profiles = GRADE_TABLE["A+"]
     qwen = next(p for p in GRADE_TABLE["S+"] if p.name == "oc-qwen37-max")
@@ -522,6 +527,7 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
         _result("claude", 10.0, pool_class="preserve"),
         _result("codex", 10.0, pool_class="preserve"),
         _result("clinepass", 10.0, window="30d"),
+        _result("grok", 10.0),
     ]
 
     s_output = recommend(providers, "S", today=TODAY, now=NOW)
@@ -532,8 +538,11 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in aplus_output.splitlines())
     assert "sonnet --effort xhigh" in aplus_output
     assert "opus --effort low" in aplus_output
-    assert "벤치 55.0(추정)" in aplus_output
+    assert "벤치 55.0(추정(내삽))" in aplus_output
     assert not any(line[:1].isdigit() and "opus --effort low" in line for line in aplus_output.splitlines())
+    # ROB-1202: Grok medium relocated here — estimated + unmeasured, not the raw high score.
+    assert any(line[:1].isdigit() and "grok --effort medium" in line for line in aplus_output.splitlines())
+    assert "추정(외삽·미측정)" in aplus_output
 
     a_output = recommend(providers, "A", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "codex-luna --effort high" in line for line in a_output.splitlines())
@@ -544,6 +553,11 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     b_output = recommend(providers, "B", today=TODAY, now=NOW)
     assert "codex-luna --effort medium" in b_output
     assert "haiku --effort low" not in b_output
+    # ROB-1202: Haiku high (extrapolated/unmeasured estimate) belongs to B; Grok low relocated here too.
+    assert any(line[:1].isdigit() and "haiku --effort high" in line for line in b_output.splitlines())
+    assert "haiku --effort medium" not in b_output
+    assert any(line[:1].isdigit() and "grok --effort low" in line for line in b_output.splitlines())
+    assert f"벤치 44.0({HAIKU_ESTIMATE_ANNOTATION})" in b_output
 
     c_output = recommend(providers, "C", today=TODAY, now=NOW)
     assert f"벤치 35.0({HAIKU_ESTIMATE_ANNOTATION})" in c_output
@@ -1476,8 +1490,38 @@ def test_opencode_harness_mismatch_is_display_only_with_native_hint(
         bench_scores=scores,
     )
     line = next(line for line in out.splitlines() if profile_name in line and line[:1].isdigit())
-    assert f"61.0(AA-agent/{score_harness}/{score_effort}) ⚠️ 다른 하네스 참고치" in line
+    assert f"61.0(AA-agent/{score_harness}/{score_effort}) ⚠️ harness-이식 추정" in line
     assert f"💡 {expected_label} 는 " in line
+    assert "네이티브 하네스 검토 권장" in line
+
+
+def test_oc_sonnet46_shows_harness_transfer_estimate_annotation():
+    """ROB-1202 item 4 acceptance example: oc-sonnet46 cross-harness AA-agent score is marked
+    harness-이식 추정 without altering rank/scoring."""
+    from scopefuel.bench import ModelScore
+
+    scores = [
+        ModelScore(
+            model_id="claude-sonnet-4.6",
+            effort="medium",
+            harness="claude-code",
+            source="AA-agent",
+            metric="agentic",
+            score=38.0,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        )
+    ]
+    out = recommend(
+        [_result("agy", 10.0, pool_class="spend", scope=Scope("group", "3p"))],
+        "C",
+        today=TODAY,
+        now=NOW,
+        bench_scores=scores,
+    )
+    line = next(line for line in out.splitlines() if "oc-sonnet46" in line and line[:1].isdigit())
+    assert "38.0(AA-agent/claude-code/medium) ⚠️ harness-이식 추정" in line
+    assert "💡 Sonnet 4.6 는 Claude Code 에서 측정됨" in line
     assert "네이티브 하네스 검토 권장" in line
 
 

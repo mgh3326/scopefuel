@@ -77,7 +77,10 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--explain",
         action="store_true",
-        help="--recommend 시 연속 점수 구성요소(capacity/waste/throughput·제약 창)를 함께 표시",
+        help=(
+            "--recommend 시 연속 점수 구성요소(capacity/waste/throughput·제약 창) 및 "
+            "추정(내삽/외삽) 근거를 함께 표시"
+        ),
     )
     parser.add_argument(
         "--hide-excluded",
