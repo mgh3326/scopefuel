@@ -140,6 +140,9 @@ class Profile:
     benchmark_annotation: str | None = None
     # ROB-1202: one-line justification for an estimated (내삽/외삽) benchmark value.
     estimate_reason: str | None = None
+    # Explicitly disclose a conservative grade placement when the displayed estimate
+    # falls in a higher numeric range than the operational grade.
+    placement_note: str | None = None
     benchmark_source: str | None = None
     benchmark_metric: str | None = None
     benchmark_harness: str | None = None
@@ -183,11 +186,14 @@ KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가
 HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
 HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
 GROK_MEDIUM_ESTIMATE_REASON = (
-    "grok-4.5 high 실측(64)에서 하위 effort로 투사 — 대조 가능한 하한 기준점 없음, 미측정"
+    "grok-4.5 high 실측(64)에서 하위 effort로 투사: 보수 하락폭 8 적용 = 56 — 하위 effort 미측정"
 )
 GROK_LOW_ESTIMATE_REASON = (
-    "grok-4.5 high 실측(64)에서 하위 effort로 투사 — 대조 가능한 하한 기준점 없음, 미측정"
+    "grok-4.5 high 실측(64)에서 하위 effort로 투사: 56에 보수 하락폭 7 적용 = 49 — "
+    "점수상 A 범위지만 미측정 추정치라 B 보수 배치"
 )
+GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 미측정 추정치)"
+CROSS_GRADE_MEASURED_REASON = "동급 후보가 미측정 추정일 때의 상위 급 실측 대안"
 
 
 def _profile_actual_harness(profile: Profile) -> str | None:
@@ -423,10 +429,10 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile(
             "grok",
             "Grok 4.5 (medium)",
-            None,
+            56.0,
             launcher_effort="medium",
             benchmark_effort="medium",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_MEDIUM_ESTIMATE_REASON,
             aa_agent_model_id="grok-4.5",
         ),
@@ -545,11 +551,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile(
             "grok",
             "Grok 4.5 (low)",
-            None,
+            49.0,
             launcher_effort="low",
             benchmark_effort="low",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_LOW_ESTIMATE_REASON,
+            placement_note=GROK_LOW_PLACEMENT_NOTE,
             aa_agent_model_id="grok-4.5",
         ),
         # ROB-1202: extrapolated/unmeasured Haiku high estimate — not a Haiku medium placement.
@@ -1023,6 +1030,63 @@ def resolve_display_effort(profile: Profile) -> tuple[str | None, str]:
     return None, "unknown"
 
 
+def _profile_has_benchmark_score(profile: Profile, bench_scores: list[ModelScore] | None) -> bool:
+    """Return whether the profile has a static or uniquely displayable score."""
+
+    if profile.benchmark is not None:
+        return True
+    if not bench_scores:
+        return False
+
+    def not_retired(score: ModelScore) -> bool:
+        return score.score is not None and score.effort != "ultra"
+
+    agent_lookup_id = profile.aa_agent_model_id or (
+        profile.benchmark_model_id if profile.benchmark_source == "AA-agent" else None
+    )
+    agent_scores = [
+        score
+        for score in bench_scores
+        if agent_lookup_id is not None
+        and score.model_id == agent_lookup_id
+        and score.source == "AA-agent"
+        and not_retired(score)
+    ]
+
+    model_fallback_id = profile.aa_model_id or (
+        profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
+    )
+    codex_profile = profile_pool(profile.name)[0] == "codex"
+    registered_model_metric = profile.benchmark_metric if profile.benchmark_source == "AA-model" else None
+    model_scores = [
+        score
+        for score in bench_scores
+        if model_fallback_id is not None
+        and normalize_aa_model_id(score.model_id) == normalize_aa_model_id(model_fallback_id)
+        and score.source == "AA-model"
+        and (registered_model_metric is None or score.metric == registered_model_metric)
+        and not (codex_profile and score.effort is None)
+        and not_retired(score)
+    ]
+    other_scores = [
+        score
+        for score in bench_scores
+        if profile.benchmark_model_id is not None
+        and score.model_id == profile.benchmark_model_id
+        and score.source not in ("AA-agent", "AA-model")
+        and not_retired(score)
+    ]
+
+    target_effort, _ = resolve_display_effort(profile)
+    for scores in (agent_scores, model_scores, other_scores):
+        if not scores:
+            continue
+        if target_effort is not None:
+            return any(score.effort == target_effort for score in scores)
+        return len({score.effort for score in scores}) == 1
+    return False
+
+
 def _policy_reason(item: _PolicyExcluded) -> str:
     parts = [f"정책 제외 ({item.provider_id}"]
     if item.until is not None:
@@ -1037,10 +1101,11 @@ def _build_escalation_entry(
     by_id: dict[str, ProviderResult],
     today: dt.date,
     now: dt.datetime | None = None,
+    reason_override: str | None = None,
 ) -> _EscalationEntry:
     provider_id, group_name = profile_pool(profile.name)
     provider_label = _provider_label(provider_id, group_name)
-    gate_reason = profile.gate_reason or ""
+    gate_reason = reason_override if reason_override is not None else (profile.gate_reason or "")
     now = now or dt.datetime.now(dt.UTC)
 
     result = by_id.get(provider_id)
@@ -1083,6 +1148,58 @@ def _build_escalation_entry(
         gate_reason=gate_reason,
         status_note=" | ".join(status_notes) if status_notes else None,
     )
+
+
+def _cross_grade_measured_alternatives(grade: Grade) -> list[tuple[Profile, str]]:
+    """Find measured upper-grade options for an unmeasured estimate in this grade."""
+
+    grade_index = _GRADE_ORDER.index(grade)
+    if grade_index == 0:
+        return []
+    existing_escalation_pools = {
+        profile_pool(profile.name)[0]
+        for profile in GRADE_TABLE[grade]
+        if profile.gate == "escalation"
+    }
+    if not existing_escalation_pools:
+        return []
+
+    estimated_by_provider: dict[str, Profile] = {}
+    for profile in GRADE_TABLE[grade]:
+        if (
+            profile.gate == "default"
+            and profile.benchmark_source is None
+            and profile.benchmark_annotation is not None
+            and profile.estimate_reason is not None
+        ):
+            provider_id, _ = profile_pool(profile.name)
+            estimated_by_provider.setdefault(provider_id, profile)
+
+    alternatives: list[tuple[Profile, str]] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for upper_grade in _GRADE_ORDER[:grade_index]:
+        for profile in GRADE_TABLE[upper_grade]:
+            provider_id, _ = profile_pool(profile.name)
+            source_profile = estimated_by_provider.get(provider_id)
+            if (
+                source_profile is None
+                or provider_id in existing_escalation_pools
+                or profile.benchmark is None
+                or profile.benchmark_source != "AA-agent"
+                or profile.benchmark_annotation is not None
+            ):
+                continue
+            key = (profile.name, profile.launcher_effort, profile.benchmark_model_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            reason = (
+                f"{CROSS_GRADE_MEASURED_REASON} — {grade}의 {_profile_label(source_profile)}은 "
+                f"{source_profile.benchmark_annotation}, {upper_grade}의 {_profile_label(profile)}은 "
+                f"AA-agent 실측 {profile.benchmark:.1f}"
+            )
+            alternatives.append((profile, reason))
+    return alternatives
 
 
 @dataclass(frozen=True)
@@ -1460,14 +1577,28 @@ def recommend(
             )
         )
 
+    for profile, reason in _cross_grade_measured_alternatives(grade):
+        escalation.append(
+            _build_escalation_entry(
+                profile,
+                by_id,
+                today,
+                now=now,
+                reason_override=reason,
+            )
+        )
+
     # 0) 소멸 임박 역전 → 1) numeric boost(하드 오버라이드) → 2) continuous score(큰 순)
     # → 3) 표 순서(결정성). Binary 🔥 urgency 정렬 키는 연속 점수로 대체(표시는 유지).
-    def sort_key(c: _Candidate) -> tuple[int, int, int, float, int]:
+    # Benchmark가 없는 항목은 quota boost/urgency와 무관하게 급 내 마지막으로 보낸다.
+    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int]:
+        benchmark_missing = 0 if _profile_has_benchmark_score(c.profile, bench_scores) else 1
         imminent_first = 0 if c.imminent_exhaustion else 1
         boost_present = 0 if c.boost is not None else 1
         boost_value = c.boost if c.boost is not None else 0
         profile_order = next((i for i, p in enumerate(GRADE_TABLE[grade]) if p.name == c.profile.name), 0)
         return (
+            benchmark_missing,
             imminent_first,
             boost_present,
             boost_value,
@@ -1500,6 +1631,8 @@ def recommend(
         annotation = None if suppress_estimate else _benchmark_annotation(profile)
         if annotation:
             rendered += f" · {annotation}"
+        if profile.placement_note and not suppress_estimate:
+            rendered += f" · {profile.placement_note}"
 
         measurements = _format_benchmark_measurements(
             time_per_task_min=time_per_task_min,
@@ -1633,7 +1766,10 @@ def recommend(
             and profile.benchmark_source is None
             and profile.benchmark_annotation
         ):
-            return f"{profile.benchmark:.1f}({profile.benchmark_annotation})", False
+            rendered = f"{profile.benchmark:.1f}({profile.benchmark_annotation})"
+            if profile.placement_note:
+                rendered += f" · {profile.placement_note}"
+            return rendered, False
 
         if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
             return ("미지정" if target_effort is None else ""), False
