@@ -1485,6 +1485,8 @@ def recommend(
         effort: str | None,
         time_per_task_min: float | None = None,
         cost_per_task_usd: float | None = None,
+        *,
+        suppress_estimate: bool = False,
     ) -> str:
         effort_s = display_effort(effort)
         if harness:
@@ -1492,7 +1494,10 @@ def recommend(
         else:
             rendered = f"{score:.1f}({source}/{effort_s})"
 
-        annotation = _benchmark_annotation(profile)
+        # ROB-1202 rework r1: a live AA-agent execution measurement contradicts a static
+        # "estimated/unmeasured" annotation — once a real measurement exists, suppress it
+        # (the cross-harness transfer note below is unrelated and still applies).
+        annotation = None if suppress_estimate else _benchmark_annotation(profile)
         if annotation:
             rendered += f" · {annotation}"
 
@@ -1517,7 +1522,11 @@ def recommend(
             )
         return rendered
 
-    def benchmark_cell(profile: Profile) -> str:
+    def benchmark_cell(profile: Profile) -> tuple[str, bool]:
+        """Return (rendered cell, live_measured) — live_measured means a real AA-agent
+        execution measurement (not the static profile placeholder) was selected, so any
+        static estimate annotation/reason must not be shown alongside it."""
+
         # ROB-1191 ④: single effort row only. No best-of multi-effort guess.
         def _not_retired(score: ModelScore) -> bool:
             return score.effort != "ultra"
@@ -1569,7 +1578,7 @@ def recommend(
 
         target_effort, _provenance = resolve_display_effort(profile)
 
-        def _pick_single(scores: list[ModelScore]) -> str | None:
+        def _pick_single(scores: list[ModelScore], *, suppress_estimate: bool) -> str | None:
             if not scores:
                 return None
             if target_effort is not None:
@@ -1587,6 +1596,7 @@ def recommend(
                     s.effort,
                     s.time_per_task_min,
                     s.cost_per_task_usd,
+                    suppress_estimate=suppress_estimate,
                 )
             # Effort unconfirmed: only show when a single effort value exists (no best-of).
             efforts = {s.effort for s in scores}
@@ -1603,44 +1613,55 @@ def recommend(
                 s.effort,
                 s.time_per_task_min,
                 s.cost_per_task_usd,
+                suppress_estimate=suppress_estimate,
             )
 
-        for pool in (_agent_candidates, _model_candidates, _other_candidates):
-            picked = _pick_single(pool())
+        for pool, is_agent_pool in (
+            (_agent_candidates, True),
+            (_model_candidates, False),
+            (_other_candidates, False),
+        ):
+            picked = _pick_single(pool(), suppress_estimate=is_agent_pool)
             if picked is not None:
-                return picked
+                return picked, is_agent_pool and picked != "미지정"
 
         if profile.benchmark is None and profile.benchmark_annotation:
-            return _benchmark_annotation(profile) or "미지정"
+            return _benchmark_annotation(profile) or "미지정", False
 
         if (
             profile.benchmark is not None
             and profile.benchmark_source is None
             and profile.benchmark_annotation
         ):
-            return f"{profile.benchmark:.1f}({profile.benchmark_annotation})"
+            return f"{profile.benchmark:.1f}({profile.benchmark_annotation})", False
 
         if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
-            return "미지정" if target_effort is None else ""
+            return ("미지정" if target_effort is None else ""), False
         if target_effort is not None and (profile.benchmark_effort or "") not in ("", target_effort):
-            return "미지정"
+            return "미지정", False
         if target_effort is None and profile.benchmark_effort is None:
             # Static single openrouter-style row with no effort dimension → show unspecified once.
-            return _compact_bench(
+            return (
+                _compact_bench(
+                    profile,
+                    profile.benchmark,
+                    profile.benchmark_source,
+                    profile.benchmark_harness,
+                    profile.benchmark_effort,
+                ),
+                False,
+            )
+        if target_effort is None:
+            return "미지정", False
+        return (
+            _compact_bench(
                 profile,
                 profile.benchmark,
                 profile.benchmark_source,
                 profile.benchmark_harness,
                 profile.benchmark_effort,
-            )
-        if target_effort is None:
-            return "미지정"
-        return _compact_bench(
-            profile,
-            profile.benchmark,
-            profile.benchmark_source,
-            profile.benchmark_harness,
-            profile.benchmark_effort,
+            ),
+            False,
         )
 
     def _fold_policy_excluded(items: list[_PolicyExcluded]) -> list[str]:
@@ -1702,7 +1723,7 @@ def recommend(
             )
     else:
         for rank, cand in enumerate(included, start=1):
-            benchmark = benchmark_cell(cand.profile)
+            benchmark, live_measured = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
             profile_label = _profile_label(cand.profile)
             usage = cand.windows_display
@@ -1731,7 +1752,7 @@ def recommend(
                     f"+ thru×{SCORE_THRU_WEIGHT:g}={cand.throughput_term:.2f}; "
                     f"제약={cand.constraint.display_window})"
                 )
-                if cand.profile.estimate_reason:
+                if cand.profile.estimate_reason and not live_measured:
                     lines.append(f"    추정근거: {cand.profile.estimate_reason}")
         if not hide_excluded:
             lines.extend(_fold_policy_excluded(policy_excluded))

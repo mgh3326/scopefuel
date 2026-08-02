@@ -1525,6 +1525,57 @@ def test_oc_sonnet46_shows_harness_transfer_estimate_annotation():
     assert "네이티브 하네스 검토 권장" in line
 
 
+@pytest.mark.parametrize(
+    ("grade", "effort", "score", "expected_label"),
+    [
+        ("A+", "medium", 55.5, "grok --effort medium"),
+        ("B", "low", 41.0, "grok --effort low"),
+    ],
+)
+def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reason(
+    grade, effort, score, expected_label
+):
+    """ROB-1202 rework r1 (BLOCKER fix): once a real AA-agent measurement exists for Grok
+    medium/low, the static 추정(외삽·미측정) annotation and its --explain reason must not
+    render alongside the real score — otherwise the output contradicts itself."""
+    from scopefuel.bench import ModelScore
+
+    live_scores = [
+        ModelScore(
+            model_id="grok-4.5",
+            effort=effort,
+            harness="grok-build",
+            source="AA-agent",
+            metric="agentic",
+            score=score,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        )
+    ]
+    providers = [_result("grok", 10.0)]
+
+    without_measurement = recommend(providers, grade, today=TODAY, now=NOW, explain=True)
+    with_measurement = recommend(
+        providers, grade, today=TODAY, now=NOW, bench_scores=live_scores, explain=True
+    )
+
+    # Before a live measurement: static estimate annotation + explain reason are shown.
+    stale_line = next(line for line in without_measurement.splitlines() if expected_label in line)
+    assert "추정(외삽·미측정)" in stale_line
+    stale_block = "\n".join(without_measurement.splitlines())
+    assert "추정근거: grok-4.5 high 실측(64)에서 하위 effort로 투사" in stale_block
+
+    # After a live measurement: real score shown, stale annotation/reason both gone.
+    live_line = next(
+        line for line in with_measurement.splitlines() if expected_label in line and line[:1].isdigit()
+    )
+    assert f"{score:.1f}(AA-agent/grok-build/{effort})" in live_line
+    assert "추정" not in live_line
+    assert "미측정" not in live_line
+    # Grok's own stale reason must be gone; other unrelated candidates' reasons (if any) are untouched.
+    assert "추정근거: grok-4.5 high 실측(64)에서 하위 effort로 투사" not in with_measurement
+
+
 def test_matching_opencode_harness_has_no_warning_or_native_hint():
     from scopefuel.bench import ModelScore
 
