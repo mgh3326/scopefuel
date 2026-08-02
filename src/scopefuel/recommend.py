@@ -125,6 +125,7 @@ def grade_help_text() -> str:
     for g in ("S+", "S", "A+", "A", "B", "C"):
         info = GRADE_DISCRIM[g]
         lines.append(f"  {g:<3} {info.task_class}  |  {info.decision_question}")
+    lines.append(ESTIMATE_PROVENANCE_LEGEND)
     return "\n".join(lines)
 
 
@@ -137,6 +138,8 @@ class Profile:
     gate_reason: str | None = None
     launcher_effort: str | None = None
     benchmark_annotation: str | None = None
+    # ROB-1202: one-line justification for an estimated (내삽/외삽) benchmark value.
+    estimate_reason: str | None = None
     benchmark_source: str | None = None
     benchmark_metric: str | None = None
     benchmark_harness: str | None = None
@@ -159,9 +162,32 @@ _HARNESS_LABELS = {
 OPUS_MAX_ESCALATION_REASON = "더 깊은 탐색이 필요하거나 xhigh 실패 후 재시도할 때"
 CODEX_SOL_XHIGH_ESCALATION_REASON = "쿼타 절약·속도 우선"
 UNMEASURED_ANNOTATION = "미측정"
-ESTIMATED_ANNOTATION = "추정"
-HAIKU_ESTIMATE_ANNOTATION = "추정 · 미측정"
+# ROB-1202: "추정" 표시를 근거 계열로 세분화한다.
+# 내삽(interpolation) — 상하로 대조 가능한 기준점(실측 곡선 등) 사이에서 추정.
+# 외삽(extrapolation) — 단일 기준점에서 투사하거나 대조 기준점이 아예 없는 추정.
+ESTIMATED_INTERPOLATED_ANNOTATION = "추정(내삽)"
+ESTIMATED_EXTRAPOLATED_ANNOTATION = "추정(외삽)"
+# 값이 아예 없는(benchmark=None) 항목이 "추정이며 동시에 미측정"임을 명시하는 결합 표기.
+ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION = "추정(외삽·미측정)"
+HAIKU_ESTIMATE_ANNOTATION = ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION
 MODEL_ONLY_ANNOTATION = "모델지수만 있음(에이전트 미측정)"
+ESTIMATE_PROVENANCE_LEGEND = (
+    "추정(내삽)=상하 대조 가능한 기준점 사이에서 추정 · 추정(외삽)=단일/무 기준점에서 투사한 추정 "
+    "· (·미측정)=AA-agent 실행 실측 없음"
+)
+
+SONNET_ESTIMATE_REASON = (
+    "Opus 5 동일 effort 실측 곡선 대비 고정 오프셋(-8~-10점) — 상하 effort 모두 대조 가능"
+)
+KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가능한 기준점 없이 단일 추정"
+HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
+HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
+GROK_MEDIUM_ESTIMATE_REASON = (
+    "grok-4.5 high 실측(64)에서 하위 effort로 투사 — 대조 가능한 하한 기준점 없음, 미측정"
+)
+GROK_LOW_ESTIMATE_REASON = (
+    "grok-4.5 high 실측(64)에서 하위 effort로 투사 — 대조 가능한 하한 기준점 없음, 미측정"
+)
 
 
 def _profile_actual_harness(profile: Profile) -> str | None:
@@ -337,24 +363,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="grok-4.5",
             aa_model_id="grok-4-5",
         ),
-        Profile(
-            "grok",
-            "Grok 4.5 (medium)",
-            None,
-            launcher_effort="medium",
-            benchmark_effort="medium",
-            benchmark_annotation=UNMEASURED_ANNOTATION,
-            aa_agent_model_id="grok-4.5",
-        ),
-        Profile(
-            "grok",
-            "Grok 4.5 (low)",
-            None,
-            launcher_effort="low",
-            benchmark_effort="low",
-            benchmark_annotation=UNMEASURED_ANNOTATION,
-            aa_agent_model_id="grok-4.5",
-        ),
     ],
     "A+": [
         Profile(
@@ -398,7 +406,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             55.0,
             launcher_effort="high",
             benchmark_effort="high",
-            benchmark_annotation=ESTIMATED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
+            estimate_reason=SONNET_ESTIMATE_REASON,
         ),
         Profile(
             "sonnet",
@@ -408,7 +417,18 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             gate_reason="쿼타 여유 시",
             launcher_effort="xhigh",
             benchmark_effort="xhigh",
-            benchmark_annotation=ESTIMATED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
+            estimate_reason=SONNET_ESTIMATE_REASON,
+        ),
+        Profile(
+            "grok",
+            "Grok 4.5 (medium)",
+            None,
+            launcher_effort="medium",
+            benchmark_effort="medium",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            estimate_reason=GROK_MEDIUM_ESTIMATE_REASON,
+            aa_agent_model_id="grok-4.5",
         ),
         Profile(
             "codex-terra",
@@ -481,7 +501,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             52.0,
             launcher_effort="medium",
             benchmark_effort="medium",
-            benchmark_annotation=ESTIMATED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
+            estimate_reason=SONNET_ESTIMATE_REASON,
         ),
         Profile(
             "sonnet",
@@ -489,7 +510,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             48.0,
             launcher_effort="low",
             benchmark_effort="low",
-            benchmark_annotation=ESTIMATED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
+            estimate_reason=SONNET_ESTIMATE_REASON,
         ),
         Profile(
             "oc-gflash",
@@ -515,9 +537,31 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "kiro-haiku",
             "Haiku 4.5",
             35.0,
-            benchmark_annotation=ESTIMATED_ANNOTATION,
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=KIRO_HAIKU_ESTIMATE_REASON,
         ),
         Profile("oc-dsflash", "DeepSeek V4 Flash", None, aa_model_id="deepseek-v4-flash"),
+        # ROB-1202: estimated + unmeasured Grok low (no lower-effort anchor to compare against).
+        Profile(
+            "grok",
+            "Grok 4.5 (low)",
+            None,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            estimate_reason=GROK_LOW_ESTIMATE_REASON,
+            aa_agent_model_id="grok-4.5",
+        ),
+        # ROB-1202: extrapolated/unmeasured Haiku high estimate — not a Haiku medium placement.
+        Profile(
+            "haiku",
+            "Claude Haiku 4.5",
+            44.0,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
+            estimate_reason=HAIKU_HIGH_ESTIMATE_REASON,
+        ),
     ],
     "C": [
         Profile(
@@ -546,6 +590,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             launcher_effort="low",
             benchmark_effort="low",
             benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
+            estimate_reason=HAIKU_LOW_ESTIMATE_REASON,
         ),
         Profile(
             "oc-omni",
@@ -568,7 +613,13 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
 
 _GRADE_ORDER: tuple[Grade, ...] = ("S+", "S", "A+", "A", "B", "C")
 _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
-    {UNMEASURED_ANNOTATION, ESTIMATED_ANNOTATION, HAIKU_ESTIMATE_ANNOTATION, MODEL_ONLY_ANNOTATION}
+    {
+        UNMEASURED_ANNOTATION,
+        ESTIMATED_INTERPOLATED_ANNOTATION,
+        ESTIMATED_EXTRAPOLATED_ANNOTATION,
+        HAIKU_ESTIMATE_ANNOTATION,
+        MODEL_ONLY_ANNOTATION,
+    }
 )
 
 
@@ -1434,6 +1485,8 @@ def recommend(
         effort: str | None,
         time_per_task_min: float | None = None,
         cost_per_task_usd: float | None = None,
+        *,
+        suppress_estimate: bool = False,
     ) -> str:
         effort_s = display_effort(effort)
         if harness:
@@ -1441,7 +1494,10 @@ def recommend(
         else:
             rendered = f"{score:.1f}({source}/{effort_s})"
 
-        annotation = _benchmark_annotation(profile)
+        # ROB-1202 rework r1: a live AA-agent execution measurement contradicts a static
+        # "estimated/unmeasured" annotation — once a real measurement exists, suppress it
+        # (the cross-harness transfer note below is unrelated and still applies).
+        annotation = None if suppress_estimate else _benchmark_annotation(profile)
         if annotation:
             rendered += f" · {annotation}"
 
@@ -1460,13 +1516,17 @@ def recommend(
             and harness.casefold() != actual_harness.casefold()
         ):
             rendered += (
-                " ⚠️ 다른 하네스 참고치"
+                " ⚠️ harness-이식 추정"
                 f" · 💡 {profile.model} 는 {_harness_label(harness)} 에서 측정됨"
                 " — 네이티브 하네스 검토 권장"
             )
         return rendered
 
-    def benchmark_cell(profile: Profile) -> str:
+    def benchmark_cell(profile: Profile) -> tuple[str, bool]:
+        """Return (rendered cell, live_measured) — live_measured means a real AA-agent
+        execution measurement (not the static profile placeholder) was selected, so any
+        static estimate annotation/reason must not be shown alongside it."""
+
         # ROB-1191 ④: single effort row only. No best-of multi-effort guess.
         def _not_retired(score: ModelScore) -> bool:
             return score.effort != "ultra"
@@ -1518,7 +1578,7 @@ def recommend(
 
         target_effort, _provenance = resolve_display_effort(profile)
 
-        def _pick_single(scores: list[ModelScore]) -> str | None:
+        def _pick_single(scores: list[ModelScore], *, suppress_estimate: bool) -> str | None:
             if not scores:
                 return None
             if target_effort is not None:
@@ -1536,6 +1596,7 @@ def recommend(
                     s.effort,
                     s.time_per_task_min,
                     s.cost_per_task_usd,
+                    suppress_estimate=suppress_estimate,
                 )
             # Effort unconfirmed: only show when a single effort value exists (no best-of).
             efforts = {s.effort for s in scores}
@@ -1552,44 +1613,55 @@ def recommend(
                 s.effort,
                 s.time_per_task_min,
                 s.cost_per_task_usd,
+                suppress_estimate=suppress_estimate,
             )
 
-        for pool in (_agent_candidates, _model_candidates, _other_candidates):
-            picked = _pick_single(pool())
+        for pool, is_agent_pool in (
+            (_agent_candidates, True),
+            (_model_candidates, False),
+            (_other_candidates, False),
+        ):
+            picked = _pick_single(pool(), suppress_estimate=is_agent_pool)
             if picked is not None:
-                return picked
+                return picked, is_agent_pool and picked != "미지정"
 
         if profile.benchmark is None and profile.benchmark_annotation:
-            return _benchmark_annotation(profile) or "미지정"
+            return _benchmark_annotation(profile) or "미지정", False
 
         if (
             profile.benchmark is not None
             and profile.benchmark_source is None
             and profile.benchmark_annotation
         ):
-            return f"{profile.benchmark:.1f}({profile.benchmark_annotation})"
+            return f"{profile.benchmark:.1f}({profile.benchmark_annotation})", False
 
         if profile.benchmark is None or profile.benchmark_source is None or profile.benchmark_metric is None:
-            return "미지정" if target_effort is None else ""
+            return ("미지정" if target_effort is None else ""), False
         if target_effort is not None and (profile.benchmark_effort or "") not in ("", target_effort):
-            return "미지정"
+            return "미지정", False
         if target_effort is None and profile.benchmark_effort is None:
             # Static single openrouter-style row with no effort dimension → show unspecified once.
-            return _compact_bench(
+            return (
+                _compact_bench(
+                    profile,
+                    profile.benchmark,
+                    profile.benchmark_source,
+                    profile.benchmark_harness,
+                    profile.benchmark_effort,
+                ),
+                False,
+            )
+        if target_effort is None:
+            return "미지정", False
+        return (
+            _compact_bench(
                 profile,
                 profile.benchmark,
                 profile.benchmark_source,
                 profile.benchmark_harness,
                 profile.benchmark_effort,
-            )
-        if target_effort is None:
-            return "미지정"
-        return _compact_bench(
-            profile,
-            profile.benchmark,
-            profile.benchmark_source,
-            profile.benchmark_harness,
-            profile.benchmark_effort,
+            ),
+            False,
         )
 
     def _fold_policy_excluded(items: list[_PolicyExcluded]) -> list[str]:
@@ -1651,7 +1723,7 @@ def recommend(
             )
     else:
         for rank, cand in enumerate(included, start=1):
-            benchmark = benchmark_cell(cand.profile)
+            benchmark, live_measured = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
             profile_label = _profile_label(cand.profile)
             usage = cand.windows_display
@@ -1680,6 +1752,8 @@ def recommend(
                     f"+ thru×{SCORE_THRU_WEIGHT:g}={cand.throughput_term:.2f}; "
                     f"제약={cand.constraint.display_window})"
                 )
+                if cand.profile.estimate_reason and not live_measured:
+                    lines.append(f"    추정근거: {cand.profile.estimate_reason}")
         if not hide_excluded:
             lines.extend(_fold_policy_excluded(policy_excluded))
 
@@ -1695,5 +1769,7 @@ def recommend(
             lines.append(f"    근거: {entry.gate_reason}")
             if entry.status_note:
                 lines.append(f"    {entry.status_note}")
+            if explain and entry.profile.estimate_reason:
+                lines.append(f"    추정근거: {entry.profile.estimate_reason}")
 
     return "\n".join(lines)
