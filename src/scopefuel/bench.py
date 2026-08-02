@@ -29,6 +29,8 @@ MANUAL_SOURCES = frozenset({"AA-agent", "benchlm", "openrouter"})
 SOURCES = MANUAL_SOURCES | {"AA-model"}
 METRICS = frozenset({"coding_index", "intelligence", "agentic", "coding"})
 APPROVED_EFFORTS = frozenset({"default", "low", "medium", "high", "xhigh", "max", "non-reasoning"})
+REP_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+REP_GRADES = ("S+", "S", "A+", "A", "B", "C")
 
 # ROB-1190 ②-1: AA-model slug 의 effort 접미사. 순서가 중요하다 — "non-reasoning" 이
 # "-high"/"-low" 등 다른 접미사의 부분열이 아니므로 순서 무관하지만, 길이가 긴 접미사부터
@@ -100,6 +102,8 @@ _REP_COLUMNS = (
     "output_tokens",
     "notes",
     "recorded_at",
+    "effort",
+    "grade",
 )
 
 # ROB-1194: operator-approved AA-agent measurements.  The complete key is
@@ -178,9 +182,22 @@ class RepRecord:
     output_tokens: int | None
     notes: str | None
     recorded_at: str
+    effort: str | None
+    grade: str | None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _REP_COLUMNS}
+
+
+@dataclass(frozen=True)
+class RepComparison:
+    profile: str
+    count: int
+    average_rounds: float | None
+    average_blockers_found: float | None
+    completion_rate: float
+    average_input_tokens: float | None
+    average_output_tokens: float | None
 
 
 def db_path() -> pathlib.Path:
@@ -237,6 +254,9 @@ def _schema(conn: sqlite3.Connection) -> None:
     for column in ("input_tokens", "output_tokens"):
         if column not in existing_rep_columns:
             conn.execute(f"ALTER TABLE reps ADD COLUMN {column} INTEGER")
+    for column in ("effort", "grade"):
+        if column not in existing_rep_columns:
+            conn.execute(f"ALTER TABLE reps ADD COLUMN {column} TEXT")
 
 
 def connect(path: pathlib.Path | str | None = None) -> sqlite3.Connection:
@@ -274,6 +294,14 @@ def _model_id(value: object) -> str:
 
 def _optional_text(value: object, field: str) -> str | None:
     return _text(value, field, required=False)
+
+
+def _rep_choice(value: object, field: str, choices: tuple[str, ...]) -> str | None:
+    value = _optional_text(value, field)
+    if value is not None and value not in choices:
+        allowed = ", ".join(choices)
+        raise BenchError(f"{field} must be one of: {allowed}")
+    return value
 
 
 def _score(value: object, *, allow_none: bool) -> float | None:
@@ -1086,6 +1114,8 @@ def add_rep(
     task_ref: str,
     tier: str,
     role: str,
+    effort: str | None = None,
+    grade: str | None = None,
     rounds: int,
     blockers_found: int,
     completed: int,
@@ -1100,6 +1130,8 @@ def add_rep(
     task_ref = _text(task_ref, "task") or ""
     tier = _text(tier, "tier") or ""
     role = _text(role, "role") or ""
+    effort = _rep_choice(effort, "effort", REP_EFFORTS)
+    grade = _rep_choice(grade, "grade", REP_GRADES)
     if tier not in {"T0", "T1", "T2", "T3"}:
         raise BenchError("tier must be T0, T1, T2, or T3")
     if role not in {"impl", "verify", "fix", "orch"}:
@@ -1120,8 +1152,8 @@ def add_rep(
         cursor = conn.execute(
             "INSERT INTO reps "
             "(profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
-            "input_tokens, output_tokens, notes, recorded_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "input_tokens, output_tokens, notes, recorded_at, effort, grade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 profile,
                 model_id,
@@ -1135,13 +1167,15 @@ def add_rep(
                 output_tokens,
                 notes,
                 recorded_at,
+                effort,
+                grade,
             ),
         )
         conn.commit()
         rep_id = int(cursor.lastrowid)
         row = conn.execute(
             "SELECT id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
-            "input_tokens, output_tokens, notes, recorded_at "
+            "input_tokens, output_tokens, notes, recorded_at, effort, grade "
             "FROM reps WHERE id = ?",
             (rep_id,),
         ).fetchone()
@@ -1154,9 +1188,19 @@ def add_rep(
         conn.close()
 
 
-def read_reps(*, path: pathlib.Path | str | None = None, limit: int | None = None) -> list[RepRecord]:
+def read_reps(
+    *,
+    path: pathlib.Path | str | None = None,
+    limit: int | None = None,
+    grade: str | None = None,
+    profile: str | None = None,
+    effort: str | None = None,
+) -> list[RepRecord]:
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise BenchError("limit must be a positive integer")
+    grade = _rep_choice(grade, "grade", REP_GRADES)
+    effort = _rep_choice(effort, "effort", REP_EFFORTS)
+    profile = _optional_text(profile, "profile")
     target = pathlib.Path(path) if path is not None else db_path()
     if str(target) != ":memory:" and not target.expanduser().exists():
         return []
@@ -1168,14 +1212,27 @@ def read_reps(*, path: pathlib.Path | str | None = None, limit: int | None = Non
         if table_exists is None:
             return []
         available_columns = {row[1] for row in conn.execute("PRAGMA table_info(reps)").fetchall()}
+        if (grade is not None and "grade" not in available_columns) or (
+            effort is not None and "effort" not in available_columns
+        ):
+            return []
         select_columns = ", ".join(
             column if column in available_columns else f"NULL AS {column}" for column in _REP_COLUMNS
         )
-        query = f"SELECT {select_columns} FROM reps ORDER BY id DESC"
-        params: tuple[object, ...] = ()
+        where: list[str] = []
+        params_list: list[object] = []
+        for column, value in (("grade", grade), ("profile", profile), ("effort", effort)):
+            if value is not None:
+                where.append(f"{column} = ?")
+                params_list.append(value)
+        query = f"SELECT {select_columns} FROM reps"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY id DESC"
+        params: tuple[object, ...] = tuple(params_list)
         if limit is not None:
             query += " LIMIT ?"
-            params = (limit,)
+            params = (*params_list, limit)
         rows = conn.execute(query, params).fetchall()
         return [RepRecord(**{column: row[column] for column in _REP_COLUMNS}) for row in rows]
     finally:
@@ -1186,6 +1243,8 @@ def format_rep(rep: RepRecord) -> str:
     fields = [
         f"id={rep.id}",
         f"profile={rep.profile}",
+        f"effort={rep.effort or '-'}",
+        f"grade={rep.grade or '-'}",
         f"model={rep.model_id or '-'}",
         f"task={rep.task_ref or '-'}",
         f"tier={rep.tier or '-'}",
@@ -1201,6 +1260,62 @@ def format_rep(rep: RepRecord) -> str:
         fields.append(f"output-tokens={rep.output_tokens}")
     if rep.notes:
         fields.append(f"notes={rep.notes}")
+    return " ".join(fields)
+
+
+def _average(values: Iterable[int | None]) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return sum(present) / len(present) if present else None
+
+
+def compare_reps(
+    *,
+    grade: str,
+    profile: str | None = None,
+    effort: str | None = None,
+    path: pathlib.Path | str | None = None,
+) -> list[RepComparison]:
+    """Compare representative runs by profile within one recorded grade."""
+
+    grade = _rep_choice(grade, "grade", REP_GRADES)
+    assert grade is not None
+    rows = read_reps(path=path, grade=grade, profile=profile, effort=effort)
+    by_profile: dict[str, list[RepRecord]] = {}
+    for row in rows:
+        by_profile.setdefault(row.profile, []).append(row)
+
+    comparisons: list[RepComparison] = []
+    for profile_name in sorted(by_profile):
+        group = by_profile[profile_name]
+        comparisons.append(
+            RepComparison(
+                profile=profile_name,
+                count=len(group),
+                average_rounds=_average(row.rounds for row in group),
+                average_blockers_found=_average(row.blockers_found for row in group),
+                completion_rate=(sum(row.completed == 1 for row in group) / len(group)) * 100.0,
+                average_input_tokens=_average(row.input_tokens for row in group),
+                average_output_tokens=_average(row.output_tokens for row in group),
+            )
+        )
+    return comparisons
+
+
+def format_rep_comparison(comparison: RepComparison) -> str:
+    def render_average(value: float | None) -> str:
+        return f"{value:.2f}" if value is not None else "-"
+
+    fields = [
+        f"profile={comparison.profile}",
+        f"count={comparison.count}",
+        f"avg-rounds={render_average(comparison.average_rounds)}",
+        f"avg-blockers-found={render_average(comparison.average_blockers_found)}",
+        f"completion-rate={comparison.completion_rate:.1f}%",
+    ]
+    if comparison.average_input_tokens is not None:
+        fields.append(f"avg-input-tokens={render_average(comparison.average_input_tokens)}")
+    if comparison.average_output_tokens is not None:
+        fields.append(f"avg-output-tokens={render_average(comparison.average_output_tokens)}")
     return " ".join(fields)
 
 

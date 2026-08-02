@@ -162,6 +162,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_add.add_argument("--task", dest="task_ref", required=True, help="Linear 이슈 또는 PR")
     reps_add.add_argument("--tier", required=True, choices=["T0", "T1", "T2", "T3"])
     reps_add.add_argument("--role", required=True, choices=["impl", "verify", "fix", "orch"])
+    reps_add.add_argument(
+        "--effort", choices=bench.REP_EFFORTS, help="실행 effort (low/medium/high/xhigh/max)"
+    )
+    reps_add.add_argument(
+        "--grade", choices=bench.REP_GRADES, help="실행 당시 급 (S+/S/A+/A/B/C)"
+    )
     reps_add.add_argument("--rounds", required=True, type=_nonnegative_int)
     reps_add.add_argument("--blockers-found", required=True, type=_nonnegative_int)
     reps_add.add_argument("--completed", required=True, type=_completed_arg, help="0/1")
@@ -171,6 +177,14 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     reps_list = reps_sub.add_parser("list", help="대표 실행 기록 조회")
     reps_list.add_argument("--limit", type=_nonnegative_int, help="최대 행 수 (1 이상)")
+    reps_list.add_argument("--grade", choices=bench.REP_GRADES, help="급 필터")
+    reps_list.add_argument("--profile", help="프로필 필터")
+    reps_list.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
+
+    reps_compare = reps_sub.add_parser("compare", help="같은 급 안 프로필별 대표 실행 비교")
+    reps_compare.add_argument("--grade", required=True, choices=bench.REP_GRADES, help="비교할 급")
+    reps_compare.add_argument("--profile", help="프로필 필터")
+    reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
 
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
@@ -342,6 +356,8 @@ def _reps_command(args: argparse.Namespace) -> int:
                 task_ref=args.task_ref,
                 tier=args.tier,
                 role=args.role,
+                effort=args.effort,
+                grade=args.grade,
                 rounds=args.rounds,
                 blockers_found=args.blockers_found,
                 completed=args.completed,
@@ -356,12 +372,45 @@ def _reps_command(args: argparse.Namespace) -> int:
         return 0
     if args.reps_command == "list":
         try:
-            reps = bench.read_reps(limit=args.limit)
+            reps = bench.read_reps(
+                limit=args.limit,
+                grade=args.grade,
+                profile=args.profile,
+                effort=args.effort,
+            )
         except bench.BenchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        if not reps:
+            filters = []
+            if args.grade:
+                filters.append(f"grade={args.grade}")
+            if args.profile:
+                filters.append(f"profile={args.profile}")
+            if args.effort:
+                filters.append(f"effort={args.effort}")
+            suffix = " (" + ", ".join(filters) + ")" if filters else ""
+            print(f"reps 기록 없음 — 조건에 맞는 대표 실행이 없습니다{suffix}")
+            return 0
         for rep in reps:
             print(bench.format_rep(rep))
+        return 0
+    if args.reps_command == "compare":
+        try:
+            comparisons = bench.compare_reps(
+                grade=args.grade,
+                profile=args.profile,
+                effort=args.effort,
+            )
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"reps 비교 grade={args.grade}")
+        if not comparisons:
+            print("reps 비교 기록 없음 — 비교할 프로필별 대표 실행이 없습니다")
+            return 0
+        for comparison in comparisons:
+            print(bench.format_rep_comparison(comparison))
         return 0
     return 2
 

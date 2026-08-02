@@ -10,6 +10,7 @@ from scopefuel import bench, cli, policy
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     CODEX_SOL_XHIGH_ESCALATION_REASON,
+    CROSS_GRADE_MEASURED_REASON,
     GRADE_BOUNDARIES,
     GRADE_DISCRIM,
     GRADE_TABLE,
@@ -463,11 +464,14 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     assert PROFILE_ALIASES == {"codex-max": "codex-sol"}
 
     # ROB-1202: Grok medium/low relocated out of S (measured Grok high only stays there).
-    # Both are estimated AND unmeasured — combined annotation with an interpolation/extrapolation reason.
+    # Both are explicit extrapolations from the high anchor; low keeps its conservative placement note.
     aplus_grok = next(p for p in GRADE_TABLE["A+"] if p.name == "grok" and p.launcher_effort == "medium")
     b_grok = next(p for p in GRADE_TABLE["B"] if p.name == "grok" and p.launcher_effort == "low")
-    assert aplus_grok.benchmark_annotation == "추정(외삽·미측정)"
-    assert b_grok.benchmark_annotation == "추정(외삽·미측정)"
+    assert aplus_grok.benchmark == 56.0
+    assert b_grok.benchmark == 49.0
+    assert aplus_grok.benchmark_annotation == "추정(외삽)"
+    assert b_grok.benchmark_annotation == "추정(외삽)"
+    assert b_grok.placement_note and "보수 배치" in b_grok.placement_note
     assert aplus_grok.estimate_reason and "미측정" in aplus_grok.estimate_reason
     assert b_grok.estimate_reason and "미측정" in b_grok.estimate_reason
 
@@ -542,7 +546,7 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert not any(line[:1].isdigit() and "opus --effort low" in line for line in aplus_output.splitlines())
     # ROB-1202: Grok medium relocated here — estimated + unmeasured, not the raw high score.
     assert any(line[:1].isdigit() and "grok --effort medium" in line for line in aplus_output.splitlines())
-    assert "추정(외삽·미측정)" in aplus_output
+    assert "벤치 56.0(추정(외삽))" in aplus_output
 
     a_output = recommend(providers, "A", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "codex-luna --effort high" in line for line in a_output.splitlines())
@@ -567,6 +571,63 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
 
     all_profiles = {profile.name for profiles in GRADE_TABLE.values() for profile in profiles}
     assert "gpt-5.4-mini" not in all_profiles
+
+
+def test_rob1204_grok_estimates_are_numeric_and_low_placement_is_explicit():
+    providers = [_result("grok", 10.0)]
+
+    aplus = recommend(providers, "A+", today=TODAY, now=NOW)
+    medium_line = next(line for line in aplus.splitlines() if "grok --effort medium" in line)
+    assert "벤치 56.0(추정(외삽))" in medium_line
+    assert "grok-hi" not in "\n".join(line for line in aplus.splitlines() if line[:1].isdigit())
+    escalation_idx = next(i for i, line in enumerate(aplus.splitlines()) if "⚠ 승급 후보" in line)
+    grok_hi_idx = next(i for i, line in enumerate(aplus.splitlines()) if "grok-hi" in line)
+    assert grok_hi_idx > escalation_idx
+    assert CROSS_GRADE_MEASURED_REASON in aplus
+    assert "AA-agent 실측 64.0" in aplus
+
+    b = recommend(providers, "B", today=TODAY, now=NOW)
+    low_line = next(line for line in b.splitlines() if "grok --effort low" in line)
+    assert "벤치 49.0(추정(외삽))" in low_line
+    assert "보수 배치(B; 점수상 A 범위지만 미측정 추정치)" in low_line
+
+
+def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
+    measured = Profile(
+        "codex-luna",
+        "Luna (medium)",
+        42.0,
+        launcher_effort="medium",
+        benchmark_source="AA-agent",
+        benchmark_metric="agentic",
+        benchmark_harness="codex",
+        benchmark_effort="medium",
+        benchmark_model_id="gpt-5.6-luna",
+    )
+    unscored = Profile("kiro-cheap", "Qwen3 Coder", None)
+    monkeypatch.setitem(GRADE_TABLE, "C", [measured, unscored])
+    policy.set_policy("kiro", "spend", until=dt.date(2026, 8, 31), boost=1, note="test boost")
+    out = recommend(
+        [
+            _result("codex", 10.0, pool_class="preserve"),
+            _result("kiro", 10.0, pool_class="spend", window="30d"),
+        ],
+        "C",
+        today=TODAY,
+        now=NOW,
+    )
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert ranked[0].startswith("1. codex-luna")
+    assert ranked[1].startswith("2. kiro-cheap")
+
+
+def test_rob1204_existing_top_rank_intent_remains_for_claude_only_inputs():
+    aplus = recommend([_result("claude", 10.0, pool_class="preserve")], "A+", today=TODAY, now=NOW)
+    b = recommend([_result("claude", 10.0, pool_class="preserve")], "B", today=TODAY, now=NOW)
+    assert next(line for line in aplus.splitlines() if line[:1].isdigit()).startswith(
+        "1. sonnet --effort high"
+    )
+    assert next(line for line in b.splitlines() if line[:1].isdigit()).startswith("1. haiku --effort high")
 
 
 def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
@@ -820,7 +881,7 @@ def test_oc_oss_escalation_at_end_of_c():
 
     # kiro-cheap 이 1위 (oc-omni/oc-oss 는 escalation)
     ranked = [line for line in lines if line[:1].isdigit()]
-    assert ranked[0].startswith("1. kiro-cheap")
+    assert ranked[0].startswith("1. oc-sonnet46")
 
     # oc-oss 는 escalation 섹션에, 정상후보/제외 뒤에 위치
     escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
@@ -1561,7 +1622,7 @@ def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reaso
 
     # Before a live measurement: static estimate annotation + explain reason are shown.
     stale_line = next(line for line in without_measurement.splitlines() if expected_label in line)
-    assert "추정(외삽·미측정)" in stale_line
+    assert "추정(외삽)" in stale_line
     stale_block = "\n".join(without_measurement.splitlines())
     assert "추정근거: grok-4.5 high 실측(64)에서 하위 effort로 투사" in stale_block
 

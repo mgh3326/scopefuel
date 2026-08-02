@@ -91,6 +91,8 @@ def test_schema_and_xdg_path_are_exact(bench_home):
         "output_tokens",
         "notes",
         "recorded_at",
+        "effort",
+        "grade",
     ]
     assert ".cache" not in str(path)
 
@@ -484,9 +486,133 @@ def test_reps_add_and_list_round_trip(bench_home, capsys):
     assert reps[0].input_tokens is None
     assert reps[0].output_tokens is None
     assert reps[0].notes == "fixture"
+    assert reps[0].effort is None
+    assert reps[0].grade is None
 
     assert cli.main(["reps", "list"]) == 0
     assert "profile=codex-terra-max" in capsys.readouterr().out
+
+
+def test_reps_help_and_filters_preserve_nullable_legacy_rows(bench_home, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["reps", "add", "--help"])
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--effort {low,medium,high,xhigh,max}" in help_text
+    assert "--grade {S+,S,A+,A,B,C}" in help_text
+
+    for profile, effort, grade in (
+        ("legacy-one", None, None),
+        ("legacy-two", None, None),
+        ("codex-luna", "medium", "B"),
+        ("haiku", "high", "B"),
+        ("codex-luna", "high", "A+"),
+    ):
+        args = [
+            "reps",
+            "add",
+            "--profile",
+            profile,
+            "--model",
+            "model",
+            "--task",
+            "ROB-1203",
+            "--tier",
+            "T1",
+            "--role",
+            "impl",
+            "--rounds",
+            "1",
+            "--blockers-found",
+            "0",
+            "--completed",
+            "1",
+        ]
+        if effort is not None:
+            args.extend(["--effort", effort])
+        if grade is not None:
+            args.extend(["--grade", grade])
+        assert cli.main(args) == 0
+        capsys.readouterr()
+
+    rows = bench.read_reps()
+    assert len(rows) == 5
+    by_id = {row.id: row for row in rows}
+    assert by_id[1].effort is None and by_id[1].grade is None
+    assert by_id[2].effort is None and by_id[2].grade is None
+    assert by_id[3].effort == "medium" and by_id[3].grade == "B"
+
+    assert cli.main(["reps", "list", "--grade", "B"]) == 0
+    grade_b = capsys.readouterr().out
+    assert "profile=codex-luna" in grade_b and "profile=haiku" in grade_b
+    assert "profile=codex-luna" in grade_b
+
+    assert cli.main(["reps", "list", "--profile", "codex-luna"]) == 0
+    profile_rows = capsys.readouterr().out
+    assert profile_rows.count("profile=codex-luna") == 2
+
+    assert cli.main(["reps", "list", "--effort", "high"]) == 0
+    high_rows = capsys.readouterr().out
+    assert high_rows.count("effort=high") == 2
+
+    assert cli.main(["reps", "list", "--grade", "B", "--profile", "codex-luna", "--effort", "medium"]) == 0
+    combined = capsys.readouterr().out
+    assert "id=3" in combined and "id=4" not in combined and "id=5" not in combined
+
+    assert cli.main(["reps", "list", "--grade", "C"]) == 0
+    empty = capsys.readouterr().out
+    assert "기록 없음" in empty
+
+
+def test_reps_compare_reports_profile_averages_and_tokens(bench_home, capsys):
+    def add(profile, rounds, blockers, completed, input_tokens=None, output_tokens=None):
+        args = [
+            "reps",
+            "add",
+            "--profile",
+            profile,
+            "--model",
+            "model",
+            "--task",
+            "ROB-1203",
+            "--tier",
+            "T1",
+            "--role",
+            "impl",
+            "--effort",
+            "high",
+            "--grade",
+            "B",
+            "--rounds",
+            str(rounds),
+            "--blockers-found",
+            str(blockers),
+            "--completed",
+            str(completed),
+        ]
+        if input_tokens is not None:
+            args.extend(["--input-tokens", str(input_tokens)])
+        if output_tokens is not None:
+            args.extend(["--output-tokens", str(output_tokens)])
+        assert cli.main(args) == 0
+        capsys.readouterr()
+
+    add("alpha", 2, 1, 1, 10, 20)
+    add("alpha", 4, 3, 0, 30, 40)
+    add("beta", 1, 0, 1)
+
+    assert cli.main(["reps", "compare", "--grade", "B"]) == 0
+    out = capsys.readouterr().out
+    alpha = next(line for line in out.splitlines() if "profile=alpha" in line)
+    beta = next(line for line in out.splitlines() if "profile=beta" in line)
+    assert "count=2" in alpha
+    assert "avg-rounds=3.00" in alpha
+    assert "avg-blockers-found=2.00" in alpha
+    assert "completion-rate=50.0%" in alpha
+    assert "avg-input-tokens=20.00" in alpha
+    assert "avg-output-tokens=30.00" in alpha
+    assert "count=1" in beta and "avg-rounds=1.00" in beta
+    assert "avg-blockers-found=0.00" in beta and "completion-rate=100.0%" in beta
 
 
 def test_reps_tokens_round_trip_and_legacy_read_compat(bench_home, capsys, tmp_path):
