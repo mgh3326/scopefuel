@@ -1184,9 +1184,7 @@ def _cross_grade_measured_alternatives(grade: Grade) -> list[tuple[Profile, str]
     if grade_index == 0:
         return []
     existing_escalation_pools = {
-        profile_pool(profile.name)[0]
-        for profile in GRADE_TABLE[grade]
-        if profile.gate == "escalation"
+        profile_pool(profile.name)[0] for profile in GRADE_TABLE[grade] if profile.gate == "escalation"
     }
     if not existing_escalation_pools:
         return []

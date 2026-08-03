@@ -1497,6 +1497,8 @@ def test_rob1210_single_window_score_is_numerically_unchanged(provider_id):
     )
     assert budget is constraint
     assert new_score == pytest.approx(legacy_score)
+
+
 def test_rob1191_any_window_over_cutoff_excludes_candidate():
     """AC1: 5h 95% + 7d 46% preserve → 5h exceeds 90% cutoff → excluded (not max-only)."""
     providers = [
