@@ -52,6 +52,8 @@ SCORE_WASTE_WEIGHT = 50.0
 SCORE_THRU_WEIGHT = 0.25
 # Short windows (≤6h) contribute the throughput-margin term.
 SHORT_WINDOW_MAX_S = 6 * 3600
+# ROB-1210 r2: progressively brake a candidate as its short-window headroom enters the knee.
+BRAKE_KNEE_PCT = 50.0
 # Pace-unknown constraint fallback: treat as less constraining than any finite TTE,
 # ordered by used_pct (higher usage = more constrained). Deterministic & conservative.
 _TTE_UNKNOWN_RANK = 1
@@ -748,6 +750,8 @@ class _Candidate:
     constraint: _WindowState
     budget: _WindowState
     throughput_window: _WindowState
+    brake: float
+    brake_window: _WindowState | None
     windows_display: str
     used_pct: float  # budget window
     remaining_pct: float
@@ -1008,17 +1012,32 @@ def _score_components(
     throughput_window = _select_throughput_window(states, constraint)
     throughput = throughput_window.remaining_pct
 
-    total = capacity + SCORE_WASTE_WEIGHT * waste + SCORE_THRU_WEIGHT * throughput
+    base_score = capacity + SCORE_WASTE_WEIGHT * waste + SCORE_THRU_WEIGHT * throughput
+    brake, _brake_window = _brake_factor(states)
+    total = base_score * brake
     return capacity, waste, throughput, total
+
+
+def _select_shortest_window(states: list[_WindowState]) -> _WindowState | None:
+    """Return the tightest window from the same short-window set as throughput."""
+    short = [
+        s for s in states if (secs := _window_seconds(s.window)) is not None and secs <= SHORT_WINDOW_MAX_S
+    ]
+    # Existing throughput semantics: lower remaining means less headroom.
+    return min(short, key=lambda s: s.remaining_pct) if short else None
 
 
 def _select_throughput_window(states: list[_WindowState], fallback: _WindowState) -> _WindowState:
     """Return the existing shortest-window throughput source, with its old fallback."""
-    short = [
-        s for s in states if (secs := _window_seconds(s.window)) is not None and secs <= SHORT_WINDOW_MAX_S
-    ]
-    # Tightest short window by remaining (lower remaining = less throughput headroom).
-    return min(short, key=lambda s: s.remaining_pct) if short else fallback
+    return _select_shortest_window(states) or fallback
+
+
+def _brake_factor(states: list[_WindowState]) -> tuple[float, _WindowState | None]:
+    """Return (short-window brake, source window); no short window means no brake."""
+    short = _select_shortest_window(states)
+    if short is None:
+        return 1.0, None
+    return min(1.0, short.remaining_pct / BRAKE_KNEE_PCT), short
 
 
 def _read_claude_settings_effort() -> str | None:
@@ -1570,6 +1589,7 @@ def recommend(
             budget=budget,
         )
         throughput_window = _select_throughput_window(states, constraint)
+        brake, brake_window = _brake_factor(states)
 
         # ROB-1188 fix 4: 리셋까지 아주 짧게(기본 1h) 남았고 잔여가 유의미한 임계(기본 5%)
         # 이상이면 "확실히 소멸"이 "며칠 단위 의도(boost)"보다 시급하다 — boost 를 역전.
@@ -1589,6 +1609,8 @@ def recommend(
                 constraint=constraint,
                 budget=budget,
                 throughput_window=throughput_window,
+                brake=brake,
+                brake_window=brake_window,
                 windows_display=_format_windows_display(states, constraint),
                 used_pct=used_pct,
                 remaining_pct=remaining_pct,
@@ -1911,6 +1933,13 @@ def recommend(
                     f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}{bench}"
                 )
             if explain:
+                brake_explain = ""
+                if cand.brake < 1.0 and cand.brake_window is not None:
+                    brake_explain = (
+                        f" × brake={cand.brake:.2f} "
+                        f"({cand.brake_window.display_window} 잔여 {cand.brake_window.remaining_pct:g}% "
+                        f"< knee {BRAKE_KNEE_PCT:g}%)"
+                    )
                 lines.append(
                     f"    score={cand.score:.2f} "
                     f"(capacity={cand.capacity_term:.2f}=w{cand.weight:g}×rem{cand.remaining_pct:g} "
@@ -1918,7 +1947,7 @@ def recommend(
                     f"+ waste×{SCORE_WASTE_WEIGHT:g}={cand.waste_term:.2f} "
                     f"(budget={cand.budget.display_window}) "
                     f"+ thru×{SCORE_THRU_WEIGHT:g}={cand.throughput_term:.2f} "
-                    f"(short={cand.throughput_window.display_window}); "
+                    f"(short={cand.throughput_window.display_window}){brake_explain}; "
                     f"제약={cand.constraint.display_window})"
                 )
                 if cand.profile.estimate_reason and not live_measured:

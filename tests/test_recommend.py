@@ -9,6 +9,7 @@ import pytest
 from scopefuel import bench, cli, policy
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
+    BRAKE_KNEE_PCT,
     CODEX_SOL_XHIGH_ESCALATION_REASON,
     CROSS_GRADE_MEASURED_REASON,
     GRADE_BOUNDARIES,
@@ -20,6 +21,7 @@ from scopefuel.recommend import (
     PROFILE_ALIASES,
     SPEND_EXCLUDE_PCT,
     Profile,
+    _brake_factor,
     _score_components,
     _select_budget,
     _select_constraint,
@@ -1497,6 +1499,152 @@ def test_rob1210_single_window_score_is_numerically_unchanged(provider_id):
     )
     assert budget is constraint
     assert new_score == pytest.approx(legacy_score)
+
+
+def test_rob1210_brake_is_exactly_short_remaining_over_knee():
+    """5h 70% used leaves a 0.60 brake on the full budget score."""
+    states = _window_states(
+        [
+            (70.0, "5h", _reset_in(0.5)),
+            (10.0, "7d", _reset_in(68.0)),
+        ],
+        NOW,
+    )
+    constraint = _select_constraint(states)
+    budget = _select_budget(states)
+    capacity, waste, throughput, score = _score_components(
+        states=states,
+        constraint=constraint,
+        budget=budget,
+        weight=1.0,
+        pool_class="spend",
+        urgency_hours=12.0,
+    )
+    brake, brake_window = _brake_factor(states)
+    base_score = capacity + 50.0 * waste + 0.25 * throughput
+
+    assert BRAKE_KNEE_PCT == 50.0
+    assert brake_window is not None and brake_window.window == "5h"
+    assert brake == pytest.approx(0.6)
+    assert base_score == pytest.approx(4257.5)
+    assert score == pytest.approx(2554.5)
+    assert score == pytest.approx(base_score * 0.6)
+
+
+def test_rob1210_knee_or_more_short_remaining_has_no_score_penalty():
+    """At the knee (50% remaining), the r1 score is unchanged."""
+    states = _window_states(
+        [
+            (50.0, "5h", _reset_in(0.5)),
+            (10.0, "7d", _reset_in(68.0)),
+        ],
+        NOW,
+    )
+    constraint = _select_constraint(states)
+    budget = _select_budget(states)
+    capacity, waste, throughput, score = _score_components(
+        states=states,
+        constraint=constraint,
+        budget=budget,
+        weight=1.0,
+        pool_class="spend",
+        urgency_hours=12.0,
+    )
+    brake, _brake_window = _brake_factor(states)
+    base_score = capacity + 50.0 * waste + 0.25 * throughput
+    assert brake == pytest.approx(1.0)
+    assert score == pytest.approx(base_score)
+
+
+def test_rob1210_brake_reverses_rank_against_weekly_only_pool():
+    """A progressing 5h depletion moves the braked multi-window pool below weekly-only."""
+    out = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(70.0, "5h", 0.5), (10.0, "7d", 68.0)],
+            ),
+            _result_windows_with_resets("grok", [(20.0, "7d", 68.0)]),
+        ],
+        "S",
+        today=TODAY,
+        now=NOW,
+        explain=True,
+    )
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert ranked[0].find("grok-hi") >= 0
+    assert ranked[1].find("opus") >= 0
+    assert "score=3420.00" in out
+    assert "score=2554.50" in out
+    assert "× brake=0.60 (5h 잔여 30% < knee 50%)" in out
+
+
+@pytest.mark.parametrize("provider_id", ["grok", "codex"])
+def test_rob1210_no_short_window_brake_is_one(provider_id):
+    """Grok/Codex-shaped long-only pools retain the r1 numeric score."""
+    states = _window_states([(20.0, "7d", _reset_in(68.0))], NOW)
+    constraint = _select_constraint(states)
+    budget = _select_budget(states)
+    score = _score_components(
+        states=states,
+        constraint=constraint,
+        budget=budget,
+        weight=1.0,
+        pool_class="spend",
+        urgency_hours=12.0,
+    )[-1]
+    brake, brake_window = _brake_factor(states)
+    assert brake == pytest.approx(1.0)
+    assert brake_window is None
+    assert score == pytest.approx(3420.0)
+
+
+@pytest.mark.parametrize(
+    "pool_class, cutoff", [("spend", SPEND_EXCLUDE_PCT), ("preserve", PRESERVE_EXCLUDE_PCT)]
+)
+def test_rob1210_cutoff_still_excludes_at_existing_threshold(pool_class, cutoff):
+    """The multiplicative brake never changes the final 99%/90% cutoff."""
+    out = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(cutoff, "5h", 0.5), (10.0, "7d", 68.0)],
+                pool_class=pool_class,
+            )
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+    )
+    assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
+    assert any("claude 풀 소진" in line and f"{cutoff:g}%" in line for line in out.splitlines())
+
+
+def test_rob1210_explain_only_shows_brake_when_below_knee():
+    """The explain line names the brake source below knee and stays quiet at brake=1."""
+    braked = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(70.0, "5h", 0.5), (10.0, "7d", 68.0)],
+            )
+        ],
+        "S",
+        today=TODAY,
+        now=NOW,
+        explain=True,
+    )
+    flat = recommend(
+        [_result_windows_with_resets("grok", [(20.0, "7d", 68.0)])],
+        "S",
+        today=TODAY,
+        now=NOW,
+        explain=True,
+    )
+    braked_explain = next(line for line in braked.splitlines() if line.strip().startswith("score="))
+    flat_explain = next(line for line in flat.splitlines() if line.strip().startswith("score="))
+    assert "× brake=0.60 (5h 잔여 30% < knee 50%)" in braked_explain
+    assert "brake" not in flat_explain
 
 
 def test_rob1191_any_window_over_cutoff_excludes_candidate():
