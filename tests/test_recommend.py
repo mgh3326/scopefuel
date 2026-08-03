@@ -20,6 +20,11 @@ from scopefuel.recommend import (
     PROFILE_ALIASES,
     SPEND_EXCLUDE_PCT,
     Profile,
+    _score_components,
+    _select_budget,
+    _select_constraint,
+    _select_throughput_window,
+    _window_states,
     grade_help_text,
     profile_pool,
     recommend,
@@ -1269,6 +1274,229 @@ def _result_windows(
     )
 
 
+def _result_windows_with_resets(
+    provider_id: str,
+    windows: list[tuple[float, str, float]],
+    pool_class: str = "spend",
+) -> ProviderResult:
+    """Build account windows as (used_pct, window, hours_until_reset)."""
+    buckets = []
+    for used, window, hours in windows:
+        horizon = "now" if window == "5h" else "week"
+        buckets.append(
+            _bucket(
+                used,
+                window=window,
+                horizon=horizon,
+                resets_at=_reset_in(hours),
+            )
+        )
+    return ProviderResult(
+        id=provider_id,
+        pool_class=pool_class,  # type: ignore[arg-type]
+        buckets=buckets,
+    )
+
+
+def test_rob1210_budget_is_longest_and_unknown_duration_wins():
+    """Budget selection uses window duration, with an unparseable duration as longest."""
+    states = _window_states(
+        [
+            (10.0, "5h", _reset_in(0.5)),
+            (40.0, "7d", _reset_in(68.0)),
+        ],
+        NOW,
+    )
+    assert _select_constraint(states).window == "5h"
+    assert _select_budget(states).window == "7d"
+
+    unknown = _window_states(
+        [
+            (10.0, "7d", _reset_in(68.0)),
+            (20.0, "week", _reset_in(68.0)),
+        ],
+        NOW,
+    )
+    assert _select_budget(unknown).window == "week"
+
+
+def test_rob1210_budget_window_drives_capacity_waste_and_explain():
+    """A 5h constraint cannot make capacity/waste use the short window."""
+    out = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(10.0, "5h", 0.5), (40.0, "7d", 68.0)],
+            )
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+        explain=True,
+    )
+    opus_line = next(line for line in out.splitlines() if line[:1].isdigit() and "opus" in line)
+    explain = next(line for line in out.splitlines() if line.strip().startswith("score="))
+
+    assert "5h 10%" in opus_line and "주 40%" in opus_line
+    assert "제약=5h" in opus_line
+    assert "잔여 60%" in opus_line  # budget=7d, not constraint=5h's 90%
+    assert "🔥" in opus_line  # budget-window pace is urgent
+    assert "capacity=60.00=w1×rem60 (budget=주)" in explain
+    assert "waste×50=32.80 (budget=주)" in explain
+    assert "thru×0.25=90.00 (short=5h)" in explain
+    assert "제약=5h" in explain
+
+
+def test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool():
+    """The short-window waste illusion no longer outranks a higher weekly budget waste."""
+    out = recommend(
+        [
+            # The old constraint-based score would count almost all 5h remainder as waste.
+            _result_windows_with_resets(
+                "claude",
+                [(10.0, "5h", 0.5), (40.0, "7d", 68.0)],
+            ),
+            # Weekly-only control: 80% remains and the slow pace leaves 66.4% at risk.
+            _result_windows_with_resets("grok", [(20.0, "7d", 68.0)]),
+        ],
+        "S",
+        today=TODAY,
+        now=NOW,
+        explain=True,
+    )
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert ranked[0].find("grok-hi") >= 0
+    assert ranked[1].find("opus") >= 0
+    grok_explain = next(
+        line for line in out.splitlines() if line.strip().startswith("score=") and "66.40" in line
+    )
+    claude_explain = next(
+        line for line in out.splitlines() if line.strip().startswith("score=") and "32.80" in line
+    )
+    assert "waste×50=66.40 (budget=주)" in grok_explain
+    assert "waste×50=32.80 (budget=주)" in claude_explain
+
+
+def test_rob1210_imminent_exhaustion_uses_budget_window():
+    """A 5h reset within an hour is not imminent if the weekly budget is safe."""
+    safe_week = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(10.0, "5h", 0.5), (40.0, "7d", 68.0)],
+            )
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+    )
+    safe_line = next(line for line in safe_week.splitlines() if line[:1].isdigit() and "opus" in line)
+    assert "🔥🔥" not in safe_line
+    assert "소멸 임박 우선" not in safe_line
+
+    urgent_week = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(10.0, "5h", 4.9), (40.0, "7d", 0.5)],
+            )
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+    )
+    urgent_line = next(line for line in urgent_week.splitlines() if line[:1].isdigit() and "opus" in line)
+    assert "🔥🔥" in urgent_line
+    assert "소멸 임박 우선" in urgent_line
+    assert "잔여 60%" in urgent_line
+
+
+def test_rob1210_urgency_uses_budget_window_pace():
+    """A pace-urgent 5h window does not add 🔥 when the weekly budget pace is safe."""
+    out = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(50.0, "5h", 0.5), (60.0, "7d", 68.0)],
+            )
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+    )
+    opus_line = next(line for line in out.splitlines() if line[:1].isdigit() and "opus" in line)
+    assert "🔥" not in opus_line
+
+
+def test_rob1210_short_window_cutoff_remains_a_brake():
+    """A 5h spend cutoff still excludes the pool even when its weekly budget is low-use."""
+    out = recommend(
+        [
+            _result_windows_with_resets(
+                "claude",
+                [(99.0, "5h", 0.5), (10.0, "7d", 68.0)],
+            )
+        ],
+        "S+",
+        today=TODAY,
+        now=NOW,
+    )
+    assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
+    assert any("claude 풀 소진" in line and "99%" in line for line in out.splitlines())
+
+
+def test_rob1210_throughput_stays_on_shortest_window():
+    states = _window_states(
+        [
+            (80.0, "5h", _reset_in(0.5)),
+            (20.0, "7d", _reset_in(68.0)),
+        ],
+        NOW,
+    )
+    constraint = _select_constraint(states)
+    budget = _select_budget(states)
+    assert budget.window == "7d"
+    assert _select_throughput_window(states, constraint).window == "5h"
+    capacity, waste, throughput, _score = _score_components(
+        states=states,
+        constraint=constraint,
+        budget=budget,
+        weight=1.0,
+        pool_class="spend",
+        urgency_hours=12.0,
+    )
+    assert capacity == pytest.approx(80.0)
+    assert throughput == pytest.approx(20.0)
+    assert waste == pytest.approx(66.4)
+
+
+@pytest.mark.parametrize("provider_id", ["grok", "codex"])
+def test_rob1210_single_window_score_is_numerically_unchanged(provider_id):
+    """For a single window, budget and constraint are the same score source."""
+    states = _window_states([(10.0, "7d", _reset_almost_full("7d"))], NOW)
+    constraint = _select_constraint(states)
+    budget = _select_budget(states)
+    new_score = _score_components(
+        states=states,
+        constraint=constraint,
+        budget=budget,
+        weight=1.0,
+        pool_class="spend",
+        urgency_hours=12.0,
+    )
+
+    # ROB-1210's before-value: the legacy formula used the sole constraint window.
+    legacy_capacity = constraint.remaining_pct
+    legacy_waste = max(0.0, constraint.remaining_pct - constraint.burn_rate * constraint.hours_to_reset)
+    legacy_throughput = constraint.remaining_pct
+    legacy_score = (
+        legacy_capacity,
+        legacy_waste,
+        legacy_throughput,
+        legacy_capacity + 50.0 * legacy_waste + 0.25 * legacy_throughput,
+    )
+    assert budget is constraint
+    assert new_score == pytest.approx(legacy_score)
 def test_rob1191_any_window_over_cutoff_excludes_candidate():
     """AC1: 5h 95% + 7d 46% preserve → 5h exceeds 90% cutoff → excluded (not max-only)."""
     providers = [
