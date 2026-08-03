@@ -165,9 +165,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_add.add_argument(
         "--effort", choices=bench.REP_EFFORTS, help="실행 effort (low/medium/high/xhigh/max)"
     )
-    reps_add.add_argument(
-        "--grade", choices=bench.REP_GRADES, help="실행 당시 급 (S+/S/A+/A/B/C)"
-    )
+    reps_add.add_argument("--grade", choices=bench.REP_GRADES, help="실행 당시 급 (S+/S/A+/A/B/C)")
     reps_add.add_argument("--rounds", required=True, type=_nonnegative_int)
     reps_add.add_argument("--blockers-found", required=True, type=_nonnegative_int)
     reps_add.add_argument("--completed", required=True, type=_completed_arg, help="0/1")

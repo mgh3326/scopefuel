@@ -52,6 +52,8 @@ SCORE_WASTE_WEIGHT = 50.0
 SCORE_THRU_WEIGHT = 0.25
 # Short windows (≤6h) contribute the throughput-margin term.
 SHORT_WINDOW_MAX_S = 6 * 3600
+# ROB-1210 r2: progressively brake a candidate as its short-window headroom enters the knee.
+BRAKE_KNEE_PCT = 50.0
 # Pace-unknown constraint fallback: treat as less constraining than any finite TTE,
 # ordered by used_pct (higher usage = more constrained). Deterministic & conservative.
 _TTE_UNKNOWN_RANK = 1
@@ -746,8 +748,12 @@ class _Candidate:
     provider_id: str
     windows: list[_WindowState]
     constraint: _WindowState
+    budget: _WindowState
+    throughput_window: _WindowState
+    brake: float
+    brake_window: _WindowState | None
     windows_display: str
-    used_pct: float  # constraining window
+    used_pct: float  # budget window
     remaining_pct: float
     pool_class: PoolClass
     reset_at: str | None
@@ -931,6 +937,21 @@ def _select_constraint(states: list[_WindowState]) -> _WindowState:
     return min(states, key=_constraint_sort_key)
 
 
+def _budget_sort_key(state: _WindowState) -> tuple[int, float, str]:
+    """Larger key = longer budget window; an unknown duration is longest."""
+    seconds = _window_seconds(state.window)
+    if seconds is None:
+        # Provider labels such as ``week``/``?`` do not expose seconds.  They
+        # are budget windows by policy; the label is only a deterministic tie-break.
+        return (1, 0.0, state.window)
+    return (0, seconds, state.window)
+
+
+def _select_budget(states: list[_WindowState]) -> _WindowState:
+    """Select the longest-duration window used for budget and expiry scoring."""
+    return max(states, key=_budget_sort_key)
+
+
 def _any_window_over_cutoff(states: list[_WindowState], cutoff: float) -> _WindowState | None:
     """Return the worst over-cutoff window (highest used_pct), or None if all under."""
     over = [s for s in states if s.used_pct >= cutoff]
@@ -961,37 +982,62 @@ def _score_components(
     weight: float,
     pool_class: PoolClass,
     urgency_hours: float,
+    budget: _WindowState | None = None,
 ) -> tuple[float, float, float, float]:
     """Return (capacity, waste, throughput, total) continuous score terms.
 
-    (a) capacity — constraining-window remaining × capacity_weight
-    (b) waste — spend-only unused remainder that current pace will not consume before reset
+    (a) capacity — budget-window remaining × capacity_weight
+    (b) waste — spend-only budget-window remainder that current pace will not consume before reset
         (pace unknown + reset within urgency_hours → entire remainder counted as at-risk)
     (c) throughput — remaining on the tightest short window (draw-rate headroom)
     """
-    capacity = weight * constraint.remaining_pct
+    if budget is None:
+        budget = _select_budget(states)
+
+    capacity = weight * budget.remaining_pct
 
     waste = 0.0
     if pool_class == "spend":
-        br = constraint.burn_rate
-        hours = constraint.hours_to_reset
+        br = budget.burn_rate
+        hours = budget.hours_to_reset
         if br is not None and br > 0 and hours is not None:
-            waste = max(0.0, constraint.remaining_pct - br * hours)
+            waste = max(0.0, budget.remaining_pct - br * hours)
         elif hours is not None and br == 0.0:
             # Measured zero burn with remaining → entire remainder at risk of expiry.
-            waste = constraint.remaining_pct
+            waste = budget.remaining_pct
         elif hours is not None and br is None and hours <= urgency_hours:
             # Pace unmeasurable: conservative fallback matches 🔥 threshold.
-            waste = constraint.remaining_pct
+            waste = budget.remaining_pct
 
+    throughput_window = _select_throughput_window(states, constraint)
+    throughput = throughput_window.remaining_pct
+
+    base_score = capacity + SCORE_WASTE_WEIGHT * waste + SCORE_THRU_WEIGHT * throughput
+    brake, _brake_window = _brake_factor(states)
+    total = base_score * brake
+    return capacity, waste, throughput, total
+
+
+def _select_shortest_window(states: list[_WindowState]) -> _WindowState | None:
+    """Return the tightest window from the same short-window set as throughput."""
     short = [
         s for s in states if (secs := _window_seconds(s.window)) is not None and secs <= SHORT_WINDOW_MAX_S
     ]
-    # Tightest short window by remaining (lower remaining = less throughput headroom).
-    throughput = min(s.remaining_pct for s in short) if short else constraint.remaining_pct
+    # Existing throughput semantics: lower remaining means less headroom.
+    return min(short, key=lambda s: s.remaining_pct) if short else None
 
-    total = capacity + SCORE_WASTE_WEIGHT * waste + SCORE_THRU_WEIGHT * throughput
-    return capacity, waste, throughput, total
+
+def _select_throughput_window(states: list[_WindowState], fallback: _WindowState) -> _WindowState:
+    """Return the existing shortest-window throughput source, with its old fallback."""
+    return _select_shortest_window(states) or fallback
+
+
+def _brake_factor(states: list[_WindowState]) -> tuple[float, _WindowState | None]:
+    """Return (short-window brake, source window); no short window means no brake."""
+    short = _select_shortest_window(states)
+    if short is None:
+        return 1.0, None
+    return min(1.0, short.remaining_pct / BRAKE_KNEE_PCT), short
 
 
 def _read_claude_settings_effort() -> str | None:
@@ -1157,9 +1203,7 @@ def _cross_grade_measured_alternatives(grade: Grade) -> list[tuple[Profile, str]
     if grade_index == 0:
         return []
     existing_escalation_pools = {
-        profile_pool(profile.name)[0]
-        for profile in GRADE_TABLE[grade]
-        if profile.gate == "escalation"
+        profile_pool(profile.name)[0] for profile in GRADE_TABLE[grade] if profile.gate == "escalation"
     }
     if not existing_escalation_pools:
         return []
@@ -1487,6 +1531,7 @@ def recommend(
 
         states = _window_states(matches, now)
         constraint = _select_constraint(states)
+        budget = _select_budget(states)
         # result.pool_class may already include a policy stamp from cache; only preserve/spend
         # are valid builtins. get_policy re-reads XDG config for the effective class.
         fallback_class: PoolClass = (
@@ -1520,11 +1565,11 @@ def recommend(
             )
             continue
 
-        used_pct = constraint.used_pct
-        remaining_pct = constraint.remaining_pct
-        reset_at = constraint.reset_at
-        hours = constraint.hours_to_reset
-        burn_rate = constraint.burn_rate
+        used_pct = budget.used_pct
+        remaining_pct = budget.remaining_pct
+        reset_at = budget.reset_at
+        hours = budget.hours_to_reset
+        burn_rate = budget.burn_rate
 
         urgent = False
         if effective_class == "spend" and remaining_pct > 0 and hours is not None:
@@ -1541,7 +1586,10 @@ def recommend(
             weight=weight,
             pool_class=effective_class,
             urgency_hours=urgency_hours,
+            budget=budget,
         )
+        throughput_window = _select_throughput_window(states, constraint)
+        brake, brake_window = _brake_factor(states)
 
         # ROB-1188 fix 4: 리셋까지 아주 짧게(기본 1h) 남았고 잔여가 유의미한 임계(기본 5%)
         # 이상이면 "확실히 소멸"이 "며칠 단위 의도(boost)"보다 시급하다 — boost 를 역전.
@@ -1559,6 +1607,10 @@ def recommend(
                 provider_id=provider_id,
                 windows=states,
                 constraint=constraint,
+                budget=budget,
+                throughput_window=throughput_window,
+                brake=brake,
+                brake_window=brake_window,
                 windows_display=_format_windows_display(states, constraint),
                 used_pct=used_pct,
                 remaining_pct=remaining_pct,
@@ -1881,11 +1933,21 @@ def recommend(
                     f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}{bench}"
                 )
             if explain:
+                brake_explain = ""
+                if cand.brake < 1.0 and cand.brake_window is not None:
+                    brake_explain = (
+                        f" × brake={cand.brake:.2f} "
+                        f"({cand.brake_window.display_window} 잔여 {cand.brake_window.remaining_pct:g}% "
+                        f"< knee {BRAKE_KNEE_PCT:g}%)"
+                    )
                 lines.append(
                     f"    score={cand.score:.2f} "
                     f"(capacity={cand.capacity_term:.2f}=w{cand.weight:g}×rem{cand.remaining_pct:g} "
+                    f"(budget={cand.budget.display_window}) "
                     f"+ waste×{SCORE_WASTE_WEIGHT:g}={cand.waste_term:.2f} "
-                    f"+ thru×{SCORE_THRU_WEIGHT:g}={cand.throughput_term:.2f}; "
+                    f"(budget={cand.budget.display_window}) "
+                    f"+ thru×{SCORE_THRU_WEIGHT:g}={cand.throughput_term:.2f} "
+                    f"(short={cand.throughput_window.display_window}){brake_explain}; "
                     f"제약={cand.constraint.display_window})"
                 )
                 if cand.profile.estimate_reason and not live_measured:
