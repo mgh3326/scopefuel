@@ -204,6 +204,13 @@ def _active_override(pool: str, today: dt.date) -> ActiveOverride | None | str:
     if not isinstance(entry, dict):
         return None
 
+    # A boost-only entry is intentionally allowed to omit ``class``.  It must
+    # inherit the provider's builtin class instead of surfacing as the corrupt
+    # ``invalid class None`` override that used to be written by
+    # ``policy set <pool> --boost N --until ...``.
+    if "class" not in entry:
+        return None
+
     pool_class = _normalize_class(entry.get("class"))
     if pool_class is None:
         return f"invalid class {entry.get('class')!r}"

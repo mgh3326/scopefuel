@@ -140,6 +140,9 @@ class Profile:
     gate_reason: str | None = None
     launcher_effort: str | None = None
     benchmark_annotation: str | None = None
+    # True when the displayed benchmark is derived from AA-model only data;
+    # such a row must not fall back to the raw AA-model DB value at runtime.
+    model_only: bool = False
     # ROB-1202: one-line justification for an estimated (내삽/외삽) benchmark value.
     estimate_reason: str | None = None
     # Explicitly disclose a conservative grade placement when the displayed estimate
@@ -176,6 +179,11 @@ ESTIMATED_EXTRAPOLATED_ANNOTATION = "추정(외삽)"
 ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION = "추정(외삽·미측정)"
 HAIKU_ESTIMATE_ANNOTATION = ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION
 MODEL_ONLY_ANNOTATION = "모델지수만 있음(에이전트 미측정)"
+# ROB-1212: a model-only value is a reference for ordering, never an AA-agent
+# grade score.  These annotations make the derived score and the missing
+# execution harness visible in the recommendation output.
+MODEL_ONLY_INTERPOLATED_ANNOTATION = "추정(내삽·harness-이식)"
+MODEL_ONLY_EXTRAPOLATED_ANNOTATION = "추정(외삽·harness-이식)"
 ESTIMATE_PROVENANCE_LEGEND = (
     "추정(내삽)=상하 대조 가능한 기준점 사이에서 추정 · 추정(외삽)=단일/무 기준점에서 투사한 추정 "
     "· (·미측정)=AA-agent 실행 실측 없음"
@@ -248,6 +256,62 @@ def _aa_model_benchmark(score: float, model_id: str, metric: str = "coding_index
     }
 
 
+# ROB-1212: DB-derived calibration curve for model-only rows.  Each pair is
+# (AA-model coding_index, AA-agent agentic score).  The rows below are the
+# conservative, single-effort anchor values read from bench.db; Opus has a
+# 62–67 AA-agent range across its measured efforts, so the full range is kept
+# in the table for auditability.
+_MODEL_ONLY_ANCHORS: tuple[tuple[float, float], ...] = (
+    (63.0, 38.0),  # claude-sonnet-4.6 / medium / claude-code
+    (68.8, 43.0),  # glm-5.2 / default / claude-code
+    (72.4, 64.0),  # grok-4.5 / high / grok-build
+    (76.2, 61.0),  # kimi-k3 / default / kimi-code-cli
+    (76.5, 62.0),  # claude-opus-5 / medium / claude-code
+    (76.5, 63.0),  # claude-opus-5 / high / claude-code
+    (76.5, 66.0),  # claude-opus-5 / max / claude-code
+    (77.0, 67.0),  # claude-opus-5 / xhigh / claude-code
+)
+
+
+def _interpolate_model_only_score(model_score: float) -> float:
+    """Map an AA-model value onto the observed AA-agent scale.
+
+    This helper is intentionally only used to materialize static profile
+    estimates.  It never participates in runtime ranking and does not turn a
+    model score into a measured boundary value.  Outside the anchor range it
+    uses the nearest segment; the caller must mark that result as extrapolated
+    and apply the additional conservative placement rule.
+    """
+
+    anchors = sorted(_MODEL_ONLY_ANCHORS)
+    if model_score <= anchors[0][0]:
+        lower, upper = anchors[0], anchors[1]
+    elif model_score >= anchors[-1][0]:
+        lower, upper = anchors[-2], anchors[-1]
+    else:
+        lower = upper = anchors[0]
+        for candidate_lower, candidate_upper in zip(anchors, anchors[1:], strict=False):
+            if candidate_lower[0] <= model_score <= candidate_upper[0]:
+                lower, upper = candidate_lower, candidate_upper
+                if candidate_lower[0] != candidate_upper[0]:
+                    break
+        if lower[0] == upper[0]:
+            # Duplicate model values are only Opus effort rows.  Use the
+            # conservative lower agent anchor if a caller lands exactly there.
+            same_score = [agent for score, agent in anchors if score == model_score]
+            return round(min(same_score), 1)
+
+    fraction = (model_score - lower[0]) / (upper[0] - lower[0])
+    return round(lower[1] + fraction * (upper[1] - lower[1]), 1)
+
+
+# Source values are retained only as calibration inputs.  The Profile score
+# fields below contain the derived values, never these AA-model originals.
+_QWEN37_DERIVED_SCORE = _interpolate_model_only_score(66.0)
+_MINIMAX_M3_DERIVED_SCORE = _interpolate_model_only_score(58.6)
+_GFLASH_DERIVED_SCORE = _interpolate_model_only_score(69.2)
+
+
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
@@ -305,14 +369,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             launcher_effort="xhigh",
             aa_agent_model_id="gpt-5.6-sol",
             aa_model_id="gpt-5-6-sol",
-        ),
-        Profile(
-            "oc-qwen37-max",
-            "qwen3.7-max",
-            66.0,
-            **_aa_model_benchmark(66.0, "qwen3-7-max"),
-            benchmark_annotation=MODEL_ONLY_ANNOTATION,
-            aa_model_id="qwen3-7-max",
         ),
         Profile(
             "fable",
@@ -464,14 +520,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="glm-5.2",
             aa_model_id="glm-5-2",
         ),
-        Profile(
-            "oc-minimax-m3",
-            "minimax-m3",
-            58.6,
-            **_aa_model_benchmark(58.6, "minimax-m3"),
-            benchmark_annotation=MODEL_ONLY_ANNOTATION,
-            aa_model_id="minimax-m3",
-        ),
     ],
     "A": [
         Profile(
@@ -520,13 +568,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_effort="low",
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
-        ),
-        Profile(
-            "oc-gflash",
-            "Gemini 3.6 Flash",
-            50.1,
-            **_openrouter_benchmark(50.1, "gemini-3.6-flash"),
-            aa_model_id="gemini-3-6-flash",
         ),
         Profile("oc-kimi-code", "Kimi K2.7 Code", None),
     ],
@@ -602,6 +643,46 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             estimate_reason=HAIKU_LOW_ESTIMATE_REASON,
         ),
         Profile(
+            "oc-qwen37-max",
+            "qwen3.7-max",
+            _QWEN37_DERIVED_SCORE,
+            benchmark_annotation=MODEL_ONLY_INTERPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=(
+                "AA-model coding_index 66.0 — 63.0→38.0 / 68.8→43.0 내삽 = 40.6; "
+                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C)"
+            ),
+            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
+            aa_model_id="qwen3-7-max",
+        ),
+        Profile(
+            "oc-gflash",
+            "Gemini 3.6 Flash",
+            _GFLASH_DERIVED_SCORE,
+            benchmark_annotation=MODEL_ONLY_INTERPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=(
+                "AA-model coding_index 69.2 — 68.8→43.0 / 72.4→64.0 내삽 = 45.3; "
+                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C)"
+            ),
+            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
+            aa_model_id="gemini-3-6-flash",
+        ),
+        Profile(
+            "oc-minimax-m3",
+            "minimax-m3",
+            _MINIMAX_M3_DERIVED_SCORE,
+            benchmark_annotation=MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=(
+                "AA-model coding_index 58.6 — 최저 앵커 63.0→38.0 밖, "
+                "63.0→38.0 / 68.8→43.0 기울기로 외삽 = 34.2; "
+                "harness 미측정, 추가 보수 배치(C)"
+            ),
+            placement_note="보수 배치(C; 앵커 밖 외삽)",
+            aa_model_id="minimax-m3",
+        ),
+        Profile(
             "oc-omni",
             "OmniRoute free",
             None,
@@ -626,6 +707,8 @@ _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
         UNMEASURED_ANNOTATION,
         ESTIMATED_INTERPOLATED_ANNOTATION,
         ESTIMATED_EXTRAPOLATED_ANNOTATION,
+        MODEL_ONLY_INTERPOLATED_ANNOTATION,
+        MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
         HAIKU_ESTIMATE_ANNOTATION,
         MODEL_ONLY_ANNOTATION,
     }
@@ -652,6 +735,7 @@ def _boundary_checked(profile: Profile) -> bool:
     return (
         profile.benchmark is not None
         and profile.benchmark_source == "AA-agent"
+        and not profile.model_only
         and profile.benchmark_annotation not in _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS
     )
 
@@ -663,6 +747,17 @@ def validate_grade_table(table: dict[Grade, list[Profile]] | None = None) -> Non
     for grade, profiles in table.items():
         lower, upper = _grade_range(grade)
         for profile in profiles:
+            if (
+                profile.benchmark is not None
+                and profile.benchmark_source == "AA-model"
+                and not profile.model_only
+                and profile.benchmark_annotation not in _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS
+            ):
+                violations.append(
+                    f"{profile.name} has raw AA-model {profile.benchmark:g} as a grade score; "
+                    "derive it or mark it model-only"
+                )
+                continue
             if not _boundary_checked(profile):
                 continue
             assert profile.benchmark is not None
@@ -694,6 +789,11 @@ def _profile_label(profile: Profile) -> str:
 
 
 def _benchmark_annotation(profile: Profile) -> str | None:
+    if profile.model_only:
+        annotation = profile.benchmark_annotation or MODEL_ONLY_ANNOTATION
+        if MODEL_ONLY_ANNOTATION in annotation:
+            return f"{annotation} · {profile.model}"
+        return f"{annotation} · {profile.model} · {MODEL_ONLY_ANNOTATION}"
     if profile.benchmark_annotation == MODEL_ONLY_ANNOTATION:
         return f"{profile.model} · {profile.benchmark_annotation}"
     return profile.benchmark_annotation
@@ -1731,6 +1831,12 @@ def recommend(
             ]
 
         def _model_candidates() -> list[ModelScore]:
+            if profile.model_only or profile.aa_agent_model_id is None:
+                # The raw AA-model row is a calibration input only.  A
+                # materialized derived score is displayed from Profile below;
+                # profiles without an agent mapping must not silently turn an
+                # AA-model fallback into a grade score when bench.db exists.
+                return []
             model_fallback_id = profile.aa_model_id or (
                 profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
             )
@@ -1818,7 +1924,8 @@ def recommend(
             and profile.benchmark_source is None
             and profile.benchmark_annotation
         ):
-            rendered = f"{profile.benchmark:.1f}({profile.benchmark_annotation})"
+            annotation = _benchmark_annotation(profile) or profile.benchmark_annotation
+            rendered = f"{profile.benchmark:.1f}({annotation})"
             if profile.placement_note:
                 rendered += f" · {profile.placement_note}"
             return rendered, False
