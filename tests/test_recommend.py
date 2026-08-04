@@ -16,6 +16,9 @@ from scopefuel.recommend import (
     GRADE_DISCRIM,
     GRADE_TABLE,
     HAIKU_ESTIMATE_ANNOTATION,
+    MODEL_ONLY_ANNOTATION,
+    MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
+    MODEL_ONLY_INTERPOLATED_ANNOTATION,
     OPUS_MAX_ESCALATION_REASON,
     PRESERVE_EXCLUDE_PCT,
     PROFILE_ALIASES,
@@ -164,7 +167,8 @@ def test_recommend_excludes_unmeasurable_provider():
 
 def test_grade_table_has_expected_a_profiles():
     names = [p.name for p in GRADE_TABLE["A"]]
-    assert {"oc-gflash", "oc-kimi-code"}.issubset(names)
+    assert "oc-kimi-code" in names
+    assert "oc-gflash" not in names
     assert {"codex-sol", "codex-luna", "codex-terra"}.issubset(names)
     assert "oc-sonnet46" not in names
 
@@ -286,7 +290,7 @@ def test_multiple_urgent_sorted_by_remaining():
     out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "🔥" in lines[0] and "oc-glm" in lines[0]
-    assert "🔥" in lines[1] and "oc-minimax-m3" in lines[1]
+    assert "oc-minimax-m3" not in out
     kiro_line = next(line for line in lines if "kiro-sonnet" in line)
     assert "🔥" in kiro_line
 
@@ -397,7 +401,8 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"}.issubset(aplus_names)
-    assert {"codex-terra", "codex-luna", "opus", "oc-minimax-m3"}.issubset(aplus_names)
+    assert {"codex-terra", "codex-luna", "opus"}.issubset(aplus_names)
+    assert "oc-minimax-m3" not in aplus_names
 
     a_names = [p.name for p in GRADE_TABLE["A"]]
     assert "oc-sonnet46" not in a_names
@@ -482,13 +487,19 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     assert aplus_grok.estimate_reason and "미측정" in aplus_grok.estimate_reason
     assert b_grok.estimate_reason and "미측정" in b_grok.estimate_reason
 
-    aplus_profiles = GRADE_TABLE["A+"]
-    qwen = next(p for p in GRADE_TABLE["S+"] if p.name == "oc-qwen37-max")
-    minimax = next(p for p in aplus_profiles if p.name == "oc-minimax-m3")
-    assert qwen.benchmark_source == minimax.benchmark_source == "AA-model"
-    assert qwen.benchmark == 66.0
-    assert minimax.benchmark == 58.6
-    assert qwen.benchmark_annotation == minimax.benchmark_annotation == "모델지수만 있음(에이전트 미측정)"
+    c_profiles = GRADE_TABLE["C"]
+    qwen = next(p for p in c_profiles if p.name == "oc-qwen37-max")
+    gflash = next(p for p in c_profiles if p.name == "oc-gflash")
+    minimax = next(p for p in c_profiles if p.name == "oc-minimax-m3")
+    assert all(p.model_only and p.benchmark_source is None for p in (qwen, gflash, minimax))
+    assert qwen.benchmark == 40.6
+    assert gflash.benchmark == 45.3
+    assert minimax.benchmark == 34.2
+    assert qwen.benchmark_annotation == gflash.benchmark_annotation == MODEL_ONLY_INTERPOLATED_ANNOTATION
+    assert minimax.benchmark_annotation == MODEL_ONLY_EXTRAPOLATED_ANNOTATION
+    assert all(MODEL_ONLY_ANNOTATION not in (p.benchmark_annotation or "") for p in (qwen, gflash, minimax))
+    assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S+"])
+    assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S"])
 
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
@@ -530,6 +541,23 @@ def test_rob1201_measured_grade_boundaries_and_explicit_exceptions():
         )
     )
     with pytest.raises(ValueError, match="grade boundary violation"):
+        validate_grade_table(invalid)
+
+
+def test_rob1212_raw_aa_model_value_cannot_pass_as_a_grade_score():
+    """A model-benchmark number in an otherwise unannotated grade row is a hard failure."""
+    invalid = {grade: list(profiles) for grade, profiles in GRADE_TABLE.items()}
+    invalid["S+"].append(
+        Profile(
+            "raw-model-fixture",
+            "Qwen fixture",
+            66.0,
+            benchmark_source="AA-model",
+            benchmark_metric="coding_index",
+            benchmark_model_id="qwen3-7-max",
+        )
+    )
+    with pytest.raises(ValueError, match="raw AA-model"):
         validate_grade_table(invalid)
 
 
@@ -681,16 +709,34 @@ def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
             rank=1,
             captured_at="2026-08-01T00:00:00+00:00",
         ),
+        ModelScore(
+            model_id="gemini-3-6-flash",
+            effort=None,
+            harness=None,
+            source="AA-model",
+            metric="coding_index",
+            score=69.2,
+            rank=1,
+            captured_at="2026-08-01T00:00:00+00:00",
+        ),
     ]
-    providers = [_result("clinepass", 10.0, window="30d")]
-    splus = recommend(providers, "S+", today=TODAY, now=NOW, bench_scores=scores)
-    aplus = recommend(providers, "A+", today=TODAY, now=NOW, bench_scores=scores)
-    qwen_line = next(line for line in splus.splitlines() if "oc-qwen37-max" in line and line[:1].isdigit())
-    minimax_line = next(line for line in aplus.splitlines() if "oc-minimax-m3" in line and line[:1].isdigit())
-    assert "66.0(AA-model/unspecified)" in qwen_line
-    assert "58.6(AA-model/unspecified)" in minimax_line
+    providers = [
+        _result("clinepass", 10.0, window="30d"),
+        _result("agy", 10.0, scope=Scope("group", "gemini")),
+    ]
+    c_output = recommend(providers, "C", today=TODAY, now=NOW, bench_scores=scores)
+    qwen_line = next(line for line in c_output.splitlines() if "oc-qwen37-max" in line and line[:1].isdigit())
+    minimax_line = next(
+        line for line in c_output.splitlines() if "oc-minimax-m3" in line and line[:1].isdigit()
+    )
+    gflash_line = next(line for line in c_output.splitlines() if "oc-gflash" in line and line[:1].isdigit())
+    assert "40.6(추정(내삽·harness-이식)" in qwen_line
+    assert "34.2(추정(외삽·harness-이식)" in minimax_line
+    assert "45.3(추정(내삽·harness-이식)" in gflash_line
     assert "모델지수만 있음(에이전트 미측정)" in qwen_line
     assert "모델지수만 있음(에이전트 미측정)" in minimax_line
+    assert "66.0" not in qwen_line and "58.6" not in minimax_line
+    assert "69.2" not in gflash_line
     assert "46.0" not in qwen_line and "44.4" not in minimax_line
 
 

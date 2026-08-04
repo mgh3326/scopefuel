@@ -62,12 +62,12 @@ def test_clear_missing_returns_false(policy_config):
 
 
 def test_list_shows_builtin_and_overrides(policy_config, capsys, monkeypatch):
-    policy.set_policy("claude", "preserve", until=dt.date(2026, 8, 3), note="테스트")
+    policy.set_policy("claude", "preserve", until=dt.date(2026, 8, 6), note="테스트")
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
     assert cli.main(["policy", "list"]) == 0
     out = capsys.readouterr().out
     assert "claude" in out and "preserve" in out
-    assert "2026-08-03" in out or "expires 2026-08-03" in out
+    assert "2026-08-06" in out or "expires 2026-08-06" in out
     assert "테스트" in out
 
 
@@ -168,6 +168,22 @@ def test_boost_set_without_class_only_touches_boost(policy_config):
     assert effective == "spend"
     boost, _ = policy.get_boost("codex", today=TODAY)
     assert boost == 1
+
+
+def test_boost_only_new_pool_keeps_builtin_class_and_clean_policy_list(policy_config, capsys, monkeypatch):
+    """ROB-1212: omitting class must not create an ``invalid class None`` row."""
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    assert cli.main(["policy", "set", "grok", "--boost", "2", "--until", "2026-08-10"]) == 0
+    builtin_class = getattr(BUILTIN["grok"], "pool_class", "preserve")
+    assert policy.get_policy("grok", builtin_class, today=TODAY) == (builtin_class, None)
+    capsys.readouterr()
+
+    assert cli.main(["policy", "list"]) == 0
+    out = capsys.readouterr().out
+    grok_line = next(line for line in out.splitlines() if line.startswith("grok"))
+    assert f"{builtin_class}" in grok_line
+    assert "[invalid class None]" not in grok_line
+    assert "boost=2" in grok_line
 
 
 def test_boost_none_clears_boost_without_touching_class(policy_config):
