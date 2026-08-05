@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import time
+from pathlib import Path
 
 from ..model import Bucket, ProviderResult, Scope
 
@@ -30,7 +31,9 @@ READY_SETTLE_S = 0.5
 IDLE_TIMEOUT_S = 8.0
 USAGE_SETTLE_S = 0.5
 PROBE_INPUT = "/usage\r"
-_READY_MARKERS = ("│ >", "Kimi K3 thinking")
+PROBE_WORKDIR = Path.home() / ".local" / "share" / "scopefuel" / "kimi-probe-workdir"
+TRUST_MARKER = "Trust this folder?"
+_READY_MARKERS = ("│ >", "Kimi K3 thinking", TRUST_MARKER)
 
 _ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])")
 _PERCENT_LEFT = re.compile(r"(?P<remaining>\d+(?:\.\d+)?)\s*%\s+left", re.IGNORECASE)
@@ -77,11 +80,14 @@ def fetch() -> ProviderResult:
 def _probe_once() -> str:
     """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice."""
 
+    probe_workdir = Path(PROBE_WORKDIR).expanduser()
+    probe_workdir.mkdir(parents=True, exist_ok=True)
     master_fd, slave_fd = pty.openpty()
     process: subprocess.Popen[bytes] | None = None
     try:
         process = subprocess.Popen(  # noqa: S603 - fixed command/input; binary is explicit/env-configured
             [BINARY],
+            cwd=probe_workdir,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -100,6 +106,7 @@ def _probe_once() -> str:
         last_input = None
         usage_seen_at = None
         ready = False
+        trust_sent = False
         sends = 0
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
@@ -115,7 +122,13 @@ def _probe_once() -> str:
                 output.extend(chunk)
                 last_data = time.monotonic()
                 clean = _clean(output.decode("utf-8", errors="replace"))
-                if not ready and _prompt_ready(clean):
+                if not trust_sent and TRUST_MARKER in clean:
+                    os.write(master_fd, b"\r")
+                    trust_sent = True
+                    last_input = time.monotonic()
+                    last_data = last_input
+                    continue
+                if not ready and _normal_prompt_ready(clean):
                     ready = True
                 if _RATE_LIMIT.search(clean):
                     break
@@ -178,6 +191,10 @@ def _child_env() -> dict[str, str]:
 def _prompt_ready(text: str) -> bool:
     clean = _clean(text)
     return any(marker in clean for marker in _READY_MARKERS)
+
+
+def _normal_prompt_ready(text: str) -> bool:
+    return _prompt_ready(_clean(text).replace(TRUST_MARKER, ""))
 
 
 def _usage_panel_seen(text: str) -> bool:

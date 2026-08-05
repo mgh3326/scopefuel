@@ -59,6 +59,49 @@ def test_fetch_uses_a_pty_and_sends_usage_once(tmp_path, monkeypatch):
     ]
 
 
+def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch):
+    binary = tmp_path / "fake-kimi-trust"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "printf 'CWD=%s\\r\\n' \"$PWD\"\n"
+        "if [ ! -f .trusted ]; then\n"
+        "  printf 'Trust this folder?\\r\\n  ❯ Trust this folder\\r\\n'\n"
+        "  IFS= read -r trust_input\n"
+        '  [ -z "$trust_input" ] || exit 8\n'
+        "  : > .trusted\n"
+        "  printf 'TRUST_ACCEPTED\\r\\n'\n"
+        "else\n"
+        "  printf 'TRUST_ALREADY_ACCEPTED\\r\\n'\n"
+        "fi\n"
+        "printf '│ >\\r\\n'\n"
+        "IFS= read -r command\n"
+        "[ \"$command\" = '/usage' ] || exit 9\n"
+        "printf 'Weekly: 80%% left (resets in 1d)\\r\\n5h: 50%% left (resets in 1h)\\r\\n'\n"
+    )
+    binary.chmod(binary.stat().st_mode | 0o111)
+    workdir = tmp_path / "provider-workdir"
+    monkeypatch.setattr(kimi, "BINARY", str(binary))
+    monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
+
+    first_output = kimi._probe_once()
+    second_output = kimi._probe_once()
+    first = kimi.parse(first_output)
+    second = kimi.parse(second_output)
+
+    assert first.error is None
+    assert second.error is None
+    assert "Trust this folder?" in first_output
+    assert "TRUST_ACCEPTED" in first_output
+    assert "Trust this folder?" not in second_output
+    assert "TRUST_ALREADY_ACCEPTED" in second_output
+    assert f"CWD={workdir}" in first_output
+    assert f"CWD={workdir}" in second_output
+    assert [(bucket.label, bucket.used_pct) for bucket in second.buckets] == [
+        ("5h", 50.0),
+        ("weekly", 20.0),
+    ]
+
+
 def test_child_env_removes_herdr_integration_variables(monkeypatch):
     monkeypatch.setenv("HERDR_PANE_ID", "pane-1")
     monkeypatch.setenv("HERDR_AGENT_STATE", "working")
