@@ -67,7 +67,7 @@ def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch
         "if [ ! -f .trusted ]; then\n"
         "  printf 'Trust this folder?\\r\\n  ❯ Trust this folder\\r\\n'\n"
         "  IFS= read -r trust_input\n"
-        "  [ -z \"$trust_input\" ] || exit 8\n"
+        '  [ -z "$trust_input" ] || exit 8\n'
         "  : > .trusted\n"
         "  printf 'TRUST_ACCEPTED\\r\\n'\n"
         "else\n"
