@@ -1338,7 +1338,12 @@ def _cross_grade_measured_alternatives(grade: Grade) -> list[tuple[Profile, str]
 
     alternatives: list[tuple[Profile, str]] = []
     seen: set[tuple[str, str | None, str | None]] = set()
-    for upper_grade in _GRADE_ORDER[:grade_index]:
+    # ROB-1218: adjacent grade only. Scanning every upper grade degenerated —
+    # C-grade work (haiku low, est. 35) listed opus xhigh (S+, measured 67) and
+    # kimi-k3 (S, 61) as "alternatives", a 26-32 point jump that no C task wants.
+    # The rule exists for the near-miss case it was built for (A+ grok medium,
+    # estimated -> S grok-hi, measured 64), which is one grade up by construction.
+    for upper_grade in _GRADE_ORDER[grade_index - 1 : grade_index]:
         for profile in GRADE_TABLE[upper_grade]:
             provider_id, _ = profile_pool(profile.name)
             source_profile = estimated_by_provider.get(provider_id)

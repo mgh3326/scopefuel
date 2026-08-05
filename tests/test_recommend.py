@@ -2214,3 +2214,44 @@ def test_rob1191_cli_explain_and_hide_excluded_flags(monkeypatch, capsys):
     assert cli.main(["--recommend", "S+", "--hide-excluded", "--no-cache"]) == 0
     hidden = capsys.readouterr().out
     assert "kiro 풀 제외" not in hidden
+
+
+def test_cross_grade_alternatives_are_adjacent_grade_only():
+    """ROB-1218: the measured-alternative rule spans exactly one grade, never further.
+
+    Unbounded it degenerated: C-grade work (haiku low, est. 35) was offered opus
+    xhigh (S+, measured 67) and kimi-k3 (S, 61) as "alternatives" — a 26-32 point
+    jump no C task wants. The near-miss case it exists for (A+ grok medium
+    estimated -> S grok-hi measured) is one grade up by construction.
+    """
+    from scopefuel.recommend import (
+        _GRADE_ORDER,
+        GRADE_TABLE,
+        _cross_grade_measured_alternatives,
+        profile_pool,
+    )
+
+    for grade in _GRADE_ORDER:
+        grade_index = _GRADE_ORDER.index(grade)
+        if grade_index == 0:
+            assert _cross_grade_measured_alternatives(grade) == []
+            continue
+        adjacent = {p.name for p in GRADE_TABLE[_GRADE_ORDER[grade_index - 1]]}
+        for profile, reason in _cross_grade_measured_alternatives(grade):
+            assert profile.name in adjacent, (
+                f"{grade}: {profile.name} is not from the adjacent grade {_GRADE_ORDER[grade_index - 1]}"
+            )
+            # the alternative must share a pool with an estimated same-grade entry
+            assert profile_pool(profile.name)[0] in {profile_pool(p.name)[0] for p in GRADE_TABLE[grade]}, (
+                f"{grade}: {profile.name} shares no pool with this grade"
+            )
+            assert "실측" in reason
+
+
+def test_c_grade_has_no_top_tier_escalation():
+    """ROB-1218 regression: no S/S+ profile may surface as a C-grade alternative."""
+    from scopefuel.recommend import _GRADE_ORDER, GRADE_TABLE, _cross_grade_measured_alternatives
+
+    top_tier = {p.name for g in _GRADE_ORDER[:3] for p in GRADE_TABLE[g]}
+    offered = {p.name for p, _ in _cross_grade_measured_alternatives("C")}
+    assert not (offered & top_tier), f"C grade offered top-tier profiles: {offered & top_tier}"
