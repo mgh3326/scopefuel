@@ -97,6 +97,7 @@ def _result(
 
 def test_profile_pool_matches_quota_guard():
     assert profile_pool("kimi-k3") == ("kimi", None)
+    assert profile_pool("kimi-k3-low") == ("kimi", None)
     assert profile_pool("kimi-k27") == ("kimi", None)
     assert profile_pool("oc-gflash") == ("agy", "gemini")
     assert profile_pool("oc-sonnet46") == ("agy", "3p")
@@ -170,7 +171,9 @@ def test_recommend_excludes_unmeasurable_provider():
 def test_grade_table_has_expected_a_profiles():
     names = [p.name for p in GRADE_TABLE["A"]]
     assert "kimi-k27" not in names
-    assert "kimi-k27" in [p.name for p in GRADE_TABLE["C"]]
+    assert "kimi-k27" not in [p.name for p in GRADE_TABLE["C"]]
+    assert "kimi-k3-max" not in names
+    assert "kimi-k3-low" in names
     assert "oc-gflash" not in names
     assert {"codex-sol", "codex-luna", "codex-terra"}.issubset(names)
     assert "oc-sonnet46" not in names
