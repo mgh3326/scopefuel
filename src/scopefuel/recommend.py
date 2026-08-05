@@ -1995,6 +1995,21 @@ def recommend(
             lines_out.append(f"✗ {provider_id} 풀 제외 — 이 급에서 {len(group)}개({names}){tail}")
         return lines_out
 
+    def _suppress_policy_excluded(items: list[_PolicyExcluded]) -> bool:
+        """ROB-1219: a deliberately excluded pool is noise, not information.
+
+        `class = exclude` is an operator decision that the pool is out of rotation
+        for a stated period (kiro: subscription ended 2026-08-01, re-evaluate after
+        the 2026-09-01 free-credit reset). Repeating a "✗ pool excluded" line in
+        every grade tells the reader nothing they did not already decide. The
+        record lives on in `policy list` (class, until, note) and in GRADE_TABLE,
+        so restoring the pool is `scopefuel policy clear <pool>` — no code change.
+
+        Suppression is display-only and never applies when the grade has no usable
+        candidate: the emergency-candidate block below still surfaces the pool.
+        """
+        return bool(items)
+
     def _fold_excluded(items: list[_Excluded]) -> list[str]:
         """③ fold exhausted/unmeasurable by pool; keep kinds separate."""
         # Group key: (kind, provider_id, reason) so different cutoffs don't merge incorrectly.
@@ -2079,7 +2094,7 @@ def recommend(
                 )
                 if cand.profile.estimate_reason and not live_measured:
                     lines.append(f"    추정근거: {cand.profile.estimate_reason}")
-        if not hide_excluded:
+        if not hide_excluded and not _suppress_policy_excluded(policy_excluded):
             lines.extend(_fold_policy_excluded(policy_excluded))
 
     if not hide_excluded:
