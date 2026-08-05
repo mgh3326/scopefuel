@@ -192,10 +192,10 @@ def test_exclude_policy_removes_claude_from_sp_candidates():
     # kiro-opus/kiro-sol spend, codex-sol preserve → kiro first
     assert any("kiro-opus" in line for line in ranked)
     assert any("codex-sol" in line for line in ranked)
-    # opus is default gate but policy-excluded (ROB-1191: folded per pool)
-    assert any(line.startswith("✗ claude 풀 제외") and "opus" in line for line in lines)
-    assert "until 2026-08-31" in out
-    assert "Pro 요금제" in out
+    # ROB-1219: an excluded pool is suppressed from the recommendation entirely.
+    # The invariant that matters is that it is not offered as a candidate; the
+    # decision itself is recorded in `policy list`, not repeated per grade.
+    assert "claude 풀 제외" not in out
     assert not any(line[:1].isdigit() and "opus" in line.split() for line in lines)
     # fable is escalation — not in normal candidates
     assert not any(line[:1].isdigit() and "fable" in line for line in lines)
@@ -384,7 +384,8 @@ def test_ac1_sp_recommend_with_claude_exclude():
     assert fable_section
 
     # opus is default-gate, policy-excluded → folded pool line, not in escalation
-    assert any(line.startswith("✗ claude 풀 제외") and "opus" in line for line in lines)
+    # ROB-1219: excluded pools are suppressed, not folded into a per-grade line
+    assert "claude 풀 제외" not in out
 
 
 # ------------------------------------------------------------------ AC2: S grade
@@ -1802,8 +1803,16 @@ def test_rob1191_boost_hard_override_stays_first():
     assert not ranked[0].startswith("1. kimi-k3")
 
 
-def test_rob1191_excluded_kiro_pool_folds_and_hide_excluded():
-    """AC6: same-grade kiro policy excludes fold to one pool line; --hide-excluded removes it."""
+def test_rob1219_excluded_pool_is_absent_from_recommendation():
+    """ROB-1219 (supersedes ROB-1191 AC6): an excluded pool is suppressed entirely.
+
+    ROB-1191 folded same-grade kiro excludes into one "✗ kiro 풀 제외" line per
+    grade. Operator judgment 2026-08-06: that line is noise — `class = exclude`
+    is a decision already made, repeated in every grade. The record lives in
+    `policy list` (class/until/note) and GRADE_TABLE, so restoring the pool stays
+    a one-command `policy clear`. The emergency-candidate path (no usable
+    candidate in the grade) is unaffected and still surfaces the pool.
+    """
     policy.set_policy(
         "kiro",
         "exclude",
@@ -1818,20 +1827,29 @@ def test_rob1191_excluded_kiro_pool_folds_and_hide_excluded():
     shown = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=False)
     hidden = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=True)
 
-    fold_lines = [line for line in shown.splitlines() if "kiro 풀 제외" in line]
-    assert len(fold_lines) == 1
-    fold = fold_lines[0]
-    assert "2개" in fold
-    assert "kiro-opus" in fold and "kiro-sol" in fold
-    assert "until 2026-09-01" in fold
-    assert "무료 전환" in fold
-    # negative: must not emit one long line per profile for the same pool
-    assert not any(line.startswith("✗ kiro-opus") for line in shown.splitlines())
-    assert not any(line.startswith("✗ kiro-sol") for line in shown.splitlines())
+    # no exclusion line, and no per-profile leakage either
+    assert "kiro 풀 제외" not in shown
+    assert "kiro" not in shown
+    assert "kiro" not in hidden
+    # the usable candidates are still there — suppression must not empty the grade
+    assert "codex" in shown or "opus" in shown
 
-    assert "kiro 풀 제외" not in hidden
-    assert "kiro-opus" not in hidden or "승급" in hidden  # names only if elsewhere; fold gone
-    assert not any("풀 제외" in line and "kiro" in line for line in hidden.splitlines())
+
+def test_rob1219_excluded_pool_still_surfaces_when_grade_has_no_candidate():
+    """Suppression is display-only: with nothing usable, the pool must reappear."""
+    policy.set_policy(
+        "kiro",
+        "exclude",
+        until=dt.date(2026, 9, 1),
+        note="무료 전환(구독 종료 2026-08-01)",
+    )
+    # kiro is the only provider that reports at all -> grade has no usable candidate
+    providers = [_result("kiro", 10.0, pool_class="spend", window="30d")]
+    shown = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=False)
+
+    assert "정책 가용 후보 없음" in shown
+    assert "비상 후보" in shown
+    assert "kiro" in shown
 
 
 def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
