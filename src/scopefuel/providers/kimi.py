@@ -25,13 +25,17 @@ from ..model import Bucket, ProviderResult, Scope
 BINARY = os.environ.get("SCOPEFUEL_KIMI_BIN") or "kimi"
 TIMEOUT_S = 30.0
 STARTUP_DELAY_S = 0.4
-IDLE_TIMEOUT_S = 2.0
+READY_SETTLE_S = 0.5
+IDLE_TIMEOUT_S = 8.0
+USAGE_SETTLE_S = 0.5
 PROBE_INPUT = "/usage\r"
+_READY_MARKERS = ("│ >", "Kimi K3 thinking")
 
 _ANSI = re.compile(
     r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])"
 )
 _PERCENT_LEFT = re.compile(r"(?P<remaining>\d+(?:\.\d+)?)\s*%\s+left", re.IGNORECASE)
+_PERCENT_USED = re.compile(r"(?P<used>\d+(?:\.\d+)?)\s*%\s+used", re.IGNORECASE)
 _RESET_IN = re.compile(r"\(\s*resets\s+in\s+(?P<duration>[^)]*)\)", re.IGNORECASE)
 _DURATION_PART = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[dhms])", re.IGNORECASE)
 _RATE_LIMIT = re.compile(r"\b(?:429|too\s+many\s+requests|rate[- ]?limited)\b", re.IGNORECASE)
@@ -72,7 +76,7 @@ def fetch() -> ProviderResult:
 
 
 def _probe_once() -> str:
-    """Run ``kimi`` in a PTY, send ``/usage``, then stop after output settles."""
+    """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice."""
 
     master_fd, slave_fd = pty.openpty()
     process: subprocess.Popen[bytes] | None = None
@@ -84,16 +88,20 @@ def _probe_once() -> str:
             stderr=slave_fd,
             close_fds=True,
             start_new_session=True,
+            env=_child_env(),
         )
         os.close(slave_fd)
         slave_fd = -1
 
         time.sleep(STARTUP_DELAY_S)
-        os.write(master_fd, PROBE_INPUT.encode())
 
         output = bytearray()
         deadline = time.monotonic() + TIMEOUT_S
         last_data = time.monotonic()
+        last_input = None
+        usage_seen_at = None
+        ready = False
+        sends = 0
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
             if readable:
@@ -107,11 +115,38 @@ def _probe_once() -> str:
                     break
                 output.extend(chunk)
                 last_data = time.monotonic()
+                clean = _clean(output.decode("utf-8", errors="replace"))
+                if not ready and _prompt_ready(clean):
+                    ready = True
+                if _RATE_LIMIT.search(clean):
+                    break
+                if ready and usage_seen_at is None and _usage_panel_seen(clean):
+                    usage_seen_at = time.monotonic()
+                if usage_seen_at is not None and time.monotonic() - usage_seen_at >= USAGE_SETTLE_S:
+                    break
                 continue
 
             if process.poll() is not None:
                 break
-            if output and time.monotonic() - last_data >= IDLE_TIMEOUT_S:
+            now = time.monotonic()
+            if not ready:
+                continue
+            if usage_seen_at is not None:
+                if now - usage_seen_at >= USAGE_SETTLE_S:
+                    break
+                continue
+            if sends == 0 and now - last_data >= READY_SETTLE_S:
+                os.write(master_fd, PROBE_INPUT.encode())
+                sends = 1
+                last_input = now
+                last_data = now
+                continue
+            if sends == 1 and now - last_data >= IDLE_TIMEOUT_S:
+                os.write(master_fd, PROBE_INPUT.encode())
+                sends = 2
+                last_input = now
+                last_data = now
+            elif sends == 2 and last_input is not None and now - last_input >= IDLE_TIMEOUT_S:
                 break
 
         if time.monotonic() >= deadline:
@@ -133,6 +168,33 @@ def _probe_once() -> str:
             pass
 
 
+def _child_env() -> dict[str, str]:
+    """Keep herdr integration variables out of the read-only quota subprocess."""
+
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name == "HERDR" or name.startswith("HERDR_"):
+            del env[name]
+    return env
+
+
+def _prompt_ready(text: str) -> bool:
+    clean = _clean(text)
+    return any(marker in clean for marker in _READY_MARKERS)
+
+
+def _usage_panel_seen(text: str) -> bool:
+    clean = _clean(text)
+    lines = [line.lower() for line in clean.splitlines()]
+    return any("weekly" in line and _usage_percent_present(line) for line in lines) and any(
+        ("5h" in line or "hour" in line) and _usage_percent_present(line) for line in lines
+    )
+
+
+def _usage_percent_present(line: str) -> bool:
+    return _PERCENT_LEFT.search(line) is not None or _PERCENT_USED.search(line) is not None
+
+
 def parse(text: str) -> ProviderResult:
     """Parse Kimi CLI remaining percentages into scopefuel used percentages."""
 
@@ -140,7 +202,7 @@ def parse(text: str) -> ProviderResult:
     buckets_by_kind: dict[str, Bucket] = {}
     for line in clean.splitlines():
         lower = line.lower()
-        if "% left" not in lower:
+        if not _usage_percent_present(lower):
             continue
 
         if "weekly" in lower:
@@ -150,11 +212,13 @@ def parse(text: str) -> ProviderResult:
         else:
             continue
 
-        match = _PERCENT_LEFT.search(line)
-        if match is None:
+        left_match = _PERCENT_LEFT.search(line)
+        used_match = _PERCENT_USED.search(line)
+        if left_match is None and used_match is None:
             continue
-        remaining = float(match["remaining"])
-        if not 0 <= remaining <= 100:
+        remaining = float(left_match["remaining"]) if left_match else None
+        used = float(used_match["used"]) if used_match else 100.0 - remaining  # type: ignore[operator]
+        if not 0 <= used <= 100:
             continue
 
         reset_match = _RESET_IN.search(line)
@@ -164,11 +228,14 @@ def parse(text: str) -> ProviderResult:
             Bucket(
                 label=label,
                 window=window,
-                used_pct=round(100.0 - remaining, 1),
+                used_pct=round(used, 1),
                 resets_at=_reset_iso(duration),
                 scope=Scope("account"),
                 horizon=horizon,  # type: ignore[arg-type]
-                note=f"remaining {remaining:g}%" + (f"; resets in {duration}" if duration else ""),
+                note=(
+                    f"remaining {remaining:g}%" if remaining is not None else f"used {used:g}%"
+                )
+                + (f"; resets in {duration}" if duration else ""),
             ),
         )
 
