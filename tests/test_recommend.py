@@ -96,7 +96,8 @@ def _result(
 
 
 def test_profile_pool_matches_quota_guard():
-    assert profile_pool("oc-kimi-k3") == ("clinepass", None)
+    assert profile_pool("kimi-k3") == ("kimi", None)
+    assert profile_pool("kimi-k27") == ("kimi", None)
     assert profile_pool("oc-gflash") == ("agy", "gemini")
     assert profile_pool("oc-sonnet46") == ("agy", "3p")
     assert profile_pool("oc-oss") == ("agy", "3p")
@@ -119,6 +120,7 @@ def test_recommend_s_spend_sorts_by_remaining():
     """Within spend class, higher remaining% ranks first (ROB-1182 sort)."""
     providers = [
         _result("clinepass", 17.0, window="30d"),
+        _result("kimi", 10.0, pool_class="spend", window="30d"),
         _result("grok", 8.0),
         _result("codex", 46.0, pool_class="preserve"),
         _result("agy", 95.0, scope=Scope("group", "gemini"), window="5h"),
@@ -127,7 +129,7 @@ def test_recommend_s_spend_sorts_by_remaining():
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert lines[0].startswith("1. grok-hi")
     assert "Grok" in lines[0]
-    assert any("oc-kimi-k3" in line for line in lines)
+    assert any("kimi-k3" in line for line in lines)
 
 
 def test_recommend_preserves_spend_before_preserve():
@@ -147,7 +149,7 @@ def test_recommend_excludes_exhausted_and_unmeasurable():
         _result("grok", 50.0),
     ]
     out = recommend(providers, "S", today=TODAY, now=NOW)
-    assert any("oc-kimi-k3" in line for line in out.splitlines())
+    assert any("kimi-k3" in line and "측정 불가" in line for line in out.splitlines())
     assert any("codex-terra-max" in line and "측정 불가" in line for line in out.splitlines())
 
 
@@ -162,12 +164,13 @@ def test_recommend_excludes_exhausted_spend():
 def test_recommend_excludes_unmeasurable_provider():
     providers = [ProviderResult(id="clinepass", error="API key 없음")]
     out = recommend(providers, "S", today=TODAY, now=NOW)
-    assert any("oc-kimi-k3" in line and "측정 불가" in line for line in out.splitlines())
+    assert any("kimi-k3" in line and "측정 불가" in line for line in out.splitlines())
 
 
 def test_grade_table_has_expected_a_profiles():
     names = [p.name for p in GRADE_TABLE["A"]]
-    assert "oc-kimi-code" in names
+    assert "kimi-k27" not in names
+    assert "kimi-k27" in [p.name for p in GRADE_TABLE["C"]]
     assert "oc-gflash" not in names
     assert {"codex-sol", "codex-luna", "codex-terra"}.issubset(names)
     assert "oc-sonnet46" not in names
@@ -390,7 +393,7 @@ def test_ac1_sp_recommend_with_claude_exclude():
 def test_ac2_s_grade_profiles():
     """AC2: S keeps the original profiles; measured Grok high only (medium/low moved out)."""
     names = [p.name for p in GRADE_TABLE["S"]]
-    assert {"codex-terra-max", "oc-kimi-k3", "grok-hi"}.issubset(names)
+    assert {"codex-terra-max", "kimi-k3", "grok-hi"}.issubset(names)
     assert "grok" not in names
 
 
@@ -1028,11 +1031,12 @@ def test_boost_expired_does_not_affect_sort():
     providers = [
         _result("codex", 50.0, pool_class="spend", window="30d"),
         _result("clinepass", 10.0, window="30d"),
+        _result("kimi", 10.0, pool_class="spend", window="30d"),
     ]
     out = recommend(providers, "S", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     # boost 만료 → 일반 정렬(잔여율 큰 순): clinepass(90%) 가 codex(50%) 보다 우선.
-    assert "oc-kimi-k3" in ranked[0]
+    assert "kimi-k3" in ranked[0]
 
 
 def test_boost_bool_true_in_config_is_rejected_not_treated_as_1():
@@ -1048,11 +1052,12 @@ def test_boost_bool_true_in_config_is_rejected_not_treated_as_1():
     providers = [
         _result("codex", 50.0, pool_class="spend", window="30d"),
         _result("clinepass", 10.0, window="30d"),
+        _result("kimi", 10.0, pool_class="spend", window="30d"),
     ]
     out = recommend(providers, "S", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     # boost 무시 → 잔여율 정렬: clinepass 가 codex 보다 우선.
-    assert "oc-kimi-k3" in ranked[0]
+    assert "kimi-k3" in ranked[0]
 
 
 # ------------------------------------------------------------------ ROB-1188: imminent-reset boost 역전
@@ -1130,7 +1135,7 @@ def test_imminent_reset_thresholds_configurable_via_settings():
     providers = [
         _result("codex", 10.0, pool_class="spend", window="30d"),
         _result(
-            "clinepass",
+            "kimi",
             98.5,  # 잔여 1.5% -> 조정된 임계 1% 이상이면 유의미
             pool_class="spend",
             window="7d",
@@ -1139,7 +1144,7 @@ def test_imminent_reset_thresholds_configurable_via_settings():
     ]
     out = recommend(providers, "S", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "oc-kimi-k3" in ranked[0]
+    assert "kimi-k3" in ranked[0]
     assert "소멸 임박 우선" in ranked[0]
 
 
@@ -1749,11 +1754,12 @@ def test_rob1191_rotation_when_top_pool_remaining_drops():
         tok = rest.split()[1] if rest.startswith("🔥") else rest.split()[0]
         return tok
 
-    # oc-kimi at 10% rem90 ranks above grok at 40% rem60 (capacity term).
+    # Kimi at 10% rem90 ranks above grok at 40% rem60 (capacity term).
     before = recommend(
         [
             _result("grok", 40.0),
             _result("clinepass", 10.0, window="30d"),
+            _result("kimi", 10.0, pool_class="spend", window="30d"),
             _result("codex", 70.0, pool_class="preserve"),
         ],
         "S",
@@ -1764,6 +1770,7 @@ def test_rob1191_rotation_when_top_pool_remaining_drops():
         [
             _result("grok", 40.0),
             _result("clinepass", 85.0, window="30d"),  # deplete former #1 pool
+            _result("kimi", 85.0, pool_class="spend", window="30d"),  # deplete former #1 pool
             _result("codex", 70.0, pool_class="preserve"),
         ],
         "S",
@@ -1772,11 +1779,11 @@ def test_rob1191_rotation_when_top_pool_remaining_drops():
     )
     before_names = [_name(line) for line in before.splitlines() if line[:1].isdigit()]
     after_names = [_name(line) for line in after.splitlines() if line[:1].isdigit()]
-    assert before_names[0] == "oc-kimi-k3"
-    assert before_names.index("oc-kimi-k3") < before_names.index("grok-hi")
-    # After depleting clinepass/oc-kimi remaining, grok-hi becomes #1
+    assert before_names[0] == "kimi-k3"
+    assert before_names.index("kimi-k3") < before_names.index("grok-hi")
+    # After depleting clinepass/Kimi remaining, grok-hi becomes #1
     assert after_names[0] == "grok-hi"
-    assert after_names.index("grok-hi") < after_names.index("oc-kimi-k3")
+    assert after_names.index("grok-hi") < after_names.index("kimi-k3")
 
 
 def test_rob1191_boost_hard_override_stays_first():
@@ -1792,7 +1799,7 @@ def test_rob1191_boost_hard_override_stays_first():
     assert ranked[0].startswith("1. codex-terra-max")
     # negative: higher-remaining pools must not overtake boost
     assert not ranked[0].startswith("1. grok-hi")
-    assert not ranked[0].startswith("1. oc-kimi-k3")
+    assert not ranked[0].startswith("1. kimi-k3")
 
 
 def test_rob1191_excluded_kiro_pool_folds_and_hide_excluded():
@@ -1827,8 +1834,8 @@ def test_rob1191_excluded_kiro_pool_folds_and_hide_excluded():
     assert not any("풀 제외" in line and "kiro" in line for line in hidden.splitlines())
 
 
-def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
-    """AC7: codex-sol → max 1점; opus → xhigh 1점; multi-effort unknown → 미지정 (no best-pick)."""
+def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
+    """AC7: declared effort cells select one row; Kimi's CLI default is explicit."""
     from scopefuel.bench import ModelScore
 
     scores = [
@@ -1872,24 +1879,13 @@ def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
             rank=2,
             captured_at="2026-08-01T00:00:00+00:00",
         ),
-        # oc-kimi-k3 has no Profile.benchmark_effort → multi-effort must not pick best
         ModelScore(
             model_id="kimi-k3",
-            effort="high",
-            harness="codex",
+            effort="default",
+            harness="kimi-code-cli",
             source="AA-agent",
             metric="agentic",
-            score=50.0,
-            rank=2,
-            captured_at="2026-08-01T00:00:00+00:00",
-        ),
-        ModelScore(
-            model_id="kimi-k3",
-            effort="max",
-            harness="codex",
-            source="AA-agent",
-            metric="agentic",
-            score=57.0,
+            score=61.0,
             rank=1,
             captured_at="2026-08-01T00:00:00+00:00",
         ),
@@ -1910,6 +1906,7 @@ def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
             _result("clinepass", 10.0, window="30d"),
             _result("grok", 10.0),
             _result("codex", 10.0, pool_class="preserve"),
+            _result("kimi", 10.0, pool_class="spend"),
         ],
         "S",
         today=TODAY,
@@ -1919,7 +1916,7 @@ def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
 
     codex_line = next(line for line in sp.splitlines() if "codex-sol" in line and line[:1].isdigit())
     opus_line = next(line for line in sp.splitlines() if line[:1].isdigit() and "opus" in line.split())
-    kimi_line = next(line for line in s.splitlines() if "oc-kimi-k3" in line and line[:1].isdigit())
+    kimi_line = next(line for line in s.splitlines() if "kimi-k3" in line and line[:1].isdigit())
 
     # positive: single declared-effort cell
     codex_bench = codex_line.split("벤치", 1)[1].strip()
@@ -1933,19 +1930,17 @@ def test_rob1191_one_effort_bench_cells_and_unknown_is_mijeong():
     assert "; " not in opus_bench
     assert "/high)" not in opus_bench  # high≠xhigh
 
-    # positive + negative for unknown multi-effort (no best-pick / 대표)
-    assert kimi_bench == "미지정"
+    # Kimi's measured CLI default is a single declared cell, with no effort suffix.
+    assert kimi_bench == "61.0(AA-agent/kimi-code-cli)"
     assert "57.0" not in kimi_line
     assert "50.0" not in kimi_line
     assert "대표" not in kimi_line
-    assert "AA-agent" not in kimi_bench
-    assert "(" not in kimi_bench  # no score-bearing parenthetical
+    assert "추정" not in kimi_line
 
 
 @pytest.mark.parametrize(
     ("profile_name", "grade", "model_id", "score_harness", "score_effort", "expected_label"),
     [
-        ("oc-kimi-k3", "S", "kimi-k3", "kimi-code-cli", "max", "Kimi K3"),
         ("oc-glm", "A+", "glm-5.2", "claude-code", "max", "GLM-5.2"),
     ],
 )
@@ -2061,19 +2056,19 @@ def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reaso
     assert "추정근거: grok-4.5 high 실측(64)에서 하위 effort로 투사" not in with_measurement
 
 
-def test_matching_opencode_harness_has_no_warning_or_native_hint():
+def test_matching_kimi_harness_has_no_warning_or_native_hint():
     from scopefuel.bench import ModelScore
 
     out = recommend(
-        [_result("clinepass", 10.0, pool_class="spend")],
+        [_result("kimi", 10.0, pool_class="spend")],
         "S",
         today=TODAY,
         now=NOW,
         bench_scores=[
             ModelScore(
                 model_id="kimi-k3",
-                effort="max",
-                harness="opencode",
+                effort="default",
+                harness="kimi-code-cli",
                 source="AA-agent",
                 metric="agentic",
                 score=61.0,
@@ -2082,8 +2077,8 @@ def test_matching_opencode_harness_has_no_warning_or_native_hint():
             )
         ],
     )
-    kimi_line = next(line for line in out.splitlines() if "oc-kimi-k3" in line and line[:1].isdigit())
-    assert "61.0(AA-agent/opencode/max)" in kimi_line
+    kimi_line = next(line for line in out.splitlines() if "kimi-k3" in line and line[:1].isdigit())
+    assert "61.0(AA-agent/kimi-code-cli)" in kimi_line
     assert "⚠️" not in kimi_line
     assert "💡" not in kimi_line
 
