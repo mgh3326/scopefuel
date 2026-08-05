@@ -9,6 +9,7 @@ details; scopefuel only parses the rendered quota summary.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import errno
 import os
@@ -31,9 +32,7 @@ USAGE_SETTLE_S = 0.5
 PROBE_INPUT = "/usage\r"
 _READY_MARKERS = ("│ >", "Kimi K3 thinking")
 
-_ANSI = re.compile(
-    r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])"
-)
+_ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])")
 _PERCENT_LEFT = re.compile(r"(?P<remaining>\d+(?:\.\d+)?)\s*%\s+left", re.IGNORECASE)
 _PERCENT_USED = re.compile(r"(?P<used>\d+(?:\.\d+)?)\s*%\s+used", re.IGNORECASE)
 _RESET_IN = re.compile(r"\(\s*resets\s+in\s+(?P<duration>[^)]*)\)", re.IGNORECASE)
@@ -162,10 +161,8 @@ def _probe_once() -> str:
                 process.wait(timeout=2.0)
         if slave_fd >= 0:
             os.close(slave_fd)
-        try:
+        with contextlib.suppress(OSError):
             os.close(master_fd)
-        except OSError:
-            pass
 
 
 def _child_env() -> dict[str, str]:
@@ -232,9 +229,7 @@ def parse(text: str) -> ProviderResult:
                 resets_at=_reset_iso(duration),
                 scope=Scope("account"),
                 horizon=horizon,  # type: ignore[arg-type]
-                note=(
-                    f"remaining {remaining:g}%" if remaining is not None else f"used {used:g}%"
-                )
+                note=(f"remaining {remaining:g}%" if remaining is not None else f"used {used:g}%")
                 + (f"; resets in {duration}" if duration else ""),
             ),
         )

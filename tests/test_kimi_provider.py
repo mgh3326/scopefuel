@@ -2,11 +2,7 @@ from __future__ import annotations
 
 from scopefuel.providers import kimi
 
-
-SAMPLE = (
-    "\x1b[2KWeekly: 75% left (resets in 5d 12h)\r\n"
-    "\x1b[2K5h: 30% left (resets in 2h 10m)\r\n"
-)
+SAMPLE = "\x1b[2KWeekly: 75% left (resets in 5d 12h)\r\n\x1b[2K5h: 30% left (resets in 2h 10m)\r\n"
 
 
 def test_parse_cli_usage_maps_remaining_percent_and_resets():
@@ -24,10 +20,7 @@ def test_parse_cli_usage_maps_remaining_percent_and_resets():
 
 
 def test_parse_cli_usage_accepts_managed_plan_used_percent():
-    result = kimi.parse(
-        "Weekly limit: 8% used (resets in 5d 12h)\n"
-        "5h limit: 35% used (resets in 2h 10m)\n"
-    )
+    result = kimi.parse("Weekly limit: 8% used (resets in 5d 12h)\n5h limit: 35% used (resets in 2h 10m)\n")
 
     assert [(bucket.label, bucket.used_pct) for bucket in result.buckets] == [
         ("5h", 35.0),
