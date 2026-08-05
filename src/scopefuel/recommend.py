@@ -179,7 +179,6 @@ ESTIMATED_EXTRAPOLATED_ANNOTATION = "추정(외삽)"
 # 값이 아예 없는(benchmark=None) 항목이 "추정이며 동시에 미측정"임을 명시하는 결합 표기.
 ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION = "추정(외삽·미측정)"
 HAIKU_ESTIMATE_ANNOTATION = ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION
-KIMI_K27_ESTIMATE_ANNOTATION = "추정(보수·미측정)"
 MODEL_ONLY_ANNOTATION = "모델지수만 있음(에이전트 미측정)"
 # ROB-1212: a model-only value is a reference for ordering, never an AA-agent
 # grade score.  These annotations make the derived score and the missing
@@ -197,9 +196,11 @@ SONNET_ESTIMATE_REASON = (
 KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가능한 기준점 없이 단일 추정"
 HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
 HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
-KIMI_K27_ESTIMATE_REASON = (
-    "Kimi K2.6 실측 33.0(AA-agent/claude-code/default)을 기준으로 삼되, "
-    "K2.7 Code는 직접 실측이 없어 외삽하지 않고 33.0 보수 하한으로 C 배치"
+KIMI_K3_LOW_ESTIMATE_REASON = (
+    "AA-model coding_index 72.0(kimi-k3/low, bench.db 실측)을 kimi-k3 default 앵커"
+    "(76.2→61.0, AA-agent 실측) / glm-5.2 앵커(68.8→43.0, _MODEL_ONLY_ANCHORS) 사이에서 내삽: "
+    "43.0 + (72.0-68.8)/(76.2-68.8)*(61.0-43.0) = 50.8; "
+    "harness-이식 아님 — 동일 모델·동일 하네스(kimi-code-cli)의 하위 effort 단계일 뿐"
 )
 GROK_MEDIUM_ESTIMATE_REASON = (
     "grok-4.5 high 실측(64)에서 하위 effort로 투사: 보수 하락폭 8 적용 = 56 — 하위 effort 미측정"
@@ -576,6 +577,24 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
         ),
+        # ROB-1212 follow-up: kimi-k3 low effort has no AA-agent measurement in
+        # bench.db, only an AA-model coding_index=72.0 row.  Derived via the
+        # same _MODEL_ONLY_ANCHORS interpolation pattern used by the C-grade
+        # model-only rows below, anchored on kimi-k3's own default-effort AA-agent
+        # point and glm-5.2 rather than the nearest unrelated anchor (grok-4.5) —
+        # this is a same-model/same-harness effort projection, not a harness port,
+        # so it uses the plain interpolated annotation instead of the
+        # harness-이식 variant.
+        Profile(
+            "kimi-k3-low",
+            "Kimi K3 (low)",
+            50.8,
+            benchmark_effort="low",
+            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=KIMI_K3_LOW_ESTIMATE_REASON,
+            aa_model_id="kimi-k3",
+        ),
     ],
     "B": [
         # ROB-1201: measured Luna medium (42) belongs to B (40–47).
@@ -703,14 +722,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             gate_reason="agy 3p 풀 소모 — 다른 C 후보 소진 시에만",
             aa_model_id="gpt-oss-120b",
         ),
-        Profile(
-            "kimi-k27",
-            "Kimi K2.7 Code",
-            33.0,
-            benchmark_annotation=KIMI_K27_ESTIMATE_ANNOTATION,
-            estimate_reason=KIMI_K27_ESTIMATE_REASON,
-            placement_note="보수 배치(C; K2.7 미측정, K2.6 실측 하한 유지)",
-        ),
     ],
 }
 
@@ -724,7 +735,6 @@ _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
         MODEL_ONLY_INTERPOLATED_ANNOTATION,
         MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
         HAIKU_ESTIMATE_ANNOTATION,
-        KIMI_K27_ESTIMATE_ANNOTATION,
         MODEL_ONLY_ANNOTATION,
     }
 )
