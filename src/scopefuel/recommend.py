@@ -6,7 +6,7 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 
 - ``oc-gflash`` routes to ``agy/gemini``
 - ``oc-sonnet46`` and ``oc-oss`` route to ``agy/3p``
-- all other ``oc-*`` profiles route to ``clinepass``
+- all other remaining ``oc-*`` profiles route to ``clinepass``
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ _POOL_LABEL = {
     "agy": "AGY",
     "clinepass": "ClinePass",
     "omniroute": "OmniRoute",
+    "kimi": "Kimi",
 }
 
 _WINDOW_LABEL = {
@@ -178,6 +179,7 @@ ESTIMATED_EXTRAPOLATED_ANNOTATION = "추정(외삽)"
 # 값이 아예 없는(benchmark=None) 항목이 "추정이며 동시에 미측정"임을 명시하는 결합 표기.
 ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION = "추정(외삽·미측정)"
 HAIKU_ESTIMATE_ANNOTATION = ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION
+KIMI_K27_ESTIMATE_ANNOTATION = "추정(보수·미측정)"
 MODEL_ONLY_ANNOTATION = "모델지수만 있음(에이전트 미측정)"
 # ROB-1212: a model-only value is a reference for ordering, never an AA-agent
 # grade score.  These annotations make the derived score and the missing
@@ -195,6 +197,10 @@ SONNET_ESTIMATE_REASON = (
 KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가능한 기준점 없이 단일 추정"
 HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
 HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
+KIMI_K27_ESTIMATE_REASON = (
+    "Kimi K2.6 실측 33.0(AA-agent/claude-code/default)을 기준으로 삼되, "
+    "K2.7 Code는 직접 실측이 없어 외삽하지 않고 33.0 보수 하한으로 C 배치"
+)
 GROK_MEDIUM_ESTIMATE_REASON = (
     "grok-4.5 high 실측(64)에서 하위 effort로 투사: 보수 하락폭 8 적용 = 56 — 하위 effort 미측정"
 )
@@ -211,6 +217,8 @@ def _profile_actual_harness(profile: Profile) -> str | None:
 
     if profile.name.startswith("oc-"):
         return "opencode"
+    if profile.name.startswith("kimi-"):
+        return "kimi-code-cli"
     if profile.name.startswith("codex-"):
         return "codex"
     if profile.name in {"opus", "sonnet", "fable", "haiku"}:
@@ -412,12 +420,11 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_model_id="gpt-5-6-terra",
         ),
         Profile(
-            "oc-kimi-k3",
+            "kimi-k3",
             "Kimi K3",
-            57.1,
-            **_openrouter_benchmark(57.1, "kimi-k3"),
+            61.0,
+            **_aa_agent_benchmark(61.0, "kimi-k3", "default", harness="kimi-code-cli"),
             aa_agent_model_id="kimi-k3",
-            aa_model_id="kimi-k3",
         ),
         Profile(
             "grok-hi",
@@ -569,7 +576,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
         ),
-        Profile("oc-kimi-code", "Kimi K2.7 Code", None),
     ],
     "B": [
         # ROB-1201: measured Luna medium (42) belongs to B (40–47).
@@ -697,6 +703,14 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             gate_reason="agy 3p 풀 소모 — 다른 C 후보 소진 시에만",
             aa_model_id="gpt-oss-120b",
         ),
+        Profile(
+            "kimi-k27",
+            "Kimi K2.7 Code",
+            33.0,
+            benchmark_annotation=KIMI_K27_ESTIMATE_ANNOTATION,
+            estimate_reason=KIMI_K27_ESTIMATE_REASON,
+            placement_note="보수 배치(C; K2.7 미측정, K2.6 실측 하한 유지)",
+        ),
     ],
 }
 
@@ -710,6 +724,7 @@ _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
         MODEL_ONLY_INTERPOLATED_ANNOTATION,
         MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
         HAIKU_ESTIMATE_ANNOTATION,
+        KIMI_K27_ESTIMATE_ANNOTATION,
         MODEL_ONLY_ANNOTATION,
     }
 )
@@ -811,6 +826,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "agy", "3p"
     if profile.startswith("kiro"):
         return "kiro", None
+    if profile.startswith("kimi-"):
+        return "kimi", None
     if profile == "oc-gflash":
         return "agy", "gemini"
     if profile in ("oc-sonnet46", "oc-oss"):
@@ -1771,9 +1788,12 @@ def recommend(
         *,
         suppress_estimate: bool = False,
     ) -> str:
-        effort_s = display_effort(effort)
+        # Kimi's approved AA-agent row is the CLI's model-default effort.  The
+        # operator-facing cell names the measured harness, not a tunable effort.
+        effort_s = None if effort == "default" else display_effort(effort)
         if harness:
-            rendered = f"{score:.1f}({source}/{harness}/{effort_s})"
+            effort_part = f"/{effort_s}" if effort_s else ""
+            rendered = f"{score:.1f}({source}/{harness}{effort_part})"
         else:
             rendered = f"{score:.1f}({source}/{effort_s})"
 

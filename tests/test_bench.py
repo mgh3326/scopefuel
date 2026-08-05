@@ -409,7 +409,7 @@ def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, cap
     monkeypatch.setattr(
         cli,
         "registry",
-        lambda: {name: healthy(name) for name in ("codex", "clinepass", "grok")},
+        lambda: {name: healthy(name) for name in ("codex", "clinepass", "grok", "kimi")},
     )
     assert cli.main(["--recommend", "S", "--no-cache"]) == 0
     out = capsys.readouterr().out
@@ -422,7 +422,7 @@ def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, cap
     # ROB-1191 ④ compact single-effort cells
     assert "78.0(AA-agent; metric=agentic; harness=codex; effort=max)" not in out
     assert "62.0(AA-agent/codex/max)" in out
-    assert "57.1(openrouter/unspecified)" in out
+    assert "61.0(AA-agent/kimi-code-cli)" in out
 
 
 def test_import_validation_is_atomic_and_rejects_mixed_sources(bench_home, tmp_path):
@@ -722,7 +722,7 @@ def test_recommend_does_not_rank_by_raw_scores_across_sources_or_metrics(bench_h
 
     providers = [
         ProviderResult(id=name, buckets=[Bucket(label="7d", window="7d", used_pct=10.0)])
-        for name in ("codex", "clinepass", "grok")
+        for name in ("codex", "clinepass", "grok", "kimi")
     ]
     scores = [
         _score(score=1.0),
@@ -739,9 +739,9 @@ def test_recommend_does_not_rank_by_raw_scores_across_sources_or_metrics(bench_h
     out = recommend(providers, "S", bench_scores=scores)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert ranked[0].startswith("1. codex-terra-max")
-    assert ranked[1].startswith("2. oc-kimi-k3")
+    assert ranked[1].startswith("2. kimi-k3")
     assert "1.0(AA-agent/codex/max)" in ranked[0]
-    assert "99.0(openrouter/unspecified)" in ranked[1]
+    assert "61.0(AA-agent/kimi-code-cli)" in ranked[1]
 
 
 def test_no_secret_like_response_body_is_printed(bench_home, monkeypatch, capsys):

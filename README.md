@@ -84,6 +84,7 @@ herdr plugin link ~/work/scopefuel
 | `agy` | 실행 중 `agy`의 로컬 language server → 실패 시 cloudcode-pa | 로컬=weekly+5h, 클라우드=5h만 | 모델별 분해 불가(아래) |
 | `kiro` | `kiro-cli` 에 `/usage` 를 물려 출력 파싱 | 월 크레딧 1줄 (플랜+애드온 합산) | 5h급 창 없음, 호출 7초(아래) |
 | `grok` | `~/.grok/auth.json` (`https://auth.x.ai::*`.key) → `POST /rest/rate-limits` | requestKind별 remaining/total → used_pct | CLI OAuth2는 rate-limits 거부 → free-usage-gates 또는 no-data(아래) |
+| `kimi` | `kimi` CLI를 PTY로 실행해 `/usage` 출력 파싱 | 5h·weekly account 한도 | CLI 출력 형식 의존; 429/rate-limit 재시도 없음 |
 
 **kiro는 API가 아니라 CLI를 읽습니다.** 같은 값을 주는 `GetUsageLimits` API가 있지만 토큰이
 JSON 파일이 아니라 sqlite(`data.sqlite3`의 `auth_kv`)에 있고 만료 시 갱신이 필요합니다. 읽기 전용
@@ -95,6 +96,11 @@ CLI 호출 자체가 갱신하므로 1회 재시도합니다.
 `kiro`에는 **5시간급 창이 없습니다** — 월 크레딧 한 줄뿐이라 `--horizon now`에는 안 나옵니다.
 리셋은 CLI가 날짜만 주므로 로컬 자정으로 표시합니다. 플랜 크레딧이 다 차도 애드온이 남아 있으면
 작업은 계속되므로, 두 풀이 있으면 **합산 한 줄**만 account로 냅니다(각각 내면 "계정 차단"으로 오독합니다).
+
+**kimi도 API가 아니라 CLI를 읽습니다.** scopefuel은 인증 파일이나 endpoint를 직접 읽지 않고
+이미 인증된 `kimi` 프로세스의 PTY에 `/usage`를 한 번 보낸 뒤 `Weekly`·`5h`의 `N% left`를
+`used_pct`로 변환합니다. 출력이 바뀌거나 rate limit/429가 나오면 추측·재시도하지 않고 error로
+보고합니다.
 
 **agy 모델별 분해는 불가능합니다.** 클라우드 응답은 모델 이름별 행을 주지만 값이 그룹 공유입니다
 (gemini 계열 전부 동일 fraction, claude/gpt-oss 전부 동일 fraction — 로컬 그룹값과 일치).
@@ -132,7 +138,7 @@ provider는 운영 의도에 따라 두 class로 구분됩니다.
 
 - **preserve** (기본): 75%/90% 사용률을 WARN/CRIT로 승격. `claude`, `codex`.
 - **spend**: 고사용을 정상으로 본다. reset 전 24시간 미만, 70% 미만 bucket이 있으면
-  **WASTE** 권고를 낸다. `kiro`, `clinepass`, `agy`, `grok`.
+  **WASTE** 권고를 낸다. `kiro`, `clinepass`, `agy`, `grok`, `kimi`.
 
 선언형 TOML 스펙에서 `class = "preserve" | "spend"`로 지정할 수 있으며(같은 `id`로 내장 provider를 대체할 때도 전체 대체 스펙에 `class` 지정 가능), Python 플러그인 메타데이터 또는 반환 `ProviderResult.pool_class`로도 설정할 수 있습니다. 자세한 내용은 [docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요.
 

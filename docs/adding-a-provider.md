@@ -59,7 +59,7 @@ remaining_fraction_path = ["quotaInfo", "remainingFraction"]   # 0.42 → used 5
 | class | 의미 | 예 |
 |---|---|---|
 | `preserve` | 75%/90% 사용률을 WARN/CRIT로 승격. 계정/모델/그룹 차단 판정에 그대로 사용. | claude, codex |
-| `spend` | 고사용을 정상으로 본다. 리셋 전 24시간 미만, 70% 미만 bucket이 있으면 WASTE 권고. | kiro, clinepass, agy, grok |
+| `spend` | 고사용을 정상으로 본다. 리셋 전 24시간 미만, 70% 미만 bucket이 있으면 WASTE 권고. | kiro, clinepass, agy, grok, kimi |
 
 `class`는 provider 전체(선언형 TOML 스펙 및 Python 플러그인)에 적용된다. 내장 provider를 TOML 스펙으로 완전 교체할 때 같은 `id` 스펙에 `class`를 지정할 수 있다. (단, `class`만 단독으로 덮어쓰는 것은 지원하지 않으며, 같은 `id`의 스펙은 엔드포인트/자격증명/버킷 설정을 모두 포함하는 완전한 대체 스펙이어야 한다.)
 
@@ -82,6 +82,10 @@ provider가 깨졌을 때, 릴리스를 기다리지 않고 `~/.config/scopefuel
 수 있습니다. (고쳤다면 이슈나 PR로 알려주시면 반영합니다.)
 
 ## 2. Python entry-point 플러그인
+
+Kimi처럼 quota가 interactive CLI의 PTY 출력에만 있는 경우에는 TOML HTTP 스펙을 억지로
+만들지 말고, `src/scopefuel/providers/kimi.py`처럼 읽기 전용 subprocess probe를 둡니다.
+CLI가 rate-limit/429를 반환하면 재시도하지 않고 `ProviderResult.error`로 중단해야 합니다.
 
 스펙의 틀을 벗어나는 경우 — 다단계 호출, OAuth 토큰 갱신, 로컬 프로세스/포트 탐색, gRPC-web 등:
 

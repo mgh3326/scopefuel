@@ -198,7 +198,7 @@ def test_kiro_expired_token_twice_keeps_error_with_login_hint(monkeypatch):
 
 
 def test_clinepass_is_appended_after_existing_builtin_providers():
-    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass", "grok"]
+    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass", "grok", "kimi"]
 
 
 def test_clinepass_key_precedence(monkeypatch, tmp_path):
@@ -1186,7 +1186,7 @@ def test_grok_plan_from_subscriptions_redacts_account_fields(fixture_json, tmp_p
 def test_grok_registry_spend_class_and_list_order():
     assert "grok" in BUILTIN
     assert BUILTIN["grok"].pool_class == "spend"
-    assert list(BUILTIN)[-1] == "grok"
+    assert list(BUILTIN)[-2:] == ["grok", "kimi"]
 
 
 def test_grok_cache_json_rendering_secret_free(fixture_json, tmp_path, monkeypatch):
