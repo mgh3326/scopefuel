@@ -1130,35 +1130,53 @@ def test_d1_help_texts_show_task_required_grade_intent(capsys):
     assert "비교할 과제가 요구한 급" in compare_help
 
 
+def _find_profile_for_grade(
+    target_grade: str, exclude: set[str] | None = None
+) -> tuple[str, str | None, str]:
+    """Dynamically find an active (profile_name, effort, grade) from recommend.GRADE_TABLE."""
+    from scopefuel import bench
+    from scopefuel.recommend import GRADE_TABLE
+
+    exclude_set = exclude or set()
+    for p in GRADE_TABLE.get(target_grade, []):
+        if p.name in exclude_set:
+            continue
+        effort = p.launcher_effort or p.benchmark_effort
+        derived = bench.derive_table_grade(p.name, effort)
+        if derived == target_grade:
+            return p.name, effort, target_grade
+    raise RuntimeError(f"No profile found for table grade {target_grade} in GRADE_TABLE")
+
+
 def test_d2_table_grade_auto_derived_and_no_flag(bench_home, capsys):
-    # D2: --profile oc-gflash -> table_grade=C auto derived
-    assert (
-        cli.main(
-            [
-                "reps",
-                "add",
-                "--profile",
-                "oc-gflash",
-                "--model",
-                "gemini-3.6-flash",
-                "--task",
-                "ROB-1220",
-                "--tier",
-                "T1",
-                "--role",
-                "impl",
-                "--grade",
-                "B",
-                "--rounds",
-                "1",
-                "--blockers-found",
-                "0",
-                "--completed",
-                "1",
-            ]
-        )
-        == 0
-    )
+    c_profile, c_effort, c_grade = _find_profile_for_grade("C")
+    task_grade = "B"
+    add_args = [
+        "reps",
+        "add",
+        "--profile",
+        c_profile,
+        "--model",
+        "test-model",
+        "--task",
+        "ROB-1220",
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        task_grade,
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    if c_effort:
+        add_args.extend(["--effort", c_effort])
+
+    assert cli.main(add_args) == 0
     capsys.readouterr()
 
     # D2: profile not in grade table -> table_grade=None (NULL)
@@ -1193,8 +1211,8 @@ def test_d2_table_grade_auto_derived_and_no_flag(bench_home, capsys):
 
     reps = bench.read_reps()
     by_profile = {rep.profile: rep for rep in reps}
-    assert by_profile["oc-gflash"].table_grade == "C"
-    assert by_profile["oc-gflash"].grade == "B"
+    assert by_profile[c_profile].table_grade == c_grade
+    assert by_profile[c_profile].grade == task_grade
     assert by_profile["unknown-custom-profile"].table_grade is None
 
     # D2 & AC 5: verify --table-grade flag does NOT exist
@@ -1205,181 +1223,184 @@ def test_d2_table_grade_auto_derived_and_no_flag(bench_home, capsys):
 
 
 def test_d3_reps_list_direction_indicators(bench_home, capsys):
-    # Upward fixture: table C profile (oc-gflash) performing B task
-    assert (
-        cli.main(
-            [
-                "reps",
-                "add",
-                "--profile",
-                "oc-gflash",
-                "--model",
-                "gemini-3.6-flash",
-                "--task",
-                "ROB-1220-UP",
-                "--tier",
-                "T1",
-                "--role",
-                "impl",
-                "--grade",
-                "B",
-                "--rounds",
-                "1",
-                "--blockers-found",
-                "0",
-                "--completed",
-                "1",
-            ]
-        )
-        == 0
-    )
+    c_profile, c_effort, c_table_grade = _find_profile_for_grade("C")
+    b_profile, b_effort, b_table_grade = _find_profile_for_grade("B")
+    s_profile, s_effort, s_table_grade = _find_profile_for_grade("S")
+
+    task_grade = "B"
+
+    # Upward fixture: table C profile performing B task
+    up_args = [
+        "reps",
+        "add",
+        "--profile",
+        c_profile,
+        "--model",
+        "test-model-1",
+        "--task",
+        "ROB-1220-UP",
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        task_grade,
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    if c_effort:
+        up_args.extend(["--effort", c_effort])
+    assert cli.main(up_args) == 0
     capsys.readouterr()
 
-    # Same tier fixture: table B profile (codex-luna medium) performing B task
-    assert (
-        cli.main(
-            [
-                "reps",
-                "add",
-                "--profile",
-                "codex-luna",
-                "--effort",
-                "medium",
-                "--model",
-                "gpt-5.6-luna",
-                "--task",
-                "ROB-1220-SAME",
-                "--tier",
-                "T1",
-                "--role",
-                "impl",
-                "--grade",
-                "B",
-                "--rounds",
-                "1",
-                "--blockers-found",
-                "0",
-                "--completed",
-                "1",
-            ]
-        )
-        == 0
-    )
+    # Same tier fixture: table B profile performing B task
+    same_args = [
+        "reps",
+        "add",
+        "--profile",
+        b_profile,
+        "--model",
+        "test-model-2",
+        "--task",
+        "ROB-1220-SAME",
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        task_grade,
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    if b_effort:
+        same_args.extend(["--effort", b_effort])
+    assert cli.main(same_args) == 0
     capsys.readouterr()
 
-    # Downward fixture: table S profile (opus medium) performing B task
-    assert (
-        cli.main(
-            [
-                "reps",
-                "add",
-                "--profile",
-                "opus",
-                "--effort",
-                "medium",
-                "--model",
-                "claude-opus-5",
-                "--task",
-                "ROB-1220-DOWN",
-                "--tier",
-                "T1",
-                "--role",
-                "impl",
-                "--grade",
-                "B",
-                "--rounds",
-                "1",
-                "--blockers-found",
-                "0",
-                "--completed",
-                "1",
-            ]
-        )
-        == 0
-    )
+    # Downward fixture: table S profile performing B task
+    down_args = [
+        "reps",
+        "add",
+        "--profile",
+        s_profile,
+        "--model",
+        "test-model-3",
+        "--task",
+        "ROB-1220-DOWN",
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        task_grade,
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    if s_effort:
+        down_args.extend(["--effort", s_effort])
+    assert cli.main(down_args) == 0
     capsys.readouterr()
 
     assert cli.main(["reps", "list"]) == 0
     list_out = capsys.readouterr().out
-    assert "grade=B(표C↑)" in list_out
-    assert "grade=B(표S↓)" in list_out
-    # Same tier displays grade=B without parentheses
-    luna_line = next(line for line in list_out.splitlines() if "profile=codex-luna" in line)
-    assert "grade=B " in luna_line or luna_line.endswith("grade=B")
+    assert f"grade={task_grade}(표{c_table_grade}↑)" in list_out
+    assert f"grade={task_grade}(표{s_table_grade}↓)" in list_out
+    # Same tier displays grade without parentheses
+    same_line = next(line for line in list_out.splitlines() if f"profile={b_profile}" in line)
+    assert f"grade={task_grade} " in same_line or same_line.endswith(f"grade={task_grade}")
 
 
 def test_d3_reps_compare_counts_summary(bench_home, capsys):
-    # Upward run: oc-gflash (table C) on grade B task
-    cli.main(
-        [
-            "reps",
-            "add",
-            "--profile",
-            "oc-gflash",
-            "--model",
-            "gemini-3.6-flash",
-            "--task",
-            "ROB-1220-1",
-            "--tier",
-            "T1",
-            "--role",
-            "impl",
-            "--grade",
-            "B",
-            "--rounds",
-            "1",
-            "--blockers-found",
-            "0",
-            "--completed",
-            "1",
-        ]
-    )
-    # Same-tier run: haiku high (table B) on grade B task
-    cli.main(
-        [
-            "reps",
-            "add",
-            "--profile",
-            "haiku",
-            "--effort",
-            "high",
-            "--model",
-            "claude-haiku-4.5",
-            "--task",
-            "ROB-1220-2",
-            "--tier",
-            "T1",
-            "--role",
-            "impl",
-            "--grade",
-            "B",
-            "--rounds",
-            "2",
-            "--blockers-found",
-            "1",
-            "--completed",
-            "1",
-        ]
-    )
+    c_profile, c_effort, _ = _find_profile_for_grade("C")
+    b_profile, b_effort, _ = _find_profile_for_grade("B", exclude={c_profile})
+
+    # Upward run: table C profile on grade B task
+    up_args = [
+        "reps",
+        "add",
+        "--profile",
+        c_profile,
+        "--model",
+        "test-model-1",
+        "--task",
+        "ROB-1220-1",
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        "B",
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    if c_effort:
+        up_args.extend(["--effort", c_effort])
+    cli.main(up_args)
+
+    # Same-tier run: table B profile on grade B task
+    same_args = [
+        "reps",
+        "add",
+        "--profile",
+        b_profile,
+        "--model",
+        "test-model-2",
+        "--task",
+        "ROB-1220-2",
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        "B",
+        "--rounds",
+        "2",
+        "--blockers-found",
+        "1",
+        "--completed",
+        "1",
+    ]
+    if b_effort:
+        same_args.extend(["--effort", b_effort])
+    cli.main(same_args)
     capsys.readouterr()
 
     assert cli.main(["reps", "compare", "--grade", "B"]) == 0
     compare_out = capsys.readouterr().out
     assert "reps 비교 grade=B" in compare_out
-    assert "profile=oc-gflash" in compare_out
+    assert f"profile={c_profile}" in compare_out
     assert "상방 1건 / 동급 0건 / 하방 0건" in compare_out
-    assert "profile=haiku" in compare_out
+    assert f"profile={b_profile}" in compare_out
     assert "상방 0건 / 동급 1건 / 하방 0건" in compare_out
 
 
 def test_d4_backfill_idempotent_and_preserves_null(tmp_path):
     import sqlite3
 
+    b_profile, b_effort, b_grade = _find_profile_for_grade("B")
+    a_profile, a_effort, a_grade = _find_profile_for_grade("A")
+    s_profile, s_effort, s_grade = _find_profile_for_grade("S")
+
     db = tmp_path / "bench.db"
     conn = sqlite3.connect(str(db))
-    # Create legacy table without table_grade column
     conn.executescript(
-        """
+        f"""
         CREATE TABLE reps (
           id             INTEGER PRIMARY KEY,
           profile        TEXT NOT NULL,
@@ -1401,12 +1422,12 @@ def test_d4_backfill_idempotent_and_preserves_null(tmp_path):
           id, profile, model_id, task_ref, tier, role,
           rounds, blockers_found, completed, recorded_at, effort, grade
         ) VALUES
-          (1, 'codex-luna-ultra', 'gpt-5.6-luna', 'ROB-1', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
-          (2, 'codex-luna-ultra', 'gpt-5.6-luna', 'ROB-2', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
-          (3, 'codex-luna', 'gpt-5.6-luna', 'ROB-3', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'medium', 'B'),
-          (4, 'haiku', 'claude-haiku-4.5', 'ROB-4', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'high', 'B'),
-          (5, 'codex-luna', 'gpt-5.6-luna', 'ROB-5', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'high', 'A'),
-          (6, 'codex-terra-max', 'gpt-5.6-terra', 'ROB-6', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, 'S');
+          (1, 'codex-luna-ultra', 'm1', 'R1', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
+          (2, 'codex-luna-ultra', 'm2', 'R2', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
+          (3, '{b_profile}', 'm3', 'R3', 'T1', 'i', 1, 0, 1, '2026-08-06Z', '{b_effort or ""}', '{b_grade}'),
+          (4, '{b_profile}', 'm4', 'R4', 'T1', 'i', 1, 0, 1, '2026-08-06Z', '{b_effort or ""}', '{b_grade}'),
+          (5, '{a_profile}', 'm5', 'R5', 'T1', 'i', 1, 0, 1, '2026-08-06Z', '{a_effort or ""}', '{a_grade}'),
+          (6, '{s_profile}', 'm6', 'R6', 'T1', 'i', 1, 0, 1, '2026-08-06Z', '{s_effort or ""}', '{s_grade}');
         """
     )
     conn.commit()
@@ -1422,11 +1443,11 @@ def test_d4_backfill_idempotent_and_preserves_null(tmp_path):
     assert by_id1[1].grade is None and by_id1[1].table_grade is None
     assert by_id1[2].grade is None and by_id1[2].table_grade is None
 
-    # Verify D4: grade IS NOT NULL rows get table_grade populated (all 4 same-tier)
-    assert by_id1[3].grade == "B" and by_id1[3].table_grade == "B"
-    assert by_id1[4].grade == "B" and by_id1[4].table_grade == "B"
-    assert by_id1[5].grade == "A" and by_id1[5].table_grade == "A"
-    assert by_id1[6].grade == "S" and by_id1[6].table_grade == "S"
+    # Verify D4: grade IS NOT NULL rows get table_grade populated matching derived table grade
+    assert by_id1[3].grade == b_grade and by_id1[3].table_grade == b_grade
+    assert by_id1[4].grade == b_grade and by_id1[4].table_grade == b_grade
+    assert by_id1[5].grade == a_grade and by_id1[5].table_grade == a_grade
+    assert by_id1[6].grade == s_grade and by_id1[6].table_grade == s_grade
 
     # Second migration run (test rerun safety / idempotency)
     conn2 = bench.connect(db)
@@ -1440,10 +1461,15 @@ def test_d4_backfill_idempotent_and_preserves_null(tmp_path):
 def test_read_path_triggers_schema_migration_and_backfill(tmp_path):
     import sqlite3
 
+    c_profile, c_effort, c_grade = _find_profile_for_grade("C")
+    b_profile, b_effort, b_grade = _find_profile_for_grade("B")
+    a_profile, a_effort, a_grade = _find_profile_for_grade("A")
+    s_profile, s_effort, s_grade = _find_profile_for_grade("S")
+
     db = tmp_path / "legacy_bench.db"
     conn = sqlite3.connect(str(db))
     conn.executescript(
-        """
+        f"""
         CREATE TABLE reps (
           id             INTEGER PRIMARY KEY,
           profile        TEXT NOT NULL,
@@ -1465,13 +1491,13 @@ def test_read_path_triggers_schema_migration_and_backfill(tmp_path):
           id, profile, model_id, task_ref, tier, role,
           rounds, blockers_found, completed, recorded_at, effort, grade
         ) VALUES
-          (1, 'codex-luna-ultra', 'gpt-5.6-luna', 'ROB-1', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
-          (2, 'codex-luna-ultra', 'gpt-5.6-luna', 'ROB-2', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
-          (3, 'codex-luna', 'gpt-5.6-luna', 'ROB-3', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'medium', 'A+'),
-          (4, 'haiku', 'claude-haiku-4.5', 'ROB-4', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'high', 'A'),
-          (5, 'codex-luna', 'gpt-5.6-luna', 'ROB-5', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'high', 'B'),
-          (6, 'codex-terra-max', 'gpt-5.6-terra', 'ROB-6', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, 'C'),
-          (7, 'oc-gflash', 'gemini-3.6-flash', 'ROB-7', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, 'B');
+          (1, 'codex-luna-ultra', 'm1', 'ROB-1', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
+          (2, 'codex-luna-ultra', 'm2', 'ROB-2', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
+          (3, '{b_profile}', 'm3', 'ROB-3', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', '{b_effort or ""}', 'A+'),
+          (4, '{b_profile}', 'm4', 'ROB-4', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', '{b_effort or ""}', 'A'),
+          (5, '{a_profile}', 'm5', 'ROB-5', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', '{a_effort or ""}', 'B'),
+          (6, '{s_profile}', 'm6', 'ROB-6', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', '{s_effort or ""}', 'C'),
+          (7, '{c_profile}', 'm7', 'ROB-7', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', '{c_effort or ""}', 'B');
         """
     )
     conn.commit()
@@ -1496,17 +1522,17 @@ def test_read_path_triggers_schema_migration_and_backfill(tmp_path):
 
     assert by_id[1]["grade"] is None and by_id[1]["table_grade"] is None
     assert by_id[2]["grade"] is None and by_id[2]["table_grade"] is None
-    assert by_id[3]["table_grade"] == "B"
-    assert by_id[4]["table_grade"] == "B"
-    assert by_id[5]["table_grade"] == "A"
-    assert by_id[6]["table_grade"] == "S"
-    assert by_id[7]["table_grade"] == "C"
+    assert by_id[3]["table_grade"] == b_grade
+    assert by_id[4]["table_grade"] == b_grade
+    assert by_id[5]["table_grade"] == a_grade
+    assert by_id[6]["table_grade"] == s_grade
+    assert by_id[7]["table_grade"] == c_grade
 
-    # R3: Run compare_reps --grade B on legacy schema DB copy -> 1 upward item (oc-gflash table C, task B)
+    # R3: Run compare_reps --grade B on legacy schema DB copy -> 1 upward item (c_profile table C, task B)
     comps = bench.compare_reps(grade="B", path=db)
-    gflash_comp = next(c for c in comps if c.profile == "oc-gflash")
-    assert gflash_comp.upward_count == 1
-    assert gflash_comp.same_count == 0
+    c_comp = next(c for c in comps if c.profile == c_profile)
+    assert c_comp.upward_count == 1
+    assert c_comp.same_count == 0
 
     # R4: Re-run safety (consecutive execution yields identical result)
     reps2 = bench.read_reps(path=db)
