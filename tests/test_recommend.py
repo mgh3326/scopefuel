@@ -99,7 +99,8 @@ def test_profile_pool_matches_quota_guard():
     assert profile_pool("kimi-k3") == ("kimi", None)
     assert profile_pool("kimi-k3-low") == ("kimi", None)
     assert profile_pool("kimi-k27") == ("kimi", None)
-    assert profile_pool("oc-gflash") == ("agy", "gemini")
+    assert profile_pool("oc-gflash") == ("agy", "gemini")  # 은퇴 중이나 pool 매핑 유지
+    assert profile_pool("agy-flash") == ("agy", "gemini")  # ROB-1222: 신설 프로필
     assert profile_pool("oc-sonnet46") == ("agy", "3p")
     assert profile_pool("oc-oss") == ("agy", "3p")
     assert profile_pool("agy-pro") == ("agy", "gemini")
@@ -496,7 +497,7 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
 
     c_profiles = GRADE_TABLE["C"]
     qwen = next(p for p in c_profiles if p.name == "oc-qwen37-max")
-    gflash = next(p for p in c_profiles if p.name == "oc-gflash")
+    gflash = next(p for p in c_profiles if p.name == "agy-flash")  # ROB-1222: oc-gflash -> agy-flash
     minimax = next(p for p in c_profiles if p.name == "oc-minimax-m3")
     assert all(p.model_only and p.benchmark_source is None for p in (qwen, gflash, minimax))
     assert qwen.benchmark == 40.6
@@ -507,6 +508,8 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     assert all(MODEL_ONLY_ANNOTATION not in (p.benchmark_annotation or "") for p in (qwen, gflash, minimax))
     assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S+"])
     assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S"])
+    # ROB-1222: oc-gflash는 은퇴 — C급에 없어야 함
+    assert not any(p.name == "oc-gflash" for p in c_profiles)
 
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
@@ -736,7 +739,7 @@ def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
     minimax_line = next(
         line for line in c_output.splitlines() if "oc-minimax-m3" in line and line[:1].isdigit()
     )
-    gflash_line = next(line for line in c_output.splitlines() if "oc-gflash" in line and line[:1].isdigit())
+    gflash_line = next(line for line in c_output.splitlines() if "agy-flash" in line and line[:1].isdigit())
     assert "40.6(추정(내삽·harness-이식)" in qwen_line
     assert "34.2(추정(외삽·harness-이식)" in minimax_line
     assert "45.3(추정(내삽·harness-이식)" in gflash_line
