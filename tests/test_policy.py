@@ -11,14 +11,6 @@ from scopefuel.providers import BUILTIN
 
 TODAY = dt.date(2026, 7, 31)
 
-# Tests that inject ``today=TODAY`` may hardcode ``until`` dates safely. Tests that
-# go through ``cli.main(["policy", "list"])`` cannot — that path reads the real
-# current date, so a hardcoded ``until`` silently becomes ``[expired]`` once the
-# wall clock passes it and the assertion fails on an unrelated day. Two such dates
-# rotted this way (2026-08-05 broke CI on 08-06; 2026-08-06 was armed for 08-07).
-# Use a date that is always in the future instead.
-STILL_ACTIVE = dt.date.today() + dt.timedelta(days=1)
-
 
 @pytest.fixture
 def policy_config(tmp_path, monkeypatch):
@@ -70,12 +62,12 @@ def test_clear_missing_returns_false(policy_config):
 
 
 def test_list_shows_builtin_and_overrides(policy_config, capsys, monkeypatch):
-    policy.set_policy("claude", "preserve", until=STILL_ACTIVE, note="테스트")
+    policy.set_policy("claude", "preserve", until=dt.date(2026, 8, 6), note="테스트")
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
     assert cli.main(["policy", "list"]) == 0
     out = capsys.readouterr().out
     assert "claude" in out and "preserve" in out
-    assert f"expires {STILL_ACTIVE}" in out
+    assert "2026-08-06" in out or "expires 2026-08-06" in out
     assert "테스트" in out
 
 
@@ -423,7 +415,7 @@ def test_policy_list_shows_builtin_tag_when_unconfigured(policy_config, capsys, 
 
 def test_policy_list_shows_configured_tag_and_boost_and_weight(policy_config, capsys, monkeypatch):
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
-    policy.set_policy("codex", "spend", until=STILL_ACTIVE, boost=1, note="리셋권")
+    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 10), boost=1, note="리셋권")
     assert cli.main(["policy", "list"]) == 0
     out = capsys.readouterr().out
     codex_line = next(line for line in out.splitlines() if line.startswith("codex"))

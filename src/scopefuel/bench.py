@@ -104,6 +104,7 @@ _REP_COLUMNS = (
     "recorded_at",
     "effort",
     "grade",
+    "table_grade",
 )
 
 # ROB-1194: operator-approved AA-agent measurements.  The complete key is
@@ -184,6 +185,7 @@ class RepRecord:
     recorded_at: str
     effort: str | None
     grade: str | None
+    table_grade: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _REP_COLUMNS}
@@ -198,6 +200,9 @@ class RepComparison:
     completion_rate: float
     average_input_tokens: float | None
     average_output_tokens: float | None
+    upward_count: int = 0
+    same_count: int = 0
+    downward_count: int = 0
 
 
 def db_path() -> pathlib.Path:
@@ -210,6 +215,40 @@ def db_path() -> pathlib.Path:
         else pathlib.Path.home() / ".local" / "share"
     )
     return base / "scopefuel" / "bench.db"
+
+
+def derive_table_grade(profile: str, effort: str | None = None) -> str | None:
+    """Derive the profile's table grade from recommend.GRADE_TABLE without operator input.
+
+    Returns the grade ("S+", "S", "A+", "A", "B", "C") if found in the grade table,
+    or None if the profile is not in the grade table.
+    """
+    if not profile:
+        return None
+    from .recommend import GRADE_TABLE, PROFILE_ALIASES
+
+    canonical = PROFILE_ALIASES.get(profile, profile)
+    if effort:
+        for grade, profiles in GRADE_TABLE.items():
+            for p in profiles:
+                if p.name == canonical and (p.launcher_effort == effort or p.benchmark_effort == effort):
+                    return grade
+    for grade, profiles in GRADE_TABLE.items():
+        for p in profiles:
+            if p.name == canonical:
+                return grade
+    return None
+
+
+def _backfill_table_grade(conn: sqlite3.Connection) -> None:
+    """Backfill table_grade for existing reps rows where grade is present but table_grade is NULL."""
+    rows = conn.execute(
+        "SELECT id, profile, effort FROM reps WHERE grade IS NOT NULL AND table_grade IS NULL"
+    ).fetchall()
+    for row in rows:
+        derived = derive_table_grade(row["profile"], row["effort"])
+        if derived is not None:
+            conn.execute("UPDATE reps SET table_grade = ? WHERE id = ?", (derived, row["id"]))
 
 
 def _schema(conn: sqlite3.Connection) -> None:
@@ -242,7 +281,10 @@ def _schema(conn: sqlite3.Connection) -> None:
           input_tokens   INTEGER,
           output_tokens  INTEGER,
           notes          TEXT,
-          recorded_at    TEXT NOT NULL
+          recorded_at    TEXT NOT NULL,
+          effort         TEXT,
+          grade          TEXT,
+          table_grade    TEXT
         );
         """
     )
@@ -254,9 +296,10 @@ def _schema(conn: sqlite3.Connection) -> None:
     for column in ("input_tokens", "output_tokens"):
         if column not in existing_rep_columns:
             conn.execute(f"ALTER TABLE reps ADD COLUMN {column} INTEGER")
-    for column in ("effort", "grade"):
+    for column in ("effort", "grade", "table_grade"):
         if column not in existing_rep_columns:
             conn.execute(f"ALTER TABLE reps ADD COLUMN {column} TEXT")
+    _backfill_table_grade(conn)
 
 
 def connect(path: pathlib.Path | str | None = None) -> sqlite3.Connection:
@@ -1132,6 +1175,7 @@ def add_rep(
     role = _text(role, "role") or ""
     effort = _rep_choice(effort, "effort", REP_EFFORTS)
     grade = _rep_choice(grade, "grade", REP_GRADES)
+    table_grade = derive_table_grade(profile, effort)
     if tier not in {"T0", "T1", "T2", "T3"}:
         raise BenchError("tier must be T0, T1, T2, or T3")
     if role not in {"impl", "verify", "fix", "orch"}:
@@ -1152,8 +1196,8 @@ def add_rep(
         cursor = conn.execute(
             "INSERT INTO reps "
             "(profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
-            "input_tokens, output_tokens, notes, recorded_at, effort, grade) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "input_tokens, output_tokens, notes, recorded_at, effort, grade, table_grade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 profile,
                 model_id,
@@ -1169,13 +1213,14 @@ def add_rep(
                 recorded_at,
                 effort,
                 grade,
+                table_grade,
             ),
         )
         conn.commit()
         rep_id = int(cursor.lastrowid)
         row = conn.execute(
             "SELECT id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
-            "input_tokens, output_tokens, notes, recorded_at, effort, grade "
+            "input_tokens, output_tokens, notes, recorded_at, effort, grade, table_grade "
             "FROM reps WHERE id = ?",
             (rep_id,),
         ).fetchone()
@@ -1239,12 +1284,36 @@ def read_reps(
         conn.close()
 
 
+_REP_GRADE_ORDER: tuple[str, ...] = ("S+", "S", "A+", "A", "B", "C")
+
+
+def _format_rep_grade(grade: str | None, table_grade: str | None) -> str:
+    if not grade:
+        return "-"
+    if (
+        not table_grade
+        or grade == table_grade
+        or grade not in _REP_GRADE_ORDER
+        or table_grade not in _REP_GRADE_ORDER
+    ):
+        return grade
+    idx_grade = _REP_GRADE_ORDER.index(grade)
+    idx_table = _REP_GRADE_ORDER.index(table_grade)
+    if idx_grade < idx_table:
+        direction = "↑"
+    elif idx_grade > idx_table:
+        direction = "↓"
+    else:
+        return grade
+    return f"{grade}(표{table_grade}{direction})"
+
+
 def format_rep(rep: RepRecord) -> str:
     fields = [
         f"id={rep.id}",
         f"profile={rep.profile}",
         f"effort={rep.effort or '-'}",
-        f"grade={rep.grade or '-'}",
+        f"grade={_format_rep_grade(rep.grade, rep.table_grade)}",
         f"model={rep.model_id or '-'}",
         f"task={rep.task_ref or '-'}",
         f"tier={rep.tier or '-'}",
@@ -1287,6 +1356,27 @@ def compare_reps(
     comparisons: list[RepComparison] = []
     for profile_name in sorted(by_profile):
         group = by_profile[profile_name]
+        upward_count = 0
+        same_count = 0
+        downward_count = 0
+        for row in group:
+            if (
+                row.grade is not None
+                and row.table_grade is not None
+                and row.grade in _REP_GRADE_ORDER
+                and row.table_grade in _REP_GRADE_ORDER
+            ):
+                idx_grade = _REP_GRADE_ORDER.index(row.grade)
+                idx_table = _REP_GRADE_ORDER.index(row.table_grade)
+                if idx_grade < idx_table:
+                    upward_count += 1
+                elif idx_grade > idx_table:
+                    downward_count += 1
+                else:
+                    same_count += 1
+            else:
+                same_count += 1
+
         comparisons.append(
             RepComparison(
                 profile=profile_name,
@@ -1296,6 +1386,9 @@ def compare_reps(
                 completion_rate=(sum(row.completed == 1 for row in group) / len(group)) * 100.0,
                 average_input_tokens=_average(row.input_tokens for row in group),
                 average_output_tokens=_average(row.output_tokens for row in group),
+                upward_count=upward_count,
+                same_count=same_count,
+                downward_count=downward_count,
             )
         )
     return comparisons
@@ -1316,6 +1409,11 @@ def format_rep_comparison(comparison: RepComparison) -> str:
         fields.append(f"avg-input-tokens={render_average(comparison.average_input_tokens)}")
     if comparison.average_output_tokens is not None:
         fields.append(f"avg-output-tokens={render_average(comparison.average_output_tokens)}")
+    fields.append(
+        f"상방 {comparison.upward_count}건 / "
+        f"동급 {comparison.same_count}건 / "
+        f"하방 {comparison.downward_count}건"
+    )
     return " ".join(fields)
 
 
