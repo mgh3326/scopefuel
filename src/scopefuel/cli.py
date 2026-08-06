@@ -13,7 +13,7 @@ import sys
 import time
 
 from . import bench, recommend, render
-from .cache import DEFAULT_TTL_S, collect
+from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
 from .providers import default_order, registry
@@ -91,7 +91,9 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--horizon", choices=["now", "week", "both"], default="both", help="--brief 에 표시할 지평"
     )
     parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
-    parser.add_argument("--cache-ttl", type=float, default=DEFAULT_TTL_S, help="캐시 TTL(초)")
+    parser.add_argument(
+        "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
+    )
     parser.add_argument("--no-color", action="store_true", help="ANSI 색 끄기")
     parser.add_argument(
         "--exit-code-on",
@@ -210,7 +212,9 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
     )
     gate_parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
-    gate_parser.add_argument("--cache-ttl", type=float, default=DEFAULT_TTL_S, help="캐시 TTL(초)")
+    gate_parser.add_argument(
+        "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
+    )
 
     return parser
 

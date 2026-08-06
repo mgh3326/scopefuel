@@ -1345,7 +1345,7 @@ def test_real_cache_fallback_high_usage_exit_code_on_crit(monkeypatch, tmp_path,
         json.dumps(
             {
                 "claude": {
-                    "fetched_at": 1.0,
+                    "fetched_at": -200.0,
                     "result": {
                         "id": "claude",
                         "plan": "pro",
@@ -1384,7 +1384,7 @@ def test_real_cache_fallback_high_usage_exit_code_on_crit(monkeypatch, tmp_path,
     payload = json.loads(out)
 
     assert payload["providers"][0]["status"] == "stale"
-    assert payload["providers"][0]["age_s"] == 99.0
+    assert payload["providers"][0]["age_s"] == 300.0
     assert "조회 실패" in payload["providers"][0]["note"]
     assert payload["providers"][0]["verdict"]["mark"] == "degraded"
     assert payload["providers"][0]["verdict"]["usage_mark"] == "crit"
