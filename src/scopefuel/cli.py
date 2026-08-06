@@ -187,6 +187,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
         | set(recommend.PROFILE_ALIASES)
+        | set(recommend.RETIRED_PROFILES.keys())
     )
     gate_parser = subparsers.add_parser(
         "gate",
