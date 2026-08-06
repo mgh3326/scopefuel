@@ -165,7 +165,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_add.add_argument(
         "--effort", choices=bench.REP_EFFORTS, help="실행 effort (low/medium/high/xhigh/max)"
     )
-    reps_add.add_argument("--grade", choices=bench.REP_GRADES, help="실행 당시 급 (S+/S/A+/A/B/C)")
+    reps_add.add_argument(
+        "--grade",
+        choices=bench.REP_GRADES,
+        help="과제가 요구한 급 (S+/S/A+/A/B/C) — 프로필의 급표 배치가 아니라 과제 난이도",
+    )
     reps_add.add_argument("--rounds", required=True, type=_nonnegative_int)
     reps_add.add_argument("--blockers-found", required=True, type=_nonnegative_int)
     reps_add.add_argument("--completed", required=True, type=_completed_arg, help="0/1")
@@ -175,12 +179,21 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     reps_list = reps_sub.add_parser("list", help="대표 실행 기록 조회")
     reps_list.add_argument("--limit", type=_nonnegative_int, help="최대 행 수 (1 이상)")
-    reps_list.add_argument("--grade", choices=bench.REP_GRADES, help="급 필터")
+    reps_list.add_argument(
+        "--grade",
+        choices=bench.REP_GRADES,
+        help="과제가 요구한 급 필터 (S+/S/A+/A/B/C) — 프로필의 급표 배치가 아니라 과제 난이도",
+    )
     reps_list.add_argument("--profile", help="프로필 필터")
     reps_list.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
 
     reps_compare = reps_sub.add_parser("compare", help="같은 급 안 프로필별 대표 실행 비교")
-    reps_compare.add_argument("--grade", required=True, choices=bench.REP_GRADES, help="비교할 급")
+    reps_compare.add_argument(
+        "--grade",
+        required=True,
+        choices=bench.REP_GRADES,
+        help="비교할 과제가 요구한 급 (S+/S/A+/A/B/C) — 프로필의 급표 배치가 아니라 과제 난이도",
+    )
     reps_compare.add_argument("--profile", help="프로필 필터")
     reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
 
