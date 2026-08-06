@@ -5,6 +5,8 @@
       "start": "2099-07-30T19:58:08Z",
       "end": "2099-08-06T19:58:08Z"
     },
+    "monthlyLimit": {"val": 1000},
+    "used": {"val": 420},
     "creditUsagePercent": 8.0,
     "productUsage": [
       {"product": "GrokBuild", "usagePercent": 5.0},
@@ -15,6 +17,6 @@
     "onDemandUsed": {"val": 0},
     "prepaidBalance": {"val": 0},
     "billingPeriodStart": "2099-07-30T19:58:08Z",
-    "billingPeriodEnd": "2099-08-06T19:58:08Z"
+    "billingPeriodEnd": "2099-08-31T19:58:08Z"
   }
 }
