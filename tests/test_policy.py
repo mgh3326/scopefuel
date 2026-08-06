@@ -415,7 +415,7 @@ def test_policy_list_shows_builtin_tag_when_unconfigured(policy_config, capsys, 
 
 def test_policy_list_shows_configured_tag_and_boost_and_weight(policy_config, capsys, monkeypatch):
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
-    policy.set_policy("codex", "spend", until=dt.date(2026, 8, 10), boost=1, note="리셋권")
+    policy.set_policy("codex", "spend", until=dt.date.today() + dt.timedelta(days=7), boost=1, note="리셋권")
     assert cli.main(["policy", "list"]) == 0
     out = capsys.readouterr().out
     codex_line = next(line for line in out.splitlines() if line.startswith("codex"))

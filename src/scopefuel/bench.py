@@ -1249,7 +1249,7 @@ def read_reps(
     target = pathlib.Path(path) if path is not None else db_path()
     if str(target) != ":memory:" and not target.expanduser().exists():
         return []
-    conn = connect(target) if str(target) == ":memory:" else _readonly_connect(target)
+    conn = connect(target)
     try:
         table_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reps'"

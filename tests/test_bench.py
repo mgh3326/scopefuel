@@ -671,11 +671,11 @@ def test_reps_tokens_round_trip_and_legacy_read_compat(bench_home, capsys, tmp_p
         legacy.commit()
     finally:
         legacy.close()
-    before_mtime = legacy_path.stat().st_mtime_ns
-
     old_rows = bench.read_reps(path=legacy_path)
     assert old_rows[0].input_tokens is None and old_rows[0].output_tokens is None
-    assert legacy_path.stat().st_mtime_ns == before_mtime
+    migrated_mtime = legacy_path.stat().st_mtime_ns
+    bench.read_reps(path=legacy_path)
+    assert legacy_path.stat().st_mtime_ns == migrated_mtime
 
     bench.add_rep(
         profile="haiku",
@@ -1435,3 +1435,79 @@ def test_d4_backfill_idempotent_and_preserves_null(tmp_path):
     by_id2 = {r.id: r for r in reps2}
 
     assert by_id1 == by_id2
+
+
+def test_read_path_triggers_schema_migration_and_backfill(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "legacy_bench.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE reps (
+          id             INTEGER PRIMARY KEY,
+          profile        TEXT NOT NULL,
+          model_id       TEXT,
+          task_ref       TEXT,
+          tier           TEXT,
+          role           TEXT,
+          rounds         INTEGER,
+          blockers_found INTEGER,
+          completed      INTEGER,
+          input_tokens   INTEGER,
+          output_tokens  INTEGER,
+          notes          TEXT,
+          recorded_at    TEXT NOT NULL,
+          effort         TEXT,
+          grade          TEXT
+        );
+        INSERT INTO reps (
+          id, profile, model_id, task_ref, tier, role,
+          rounds, blockers_found, completed, recorded_at, effort, grade
+        ) VALUES
+          (1, 'codex-luna-ultra', 'gpt-5.6-luna', 'ROB-1', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
+          (2, 'codex-luna-ultra', 'gpt-5.6-luna', 'ROB-2', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, NULL),
+          (3, 'codex-luna', 'gpt-5.6-luna', 'ROB-3', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'medium', 'A+'),
+          (4, 'haiku', 'claude-haiku-4.5', 'ROB-4', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'high', 'A'),
+          (5, 'codex-luna', 'gpt-5.6-luna', 'ROB-5', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', 'high', 'B'),
+          (6, 'codex-terra-max', 'gpt-5.6-terra', 'ROB-6', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, 'C'),
+          (7, 'oc-gflash', 'gemini-3.6-flash', 'ROB-7', 'T1', 'impl', 1, 0, 1, '2026-08-06Z', NULL, 'B');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # R1: Run ONLY read_reps (reps list) on legacy schema DB copy
+    reps = bench.read_reps(path=db)
+    assert len(reps) == 7
+
+    # Verify R1: table_grade column exists in database schema
+    conn_verify = sqlite3.connect(str(db))
+    conn_verify.row_factory = sqlite3.Row
+    columns = [row[1] for row in conn_verify.execute("PRAGMA table_info(reps)").fetchall()]
+    assert "table_grade" in columns
+
+    # Verify R2: id 3~7 table_grade populated, id 1~2 NULL preserved
+    by_id = {
+        row["id"]: dict(row)
+        for row in conn_verify.execute("SELECT id, grade, table_grade FROM reps").fetchall()
+    }
+    conn_verify.close()
+
+    assert by_id[1]["grade"] is None and by_id[1]["table_grade"] is None
+    assert by_id[2]["grade"] is None and by_id[2]["table_grade"] is None
+    assert by_id[3]["table_grade"] == "B"
+    assert by_id[4]["table_grade"] == "B"
+    assert by_id[5]["table_grade"] == "A"
+    assert by_id[6]["table_grade"] == "S"
+    assert by_id[7]["table_grade"] == "C"
+
+    # R3: Run compare_reps --grade B on legacy schema DB copy -> 1 upward item (oc-gflash table C, task B)
+    comps = bench.compare_reps(grade="B", path=db)
+    gflash_comp = next(c for c in comps if c.profile == "oc-gflash")
+    assert gflash_comp.upward_count == 1
+    assert gflash_comp.same_count == 0
+
+    # R4: Re-run safety (consecutive execution yields identical result)
+    reps2 = bench.read_reps(path=db)
+    assert len(reps2) == 7
