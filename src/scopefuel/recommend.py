@@ -343,6 +343,20 @@ RETIRED_PROFILES: dict[str, RetiredProfile] = {
         provider_id="agy",
         group_name="3p",
     ),
+    "oc-gflash": RetiredProfile(
+        name="oc-gflash",
+        retired_date="2026-08-06",
+        reason=(
+            "opencode/CLIProxy 경유 배선이 에이전트 루프를 지속하지 못함 — "
+            "같은 모델(gemini-3.6-flash-high)을 동일 브리프·clean worktree로 실측 2회: "
+            "oc-gflash는 도구 호출 1건 후 idle 복귀를 반복해 커밋 0·변경 0; "
+            "agy 네이티브(agy-flash)는 동일 실행에서 약 4분, +450줄, 수용조건 전항 통과. "
+            "모델 품질 문제가 아니라 opencode/CLIProxy 배선 문제이며, "
+            "agy-flash(agy 네이티브)로 대체 신설함."
+        ),
+        provider_id="agy",
+        group_name="gemini",
+    ),
 }
 
 
@@ -705,17 +719,23 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
             aa_model_id="qwen3-7-max",
         ),
+        # ROB-1222: oc-gflash 은퇴(opencode/CLIProxy 하네스 에이전트 루프 미지속 실측 2회).
+        # agy 네이티브 agy-flash 로 교체. 같은 모델·같은 내삽값 승계.
+        # 표본 1건(재작업 1회 포함)으로 급을 올릴 근거 없음 — 잠정 C 배치.
         Profile(
-            "oc-gflash",
+            "agy-flash",
             "Gemini 3.6 Flash",
             _GFLASH_DERIVED_SCORE,
             benchmark_annotation=MODEL_ONLY_INTERPOLATED_ANNOTATION,
             model_only=True,
             estimate_reason=(
                 "AA-model coding_index 69.2 — 68.8→43.0 / 72.4→64.0 내삽 = 45.3; "
-                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C)"
+                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C). "
+                "하네스: agy 네이티브(oc-gflash의 opencode/CLIProxy와 다름). "
+                "agy 네이티브 실측 1건(재작업 1회), 표본 1건으로 급 조정 보류 — "
+                "reps 누적 후 B 승급 재검토."
             ),
-            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
+            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향; 잠정)",
             aa_model_id="gemini-3-6-flash",
         ),
         Profile(
