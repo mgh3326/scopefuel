@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from scopefuel import cache, spec
 from scopefuel.model import Bucket, ProviderResult, Scope
@@ -180,3 +181,93 @@ def test_warning_result_is_not_cached(monkeypatch):
 
     assert calls == 2
     assert first[0].status == second[0].status == "warning"
+
+
+def test_cache_collects_misses_in_parallel_and_preserves_name_order():
+    names = ["slow", "fast", "middle"]
+    delays = {"slow": 0.20, "fast": 0.05, "middle": 0.10}
+
+    def make_fetcher(name):
+        def fetch():
+            time.sleep(delays[name])
+            return ProviderResult(id=name)
+
+        return fetch
+
+    started = time.monotonic()
+    results = cache.collect({name: make_fetcher(name) for name in names}, names, use_cache=False)
+    elapsed = time.monotonic() - started
+
+    assert [result.id for result in results] == names
+    assert elapsed < 0.30  # 직렬이면 약 0.35초, 병렬이면 max(delay)에 가깝다.
+
+
+def test_cache_fetch_exception_does_not_cancel_other_providers():
+    def boom():
+        raise RuntimeError("broken")
+
+    results = cache.collect(
+        {"bad": boom, "good": lambda: ProviderResult(id="good")},
+        ["bad", "good"],
+        use_cache=False,
+    )
+
+    assert results[0].id == "bad"
+    assert results[0].error == "broken"
+    assert results[1].id == "good"
+    assert results[1].error is None
+
+
+def test_cache_hit_does_not_call_fetcher():
+    calls = 0
+
+    def fetch():
+        nonlocal calls
+        calls += 1
+        return ProviderResult(id="claude")
+
+    cache.collect({"claude": fetch}, ["claude"], now=1000.0)
+    cached = cache.collect({"claude": fetch}, ["claude"], now=1000.0 + 179.0)
+
+    assert calls == 1
+    assert cached[0].stale is False
+
+
+def test_provider_ttls_and_default_are_used_at_boundaries():
+    names = [*cache.PROVIDER_TTL_S, "unknown"]
+    calls = {name: 0 for name in names}
+
+    def make_fetcher(name):
+        def fetch():
+            calls[name] += 1
+            return ProviderResult(id=name)
+
+        return fetch
+
+    fetchers = {name: make_fetcher(name) for name in names}
+    for name in names:
+        ttl = cache.PROVIDER_TTL_S.get(name, cache.DEFAULT_TTL_S)
+        cache.collect(fetchers, [name], now=1000.0)
+        before = cache.collect(fetchers, [name], now=1000.0 + ttl - 1)
+        assert before[0].stale is False
+        assert calls[name] == 1
+        cache.collect(fetchers, [name], now=1000.0 + ttl + 1)
+        assert calls[name] == 2
+
+
+def test_cache_ttl_override_applies_to_every_provider():
+    names = ["claude", "grok", "unknown"]
+    calls = {name: 0 for name in names}
+
+    def make_fetcher(name):
+        def fetch():
+            calls[name] += 1
+            return ProviderResult(id=name)
+
+        return fetch
+
+    fetchers = {name: make_fetcher(name) for name in names}
+    cache.collect(fetchers, names, now=1000.0)
+    cache.collect(fetchers, names, now=1000.0 + 31.0, ttl_s=30.0)
+
+    assert calls == {name: 2 for name in names}

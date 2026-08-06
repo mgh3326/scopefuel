@@ -11,11 +11,24 @@ import json
 import os
 import pathlib
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
 from .policy import get_policy
 
 DEFAULT_TTL_S = 60.0
+# 창 길이에서 허용 낡음을 약 1%로 유도한 정적 TTL 표다: 5h≈18,000s → 180s,
+# 7d≈604,800s → 600s(반올림), 7d → 1,800s(약 0.3%, grok의 별도 운영 여유).
+# fetch 전에 적용해야 하므로 캐시 버킷의 window를 읽어 동적으로 계산하지 않는다.
+PROVIDER_TTL_S = {
+    "claude": 180.0,
+    "kimi": 180.0,
+    "clinepass": 180.0,
+    "agy": 180.0,
+    "codex": 600.0,
+    "grok": 1800.0,
+}
+MAX_FETCH_WORKERS = 7  # 현재 provider 수 이하: 독립 HTTP/PTY fetch를 병렬화하되 무제한 spawn은 피한다.
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
 
 
@@ -111,46 +124,59 @@ def collect(
     fetchers: dict[str, object],
     names: list[str],
     *,
-    ttl_s: float = DEFAULT_TTL_S,
+    ttl_s: float | None = None,
     use_cache: bool = True,
     now: float | None = None,
 ) -> list[ProviderResult]:
     """fetch → 실패하면 캐시 폴백. 반환 순서는 names 순서."""
     now = time.time() if now is None else now
     cache = _load() if use_cache else {}
-    results: list[ProviderResult] = []
+    results: list[ProviderResult | None] = [None] * len(names)
     dirty = False
+    misses: list[tuple[int, str, object, dict | None, PoolClass]] = []
 
-    for name in names:
+    for index, name in enumerate(names):
         entry = cache.get(name)
         fetcher = fetchers.get(name)
         cached_class: PoolClass | None = None
         if isinstance(entry, dict):
             cached_class = (entry.get("result") or {}).get("pool_class")
         policy_class = _effective_class(name, fetcher, cached_class)
-        if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= ttl_s:
+        effective_ttl_s = ttl_s if ttl_s is not None else PROVIDER_TTL_S.get(name, DEFAULT_TTL_S)
+        if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= effective_ttl_s:
             fresh = _from_entry(entry, name, now, policy_class)
             fresh.stale = False  # TTL 안이면 신선한 값으로 취급
-            results.append(fresh)
+            results[index] = fresh
             continue
 
-        result: ProviderResult
-        if fetcher is None:
-            result = ProviderResult(id=name, error="알 수 없는 provider")
-        else:
-            try:
-                result = fetcher()  # type: ignore[operator]
-            except Exception as exc:
-                result = ProviderResult(id=name, error=str(exc))
+        misses.append((index, name, fetcher, entry if isinstance(entry, dict) else None, policy_class))
 
-        result.pool_class = _effective_class(name, fetcher, result.pool_class)
+    def fetch_one(fetcher: object) -> ProviderResult:
+        if fetcher is None:
+            return ProviderResult(id="?", error="알 수 없는 provider")
+        try:
+            return fetcher()  # type: ignore[operator]
+        except Exception as exc:
+            return ProviderResult(id="?", error=str(exc))
+
+    fetched: dict[int, Future[ProviderResult]] = {}
+    if misses:
+        with ThreadPoolExecutor(max_workers=min(MAX_FETCH_WORKERS, len(misses))) as pool:
+            for index, _name, fetcher, _entry, _policy_class in misses:
+                fetched[index] = pool.submit(fetch_one, fetcher)
+
+    for index, name, _fetcher, entry, policy_class in misses:
+        result = fetched[index].result()
+        result.id = name
+
+        result.pool_class = _effective_class(name, _fetcher, result.pool_class)
 
         if result.error and entry:
             age = now - float(entry.get("fetched_at") or 0)
             if age <= STALE_MAX_S:
                 stale = _from_entry(entry, name, now, policy_class)
                 stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
-                results.append(stale)
+                results[index] = stale
                 continue
 
         if not result.error and not result.warning:
@@ -158,11 +184,11 @@ def collect(
             result.age_s = 0.0
             cache[name] = _to_entry(result, now)
             dirty = True
-        results.append(result)
+        results[index] = result
 
     if dirty:
         _save(cache)
-    return results
+    return [result for result in results if result is not None]
 
 
 def format_age(age_s: float | None) -> str:
