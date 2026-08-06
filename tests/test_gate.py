@@ -179,32 +179,34 @@ def test_gate_escalation_fable_still_blocked_by_own_pool_unmeasurable():
     assert "측정 불가" in result.reason
 
 
-def test_gate_oc_oss_waits_for_new_sonnet46_c_candidate():
-    """S+ grade 는 opus/fable 이 같은 pool(claude) 을 공유하므로, claude 가 살아있으면 opus 가
-    항상 먼저 정상후보로 남아 fable 은 escalation 자격을 얻지 못한다(같은 pool 공유의 자연스러운
-    결과) — C급으로 이동한 oc-sonnet46 이 같은 agy/3p pool 의 정상 대안으로 남는지 검증한다.
+def test_gate_oc_oss_not_in_grade_table_passes_quota_check():
+    """D3: oc-oss (ROB-1221 이후 은퇴)는 GRADE_TABLE에 없지만 profile_pool에는 있으므로,
+    escalation 로직 없이 quota cutoff만 검사한다. pool 사용이 cutoff 이하면 통과.
     """
     providers = [
-        _result("kiro", 99.5, pool_class="spend", window="30d"),  # kiro-cheap 소진 → escalation 자격 OK
-        _result("agy", 10.0, pool_class="spend", scope=Scope("group", "3p"), window="30d"),  # 정상
+        _result("agy", 10.0, pool_class="spend", scope=Scope("group", "3p"), window="30d"),
     ]
     result = gate_check(providers, "oc-oss", today=TODAY, now=NOW)
-    assert result.ok is False
+    assert result.ok is True
+    assert result.grade is None  # GRADE_TABLE에 없으므로 grade=None
     assert result.unmeasurable is False
-    assert "다른 C 후보가 아직 가용" in result.reason
-    assert result.alternatives == ("oc-sonnet46",)
+    assert "pool=agy" in result.reason
+    assert result.alternatives == ()  # No alternatives for non-grade profiles
 
 
-def test_gate_escalation_oc_oss_still_blocked_by_raw_cutoff():
-    """BLOCKER 수정: oc-oss escalation 자격 충족해도 agy/3p raw cutoff 는 그대로 검사한다."""
+def test_gate_oc_oss_not_in_grade_table_blocked_by_quota_cutoff():
+    """D3: GRADE_TABLE에 없는 프로필도 quota cutoff로 차단된다.
+    oc-oss는 escalation 로직 없이 agy/3p pool의 raw cutoff만 검사한다.
+    """
     providers = [
-        _result("kiro", 99.5, pool_class="spend", window="30d"),  # kiro-cheap 소진 → escalation 자격 OK
         _result("agy", 99.0, pool_class="spend", scope=Scope("group", "3p"), window="30d"),  # 소진
     ]
     result = gate_check(providers, "oc-oss", today=TODAY, now=NOW)
     assert result.ok is False
+    assert result.grade is None  # GRADE_TABLE에 없으므로 grade=None
     assert result.unmeasurable is False
     assert "소진" in result.reason
+    assert "cutoff" in result.reason
 
 
 # ------------------------------------------------------------------ exit 4 (unmeasurable)

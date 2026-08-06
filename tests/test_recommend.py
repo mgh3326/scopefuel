@@ -750,8 +750,8 @@ def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
 # ------------------------------------------------------------------ AC4: C grade
 
 
-def test_ac4_c_omni_escalation_and_oss_escalation():
-    """AC4: C 정상 순위엔 oc-omni/oc-oss 둘 다 없음 — 둘 다 escalation 섹션(지정 사유 포함)."""
+def test_ac4_c_omni_escalation_only():
+    """AC4: C 정상 순위엔 oc-omni 없음 — escalation 섹션에만 나타남. oc-oss는 ROB-1221 이후 은퇴."""
     providers = [
         _result("kiro", 10.0, pool_class="spend", window="30d"),
     ]
@@ -762,21 +762,20 @@ def test_ac4_c_omni_escalation_and_oss_escalation():
     # kiro-cheap (유일한 정상 C 후보) 가 1위
     assert ranked[0].startswith("1. kiro-cheap")
 
-    # oc-omni, oc-oss 모두 정상 후보에 없음 (escalation)
+    # oc-omni는 정상 후보에 없음 (escalation)
     assert not any(line[:1].isdigit() and "oc-omni" in line for line in lines)
-    assert not any(line[:1].isdigit() and "oc-oss" in line for line in lines)
 
-    # 둘 다 escalation 섹션에, 정상후보/제외 뒤에 위치
+    # oc-omni는 escalation 섹션에, 정상후보/제외 뒤에 위치
     escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
     last_ranked = max((i for i, line in enumerate(lines) if line[:1].isdigit()), default=-1)
     last_excluded = max((i for i, line in enumerate(lines) if line.startswith("✗")), default=-1)
     assert escalation_idx > last_ranked
     assert escalation_idx > last_excluded
 
-    assert "oc-omni" in out and "oc-oss" in out
+    assert "oc-omni" in out
+    assert "oc-oss" not in out  # oc-oss 은퇴됨
     assert "big-pickle 162콜" in out
     assert "deepseek-v4-flash 21콜" in out
-    assert "agy 3p 풀 소모" in out
 
 
 # ------------------------------------------------------------------ AC5: removed
@@ -931,7 +930,8 @@ def test_fable_escalation_with_policy_exclude_shows_both():
     assert "until 2026-08-31" in out
 
 
-def test_oc_oss_escalation_at_end_of_c():
+def test_oc_omni_escalation_at_end_of_c():
+    """C 급 escalation 프로필(oc-omni)은 정상 후보/제외 뒤에 나타남. oc-oss는 ROB-1221 이후 은퇴."""
     providers = [
         _result("kiro", 10.0, pool_class="spend", window="30d"),
         _result("agy", 10.0, scope=Scope("group", "3p")),
@@ -939,18 +939,18 @@ def test_oc_oss_escalation_at_end_of_c():
     out = recommend(providers, "C", today=TODAY, now=NOW)
     lines = out.splitlines()
 
-    # kiro-cheap 이 1위 (oc-omni/oc-oss 는 escalation)
+    # oc-sonnet46 이 1위 (정상 후보)
     ranked = [line for line in lines if line[:1].isdigit()]
     assert ranked[0].startswith("1. oc-sonnet46")
 
-    # oc-oss 는 escalation 섹션에, 정상후보/제외 뒤에 위치
+    # oc-omni 는 escalation 섹션에, 정상후보/제외 뒤에 위치
     escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
     last_ranked = max((i for i, line in enumerate(lines) if line[:1].isdigit()), default=-1)
     last_excluded = max((i for i, line in enumerate(lines) if line.startswith("✗")), default=-1)
     last_content = max(last_ranked, last_excluded)
     assert escalation_idx > last_content
-    assert any("oc-oss" in line for line in lines[escalation_idx:])
-    assert "agy 3p 풀 소모" in out
+    assert any("oc-omni" in line for line in lines[escalation_idx:])
+    assert "oc-oss" not in out  # oc-oss 은퇴됨
 
 
 def test_oc_omni_escalation_available_without_provider():

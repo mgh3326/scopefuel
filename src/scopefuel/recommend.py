@@ -321,6 +321,31 @@ _MINIMAX_M3_DERIVED_SCORE = _interpolate_model_only_score(58.6)
 _GFLASH_DERIVED_SCORE = _interpolate_model_only_score(69.2)
 
 
+@dataclass(frozen=True)
+class RetiredProfile:
+    """Metadata for retired profiles: no longer recommended but still available for designated spawn."""
+
+    name: str
+    retired_date: str  # ISO date
+    reason: str
+    provider_id: str
+    group_name: str | None = None
+
+
+RETIRED_PROFILES: dict[str, RetiredProfile] = {
+    "oc-oss": RetiredProfile(
+        name="oc-oss",
+        retired_date="2026-08-06",
+        reason=(
+            "gpt-oss-120b (model-index 30.4) superseded by oc-sonnet46 (AA-agent 38.0); "
+            "multiple C-tier alternatives available"
+        ),
+        provider_id="agy",
+        group_name="3p",
+    ),
+}
+
+
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
@@ -713,14 +738,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             None,
             gate="escalation",
             gate_reason=OC_OMNI_ESCALATION_REASON,
-        ),
-        Profile(
-            "oc-oss",
-            "GPT-OSS 120B",
-            None,
-            gate="escalation",
-            gate_reason="agy 3p 풀 소모 — 다른 C 후보 소진 시에만",
-            aa_model_id="gpt-oss-120b",
         ),
     ],
 }
@@ -1451,14 +1468,68 @@ def gate_check(
     found = _find_profile(profile_name)
     provider_id, group_name = profile_pool(profile_name)
     if found is None:
+        # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
+        # If provider_id is unknown too, return unmeasurable.
+        if not provider_id:
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=f"unknown profile: {profile_name}",
+                unmeasurable=True,
+            )
+        # Profile known to profile_pool but not in GRADE_TABLE: check quota only.
+        by_id = {r.id: r for r in providers}
+        result = by_id.get(provider_id)
+        if result is None or result.error or result.warning or result.status != "ok":
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=f"{provider_id} 측정 불가 (provider error/degraded)",
+                unmeasurable=True,
+            )
+        matches = _matching_buckets(result, group_name)
+        if not matches:
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)",
+                unmeasurable=True,
+            )
+        states = _window_states(matches, now)
+        constraint = _select_constraint(states)
+        used_pct = constraint.used_pct
+        fallback_class: PoolClass = (
+            result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
+        )
+        effective_class = get_policy(provider_id, fallback_class, today=today)[0]
+        cutoff = _usage_cutoff(effective_class)
+        over = _any_window_over_cutoff(states, cutoff)
+        if over is not None:
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=f"{over.used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
+                used_pct=over.used_pct,
+                pool_class=effective_class,
+            )
         return GateResult(
-            ok=False,
+            ok=True,
             profile=profile_name,
             provider_id=provider_id,
             grade=None,
-            reason=f"unknown profile: {profile_name}",
-            unmeasurable=True,
+            reason=f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}",
+            used_pct=used_pct,
+            pool_class=effective_class,
         )
+
     grade, profile = found
     by_id = {r.id: r for r in providers}
     result = by_id.get(provider_id)
