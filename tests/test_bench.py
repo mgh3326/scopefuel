@@ -1142,6 +1142,8 @@ def _find_profile_for_grade(
         if p.name in exclude_set:
             continue
         effort = p.launcher_effort or p.benchmark_effort
+        if effort == "default":
+            effort = None
         derived = bench.derive_table_grade(p.name, effort)
         if derived == target_grade:
             return p.name, effort, target_grade

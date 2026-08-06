@@ -319,6 +319,7 @@ def _interpolate_model_only_score(model_score: float) -> float:
 _QWEN37_DERIVED_SCORE = _interpolate_model_only_score(66.0)
 _MINIMAX_M3_DERIVED_SCORE = _interpolate_model_only_score(58.6)
 _GFLASH_DERIVED_SCORE = _interpolate_model_only_score(69.2)
+_DSFLASH_DERIVED_SCORE = _interpolate_model_only_score(69.1)
 
 
 @dataclass(frozen=True)
@@ -357,9 +358,38 @@ RETIRED_PROFILES: dict[str, RetiredProfile] = {
         provider_id="agy",
         group_name="gemini",
     ),
+    "oc-kimi-code": RetiredProfile(
+        name="oc-kimi-code",
+        retired_date="2026-08-06",
+        reason=(
+            "kimi 네이티브 프로필(kimi-k3·kimi-k3-low, pool=kimi)과 중복 — "
+            "같은 모델을 ClinePass 크레딧으로 소비할 이유가 없어 "
+            "고유 모델에 크레딧을 배분하기 위함. "
+            "제거 시점 미상, 기록만 소급"
+        ),
+        provider_id="clinepass",
+        group_name=None,
+    ),
+    "oc-kimi-k3": RetiredProfile(
+        name="oc-kimi-k3",
+        retired_date="2026-08-06",
+        reason=(
+            "kimi 네이티브 프로필(kimi-k3·kimi-k3-low, pool=kimi)과 중복 — "
+            "같은 모델을 ClinePass 크레딧으로 소비할 이유가 없어 "
+            "고유 모델에 크레딧을 배분하기 위함. "
+            "제거 시점 미상, 기록만 소급"
+        ),
+        provider_id="clinepass",
+        group_name=None,
+    ),
 }
 
 
+# 배치 규칙 (두 갈래) — 근거가 무엇이냐에 따라 점수 처리가 다르다:
+# 1. AA-agent 실측: 점수를 그대로 급 점수로 사용. 하네스가 실행 하네스와 달라도
+#    표기만 harness-이식 으로 하고 점수·급은 변경하지 않음 (예: oc-sonnet46, oc-glm).
+# 2. AA-model 지수만 (에이전트 미측정): _MODEL_ONLY_ANCHORS 로 내삽/외삽 후
+#    한 단계 보수 하향으로 배치 (예: oc-qwen37-max, agy-flash, oc-minimax-m3, oc-dsflash).
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
@@ -559,14 +589,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gpt-5.6-luna",
             aa_model_id="gpt-5-6-luna",
         ),
-        Profile(
-            "oc-glm",
-            "GLM-5.2",
-            51.1,
-            **_openrouter_benchmark(51.1, "glm-5.2"),
-            aa_agent_model_id="glm-5.2",
-            aa_model_id="glm-5-2",
-        ),
     ],
     "A": [
         Profile(
@@ -646,6 +668,16 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gpt-5.6-luna",
             aa_model_id="gpt-5-6-luna",
         ),
+        # ROB-1223: AA-agent 실측 43.0(claude-code/default) — opencode 하네스 이식.
+        # oc-sonnet46 과 동일 표기 방식. 실측 기반이므로 보수 하향 없음.
+        Profile(
+            "oc-glm",
+            "GLM-5.2",
+            43.0,
+            **_aa_agent_benchmark(43.0, "glm-5.2", "default", harness="claude-code"),
+            aa_agent_model_id="glm-5.2",
+            aa_model_id="glm-5-2",
+        ),
         Profile(
             "kiro-haiku",
             "Haiku 4.5",
@@ -653,7 +685,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=KIRO_HAIKU_ESTIMATE_REASON,
         ),
-        Profile("oc-dsflash", "DeepSeek V4 Flash", None, aa_model_id="deepseek-v4-flash"),
         # ROB-1202: estimated + unmeasured Grok low (no lower-effort anchor to compare against).
         Profile(
             "grok",
@@ -737,6 +768,21 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             ),
             placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향; 잠정)",
             aa_model_id="gemini-3-6-flash",
+        ),
+        # ROB-1223: AA-model coding_index 69.1 — agy-flash(69.2→45.3→C)와 사실상 같은
+        # 모델 지수인데 B 에 있던 것을 정정. 에이전트 미측정이므로 보수 하향 → C.
+        Profile(
+            "oc-dsflash",
+            "DeepSeek V4 Flash",
+            _DSFLASH_DERIVED_SCORE,
+            benchmark_annotation=MODEL_ONLY_INTERPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=(
+                "AA-model coding_index 69.1 — 68.8→43.0 / 72.4→64.0 내삽 = 44.7; "
+                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C)"
+            ),
+            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
+            aa_model_id="deepseek-v4-flash",
         ),
         Profile(
             "oc-minimax-m3",

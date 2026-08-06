@@ -280,24 +280,25 @@ def test_urgent_spend_outranks_non_urgent_higher_remaining():
     """폴백 경로: reset-imminent spend 가 non-imminent spend 보다 remaining% 낮아도 앞선다."""
     providers = [
         _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(4)),  # 20% rem, urgent
-        _result("clinepass", 10.0, window="?", resets_at=_reset_in(48)),  # 90% rem, not urgent
+        _result("codex", 10.0, pool_class="spend", window="?", resets_at=_reset_in(48)),  # not urgent
     ]
     out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "🔥" in lines[0] and "kiro-sonnet" in lines[0]
-    assert "oc-glm" in lines[1]
+    assert len(lines) >= 2
+    assert "🔥" not in lines[1]
 
 
 def test_multiple_urgent_sorted_by_remaining():
     """폴백 경로: 여러 후보가 모두 시간-임박 urgent 면 잔여율(큰 순)로 정렬."""
     providers = [
         _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(3)),  # 20% rem
-        _result("clinepass", 40.0, window="?", resets_at=_reset_in(5)),  # 60% rem
+        _result("codex", 40.0, pool_class="spend", window="?", resets_at=_reset_in(5)),  # 60% rem
     ]
     out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in lines[0] and "oc-glm" in lines[0]
-    assert "oc-minimax-m3" not in out
+    assert "🔥" in lines[0]
+    assert "kiro-sonnet" not in lines[0]  # kiro is lower remaining, not first
     kiro_line = next(line for line in lines if "kiro-sonnet" in line)
     assert "🔥" in kiro_line
 
@@ -408,7 +409,7 @@ def test_ac2_s_grade_profiles():
 def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
-    assert {"kiro-sonnet", "codex-luna-max", "oc-glm", "sonnet"}.issubset(aplus_names)
+    assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
     assert {"codex-terra", "codex-luna", "opus"}.issubset(aplus_names)
     assert "oc-minimax-m3" not in aplus_names
 
@@ -1963,13 +1964,13 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
 
 
 @pytest.mark.parametrize(
-    ("profile_name", "grade", "model_id", "score_harness", "score_effort", "expected_label"),
+    ("profile_name", "grade", "model_id", "score_harness", "score_effort", "score_value", "expected_label"),
     [
-        ("oc-glm", "A+", "glm-5.2", "claude-code", "max", "GLM-5.2"),
+        ("oc-glm", "B", "glm-5.2", "claude-code", "default", 43.0, "GLM-5.2"),
     ],
 )
 def test_opencode_harness_mismatch_is_display_only_with_native_hint(
-    profile_name, grade, model_id, score_harness, score_effort, expected_label
+    profile_name, grade, model_id, score_harness, score_effort, score_value, expected_label
 ):
     from scopefuel.bench import ModelScore
 
@@ -1980,7 +1981,7 @@ def test_opencode_harness_mismatch_is_display_only_with_native_hint(
             harness=score_harness,
             source="AA-agent",
             metric="agentic",
-            score=61.0,
+            score=score_value,
             rank=1,
             captured_at="2026-08-01T00:00:00+00:00",
         )
@@ -1994,7 +1995,8 @@ def test_opencode_harness_mismatch_is_display_only_with_native_hint(
         bench_scores=scores,
     )
     line = next(line for line in out.splitlines() if profile_name in line and line[:1].isdigit())
-    assert f"61.0(AA-agent/{score_harness}/{score_effort}) ⚠️ harness-이식 추정" in line
+    effort_suffix = f"/{score_effort}" if score_effort != "default" else ""
+    assert f"{score_value:.1f}(AA-agent/{score_harness}{effort_suffix}) ⚠️ harness-이식 추정" in line
     assert f"💡 {expected_label} 는 " in line
     assert "네이티브 하네스 검토 권장" in line
 
