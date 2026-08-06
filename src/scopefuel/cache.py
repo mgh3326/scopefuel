@@ -7,11 +7,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pathlib
 import time
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 
 from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
 from .policy import get_policy
@@ -39,6 +42,26 @@ def cache_path() -> pathlib.Path:
     return pathlib.Path(base) / "scopefuel" / "snapshots.json"
 
 
+def cache_dir() -> pathlib.Path:
+    """Return the cache directory without touching it."""
+
+    return cache_path().parent
+
+
+@contextmanager
+def _exclusive_cache_lock() -> Iterator[None]:
+    """Serialize cache read/modify/write transactions with a kernel lock."""
+
+    path = cache_dir() / "snapshots.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _load() -> dict:
     try:
         return json.loads(cache_path().read_text())
@@ -56,6 +79,15 @@ def _save(data: dict) -> None:
         tmp.replace(path)
     except OSError:
         pass  # 캐시 실패가 조회를 막지는 않는다
+
+
+def update_entry(name: str, result: ProviderResult, now: float) -> None:
+    """Merge one freshly fetched pool into the cache atomically."""
+
+    with _exclusive_cache_lock():
+        data = _load()
+        data[name] = _to_entry(result, now)
+        _save(data)
 
 
 def _to_entry(result: ProviderResult, now: float) -> dict:
