@@ -938,30 +938,28 @@ def test_grok_missing_auth_is_error_with_hint(tmp_path, monkeypatch):
     assert "auth.x.ai" in (result.hint or "")
 
 
-def test_grok_billing_success_maps_weekly_account_and_product_breakdown(fixture_json, tmp_path, monkeypatch):
+def test_grok_billing_success_maps_monthly_account_and_product_breakdown(fixture_json, tmp_path, monkeypatch):
     _grok_auth(tmp_path, monkeypatch)
     monkeypatch.setattr(
         grok,
         "_request_billing",
         lambda _token: (200, fixture_json("grok_billing")),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _token: "grok pro")
-
     result = grok.fetch()
 
     assert result.error is None
-    assert result.plan == "grok pro"
+    assert result.plan is None
     assert result.source == "cli-billing"
     assert result.pool_class == "preserve"  # class is applied by registry, not fetch()
 
     by_label = {b.label: b for b in result.buckets}
-    weekly = by_label["weekly"]
-    assert weekly.used_pct == 8.0
-    assert weekly.window == "7d"
-    assert weekly.horizon == "week"
-    assert weekly.scope.kind == "account"
-    assert weekly.resets_at and weekly.resets_at.endswith("Z")
-    assert weekly.note and "단일 주간 풀" in weekly.note
+    monthly = by_label["monthly"]
+    assert monthly.used_pct == 8.0
+    assert monthly.window == "30d"
+    assert monthly.horizon == "month"
+    assert monthly.scope.kind == "account"
+    assert monthly.resets_at == "2099-08-31T19:58:08Z"
+    assert monthly.note and "단일 월간 풀" in monthly.note
 
     assert by_label["GrokBuild"].used_pct == 5.0
     assert by_label["GrokBuild"].scope.kind == "group"
@@ -971,8 +969,15 @@ def test_grok_billing_success_maps_weekly_account_and_product_breakdown(fixture_
     assert result.raw and "synthetic-jwt" not in raw_dump
     assert "00000000-0000-4000-8000-000000000001" not in raw_dump
     assert "redacted@example.com" not in raw_dump
+    assert result.raw["credential"]
+    assert all(isinstance(value, bool) for value in result.raw["credential"].values())
+    assert "key" not in result.raw["credential"]
     assert result.raw["creditUsagePercent"] == 8.0
+    assert result.raw["monthlyLimit"] == {"val": 1000}
+    assert result.raw["used"] == {"val": 420}
+    assert result.raw["usage_source"] == "creditUsagePercent"
     assert result.raw["isUnifiedBillingUser"] is True
+    assert "주간 사용률은 측정 불가" in (result.note or "")
 
     # registry class spend — text/JSON agree when pool_class applied
     result.pool_class = "spend"
@@ -992,7 +997,6 @@ def test_grok_billing_success_maps_weekly_account_and_product_breakdown(fixture_
 def test_grok_billing_missing_config_is_graceful_no_data(tmp_path, monkeypatch):
     _grok_auth(tmp_path, monkeypatch)
     monkeypatch.setattr(grok, "_request_billing", lambda _token: (200, {}))
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
 
     result = grok.fetch()
     assert result.buckets == []
@@ -1003,7 +1007,7 @@ def test_grok_billing_missing_config_is_graceful_no_data(tmp_path, monkeypatch):
     assert result.verdict.mark == "degraded"
 
 
-def test_grok_billing_unexpected_period_type_warns(tmp_path, monkeypatch):
+def test_grok_billing_requires_billing_period_end(tmp_path, monkeypatch):
     _grok_auth(tmp_path, monkeypatch)
     monkeypatch.setattr(
         grok,
@@ -1012,16 +1016,14 @@ def test_grok_billing_unexpected_period_type_warns(tmp_path, monkeypatch):
             200,
             {
                 "config": {
-                    "currentPeriod": {"type": "USAGE_PERIOD_TYPE_MONTHLY", "end": "2099-08-06T19:58:08Z"},
+                    "monthlyLimit": 1000,
                     "creditUsagePercent": 8.0,
                 }
             },
         ),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
-
     result = grok.fetch()
-    assert result.warning and "주기 유형" in result.warning
+    assert result.error and "billingPeriodEnd" in result.error
     assert result.buckets == []
 
 
@@ -1035,6 +1037,8 @@ def test_grok_billing_partial_product_usage_keeps_account_bucket(tmp_path, monke
             {
                 "config": {
                     "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2099-08-06T19:58:08Z"},
+                    "monthlyLimit": 1000,
+                    "billingPeriodEnd": "2099-08-31T19:58:08Z",
                     "creditUsagePercent": 8.0,
                     "isUnifiedBillingUser": True,
                     "productUsage": [
@@ -1046,14 +1050,12 @@ def test_grok_billing_partial_product_usage_keeps_account_bucket(tmp_path, monke
             },
         ),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
-
     result = grok.fetch()
     assert result.error is None
     assert result.note and "partial data" in result.note
-    assert [b.label for b in result.buckets] == ["weekly", "GrokBuild"]
+    assert [b.label for b in result.buckets] == ["monthly", "GrokBuild"]
     by_label = {b.label: b for b in result.buckets}
-    assert by_label["weekly"].used_pct == 8.0
+    assert by_label["monthly"].used_pct == 8.0
     assert by_label["GrokBuild"].used_pct == 5.0
     assert "GrokChat" not in by_label
     assert "duplicate product" in result.note
@@ -1069,6 +1071,8 @@ def test_grok_billing_missing_product_usage_is_partial_data(tmp_path, monkeypatc
             {
                 "config": {
                     "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2099-08-06T19:58:08Z"},
+                    "monthlyLimit": 1000,
+                    "billingPeriodEnd": "2099-08-31T19:58:08Z",
                     "creditUsagePercent": 8.0,
                     "isUnifiedBillingUser": True,
                     # productUsage key intentionally missing
@@ -1076,13 +1080,11 @@ def test_grok_billing_missing_product_usage_is_partial_data(tmp_path, monkeypatc
             },
         ),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
-
     result = grok.fetch()
     assert result.error is None
     assert result.warning is None
     assert result.note and "productUsage" in result.note and "누락" in result.note
-    assert [b.label for b in result.buckets] == ["weekly"]
+    assert [b.label for b in result.buckets] == ["monthly"]
     assert result.buckets[0].used_pct == 8.0
 
 
@@ -1096,6 +1098,8 @@ def test_grok_billing_empty_product_usage_is_normal(tmp_path, monkeypatch):
             {
                 "config": {
                     "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2099-08-06T19:58:08Z"},
+                    "monthlyLimit": 1000,
+                    "billingPeriodEnd": "2099-08-31T19:58:08Z",
                     "creditUsagePercent": 8.0,
                     "isUnifiedBillingUser": True,
                     "productUsage": [],
@@ -1103,13 +1107,11 @@ def test_grok_billing_empty_product_usage_is_normal(tmp_path, monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
-
     result = grok.fetch()
     assert result.error is None
     assert result.warning is None
-    assert result.note is None
-    assert [b.label for b in result.buckets] == ["weekly"]
+    assert result.note and "주간 사용률은 측정 불가" in result.note
+    assert [b.label for b in result.buckets] == ["monthly"]
 
 
 def test_grok_billing_percent_anomalies_are_explicit_warnings(tmp_path, monkeypatch):
@@ -1122,23 +1124,22 @@ def test_grok_billing_percent_anomalies_are_explicit_warnings(tmp_path, monkeypa
             {
                 "config": {
                     "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2099-08-06T19:58:08Z"},
+                    "monthlyLimit": 1000,
+                    "billingPeriodEnd": "2099-08-31T19:58:08Z",
                     "creditUsagePercent": 101.0,
                     "isUnifiedBillingUser": True,
                 }
             },
         ),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
-
     result = grok.fetch()
-    assert result.warning and "creditUsagePercent" in result.warning
+    assert result.error and "creditUsagePercent" in result.error
     assert result.buckets == []
 
 
 def test_grok_http_429_is_error(tmp_path, monkeypatch):
     _grok_auth(tmp_path, monkeypatch)
     monkeypatch.setattr(grok, "_request_billing", lambda *_a, **_k: (429, None))
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
     result = grok.fetch()
     assert result.error and "429" in result.error
     assert result.buckets == []
@@ -1151,36 +1152,88 @@ def test_grok_auth_401_is_warning(tmp_path, monkeypatch):
         "_request_billing",
         lambda *_a, **_k: (401, {"message": "unauthorized"}),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: None)
     result = grok.fetch()
     assert result.warning and "401" in result.warning
     assert result.error is None
     assert result.buckets == []
 
 
-def test_grok_plan_from_subscriptions_redacts_account_fields(fixture_json, tmp_path, monkeypatch):
+def test_grok_billing_fetch_is_single_and_url_has_no_format(tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_request(_token):
+        calls.append(grok.BILLING_URL)
+        return 200, {
+            "config": {
+                "monthlyLimit": 100,
+                "used": 25,
+                "billingPeriodEnd": "2099-08-31T19:58:08Z",
+                "productUsage": [],
+            }
+        }
+
+    monkeypatch.setattr(
+        grok,
+        "_request_billing",
+        fake_request,
+    )
+    result = grok.fetch()
+    assert calls == [grok.BILLING_URL]
+    assert "?" not in calls[0]
+    assert result.buckets[0].used_pct == 25.0
+
+
+def test_grok_billing_falls_back_to_monthly_limit_and_used(fixture_json, tmp_path, monkeypatch):
     _grok_auth(tmp_path, monkeypatch)
     monkeypatch.setattr(
         grok,
         "_request_billing",
-        lambda *_a, **_k: (200, fixture_json("grok_billing")),
+        lambda _token: (200, fixture_json("grok_billing_monthly_fallback")),
     )
 
-    def fake_get(_token, url):
-        if url == grok.SUBSCRIPTIONS_URL:
-            # live-shaped but with synthetic ids that must not leak into provider raw
-            dirty = fixture_json("grok_subscriptions")
-            dirty = json.loads(json.dumps(dirty))
-            dirty["subscriptions"][0]["xaiUserId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-            return 200, dirty
-        return 404, None
-
-    monkeypatch.setattr(grok, "_get_json", fake_get)
     result = grok.fetch()
-    assert result.plan == "grok pro"
-    dumped = json.dumps(result.as_dict(include_raw=True))
-    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" not in dumped
-    assert "xaiUserId" not in dumped
+
+    assert result.error is None
+    assert result.buckets[0].horizon == "month"
+    assert result.buckets[0].used_pct == 25.0
+    assert "source=monthlyLimit/used" in (result.note or "")
+    assert result.raw and result.raw["usage_source"] == "monthlyLimit/used"
+
+
+@pytest.mark.parametrize("limit", [0, None])
+def test_grok_monthly_limit_missing_or_zero_is_degraded(tmp_path, monkeypatch, limit):
+    _grok_auth(tmp_path, monkeypatch)
+    config = {
+        "used": 10,
+        "creditUsagePercent": 1.0,
+        "billingPeriodEnd": "2099-08-31T19:58:08Z",
+    }
+    if limit is not None:
+        config["monthlyLimit"] = limit
+    monkeypatch.setattr(grok, "_request_billing", lambda _token: (200, {"config": config}))
+
+    result = grok.fetch()
+
+    assert result.error and "monthlyLimit" in result.error
+    assert result.buckets == []
+    assert result.verdict.mark == "degraded"
+
+
+def test_grok_used_over_monthly_limit_is_clamped_with_reason(fixture_json, tmp_path, monkeypatch):
+    _grok_auth(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        grok,
+        "_request_billing",
+        lambda _token: (200, fixture_json("grok_billing_used_over_limit")),
+    )
+
+    result = grok.fetch()
+
+    assert result.error is None
+    assert result.buckets[0].used_pct == 100.0
+    assert "클램프" in (result.note or "")
+    assert "한도 초과는 소진으로 처리" in (result.note or "")
 
 
 def test_grok_registry_spend_class_and_list_order():
@@ -1197,7 +1250,6 @@ def test_grok_cache_json_rendering_secret_free(fixture_json, tmp_path, monkeypat
         "_request_billing",
         lambda _token: (200, fixture_json("grok_billing")),
     )
-    monkeypatch.setattr(grok, "_fetch_plan", lambda _t: "grok pro")
 
     results = cache.collect({"grok": grok.fetch}, ["grok"], ttl_s=60, use_cache=True)
     results[0].pool_class = "spend"

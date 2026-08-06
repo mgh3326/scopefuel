@@ -4,16 +4,15 @@
 
 - grok CLI OAuth2 token(``~/.grok/auth.json``, 키 prefix ``https://auth.x.ai::``)으로
   호출하는 정본 endpoint:
-  ``GET https://cli-chat-proxy.grok.com/v1/billing?format=credits``
+  ``GET https://cli-chat-proxy.grok.com/v1/billing``
   헤더: ``Authorization: Bearer <key>``, ``x-grok-client-mode: cli``
 - 응답 ``config``:
-  - ``currentPeriod.type`` = ``USAGE_PERIOD_TYPE_WEEKLY``
-  - ``currentPeriod.end`` = 주간 리셋 시각
-  - ``creditUsagePercent`` = 계정 주간 사용률 (0~100)
+  - ``creditUsagePercent`` = 계정 사용률 (있으면 1차 사용)
+  - ``monthlyLimit`` / ``used`` = creditUsagePercent 부재 시 월간 사용률 계산
+  - ``billingPeriodEnd`` = 월간 리셋 시각
   - ``productUsage`` = 제품별 분해 (예: GrokChat, GrokBuild)
-  - ``isUnifiedBillingUser`` = true 이면 Chat/Build/API 등이 단일 주간 풀 공유
-- ``/rest/rate-limits`` 와 ``/rest/usage/free-usage-gates`` 는 더 이상 사용하지 않는다.
-  전자는 웹앱 전용이라 CLI OAuth2 토큰으로 호출하면 ``oauth2-auth-forbidden`` 이다.
+- ``monthlyLimit``/``used`` 단위는 미상이며 비율만 신뢰한다. 주간 주기 개념은
+  응답에 남을 수 있지만 주간 사용률은 측정하지 않는다.
 
 토큰·user/team 식별자·이메일·JWT claim 값은 raw/로그/픽스처에 넣지 않는다.
 """
@@ -24,7 +23,6 @@ import datetime as dt
 import json
 import math
 import pathlib
-import re
 import urllib.error
 import urllib.request
 
@@ -32,16 +30,14 @@ from ..model import Bucket, ProviderResult, Scope
 
 AUTH = pathlib.Path.home() / ".grok" / "auth.json"
 AUTH_KEY_PREFIX = "https://auth.x.ai::"
-BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
-SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions"
+BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing"
 TIMEOUT_S = 20.0
 USER_AGENT = "scopefuel"
 
 SOURCE_BILLING = "cli-billing"
 SOURCE_NO_DATA = "no-data"
-
-_TIER_RE = re.compile(r"^SUBSCRIPTION_TIER_(.+)$")
-_STATUS_ACTIVE = "SUBSCRIPTION_STATUS_ACTIVE"
+MONTHLY_WINDOW = "30d"
+WEEKLY_USAGE_NOTE = "주간 주기 개념은 있으나 주간 사용률은 측정 불가"
 
 
 def fetch() -> ProviderResult:
@@ -56,135 +52,132 @@ def fetch() -> ProviderResult:
             raw=_safe_raw(credential=credential),
         )
 
-    plan = _fetch_plan(token)
-
     try:
         status, payload = _request_billing(token)
     except Exception as exc:
         return ProviderResult(
             id="grok",
-            plan=plan,
             error=f"billing 조회 실패 ({type(exc).__name__})",
             hint="네트워크 또는 grok.com 상태를 확인하세요",
             source=SOURCE_NO_DATA,
-            raw=_safe_raw(credential=credential, plan=plan),
+            raw=_safe_raw(credential=credential),
         )
 
     if status in (401, 403):
         return ProviderResult(
             id="grok",
-            plan=plan,
             warning=f"인증 실패 (HTTP {status}) — `grok login` 후 재시도",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, billing_status=status),
+            raw=_safe_raw(credential=credential, billing_status=status),
         )
 
     if status == 429:
         return ProviderResult(
             id="grok",
-            plan=plan,
             error="billing HTTP 429",
             hint="잠시 후 다시 시도하세요",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, billing_status=status),
+            raw=_safe_raw(credential=credential, billing_status=status),
         )
 
     if status is None or status >= 400:
         return ProviderResult(
             id="grok",
-            plan=plan,
             error=f"billing HTTP {status}" if status is not None else "billing 응답 없음",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, billing_status=status),
+            raw=_safe_raw(credential=credential, billing_status=status),
         )
 
     if status != 200 or not isinstance(payload, dict):
         return ProviderResult(
             id="grok",
-            plan=plan,
             error="billing 응답 처리 실패",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, billing_status=status),
+            raw=_safe_raw(credential=credential, billing_status=status),
         )
 
-    return _from_billing(payload, plan=plan, credential=credential)
+    return _from_billing(payload, credential=credential)
 
 
 def _from_billing(
     payload: dict,
     *,
-    plan: str | None,
     credential: dict,
 ) -> ProviderResult:
     config = payload.get("config")
     if not isinstance(config, dict):
         return ProviderResult(
             id="grok",
-            plan=plan,
             error="billing 응답에 config 없음",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan),
+            raw=_safe_raw(credential=credential),
         )
 
-    current_period = config.get("currentPeriod")
-    if not isinstance(current_period, dict):
+    billing_period_end = _parse_iso(config.get("billingPeriodEnd"))
+    if not billing_period_end:
         return ProviderResult(
             id="grok",
-            plan=plan,
-            error="billing 응답에 currentPeriod 없음",
+            error="billing 응답에 유효한 billingPeriodEnd 없음",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan),
+            raw=_safe_raw(credential=credential, **_redacted_billing_raw(config)),
         )
 
-    period_type = current_period.get("type")
-    if period_type != "USAGE_PERIOD_TYPE_WEEKLY":
+    monthly_limit = _num(config.get("monthlyLimit"))
+    if monthly_limit is None or monthly_limit <= 0:
         return ProviderResult(
             id="grok",
-            plan=plan,
-            warning=f"예상치 못한 주기 유형: {period_type}",
+            error="monthlyLimit 없음 또는 0 이하 — 월간 사용률 계산 불가",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
+            raw=_safe_raw(credential=credential, **_redacted_billing_raw(config)),
         )
 
-    resets_at = _parse_iso(current_period.get("end"))
-    if not resets_at:
+    usage_source = "creditUsagePercent" if "creditUsagePercent" in config else "monthlyLimit/used"
+    usage_value = _num(config.get("creditUsagePercent"))
+    over_limit_note: str | None = None
+    if usage_value is None and usage_source == "creditUsagePercent":
         return ProviderResult(
             id="grok",
-            plan=plan,
-            warning="currentPeriod.end 파싱 실패",
+            error="creditUsagePercent 파싱 실패",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
+            raw=_safe_raw(credential=credential, usage_source=usage_source, **_redacted_billing_raw(config)),
         )
+    if usage_value is None:
+        used = _num(config.get("used"))
+        if used is None or used < 0:
+            return ProviderResult(
+                id="grok",
+                error="monthlyLimit/used 파싱 실패 — 월간 사용률 계산 불가",
+                source=SOURCE_BILLING,
+                raw=_safe_raw(
+                    credential=credential, usage_source=usage_source, **_redacted_billing_raw(config)
+                ),
+            )
+        usage_value = used / monthly_limit * 100
+        if usage_value > 100:
+            over_limit_note = (
+                "used가 monthlyLimit을 초과해 사용률을 100%로 클램프 (한도 초과는 소진으로 처리)"
+            )
 
-    credit_pct = _num(config.get("creditUsagePercent"))
-    if credit_pct is None:
+    if usage_value < 0 or (usage_source == "creditUsagePercent" and usage_value > 100):
         return ProviderResult(
             id="grok",
-            plan=plan,
-            warning="creditUsagePercent 파싱 실패",
+            error=f"{usage_source} 범위 밖 ({usage_value:g})",
             source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
+            raw=_safe_raw(credential=credential, usage_source=usage_source, **_redacted_billing_raw(config)),
         )
-    if credit_pct < 0 or credit_pct > 100:
-        return ProviderResult(
-            id="grok",
-            plan=plan,
-            warning=f"creditUsagePercent 범위 밖 ({credit_pct:g})",
-            source=SOURCE_BILLING,
-            raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
-        )
+    usage_pct = min(100.0, usage_value)
 
     is_unified = config.get("isUnifiedBillingUser") is True
-    account_note = "Chat/Build/API 단일 주간 풀" if is_unified else None
+    account_note = "Chat/Build/API 단일 월간 풀" if is_unified else None
 
     buckets: list[Bucket] = [
         Bucket(
-            label="weekly",
-            window="7d",
-            used_pct=credit_pct,
-            resets_at=resets_at,
+            label="monthly",
+            window=MONTHLY_WINDOW,
+            used_pct=usage_pct,
+            resets_at=billing_period_end,
             scope=Scope("account"),
-            horizon="week",
+            horizon="month",
             note=account_note,
         )
     ]
@@ -217,61 +210,33 @@ def _from_billing(
             buckets.append(
                 Bucket(
                     label=product,
-                    window="7d",
+                    window=MONTHLY_WINDOW,
                     used_pct=pct,
-                    resets_at=resets_at,
+                    resets_at=billing_period_end,
                     scope=Scope("group", product),
-                    horizon="week",
+                    horizon="month",
                     note="unified pool share" if is_unified else None,
                 )
             )
     elif product_usage is not None:
         problems.append("productUsage 타입이 목록이 아님")
-
-    note: str | None = None
+    note_parts = [
+        f"사용률 source={usage_source}",
+        "monthlyLimit/used 단위 미상 — 비율만 신뢰",
+        WEEKLY_USAGE_NOTE,
+    ]
+    if over_limit_note:
+        note_parts.append(over_limit_note)
     if problems:
-        # weekly account bucket 은 credit_pct 검증 후 항상 추가되므로
-        # buckets 비어 있음 경로는 도달 불가.
-        note = "partial data — " + "; ".join(problems)
+        note_parts.append("partial data — " + "; ".join(problems))
 
     return ProviderResult(
         id="grok",
-        plan=plan,
         buckets=buckets,
-        note=note,
+        note="; ".join(note_parts),
         source=SOURCE_BILLING,
-        raw=_safe_raw(credential=credential, plan=plan, **_redacted_billing_raw(config)),
+        raw=_safe_raw(credential=credential, usage_source=usage_source, **_redacted_billing_raw(config)),
     )
-
-
-def _fetch_plan(token: str) -> str | None:
-    try:
-        status, payload = _get_json(token, SUBSCRIPTIONS_URL)
-    except Exception:
-        return None
-    if status != 200 or not isinstance(payload, dict):
-        return None
-    subs = payload.get("subscriptions")
-    if not isinstance(subs, list) or not subs:
-        return None
-    chosen = None
-    for sub in subs:
-        if not isinstance(sub, dict):
-            continue
-        if sub.get("status") == _STATUS_ACTIVE:
-            chosen = sub
-            break
-        if chosen is None:
-            chosen = sub
-    if not isinstance(chosen, dict):
-        return None
-    tier = chosen.get("tier")
-    if not isinstance(tier, str):
-        return None
-    match = _TIER_RE.match(tier)
-    if match:
-        return match.group(1).lower().replace("_", " ")
-    return tier.lower()
 
 
 def _load_token() -> tuple[str | None, dict]:
@@ -327,21 +292,6 @@ def _request_billing(token: str) -> tuple[int | None, dict | None]:
     return status, None
 
 
-def _get_json(token: str, url: str) -> tuple[int | None, dict | list | None]:
-    status, raw = _request(token, url, method="GET")
-    if status is None:
-        return None, None
-    if not raw:
-        return status, None
-    try:
-        parsed = json.loads(raw.decode("utf-8", "replace"))
-    except json.JSONDecodeError:
-        return status, None
-    if isinstance(parsed, (dict, list)):
-        return status, parsed
-    return status, None
-
-
 def _request(
     token: str,
     url: str,
@@ -367,6 +317,8 @@ def _request(
 def _num(value: object) -> float | None:
     if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, dict):
+        return _num(value.get("val"))
     if isinstance(value, (int, float)):
         try:
             f = float(value)
@@ -407,8 +359,9 @@ def _redacted_billing_raw(config: dict) -> dict:
     실제로 쓰는 하위 필드만 project 해 미래 identifier 누설을 막는다.
     """
     out: dict = {}
-    if "creditUsagePercent" in config:
-        out["creditUsagePercent"] = config["creditUsagePercent"]
+    for key in ("creditUsagePercent", "monthlyLimit", "used", "billingPeriodEnd"):
+        if key in config:
+            out[key] = config[key]
     if "isUnifiedBillingUser" in config:
         out["isUnifiedBillingUser"] = config["isUnifiedBillingUser"]
 
@@ -432,6 +385,9 @@ def _safe_raw(**parts: object) -> dict:
     out: dict = {}
     for key, value in parts.items():
         if value is None:
+            continue
+        if key == "credential" and isinstance(value, dict):
+            out[key] = {name: item for name, item in value.items() if isinstance(item, bool)}
             continue
         out[key] = value
     return out
