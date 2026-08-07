@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import time
+import threading
 
 from scopefuel import cache, spec
 from scopefuel.model import Bucket, ProviderResult, Scope
@@ -184,22 +184,35 @@ def test_warning_result_is_not_cached(monkeypatch):
 
 
 def test_cache_collects_misses_in_parallel_and_preserves_name_order():
+    # 벽시계로 병렬성을 재면 CI 부하에 흔들린다 — 직렬 0.35s 대비 임계 0.30s 는 여유가
+    # 0.05s 뿐이라 느린 러너에서 0.356s 가 나와 실패했다. 그래서 소요 시간(대리 지표)이
+    # 아니라 "동시에 실행 중인 fetcher 가 몇 개였나" 라는 성질을 직접 관측한다.
     names = ["slow", "fast", "middle"]
-    delays = {"slow": 0.20, "fast": 0.05, "middle": 0.10}
+    barrier = threading.Barrier(len(names), timeout=10)
+    running = 0
+    peak = 0
+    guard = threading.Lock()
 
     def make_fetcher(name):
         def fetch():
-            time.sleep(delays[name])
+            nonlocal running, peak
+            with guard:
+                running += 1
+                peak = max(peak, running)
+            try:
+                # 전원이 도달해야 통과한다 — 직렬이면 여기서 타임아웃으로 실패한다.
+                barrier.wait()
+            finally:
+                with guard:
+                    running -= 1
             return ProviderResult(id=name)
 
         return fetch
 
-    started = time.monotonic()
     results = cache.collect({name: make_fetcher(name) for name in names}, names, use_cache=False)
-    elapsed = time.monotonic() - started
 
     assert [result.id for result in results] == names
-    assert elapsed < 0.30  # 직렬이면 약 0.35초, 병렬이면 max(delay)에 가깝다.
+    assert peak == len(names)  # 전원이 동시에 실행 중이었다
 
 
 def test_cache_fetch_exception_does_not_cancel_other_providers():
