@@ -83,7 +83,7 @@ herdr plugin link ~/work/scopefuel
 | `codex` | `~/.codex/auth.json` → `chatgpt.com/backend-api/wham/usage` | primary/secondary 창 + 모델 전용 버킷 | — |
 | `agy` | 실행 중 `agy`의 로컬 language server → 실패 시 cloudcode-pa | 로컬=weekly+5h, 클라우드=5h만 | 모델별 분해 불가(아래) |
 | `kiro` | `kiro-cli` 에 `/usage` 를 물려 출력 파싱 | 월 크레딧 1줄 (플랜+애드온 합산) | 5h급 창 없음, 호출 7초(아래) |
-| `grok` | `~/.grok/auth.json` (`https://auth.x.ai::*`.key) → `POST /rest/rate-limits` | requestKind별 remaining/total → used_pct | CLI OAuth2는 rate-limits 거부 → free-usage-gates 또는 no-data(아래) |
+| `grok` | 인증된 `grok` CLI를 PTY로 실행해 `/usage` 출력 파싱 | 주간 account 한도 → used_pct/reset | 출력 형식 의존; 실패 시 월간 폴백 없이 degraded |
 | `kimi` | `kimi` CLI를 PTY로 실행해 `/usage` 출력 파싱 | 5h·weekly account 한도 | CLI 출력 형식 의존; 429/rate-limit 재시도 없음 |
 
 **kiro는 API가 아니라 CLI를 읽습니다.** 같은 값을 주는 `GetUsageLimits` API가 있지만 토큰이
@@ -122,15 +122,11 @@ scopefuel --only myplan
 같은 `id`를 정의하면 **선언형 스펙이 내장 provider를 완전 대체**합니다 — 엔드포인트가 깨졌을 때 릴리스를
 기다리지 않고 사용자가 직접 고칠 수 있게 한 의도적 설계입니다.
 
-**grok 사용량 소스와 한계.** 웹앱 SPA가 쓰는 신뢰 가능 소스는 `POST https://grok.com/rest/rate-limits`
-(body: `requestKind` / 선택 `modelName`)이며, 응답의 `remainingQueries`·`totalQueries`·
-`windowSizeSeconds`·`waitTimeSeconds`로 used_pct/reset을 만든다. 자격증명은 `~/.grok/auth.json`에서
-키가 `https://auth.x.ai::`로 시작하는 항목의 `key` 필드만 읽는다(값·user_id·team_id·이메일은
-로그/raw에 넣지 않음). **CLI OAuth2 access token으로는 이 엔드포인트가
-`oauth2-auth-forbidden`으로 거부**된다(웹 세션 쿠키 전용). 그 경우 물티 티어 게이트
-`GET /rest/usage/free-usage-gates`(product별 allowance/remaining)를 쓰고, allowance가 모두 0이면
-**추측하지 않고 graceful no-data**(빈 buckets + note, plan은 subscriptions tier만 표시).
-completions를 날려 rate-limit 헤더를 얻는 우회는 하지 않는다.
+**grok 사용량 소스와 한계.** 웹 화면과 일치하는 주간 게이트는 인증된 `grok` CLI의
+대화형 `/usage` 출력에서 `Weekly limit: N%`와 `Next reset: Month D, HH:MM`을 읽는다.
+세션을 시작하지 않아도 이 요약이 출력되므로 토큰 비용은 없다. 연도 없는 리셋은 현재 시각을
+기준으로 이미 지난 날짜만 다음 해로 추론하고, CLI가 KST로 렌더한 시각을 KST로 해석한다.
+출력·PTY·타임아웃·파싱에 실패하면 월간 크레딧으로 조용히 대체하지 않고 degraded로 보고한다.
 
 ## provider class — preserve vs spend
 
