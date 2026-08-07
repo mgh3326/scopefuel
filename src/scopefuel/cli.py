@@ -18,6 +18,7 @@ from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
 from .providers import default_order, registry
 from .recommend import grade_help_text
+from .refresh import REFRESH_POOLS, run_worker, spawn
 
 MARK_RANK = {"ok": 0, "warn": 1, "degraded": 2, "crit": 3}
 
@@ -215,6 +216,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     gate_parser.add_argument(
         "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
     )
+
+    refresh_parser = subparsers.add_parser("refresh", help="한 pool만 이벤트 기반으로 캐시 갱신")
+    refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
+    refresh_parser.add_argument("--background", action="store_true", help="즉시 반환하고 백그라운드 갱신")
+    refresh_parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
 
     return parser
 
@@ -447,6 +453,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "gate":
         return _gate_command(args, fetchers)
+
+    if args.command == "refresh":
+        if args._worker:
+            return run_worker(fetchers, args.pool)
+        return spawn(args.pool, background=args.background)
 
     if args.list_providers:
         for name in default_order(list(fetchers)):

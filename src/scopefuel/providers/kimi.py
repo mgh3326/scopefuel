@@ -166,11 +166,19 @@ def _probe_once() -> str:
         return output.decode("utf-8", errors="replace")
     finally:
         if process is not None and process.poll() is None:
+            process_group = None
+            with contextlib.suppress(OSError):
+                process_group = os.getpgid(process.pid)
             try:
-                process.send_signal(signal.SIGTERM)
+                if process_group is not None:
+                    os.killpg(process_group, signal.SIGTERM)
                 process.wait(timeout=2.0)
             except (subprocess.TimeoutExpired, OSError):
-                process.kill()
+                if process_group is not None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(process_group, signal.SIGKILL)
+                else:
+                    process.kill()
                 process.wait(timeout=2.0)
         if slave_fd >= 0:
             os.close(slave_fd)
