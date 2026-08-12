@@ -1,7 +1,7 @@
 [pools.claude]
 price_usd = 200
 class = "preserve"
-until = "2026-08-31"
+until = "2099-12-31"  # 테스트 fixture 날짜는 실시간 경로에서 썩는다 — 원미래로 비활성화
 
 [pools.codex]
 capacity_weight = 3.5
