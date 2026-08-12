@@ -15,8 +15,10 @@ from contextlib import contextmanager
 
 from . import cache
 from .model import ProviderResult
+from .providers import BUILTIN
 
-REFRESH_POOLS = ("agy", "claude", "clinepass", "codex", "grok", "kimi", "kiro")
+# Sorted so argparse choices stay stable in `scopefuel refresh --help`.
+REFRESH_POOLS = tuple(sorted(BUILTIN))
 DEFAULT_TIMEOUT_S = 60.0
 LOCK_DIR_NAME = "refresh-locks"
 LOG_DIR_NAME = "refresh-logs"
