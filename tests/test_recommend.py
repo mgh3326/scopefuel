@@ -11,7 +11,6 @@ from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     BRAKE_KNEE_PCT,
     CODEX_SOL_XHIGH_ESCALATION_REASON,
-    CROSS_GRADE_MEASURED_REASON,
     GRADE_BOUNDARIES,
     GRADE_DISCRIM,
     GRADE_TABLE,
@@ -488,8 +487,8 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     # Both are explicit extrapolations from the high anchor; low keeps its conservative placement note.
     aplus_grok = next(p for p in GRADE_TABLE["A+"] if p.name == "grok" and p.launcher_effort == "medium")
     b_grok = next(p for p in GRADE_TABLE["B"] if p.name == "grok" and p.launcher_effort == "low")
-    assert aplus_grok.benchmark == 56.0
-    assert b_grok.benchmark == 49.0
+    assert aplus_grok.benchmark == 59.4
+    assert b_grok.benchmark == 52.0
     assert aplus_grok.benchmark_annotation == "추정(외삽)"
     assert b_grok.benchmark_annotation == "추정(외삽)"
     assert b_grok.placement_note and "보수 배치" in b_grok.placement_note
@@ -592,7 +591,7 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert not any(line[:1].isdigit() and "opus --effort low" in line for line in aplus_output.splitlines())
     # ROB-1202: Grok medium relocated here — estimated + unmeasured, not the raw high score.
     assert any(line[:1].isdigit() and "grok --effort medium" in line for line in aplus_output.splitlines())
-    assert "벤치 56.0(추정(외삽))" in aplus_output
+    assert "벤치 59.4(추정(외삽))" in aplus_output
 
     a_output = recommend(providers, "A", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "codex-luna --effort high" in line for line in a_output.splitlines())
@@ -624,18 +623,15 @@ def test_rob1204_grok_estimates_are_numeric_and_low_placement_is_explicit():
 
     aplus = recommend(providers, "A+", today=TODAY, now=NOW)
     medium_line = next(line for line in aplus.splitlines() if "grok --effort medium" in line)
-    assert "벤치 56.0(추정(외삽))" in medium_line
-    assert "grok-hi" not in "\n".join(line for line in aplus.splitlines() if line[:1].isdigit())
-    escalation_idx = next(i for i, line in enumerate(aplus.splitlines()) if "⚠ 승급 후보" in line)
-    grok_hi_idx = next(i for i, line in enumerate(aplus.splitlines()) if "grok-hi" in line)
-    assert grok_hi_idx > escalation_idx
-    assert CROSS_GRADE_MEASURED_REASON in aplus
-    assert "AA-agent 실측 64.0" in aplus
+    assert "벤치 59.4(추정(외삽))" in medium_line
+    # ROB-1244: grok-hi 가 4.6 추정으로 바뀌며 "상위 급 실측 대안" 자격을 잃었다 —
+    # 추정 프로필은 승급 후보로도 A+ 에 나타나지 않아야 한다(실측만 대안 자격).
+    assert "grok-hi" not in aplus
 
     b = recommend(providers, "B", today=TODAY, now=NOW)
     low_line = next(line for line in b.splitlines() if "grok --effort low" in line)
-    assert "벤치 49.0(추정(외삽))" in low_line
-    assert "보수 배치(B; 점수상 A 범위지만 미측정 추정치)" in low_line
+    assert "벤치 52.0(추정(외삽))" in low_line
+    assert "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)" in low_line
 
 
 def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
@@ -2048,7 +2044,7 @@ def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reaso
 
     live_scores = [
         ModelScore(
-            model_id="grok-4.5",
+            model_id="grok-4.6",
             effort=effort,
             harness="grok-build",
             source="AA-agent",
@@ -2069,7 +2065,10 @@ def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reaso
     stale_line = next(line for line in without_measurement.splitlines() if expected_label in line)
     assert "추정(외삽)" in stale_line
     stale_block = "\n".join(without_measurement.splitlines())
-    assert "추정근거: grok-4.5 high 실측(64)에서 하위 effort로 투사" in stale_block
+    from scopefuel.recommend import GROK_LOW_ESTIMATE_REASON, GROK_MEDIUM_ESTIMATE_REASON
+
+    expected_reason = GROK_MEDIUM_ESTIMATE_REASON if effort == "medium" else GROK_LOW_ESTIMATE_REASON
+    assert f"추정근거: {expected_reason}" in stale_block
 
     # After a live measurement: real score shown, stale annotation/reason both gone.
     live_line = next(
@@ -2079,7 +2078,7 @@ def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reaso
     assert "추정" not in live_line
     assert "미측정" not in live_line
     # Grok's own stale reason must be gone; other unrelated candidates' reasons (if any) are untouched.
-    assert "추정근거: grok-4.5 high 실측(64)에서 하위 effort로 투사" not in with_measurement
+    assert f"추정근거: {expected_reason}" not in with_measurement
 
 
 def test_matching_kimi_harness_has_no_warning_or_native_hint():

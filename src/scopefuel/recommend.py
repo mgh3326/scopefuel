@@ -202,14 +202,22 @@ KIMI_K3_LOW_ESTIMATE_REASON = (
     "43.0 + (72.0-68.8)/(76.2-68.8)*(61.0-43.0) = 50.8; "
     "harness-이식 아님 — 동일 모델·동일 하네스(kimi-code-cli)의 하위 effort 단계일 뿐"
 )
+# ROB-1244: 기본 모델 4.5→4.6 전환. 4.6 은 AA-agent 미발표라 전부 추정 —
+# 동일 계열·동일 하네스(grok-build) 비율 스케일: 4.5 high 실측 64.0 × (76.8/72.4) = 67.9.
+# S+ 범위(≥65)지만 에이전트 미측정이라 한 단계 보수(S). AA-agent 발표 시 bench sync 로 복원.
+GROK_HI_ESTIMATE_REASON = (
+    "grok-4.6: 4.5 high 실측 64.0 × 동일 하네스 coding 비율(76.8/72.4) = 67.9 — "
+    "S+ 범위지만 에이전트 미측정이라 S 보수 배치"
+)
+GROK_HI_PLACEMENT_NOTE = "보수 배치(S; 비율 스케일 67.9 는 S+ 범위 — AA-agent 발표 시 승급 재검토)"
 GROK_MEDIUM_ESTIMATE_REASON = (
-    "grok-4.5 high 실측(64)에서 하위 effort로 투사: 보수 하락폭 8 적용 = 56 — 하위 effort 미측정"
+    "grok-4.6 high 추정(67.9)에서 4.5 effort 곡선 비율(56/64)로 투사 = 59.4 — 하위 effort 미측정"
 )
 GROK_LOW_ESTIMATE_REASON = (
-    "grok-4.5 high 실측(64)에서 하위 effort로 투사: 56에 보수 하락폭 7 적용 = 49 — "
-    "점수상 A 범위지만 미측정 추정치라 B 보수 배치"
+    "grok-4.6 high 추정(67.9)에서 4.5 effort 곡선 비율(49/64)로 투사 = 52.0 — "
+    "점수상 A 범위지만 미측정(추정 위의 추정)이라 B 보수 배치"
 )
-GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 미측정 추정치)"
+GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)"
 CROSS_GRADE_MEASURED_REASON = "동급 후보가 미측정 추정일 때의 상위 급 실측 대안"
 
 
@@ -498,11 +506,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         Profile(
             "grok-hi",
-            "Grok 4.5",
-            64.0,
-            **_aa_agent_benchmark(64.0, "grok-4.5", "high", harness="grok-build"),
-            aa_agent_model_id="grok-4.5",
-            aa_model_id="grok-4-5",
+            "Grok 4.6",
+            67.9,
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=GROK_HI_ESTIMATE_REASON,
+            placement_note=GROK_HI_PLACEMENT_NOTE,
+            benchmark_effort="high",
+            aa_agent_model_id="grok-4.6",
+            aa_model_id="grok-4-6",
         ),
     ],
     "A+": [
@@ -563,13 +575,13 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         Profile(
             "grok",
-            "Grok 4.5 (medium)",
-            56.0,
+            "Grok 4.6 (medium)",
+            59.4,
             launcher_effort="medium",
             benchmark_effort="medium",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_MEDIUM_ESTIMATE_REASON,
-            aa_agent_model_id="grok-4.5",
+            aa_agent_model_id="grok-4.6",
         ),
         Profile(
             "codex-terra",
@@ -688,14 +700,14 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # ROB-1202: estimated + unmeasured Grok low (no lower-effort anchor to compare against).
         Profile(
             "grok",
-            "Grok 4.5 (low)",
-            49.0,
+            "Grok 4.6 (low)",
+            52.0,
             launcher_effort="low",
             benchmark_effort="low",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_LOW_ESTIMATE_REASON,
             placement_note=GROK_LOW_PLACEMENT_NOTE,
-            aa_agent_model_id="grok-4.5",
+            aa_agent_model_id="grok-4.6",
         ),
         # ROB-1202: extrapolated/unmeasured Haiku high estimate — not a Haiku medium placement.
         Profile(
@@ -929,7 +941,7 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "omniroute", None
     if profile.startswith("oc-"):
         return "clinepass", None
-    if profile in ("grok", "grok-hi", "grok-med"):
+    if profile in ("grok", "grok-hi", "grok-med", "grok45", "grok45-med", "grok46", "grok46-med"):
         return "grok", None
     return "", None
 
