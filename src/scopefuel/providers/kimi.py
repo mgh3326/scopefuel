@@ -12,13 +12,16 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import errno
+import fcntl
 import os
 import pty
 import re
 import select
 import shutil
 import signal
+import struct
 import subprocess
+import termios
 import time
 from pathlib import Path
 
@@ -34,6 +37,10 @@ PROBE_INPUT = "/usage\r"
 PROBE_WORKDIR = Path.home() / ".local" / "share" / "scopefuel" / "kimi-probe-workdir"
 TRUST_MARKER = "Trust this folder?"
 _READY_MARKERS = ("│ >", "Kimi K3 thinking", TRUST_MARKER)
+# A/B 실측(grok): 크기 미설정 PTY에서는 TUI가 usage 패널을 렌더하지 않아 timeout한다.
+# kimi 도 동일 PTY 경로이므로 같은 크기를 선제 적용한다.
+PTY_ROWS = 50
+PTY_COLS = 200
 
 _ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])")
 _PERCENT_LEFT = re.compile(r"(?P<remaining>\d+(?:\.\d+)?)\s*%\s+left", re.IGNORECASE)
@@ -83,6 +90,7 @@ def _probe_once() -> str:
     probe_workdir = Path(PROBE_WORKDIR).expanduser()
     probe_workdir.mkdir(parents=True, exist_ok=True)
     master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
     process: subprocess.Popen[bytes] | None = None
     try:
         process = subprocess.Popen(  # noqa: S603 - fixed command/input; binary is explicit/env-configured
@@ -193,6 +201,8 @@ def _child_env() -> dict[str, str]:
     for name in tuple(env):
         if name == "HERDR" or name.startswith("HERDR_"):
             del env[name]
+    env["COLUMNS"] = str(PTY_COLS)
+    env["LINES"] = str(PTY_ROWS)
     return env
 
 
