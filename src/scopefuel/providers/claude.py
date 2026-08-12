@@ -26,9 +26,7 @@ from ..http import request_json
 from ..model import Bucket, ProviderResult, Scope
 
 CREDENTIALS = pathlib.Path.home() / ".claude" / ".credentials.json"
-KEYCHAIN_SERVICE = os.environ.get(
-    "SCOPEFUEL_CLAUDE_KEYCHAIN_SERVICE", "Claude Code-credentials"
-)
+KEYCHAIN_SERVICE = os.environ.get("SCOPEFUEL_CLAUDE_KEYCHAIN_SERVICE", "Claude Code-credentials")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 BETA_HEADER = "oauth-2025-04-20"
 

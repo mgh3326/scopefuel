@@ -57,9 +57,7 @@ def test_claude_falls_back_to_keychain_when_file_absent(fixture_json, monkeypatc
 
 def test_claude_prefers_file_over_keychain(fixture_json, monkeypatch, tmp_path):
     creds = tmp_path / ".credentials.json"
-    creds.write_text(
-        json.dumps({"claudeAiOauth": {"accessToken": "fromfile", "subscriptionType": "pro"}})
-    )
+    creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "fromfile", "subscriptionType": "pro"}}))
     monkeypatch.setattr(claude, "CREDENTIALS", creds)
     monkeypatch.setattr(claude, "_read_keychain", _unexpected_keychain_call)
     seen: dict[str, str] = {}
@@ -93,9 +91,7 @@ def test_claude_falls_back_when_file_has_no_token(fixture_json, monkeypatch, tmp
 
 def test_claude_keychain_reader_is_darwin_only(monkeypatch):
     monkeypatch.setattr(claude.sys, "platform", "linux")
-    monkeypatch.setattr(
-        claude.subprocess, "run", _unexpected_security_call
-    )
+    monkeypatch.setattr(claude.subprocess, "run", _unexpected_security_call)
     assert claude._read_keychain() is None
 
 
