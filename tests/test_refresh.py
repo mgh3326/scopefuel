@@ -11,7 +11,9 @@ import time
 from pathlib import Path
 
 from scopefuel import cache, refresh
+from scopefuel.cli import build_parser
 from scopefuel.model import Bucket, ProviderResult, Scope
+from scopefuel.providers import BUILTIN
 
 
 def _result(pool: str, used: float = 10.0) -> ProviderResult:
@@ -119,6 +121,18 @@ def test_refresh_timeout_kills_worker_process_group(tmp_path):
         ["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True, check=False
     )
     assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
+
+
+def test_refresh_pools_match_provider_registry():
+    """refresh 가 아는 pool 은 providers.BUILTIN 에서만 파생한다 (하드코딩 목록 금지)."""
+
+    expected = tuple(sorted(BUILTIN))
+    assert expected == refresh.REFRESH_POOLS
+
+    parser = build_parser(list(BUILTIN))
+    refresh_parser = parser._subparsers._group_actions[0].choices["refresh"]
+    pool_action = next(action for action in refresh_parser._actions if action.dest == "pool")
+    assert expected == tuple(pool_action.choices)
 
 
 def test_refresh_rejects_unknown_pool_before_fetch():
