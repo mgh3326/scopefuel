@@ -59,6 +59,39 @@ def test_fetch_uses_a_pty_and_sends_usage_once(tmp_path, monkeypatch):
     ]
 
 
+def test_fetch_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypatch):
+    binary = tmp_path / "fake-kimi-winsize"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "printf 'Kimi Code\\r\\n'\n"
+        'printf \'LINES=%s COLUMNS=%s\\r\\n\' "$LINES" "$COLUMNS"\n'
+        "sleep 0.1\n"
+        "printf '│ >\\r\\n'\n"
+        "IFS= read -r command\n"
+        "[ \"$command\" = '/usage' ] || exit 9\n"
+        "printf 'Weekly: 80%% left (resets in 1d)\\r\\n5h: 50%% left (resets in 1h)\\r\\n'\n"
+    )
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(kimi, "BINARY", str(binary))
+    ioctl_calls = []
+    original_ioctl = kimi.fcntl.ioctl
+
+    def recording_ioctl(fd, request, argument):
+        ioctl_calls.append((fd, request, argument))
+        return original_ioctl(fd, request, argument)
+
+    monkeypatch.setattr(kimi.fcntl, "ioctl", recording_ioctl)
+
+    result = kimi.fetch()
+
+    assert result.error is None
+    assert result.buckets[0].used_pct == 50.0
+    assert ioctl_calls
+    assert ioctl_calls[0][1] == kimi.termios.TIOCSWINSZ
+    assert kimi.struct.unpack("HHHH", ioctl_calls[0][2]) == (50, 200, 0, 0)
+    assert "LINES=50" in result.raw["stdout"] or "COLUMNS=200" in result.raw["stdout"]
+
+
 def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch):
     binary = tmp_path / "fake-kimi-trust"
     binary.write_text(
@@ -110,3 +143,5 @@ def test_child_env_removes_herdr_integration_variables(monkeypatch):
 
     assert "HERDR_PANE_ID" not in child_env
     assert "HERDR_AGENT_STATE" not in child_env
+    assert child_env["COLUMNS"] == "200"
+    assert child_env["LINES"] == "50"
