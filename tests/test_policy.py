@@ -98,7 +98,8 @@ def test_set_and_clear_command_round_trip(policy_config, capsys, monkeypatch):
 def test_set_exclude_class_round_trip(policy_config, capsys, monkeypatch):
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
     assert (
-        cli.main(["policy", "set", "claude", "exclude", "--until", "2026-08-31", "--note", "Pro 요금제"]) == 0
+        cli.main(["policy", "set", "claude", "exclude", "--until", str(STILL_ACTIVE), "--note", "Pro 요금제"])
+        == 0
     )
     assert policy.get_policy("claude", "preserve", today=TODAY)[0] == "exclude"
     out = capsys.readouterr().out
@@ -181,7 +182,7 @@ def test_boost_set_without_class_only_touches_boost(policy_config):
 def test_boost_only_new_pool_keeps_builtin_class_and_clean_policy_list(policy_config, capsys, monkeypatch):
     """ROB-1212: omitting class must not create an ``invalid class None`` row."""
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
-    assert cli.main(["policy", "set", "grok", "--boost", "2", "--until", "2026-08-10"]) == 0
+    assert cli.main(["policy", "set", "grok", "--boost", "2", "--until", str(STILL_ACTIVE)]) == 0
     builtin_class = getattr(BUILTIN["grok"], "pool_class", "preserve")
     assert policy.get_policy("grok", builtin_class, today=TODAY) == (builtin_class, None)
     capsys.readouterr()
