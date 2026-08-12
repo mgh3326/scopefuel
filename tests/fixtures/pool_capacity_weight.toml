@@ -6,9 +6,6 @@ until = "2026-08-31"
 [pools.codex]
 capacity_weight = 3.5
 
-[pools.kiro]
-capacity_weight = 0
-
 [pools.grok]
 price_usd = -10
 

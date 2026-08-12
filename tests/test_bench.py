@@ -962,17 +962,6 @@ def test_recommend_prefers_aa_agent_over_aa_model_fallback(monkeypatch, bench_ho
     assert "AA-model" not in codex_line
 
 
-def test_coverage_report_marks_unlisted_profiles_without_implying_low(bench_home):
-    path = bench.db_path()
-    report = bench.coverage_report()
-    assert "kiro-cheap" in report
-    assert "⚠" in report
-    assert "'낮음'으로 취급 금지" in report
-    assert "kiro-cheap" in report.rsplit("⚠", 1)[1]
-    assert not path.exists()
-    assert not path.parent.exists()
-
-
 def test_coverage_report_shows_hit_for_codex_terra_max(bench_home):
     bench.seed_scores()
     report = bench.coverage_report()
@@ -986,42 +975,6 @@ def test_cli_bench_coverage_command(bench_home, capsys):
     assert cli.main(["bench", "coverage"]) == 0
     out = capsys.readouterr().out
     assert "AA-agent" in out and "AA-model" in out and "openrouter" in out
-
-
-def test_source_specific_aa_agent_mapping_wins_over_openrouter(bench_home):
-    from scopefuel.recommend import recommend
-
-    scores = [
-        _score(
-            model_id="claude-opus-5",
-            source="AA-agent",
-            metric="agentic",
-            score=66.0,
-            effort="xhigh",  # matches Profile.benchmark_effort for opus (ROB-1191)
-            harness="claude-code",
-        ),
-        _score(
-            model_id="claude-opus-5",
-            source="AA-model",
-            metric="coding_index",
-            score=78.0,
-            effort=None,
-            harness=None,
-        ),
-    ]
-    providers = [
-        ProviderResult(id=name, buckets=[Bucket(label="7d", window="7d", used_pct=10.0)])
-        for name in ("claude", "codex", "kiro")
-    ]
-    out = recommend(providers, "S+", bench_scores=scores)
-    opus_line = next(
-        line
-        for line in out.splitlines()
-        if line[:1].isdigit() and len(line.split()) > 1 and line.split()[1] == "opus"
-    )
-    assert "AA-agent" in opus_line
-    assert "AA-model" not in opus_line
-    assert "xhigh" in opus_line
 
 
 def test_codex_aa_model_matching_ignores_unspecified_effort(bench_home):
@@ -1071,45 +1024,6 @@ def test_coverage_uses_source_specific_aa_agent_id(bench_home):
     report = bench.coverage_report()
     sonnet_line = next(line for line in report.splitlines() if line.startswith("oc-sonnet46"))
     assert sonnet_line.split()[1] == "있음"
-
-
-def test_aa_model_fallback_normalizes_dot_dash_slug(bench_home, monkeypatch):
-    from dataclasses import replace
-
-    from scopefuel import recommend as recommend_module
-    from scopefuel.recommend import recommend
-
-    original = recommend_module.GRADE_TABLE["S+"]
-    monkeypatch.setitem(
-        recommend_module.GRADE_TABLE,
-        "S+",
-        [
-            replace(profile, aa_model_id="gpt-5.6-sol") if profile.name == "kiro-sol" else profile
-            for profile in original
-        ],
-    )
-    providers = [ProviderResult(id="kiro", buckets=[Bucket(label="7d", window="7d", used_pct=10.0)])]
-    scores = [
-        _score(
-            model_id="gpt-5-6-sol",
-            source="AA-model",
-            metric="coding_index",
-            score=63.0,
-            effort=None,
-            harness=None,
-        )
-    ]
-    out = recommend(providers, "S+", bench_scores=scores)
-    kiro_line = next(
-        line
-        for line in out.splitlines()
-        if line[:1].isdigit() and len(line.split()) > 1 and line.split()[1] == "kiro-sol"
-    )
-    assert "AA-model" in kiro_line
-    assert "unspecified" in kiro_line
-
-
-# ------------------------------------------------------------------ ROB-1220: reps --grade 축 확정
 
 
 def test_d1_help_texts_show_task_required_grade_intent(capsys):

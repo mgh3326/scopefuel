@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from . import cache
 from .model import ProviderResult
 
-REFRESH_POOLS = ("agy", "claude", "clinepass", "codex", "grok", "kimi", "kiro")
+REFRESH_POOLS = ("agy", "claude", "clinepass", "codex", "grok", "kimi")
 DEFAULT_TIMEOUT_S = 60.0
 LOCK_DIR_NAME = "refresh-locks"
 LOG_DIR_NAME = "refresh-logs"

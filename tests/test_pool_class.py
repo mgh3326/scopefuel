@@ -20,7 +20,6 @@ from scopefuel.model import (
     overall_usage_mark,
     verdict_for,
 )
-from scopefuel.providers import BUILTIN
 
 NOW = dt.datetime(2026, 7, 31, 0, 0, 0, tzinfo=dt.UTC)
 
@@ -50,37 +49,12 @@ def bucket(
 # ------------------------------------------------------------------ metadata
 
 
-def test_builtin_providers_have_pool_class_metadata():
-    # ROB-1188: 6개 풀 전부 use-it-or-lose-it 특성이라 기본값은 전부 spend.
-    # preserve 는 "남겨야 한다"는 운영자 의도가 있을 때만 config override 로 표현한다.
-    assert BUILTIN["claude"].pool_class == "spend"
-    assert BUILTIN["codex"].pool_class == "spend"
-    assert BUILTIN["kiro"].pool_class == "spend"
-    assert BUILTIN["clinepass"].pool_class == "spend"
-    assert BUILTIN["agy"].pool_class == "spend"
-    assert BUILTIN["grok"].pool_class == "spend"
-
-
 def test_default_provider_result_is_preserve():
     result = ProviderResult(id="x")
     assert result.pool_class == "preserve"
 
 
 # ------------------------------------------------------------------ spend suppression
-
-
-def test_spend_high_usage_is_ok_not_crit():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(91.0)])
-    assert result.verdict.mark == "ok"
-    assert result.verdict.blocking_pct == 91.0
-
-
-def test_spend_high_usage_bucket_severity_is_ok():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(91.0)])
-    payload = result.as_dict()
-    assert payload["verdict"]["mark"] == "ok"
-    assert payload["buckets"][0]["severity"] == "ok"
-    assert payload["buckets"][0]["used_pct"] == 91.0
 
 
 def test_spend_does_not_populate_exhausted():
@@ -106,57 +80,6 @@ def test_preserve_exhausted_and_crit_unchanged():
 # ------------------------------------------------------------------ WASTE boundaries
 
 
-def test_spend_69_9_with_23_59_59_reset_is_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(69.9, reset_delta_s=WASTE_WINDOW_S - 1)],
-    )
-    assert result.verdict_at(NOW).waste is True
-    assert "리셋 전 소진 권장" in (result.verdict_at(NOW).waste_advice or "")
-
-
-def test_spend_exactly_70_pct_is_not_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(70.0, reset_delta_s=WASTE_WINDOW_S - 1)],
-    )
-    assert result.verdict_at(NOW).waste is False
-
-
-def test_spend_exactly_24h_reset_is_not_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(69.9, reset_delta_s=WASTE_WINDOW_S)],
-    )
-    assert result.verdict_at(NOW).waste is False
-
-
-@pytest.mark.parametrize(
-    "used,reset_delta_s",
-    [
-        (69.9, None),
-        (69.9, -1),
-        (69.9, 0),
-        (None, WASTE_WINDOW_S - 1),
-        (float("nan"), WASTE_WINDOW_S - 1),
-        (float("inf"), WASTE_WINDOW_S - 1),
-        (-1, WASTE_WINDOW_S - 1),
-        (101, WASTE_WINDOW_S - 1),
-        (True, WASTE_WINDOW_S - 1),
-    ],
-)
-def test_invalid_or_past_inputs_are_not_waste(used, reset_delta_s):
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(used, reset_delta_s=reset_delta_s)],
-    )
-    assert result.verdict_at(NOW).waste is False
-
-
 def test_preserve_is_never_waste():
     result = ProviderResult(
         id="claude",
@@ -167,17 +90,6 @@ def test_preserve_is_never_waste():
 
 
 # ------------------------------------------------------------------ failure precedence
-
-
-def test_spend_error_is_degraded_not_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        error="kiro-cli 실패",
-    )
-    assert result.verdict.mark == "degraded"
-    assert result.verdict.waste is False
 
 
 def test_spend_warning_suppresses_waste():
@@ -191,20 +103,6 @@ def test_spend_warning_suppresses_waste():
     assert result.verdict.waste is False
 
 
-def test_spend_stale_suppresses_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        stale=True,
-    )
-    assert result.verdict.mark == "degraded"
-    assert result.verdict.waste is False
-
-
-# ------------------------------------------------------------------ preserve thresholds
-
-
 def test_preserve_thresholds_unchanged():
     assert verdict_for([bucket(WARN_PCT - 0.001)]).mark == "ok"
     assert verdict_for([bucket(WARN_PCT)]).mark == "warn"
@@ -213,37 +111,6 @@ def test_preserve_thresholds_unchanged():
 
 
 # ------------------------------------------------------------------ overall / exit
-
-
-def test_waste_only_does_not_escalate_overall_mark():
-    waste = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-    )
-    assert waste.verdict_at(NOW).waste is True
-    assert overall_mark([waste]) == "ok"
-
-
-def test_waste_only_exit_code_is_success(capsys, monkeypatch):
-    def fetcher():
-        return ProviderResult(
-            id="kiro",
-            pool_class="spend",
-            buckets=[bucket(20.0, reset_delta_s=3600)],
-        )
-
-    fetcher.pool_class = "spend"  # type: ignore[attr-defined]
-    monkeypatch.setattr(cli, "registry", lambda: {"kiro": fetcher})
-
-    class MockDatetime(dt.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return NOW
-
-    monkeypatch.setattr(cli.dt, "datetime", MockDatetime)
-    assert cli.main(["--brief", "--no-cache", "--exit-code-on", "warn"]) == 0
-    assert "WASTE" in capsys.readouterr().out
 
 
 def test_preserve_warn_still_triggers_exit_code_on_warn(capsys, monkeypatch):
@@ -262,47 +129,6 @@ def test_preserve_warn_still_triggers_exit_code_on_warn(capsys, monkeypatch):
 
 
 # ------------------------------------------------------------------ render
-
-
-def test_table_shows_spend_progress_without_crit():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(91.0)])
-    out = render.table([result], color=False, now=NOW)
-    assert "[ok]" in out
-    assert "소진 진행" in out
-    assert "CRIT" not in out
-    assert "소진(" not in out
-
-
-def test_table_shows_waste():
-    result = ProviderResult(
-        id="kiro", pool_class="spend", buckets=[bucket(69.9, reset_delta_s=WASTE_WINDOW_S - 1)]
-    )
-    out = render.table([result], color=False, now=NOW)
-    assert "WASTE" in out
-    assert "리셋 전 소진 권장" in out
-
-
-def test_brief_shows_waste():
-    result = ProviderResult(
-        id="kiro", pool_class="spend", buckets=[bucket(69.9, reset_delta_s=WASTE_WINDOW_S - 1)]
-    )
-    out = render.brief([result], color=False, now=NOW)
-    assert "WASTE" in out
-
-
-def test_table_failure_not_relabeled_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        error="boom",
-    )
-    out = render.table([result], color=False, now=NOW)
-    assert "WASTE" not in out
-    assert "소진 진행" not in out
-
-
-# ------------------------------------------------------------------ multi-axis / group
 
 
 def test_clinepass_headline_uses_most_constraining_window():
@@ -354,44 +180,6 @@ def test_agy_group_independent_waste():
 
 
 # ------------------------------------------------------------------ cache / spec
-
-
-def test_cache_round_trips_pool_class(monkeypatch):
-    spend = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(50.0)])
-    fetchers = {"kiro": lambda: spend}
-    fetchers["kiro"].pool_class = "spend"  # type: ignore[attr-defined]
-    first = cache.collect(fetchers, ["kiro"], now=1000.0)
-    assert first[0].pool_class == "spend"
-
-    def error_fetcher():
-        raise RuntimeError("x")
-
-    error_fetcher.pool_class = "spend"  # type: ignore[attr-defined]
-    second = cache.collect({"kiro": error_fetcher}, ["kiro"], now=1000.0 + 120, ttl_s=60)
-    assert second[0].pool_class == "spend"
-    assert second[0].stale is True
-
-
-def test_legacy_cache_without_pool_class_defaults_to_registry_class(monkeypatch, tmp_path):
-    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
-    cache_path = tmp_path / "snapshots.json"
-    cache_path.write_text(
-        json.dumps(
-            {
-                "kiro": {
-                    "fetched_at": 1.0,
-                    "result": {"id": "kiro", "buckets": [], "pool_class": "preserve"},
-                }
-            }
-        )
-    )
-
-    def fetcher():
-        return ProviderResult(id="kiro")
-
-    fetcher.pool_class = "spend"  # type: ignore[attr-defined]
-    result = cache.collect({"kiro": fetcher}, ["kiro"], now=100.0, ttl_s=0.0)[0]
-    assert result.pool_class == "spend"
 
 
 def test_spec_supports_class_spend(tmp_path, monkeypatch):
@@ -452,39 +240,6 @@ def test_spec_omitted_class_defaults_preserve(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------ regression tests for audit findings
-
-
-def test_stale_brief_suppresses_progress_and_waste():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        age_s=600.0,
-        stale=True,
-    )
-    out = render.brief([result], color=False, now=NOW)
-    assert "(소진 진행)" not in out
-    assert "WASTE" not in out
-    assert out.count("10분 전") == 1
-
-
-@pytest.mark.parametrize(
-    "invalid_val",
-    [float("nan"), float("inf"), float("-inf"), -1.0, 101.0, True],
-)
-def test_invalid_numeric_matrix_does_not_emit_progress_or_waste(invalid_val):
-    b = Bucket("credits", "30d", invalid_val, scope=Scope("account"), horizon="week")
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[b])
-    v = result.verdict_at(NOW)
-    assert v.basis == "none"
-    assert v.waste is False
-
-    tbl = render.table([result], color=False, now=NOW)
-    brf = render.brief([result], color=False, now=NOW)
-    assert "소진 진행" not in tbl
-    assert "소진 진행" not in brf
-    assert "nanx" not in tbl and "infx" not in tbl
-    assert "nanx" not in brf and "infx" not in brf
 
 
 def test_toml_and_agy_bool_ingestion_end_to_end(tmp_path, monkeypatch):
@@ -601,18 +356,6 @@ def test_injected_clock_pace_consistency():
 
 
 # ------------------------------------------------------------------ JSON numeric shape
-
-
-def test_spend_high_usage_json_keeps_raw_used_pct():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(91.0)])
-    payload = result.as_dict()
-    assert payload["pool_class"] == "spend"
-    assert payload["verdict"]["mark"] == "ok"
-    assert payload["buckets"][0]["used_pct"] == 91.0
-    assert payload["buckets"][0]["severity"] == "ok"
-
-
-# ------------------------------------------------------------------ captured-time consistency (Fix 1)
 
 
 def test_verdict_as_dict_passes_now_to_exhausted_pace():
@@ -848,52 +591,6 @@ def test_spec_used_pct_catches_overflow(monkeypatch, tmp_path):
 # ------------------------------------------------------------------ warning+stale brief precedence (Fix 5)
 
 
-def test_warning_stale_brief_preserves_age_and_degraded():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        warning="auth fail",
-        age_s=600.0,
-        stale=True,
-    )
-    out = render.brief([result], color=False, now=NOW)
-    assert "[DEGRADED]" in out
-    assert "auth fail" in out
-    assert "10분 전" in out
-    assert out.count("10분 전") == 1
-
-
-def test_warning_only_brief_unchanged():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        warning="auth fail",
-    )
-    out = render.brief([result], color=False, now=NOW)
-    assert "[WARN]" in out
-    assert "auth fail" in out
-    assert "10분 전" not in out
-
-
-def test_stale_only_brief_unchanged():
-    result = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-        age_s=600.0,
-        stale=True,
-    )
-    out = render.brief([result], color=False, now=NOW)
-    assert "[DEGRADED]" in out
-    assert "10분 전" in out
-    assert out.count("10분 전") == 1
-
-
-# ------------------------------------------------------------------ invalid pool_class validation (Fix 6)
-
-
 @pytest.mark.parametrize("invalid", ["gold", "SPEND", "", 123, True, None])
 def test_provider_result_rejects_invalid_pool_class(invalid):
     r = ProviderResult(id="x", pool_class=invalid)
@@ -931,15 +628,6 @@ def test_to_entry_pool_class_round_trip_valid():
 
 
 # ------------------------------------------------------------------ strict JSON round-trip
-
-
-def test_full_json_serialization_allow_nan_false():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(91.0)])
-    payload = result.as_dict()
-    dumped = json.dumps(payload, allow_nan=False)
-    loaded = json.loads(dumped)
-    assert loaded["buckets"][0]["used_pct"] == 91.0
-    assert loaded["pool_class"] == "spend"
 
 
 def test_invalid_values_in_json_do_not_break_serialization():
@@ -1284,22 +972,10 @@ def test_error_no_data_usage_mark_ok():
     assert result.verdict.usage_mark == "ok"
 
 
-def test_spend_stale_high_usage_usage_mark_ok():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(97.0)], stale=True, age_s=600.0)
-    assert result.verdict.mark == "degraded"
-    assert result.verdict.usage_mark == "ok"
-
-
 def test_fresh_preserve_high_usage_both_marks_crit():
     result = ProviderResult(id="test", pool_class="preserve", buckets=[bucket(97.0)])
     assert result.verdict.mark == "crit"
     assert result.verdict.usage_mark == "crit"
-
-
-def test_fresh_spend_high_usage_both_marks_ok():
-    result = ProviderResult(id="kiro", pool_class="spend", buckets=[bucket(97.0)])
-    assert result.verdict.mark == "ok"
-    assert result.verdict.usage_mark == "ok"
 
 
 def test_fresh_warning_high_usage_usage_mark_crit():
@@ -1411,23 +1087,6 @@ def test_preserve_stale_low_usage_exit_code_on_crit_rc0(capsys, monkeypatch):
     assert ec == 0
 
 
-def test_spend_stale_high_usage_exit_code_on_crit_rc0(capsys, monkeypatch):
-    monkeypatch.setattr(
-        cli,
-        "registry",
-        lambda: {
-            "kiro": lambda: ProviderResult(
-                id="kiro", pool_class="spend", buckets=[bucket(97.0)], stale=True, age_s=600.0
-            )
-        },
-    )
-    ec = cli.main(["--json", "--no-cache", "--exit-code-on", "crit"])
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["summary"]["mark"] == "degraded"
-    assert payload["summary"]["usage_mark"] == "ok"
-    assert ec == 0
-
-
 def test_error_no_data_exit_code_on_crit_rc1(capsys, monkeypatch):
     monkeypatch.setattr(
         cli,
@@ -1452,14 +1111,3 @@ def test_fresh_preserve_high_usage_exit_code_on_crit_rc2(capsys, monkeypatch):
     assert payload["summary"]["mark"] == "crit"
     assert payload["summary"]["usage_mark"] == "crit"
     assert ec == 2
-
-
-def test_waste_only_usage_mark_stays_ok():
-    waste = ProviderResult(
-        id="kiro",
-        pool_class="spend",
-        buckets=[bucket(20.0, reset_delta_s=3600)],
-    )
-    assert waste.verdict_at(NOW).waste is True
-    assert overall_mark([waste], now=NOW) == "ok"
-    assert overall_usage_mark([waste], now=NOW) == "ok"

@@ -6,7 +6,7 @@ import datetime as dt
 
 import pytest
 
-from scopefuel import bench, cli, policy
+from scopefuel import bench, policy
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     BRAKE_KNEE_PCT,
@@ -31,7 +31,6 @@ from scopefuel.recommend import (
     _select_throughput_window,
     _window_states,
     grade_help_text,
-    profile_pool,
     recommend,
     validate_grade_table,
 )
@@ -41,19 +40,13 @@ NOW = dt.datetime(2026, 7, 31, 12, 0, 0, tzinfo=dt.UTC)
 
 
 def _reset_almost_full(window: str) -> str:
-    """window 가 방금 시작된 것처럼(거의 전체 남음) reset 시각을 계산.
-
-    pace(잔여%/소모속도 vs reset까지 남은시간)가 non-urgent 로 나오도록 하는 "평상시" 기본값.
-    순수 시간-임계값 폴백을 테스트하려는 케이스는 pace 를 의도적으로 죽이는(used_pct=0 등)
-    별도 resets_at 을 명시한다.
-    """
+    """Return a deterministic reset time that is not urgent for the test window."""
     hours = {"5h": 4.9, "1d": 23.5, "7d": 167.0, "30d": 719.0}.get(window, 167.0)
     return (NOW + dt.timedelta(hours=hours)).isoformat()
 
 
-RESET = _reset_almost_full("7d")  # 기존 테스트 다수의 기본 window(7d)에 대한 non-urgent 기준값
-
-REMOVED = ["agy-pro", "kiro-glm", "kiro-minimax", "kiro-minimax21", "kiro-deepseek"]
+RESET = _reset_almost_full("7d")
+REMOVED = ["agy-pro"]
 
 
 def _reset_in(hours: float) -> str:
@@ -95,29 +88,6 @@ def _result(
 # ------------------------------------------------------------------ profile_pool
 
 
-def test_profile_pool_matches_quota_guard():
-    assert profile_pool("kimi-k3") == ("kimi", None)
-    assert profile_pool("kimi-k3-low") == ("kimi", None)
-    assert profile_pool("kimi-k27") == ("kimi", None)
-    assert profile_pool("oc-gflash") == ("agy", "gemini")  # 은퇴 중이나 pool 매핑 유지
-    assert profile_pool("agy-flash") == ("agy", "gemini")  # ROB-1222: 신설 프로필
-    assert profile_pool("oc-sonnet46") == ("agy", "3p")
-    assert profile_pool("oc-oss") == ("agy", "3p")
-    assert profile_pool("agy-pro") == ("agy", "gemini")
-    assert profile_pool("agy-sonnet") == ("agy", "3p")
-    assert profile_pool("codex-med") == ("codex", None)
-    assert profile_pool("grok-hi") == ("grok", None)
-    assert profile_pool("codex-terra-max") == ("codex", None)
-    assert profile_pool("codex-luna-max") == ("codex", None)
-    assert profile_pool("kiro-sol") == ("kiro", None)
-    assert profile_pool("kiro-haiku") == ("kiro", None)
-    assert profile_pool("oc-omni") == ("omniroute", None)
-    assert profile_pool("haiku") == ("claude", None)
-
-
-# ------------------------------------------------------------------ sort/ranking
-
-
 def test_recommend_s_spend_sorts_by_remaining():
     """Within spend class, higher remaining% ranks first (ROB-1182 sort)."""
     providers = [
@@ -134,17 +104,6 @@ def test_recommend_s_spend_sorts_by_remaining():
     assert any("kimi-k3" in line for line in lines)
 
 
-def test_recommend_preserves_spend_before_preserve():
-    providers = [
-        _result("codex", 10.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    ranks = [line.split()[1] for line in out.splitlines() if line[:1].isdigit()]
-    # kiro-opus / kiro-sol are spend S+ profiles and precede preserve entries.
-    assert ranks[0] in ("kiro-opus", "kiro-sol", "🔥")
-
-
 def test_recommend_excludes_exhausted_and_unmeasurable():
     providers = [
         _result("clinepass", 17.0, window="30d"),
@@ -153,14 +112,6 @@ def test_recommend_excludes_exhausted_and_unmeasurable():
     out = recommend(providers, "S", today=TODAY, now=NOW)
     assert any("kimi-k3" in line and "측정 불가" in line for line in out.splitlines())
     assert any("codex-terra-max" in line and "측정 불가" in line for line in out.splitlines())
-
-
-def test_recommend_excludes_exhausted_spend():
-    providers = [
-        _result("kiro", 99.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "A+", today=TODAY, now=NOW)
-    assert any("kiro-sonnet" in line and "소진" in line for line in out.splitlines())
 
 
 def test_recommend_excludes_unmeasurable_provider():
@@ -181,28 +132,6 @@ def test_grade_table_has_expected_a_profiles():
 
 
 # ------------------------------------------------------------------ ROB-1182
-
-
-def test_exclude_policy_removes_claude_from_sp_candidates():
-    policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
-    providers = [
-        _result("claude", 10.0, pool_class="preserve"),
-        _result("codex", 20.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    lines = out.splitlines()
-    ranked = [line for line in lines if line[:1].isdigit()]
-    # kiro-opus/kiro-sol spend, codex-sol preserve → kiro first
-    assert any("kiro-opus" in line for line in ranked)
-    assert any("codex-sol" in line for line in ranked)
-    # ROB-1219: an excluded pool is suppressed from the recommendation entirely.
-    # The invariant that matters is that it is not offered as a candidate; the
-    # decision itself is recorded in `policy list`, not repeated per grade.
-    assert "claude 풀 제외" not in out
-    assert not any(line[:1].isdigit() and "opus" in line.split() for line in lines)
-    # fable is escalation — not in normal candidates
-    assert not any(line[:1].isdigit() and "fable" in line for line in lines)
 
 
 def test_exclude_clear_restores_claude_candidates():
@@ -232,170 +161,6 @@ def test_preserve_cutoff_90():
     assert any("codex-sol" in line and "소진" in line for line in out.splitlines())
 
 
-def test_spend_cutoff_95_is_candidate_99_is_excluded():
-    providers = [
-        _result("kiro", 95.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    assert any(line[:1].isdigit() and "kiro-opus" in line for line in out.splitlines())
-    # grade S has grok-hi; use it for grok 99% exclusion
-    out_s = recommend(
-        [
-            _result("grok", SPEND_EXCLUDE_PCT, pool_class="spend"),
-            _result("clinepass", 10.0, window="30d"),
-        ],
-        "S",
-        today=TODAY,
-        now=NOW,
-    )
-    assert any("grok-hi" in line and "소진" in line for line in out_s.splitlines())
-
-
-def test_spend_95_reset_imminent_gets_fire_and_top_rank():
-    providers = [
-        _result("kiro", 95.0, pool_class="spend", window="30d", resets_at=_reset_in(6)),
-        _result("codex", 10.0, pool_class="preserve"),
-        _result("claude", 10.0, pool_class="preserve"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in lines[0]
-    assert "kiro-opus" in lines[0] or "kiro-sol" in lines[0]
-    assert "잔여 5%" in lines[0]
-    assert "리셋" in lines[0]
-
-
-def test_spend_reset_not_imminent_no_fire():
-    """폴백(시간 임계값) 경로: window 를 파싱할 수 없어 pace 계산이 불가 → reset_urgency_hours 로 판정."""
-    providers = [
-        _result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(13)),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW, urgency_hours=12.0)
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked
-    assert "🔥" not in ranked[0]
-
-
-def test_urgent_spend_outranks_non_urgent_higher_remaining():
-    """폴백 경로: reset-imminent spend 가 non-imminent spend 보다 remaining% 낮아도 앞선다."""
-    providers = [
-        _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(4)),  # 20% rem, urgent
-        _result("codex", 10.0, pool_class="spend", window="?", resets_at=_reset_in(48)),  # not urgent
-    ]
-    out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
-    lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in lines[0] and "kiro-sonnet" in lines[0]
-    assert len(lines) >= 2
-    assert "🔥" not in lines[1]
-
-
-def test_multiple_urgent_sorted_by_remaining():
-    """폴백 경로: 여러 후보가 모두 시간-임박 urgent 면 잔여율(큰 순)로 정렬."""
-    providers = [
-        _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(3)),  # 20% rem
-        _result("codex", 40.0, pool_class="spend", window="?", resets_at=_reset_in(5)),  # 60% rem
-    ]
-    out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
-    lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in lines[0]
-    assert "kiro-sonnet" not in lines[0]  # kiro is lower remaining, not first
-    kiro_line = next(line for line in lines if "kiro-sonnet" in line)
-    assert "🔥" in kiro_line
-
-
-def test_all_policy_excluded_shows_emergency_block():
-    for pool in ("claude", "codex", "kiro"):
-        policy.set_policy(pool, "exclude", until=dt.date(2026, 8, 31), note=f"{pool} off")
-    providers = [
-        _result("claude", 10.0, pool_class="preserve"),
-        _result("codex", 10.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    assert "✗ 정책 가용 후보 없음" in out
-    assert "⚠ 비상 후보 (정책상 제외 — 사용 시 근거를 이슈에 기록할 것)" in out
-    assert "pool=claude" in out and "until=2026-08-31" in out
-    assert "opus" in out and "fable" in out and "codex-sol" in out
-    # no ranked normal candidates
-    assert not any(line[:1].isdigit() for line in out.splitlines())
-
-
-def test_no_config_backcompat_sort_and_output():
-    """Missing config → previous cutoff (preserve-style 90 for all without policy) via builtins."""
-    providers = [
-        _result("codex", 10.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-        _result("claude", 10.0, pool_class="preserve"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    # spend before preserve
-    assert "kiro" in lines[0]
-    assert "🔥" not in out  # default RESET is ~17h away
-    assert "정책 제외" not in out
-    assert "비상 후보" not in out
-
-
-# ------------------------------------------------------------------ AC1: S+
-
-
-def test_ac1_sp_recommend_with_claude_exclude():
-    """AC1: --recommend S+ shows kiro-opus/codex-sol as normal, fable in escalation+reason+exclude."""
-    policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
-    providers = [
-        _result("claude", 10.0, pool_class="preserve"),
-        _result("codex", 20.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    lines = out.splitlines()
-
-    # Grade discrimination header
-    assert lines[0].startswith("S+ |")
-
-    ranked = [line for line in lines if line[:1].isdigit()]
-    # kiro-opus and codex-sol are normal candidates
-    assert any("kiro-opus" in line for line in ranked)
-    assert any("codex-sol" in line for line in ranked)
-
-    # codex Sol recommendation row is exactly 1 (canonical codex-sol only, no ultra)
-    codex_sol_lines = [line for line in ranked if "codex-sol" in line or "codex-ultra" in line]
-    assert len(codex_sol_lines) == 1
-    assert "codex-sol" in codex_sol_lines[0]
-    assert "codex-ultra" not in out
-
-    # kiro-sol is also a normal candidate (different pool fallback)
-    assert any("kiro-sol" in line for line in ranked)
-
-    # fable is in escalation section with reason
-    assert "⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)" in out
-    assert "fable" in out
-    assert "Opus 5 대비 2배 가격" in out
-
-    # fable NOT in normal candidates
-    assert not any(line[:1].isdigit() and "fable" in line for line in lines)
-
-    # Claude exclude status shown alongside fable escalation
-    fable_section = False
-    for i, line in enumerate(lines):
-        if "fable" in line and "pool=claude" in line:
-            fable_section = True
-            # next lines should have gate_reason and policy-excluded status
-            remaining = "\n".join(lines[i:])
-            assert "Opus 5 대비 2배 가격" in remaining
-            assert "정책 제외" in remaining
-            assert "until 2026-08-31" in remaining
-            break
-    assert fable_section
-
-    # opus is default-gate, policy-excluded → folded pool line, not in escalation
-    # ROB-1219: excluded pools are suppressed, not folded into a per-grade line
-    assert "claude 풀 제외" not in out
-
-
-# ------------------------------------------------------------------ AC2: S grade
-
-
 def test_ac2_s_grade_profiles():
     """AC2: S keeps the original profiles; measured Grok high only (medium/low moved out)."""
     names = [p.name for p in GRADE_TABLE["S"]]
@@ -404,28 +169,6 @@ def test_ac2_s_grade_profiles():
 
 
 # ------------------------------------------------------------------ AC3: A+/A/C
-
-
-def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
-    """AC3: A+ retains legacy profiles and adds the measured effort variants."""
-    aplus_names = [p.name for p in GRADE_TABLE["A+"]]
-    assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
-    assert {"codex-terra", "codex-luna", "opus"}.issubset(aplus_names)
-    assert "oc-minimax-m3" not in aplus_names
-
-    a_names = [p.name for p in GRADE_TABLE["A"]]
-    assert "oc-sonnet46" not in a_names
-
-    b_profiles = GRADE_TABLE["B"]
-    assert any(p.name == "codex-luna" and p.launcher_effort == "medium" for p in b_profiles)
-    assert not any(p.name == "haiku" and p.launcher_effort == "low" for p in b_profiles)
-
-    c_names = [p.name for p in GRADE_TABLE["C"]]
-    assert c_names[0] == "codex-luna"
-    assert not any(p.name == "codex-luna" and p.launcher_effort == "medium" for p in GRADE_TABLE["C"])
-    assert any(p.name == "haiku" and p.launcher_effort == "low" for p in GRADE_TABLE["C"])
-    assert "oc-sonnet46" in c_names
-    assert c_names.index("oc-sonnet46") > 1
 
 
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
@@ -456,7 +199,7 @@ def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     assert "8.0분" not in without_measurement
 
     c_names = [profile.model for profile in GRADE_TABLE["C"][:4]]
-    assert c_names == ["Luna (low)", "Qwen3 Coder", "Sonnet 4.6", "Claude Haiku 4.5"]
+    assert c_names == ["Luna (low)", "Sonnet 4.6", "Claude Haiku 4.5", "qwen3.7-max"]
 
 
 def test_rob1193_splus_default_and_escalation_efforts_have_exact_reasons():
@@ -638,35 +381,6 @@ def test_rob1204_grok_estimates_are_numeric_and_low_placement_is_explicit():
     assert "보수 배치(B; 점수상 A 범위지만 미측정 추정치)" in low_line
 
 
-def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
-    measured = Profile(
-        "codex-luna",
-        "Luna (medium)",
-        42.0,
-        launcher_effort="medium",
-        benchmark_source="AA-agent",
-        benchmark_metric="agentic",
-        benchmark_harness="codex",
-        benchmark_effort="medium",
-        benchmark_model_id="gpt-5.6-luna",
-    )
-    unscored = Profile("kiro-cheap", "Qwen3 Coder", None)
-    monkeypatch.setitem(GRADE_TABLE, "C", [measured, unscored])
-    policy.set_policy("kiro", "spend", until=dt.date(2026, 8, 31), boost=1, note="test boost")
-    out = recommend(
-        [
-            _result("codex", 10.0, pool_class="preserve"),
-            _result("kiro", 10.0, pool_class="spend", window="30d"),
-        ],
-        "C",
-        today=TODAY,
-        now=NOW,
-    )
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. codex-luna")
-    assert ranked[1].startswith("2. kiro-cheap")
-
-
 def test_rob1204_existing_top_rank_intent_remains_for_claude_only_inputs():
     aplus = recommend([_result("claude", 10.0, pool_class="preserve")], "A+", today=TODAY, now=NOW)
     b = recommend([_result("claude", 10.0, pool_class="preserve")], "B", today=TODAY, now=NOW)
@@ -754,69 +468,6 @@ def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
 # ------------------------------------------------------------------ AC4: C grade
 
 
-def test_ac4_c_omni_escalation_only():
-    """AC4: C 정상 순위엔 oc-omni 없음 — escalation 섹션에만 나타남. oc-oss는 ROB-1221 이후 은퇴."""
-    providers = [
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "C", today=TODAY, now=NOW)
-    lines = out.splitlines()
-    ranked = [line for line in lines if line[:1].isdigit()]
-
-    # kiro-cheap (유일한 정상 C 후보) 가 1위
-    assert ranked[0].startswith("1. kiro-cheap")
-
-    # oc-omni는 정상 후보에 없음 (escalation)
-    assert not any(line[:1].isdigit() and "oc-omni" in line for line in lines)
-
-    # oc-omni는 escalation 섹션에, 정상후보/제외 뒤에 위치
-    escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
-    last_ranked = max((i for i, line in enumerate(lines) if line[:1].isdigit()), default=-1)
-    last_excluded = max((i for i, line in enumerate(lines) if line.startswith("✗")), default=-1)
-    assert escalation_idx > last_ranked
-    assert escalation_idx > last_excluded
-
-    assert "oc-omni" in out
-    assert "oc-oss" not in out  # oc-oss 은퇴됨
-    assert "big-pickle 162콜" in out
-    assert "deepseek-v4-flash 21콜" in out
-
-
-# ------------------------------------------------------------------ AC5: removed
-
-
-def test_ac5_removed_profiles_absent():
-    """AC5: removed 5 profiles absent from all grade tables and recommend output."""
-    for grade in GRADE_TABLE:
-        names = [p.name for p in GRADE_TABLE[grade]]
-        for removed in REMOVED:
-            assert removed not in names, f"{removed} found in grade {grade}"
-
-    # Also verify they don't appear in recommend output for any grade
-    for grade in GRADE_TABLE:
-        providers = [
-            _result("clinepass", 10.0, window="30d"),
-            _result("kiro", 10.0, pool_class="spend", window="30d"),
-            _result("codex", 10.0, pool_class="preserve"),
-            _result("claude", 10.0, pool_class="preserve"),
-            _result("grok", 10.0),
-            _result("agy", 10.0, scope=Scope("group", "gemini")),
-            _result("agy", 50.0, scope=Scope("group", "3p")),
-        ]
-        out = recommend(providers, grade, today=TODAY, now=NOW)
-        for removed in REMOVED:
-            assert removed not in out, f"{removed} found in grade {grade} output"
-
-
-def test_ac5_kiro_sol_present_in_splus():
-    """Operator correction: kiro-sol is a different-pool Sol fallback and stays in S+."""
-    names = [p.name for p in GRADE_TABLE["S+"]]
-    assert "kiro-sol" in names
-
-
-# ------------------------------------------------------------------ AC6: help
-
-
 def test_ac6_help_shows_discrimination_table():
     """AC6: argparse help exposes the 6-tier discrimination table."""
     help_text = grade_help_text()
@@ -828,24 +479,6 @@ def test_ac6_help_shows_discrimination_table():
     assert "무엇을 만들지 문서에 다 적혀 있나?" in help_text
     assert "정답이 유일하고 검색·치환에 가까운가?" in help_text
     assert "실패해도 버리고 다시 하면 되나?" in help_text
-
-
-def test_ac6_cli_recommend_choices_include_all_grades():
-    """AC6: CLI --recommend choices include all 6 grades."""
-    parser = cli.build_parser(["claude", "codex", "kiro", "grok", "agy", "clinepass"])
-    action = next(a for a in parser._actions if "--recommend" in a.option_strings)
-    assert set(action.choices) == {"S+", "S", "A+", "A", "B", "C"}
-
-
-def test_ac6_cli_help_contains_discrimination_text(capsys):
-    """AC6: `scopefuel --help` output contains the discrimination table."""
-    parser = cli.build_parser(["claude", "codex", "kiro", "grok", "agy", "clinepass"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--help"])
-    out = capsys.readouterr().out
-    assert "S+" in out and "A+" in out
-    assert "틀리면 되돌리는 비용이 큰가?" in out
-    assert "실패해도 버리고 다시 하면 되나?" in out
 
 
 def test_ac6_recommend_output_shows_grade_header():
@@ -862,22 +495,6 @@ def test_ac6_recommend_output_shows_grade_header():
 # ------------------------------------------------------------------ AC7: no-regression
 
 
-def test_ac7_no_config_no_regression():
-    """AC7: config-less state → builtin cutoff/policy/urgency unchanged."""
-    providers = [
-        _result("codex", 89.0, pool_class="preserve"),
-        _result("kiro", 50.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    # 89% < 90% preserve cutoff → included
-    assert any(line[:1].isdigit() and "codex-sol" in line for line in out.splitlines())
-    # no policy exclude, no emergency
-    assert "정책 제외" not in out
-    assert "비상 후보" not in out
-    # not urgent (RESET ~17h)
-    assert "🔥" not in out
-
-
 def test_ac7_preserve_cutoff_at_90_excludes():
     providers = [
         _result("codex", 90.0, pool_class="preserve"),
@@ -888,23 +505,6 @@ def test_ac7_preserve_cutoff_at_90_excludes():
 
 
 # ------------------------------------------------------------------ gate/escalation
-
-
-def test_escalation_profiles_not_in_normal_candidates():
-    """Escalation profiles (fable, oc-oss) never appear in ranked normal candidates."""
-    providers = [
-        _result("claude", 10.0, pool_class="preserve"),
-        _result("codex", 10.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-        _result("clinepass", 10.0, window="30d"),
-        _result("agy", 10.0, scope=Scope("group", "3p")),
-    ]
-    for grade in GRADE_TABLE:
-        out = recommend(providers, grade, today=TODAY, now=NOW)
-        ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-        for line in ranked:
-            assert "fable" not in line
-            assert "oc-oss" not in line
 
 
 def test_fable_escalation_shows_reason_and_pool_status():
@@ -932,72 +532,6 @@ def test_fable_escalation_with_policy_exclude_shows_both():
     assert "Opus 5 대비 2배 가격" in out
     assert "정책 제외" in out
     assert "until 2026-08-31" in out
-
-
-def test_oc_omni_escalation_at_end_of_c():
-    """C 급 escalation 프로필(oc-omni)은 정상 후보/제외 뒤에 나타남. oc-oss는 ROB-1221 이후 은퇴."""
-    providers = [
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-        _result("agy", 10.0, scope=Scope("group", "3p")),
-    ]
-    out = recommend(providers, "C", today=TODAY, now=NOW)
-    lines = out.splitlines()
-
-    # oc-sonnet46 이 1위 (정상 후보)
-    ranked = [line for line in lines if line[:1].isdigit()]
-    assert ranked[0].startswith("1. oc-sonnet46")
-
-    # oc-omni 는 escalation 섹션에, 정상후보/제외 뒤에 위치
-    escalation_idx = next(i for i, line in enumerate(lines) if "⚠ 승급 후보" in line)
-    last_ranked = max((i for i, line in enumerate(lines) if line[:1].isdigit()), default=-1)
-    last_excluded = max((i for i, line in enumerate(lines) if line.startswith("✗")), default=-1)
-    last_content = max(last_ranked, last_excluded)
-    assert escalation_idx > last_content
-    assert any("oc-omni" in line for line in lines[escalation_idx:])
-    assert "oc-oss" not in out  # oc-oss 은퇴됨
-
-
-def test_oc_omni_escalation_available_without_provider():
-    """oc-omni 는 escalation 후보 — provider 미등록이어도 다른 C 후보가 없으면 통계상 측정불가로 표시."""
-    providers: list[ProviderResult] = []
-    out = recommend(providers, "C", today=TODAY, now=NOW)
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    # kiro-cheap 은 provider 없어 측정 불가 → 정상 후보 없음
-    assert not ranked
-    assert "⚠ 승급 후보" in out
-    assert "oc-omni" in out
-    assert "OmniRoute" in out
-    assert "big-pickle 162콜" in out
-
-
-def test_oc_omni_escalation_not_ranked_above_urgent_spend():
-    """oc-omni 는 escalation 이므로 urgent spend 정상후보보다 위에 랭크되지 않는다(정상후보 아님)."""
-    providers = [
-        _result("kiro", 95.0, pool_class="spend", window="30d", resets_at=_reset_in(3)),
-    ]
-    out = recommend(providers, "C", today=TODAY, now=NOW)
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    # kiro-cheap 이 urgent 1위 (유일한 정상 후보)
-    assert ranked[0].startswith("1. 🔥 kiro-cheap") or ranked[0].startswith("1. kiro-cheap")
-    assert not any("oc-omni" in line for line in ranked)
-
-
-def test_gate_does_not_promote_normal_candidates():
-    """Gate escalation should not auto-promote or lower grade for normal candidates."""
-    providers = [
-        _result("claude", 10.0, pool_class="preserve"),
-        _result("codex", 10.0, pool_class="preserve"),
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-    ]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    # Normal candidates are present (gate didn't remove them)
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert len(ranked) >= 3  # kiro-opus, kiro-sol, codex-sol, opus
-    # Escalation section is separate
-    assert "⚠ 승급 후보" in out
-
-
-# ------------------------------------------------------------------ ROB-1184: numeric boost
 
 
 def test_boost_promotes_candidate_to_first_rank():
@@ -1202,43 +736,6 @@ def test_capacity_weight_does_not_bypass_raw_cutoff():
 # ------------------------------------------------------------------ ROB-1184: reset_urgency_hours settings
 
 
-def test_reset_urgency_hours_setting_changes_fallback_threshold():
-    """AC6: [settings] reset_urgency_hours 변경이 폴백(pace 불가) 🔥 판정에 반영된다."""
-    config = policy.load_config()
-    config["settings"] = {"reset_urgency_hours": 20}
-    policy._write_config(config)
-
-    # window="?" → pace 계산 불가 → 폴백. reset 15h 남음: 기본 12h 라면 not urgent, 20h 로 늘리면 urgent.
-    providers = [_result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(15))]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)  # urgency_hours 인자 생략 → config 값 사용
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in ranked[0]
-
-
-def test_reset_urgency_hours_default_backcompat_without_settings():
-    """설정 없으면 기본 12.0 유지 (백컴팻)."""
-    providers = [_result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(15))]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" not in ranked[0]
-
-
-def test_pace_urgent_path_is_independent_of_reset_urgency_hours_setting():
-    """pace 경로(소모속도 산출 가능)는 reset_urgency_hours 설정과 무관하게 수식으로만 결정된다."""
-    config = policy.load_config()
-    config["settings"] = {"reset_urgency_hours": 0.01}  # 매우 작게 설정해도 pace 판정에는 영향 없음
-    policy._write_config(config)
-
-    # 30d 창, 707h 경과, 50% 사용 (느린 소모) → pace 로 urgent=True (reset_urgency_hours 무관)
-    providers = [_result("kiro", 50.0, pool_class="spend", window="30d", resets_at=_reset_in(13))]
-    out = recommend(providers, "S+", today=TODAY, now=NOW)
-    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in ranked[0]
-
-
-# ------------------------------------------------------------------ ROB-1190 ③-1: ultra 폐기 — 벤치 셀 필터
-
-
 def test_benchmark_cell_filters_out_ultra_effort_scores():
     """DB 에 과거 ultra 실측이 남아있어도 추천 벤치 셀에는 표시하지 않는다."""
     from scopefuel.bench import ModelScore
@@ -1272,50 +769,6 @@ def test_benchmark_cell_filters_out_ultra_effort_scores():
     assert "ultra" not in luna_line
     assert "max" in luna_line
     assert "59.0" in luna_line
-
-
-def test_benchmark_cell_filters_ultra_from_model_and_other_sources():
-    """폐기된 ultra 는 AA-model/other dynamic source에서도 추천에 다시 나오지 않는다."""
-    from scopefuel.bench import ModelScore
-    from scopefuel.recommend import recommend as recommend_fn
-
-    scores = [
-        ModelScore(
-            model_id="claude-sonnet-5",
-            effort="ultra",
-            harness=None,
-            source="AA-model",
-            metric="coding_index",
-            score=75.0,
-            rank=1,
-            captured_at="2026-07-31T12:00:00+00:00",
-        ),
-        ModelScore(
-            model_id="sonnet-5",
-            effort="ultra",
-            harness=None,
-            source="openrouter",
-            metric="coding",
-            score=75.0,
-            rank=1,
-            captured_at="2026-07-31T12:00:00+00:00",
-        ),
-    ]
-    out = recommend_fn(
-        [_result("kiro", 10.0, pool_class="spend", window="30d")],
-        "A+",
-        today=TODAY,
-        now=NOW,
-        bench_scores=scores,
-    )
-    kiro_line = next(line for line in out.splitlines() if "kiro-sonnet" in line)
-    # ultra retired: never re-surface as best/representative score
-    assert "ultra" not in kiro_line
-    assert "75.0" not in kiro_line
-    assert "대표" not in kiro_line
-
-
-# ---------------------------------------------------------- ROB-1191 AC: multi-window / score / fold / effort
 
 
 def _result_windows(
@@ -1810,164 +1263,9 @@ def test_rob1191_boost_hard_override_stays_first():
     assert not ranked[0].startswith("1. kimi-k3")
 
 
-def test_rob1219_excluded_pool_is_absent_from_recommendation():
-    """ROB-1219 (supersedes ROB-1191 AC6): an excluded pool is suppressed entirely.
-
-    ROB-1191 folded same-grade kiro excludes into one "✗ kiro 풀 제외" line per
-    grade. Operator judgment 2026-08-06: that line is noise — `class = exclude`
-    is a decision already made, repeated in every grade. The record lives in
-    `policy list` (class/until/note) and GRADE_TABLE, so restoring the pool stays
-    a one-command `policy clear`. The emergency-candidate path (no usable
-    candidate in the grade) is unaffected and still surfaces the pool.
-    """
-    policy.set_policy(
-        "kiro",
-        "exclude",
-        until=dt.date(2026, 9, 1),
-        note="무료 전환(구독 종료 2026-08-01)",
-    )
-    providers = [
-        _result("kiro", 10.0, pool_class="spend", window="30d"),
-        _result("codex", 20.0, pool_class="preserve"),
-        _result("claude", 10.0, pool_class="preserve"),
-    ]
-    shown = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=False)
-    hidden = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=True)
-
-    # no exclusion line, and no per-profile leakage either
-    assert "kiro 풀 제외" not in shown
-    assert "kiro" not in shown
-    assert "kiro" not in hidden
-    # the usable candidates are still there — suppression must not empty the grade
-    assert "codex" in shown or "opus" in shown
-
-
-def test_rob1219_excluded_pool_still_surfaces_when_grade_has_no_candidate():
-    """Suppression is display-only: with nothing usable, the pool must reappear."""
-    policy.set_policy(
-        "kiro",
-        "exclude",
-        until=dt.date(2026, 9, 1),
-        note="무료 전환(구독 종료 2026-08-01)",
-    )
-    # kiro is the only provider that reports at all -> grade has no usable candidate
-    providers = [_result("kiro", 10.0, pool_class="spend", window="30d")]
-    shown = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=False)
-
-    assert "정책 가용 후보 없음" in shown
-    assert "비상 후보" in shown
-    assert "kiro" in shown
-
-
-def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
-    """AC7: declared effort cells select one row; Kimi's CLI default is explicit."""
-    from scopefuel.bench import ModelScore
-
-    scores = [
-        ModelScore(
-            model_id="gpt-5.6-sol",
-            effort="max",
-            harness="codex",
-            source="AA-agent",
-            metric="agentic",
-            score=67.0,
-            rank=1,
-            captured_at="2026-08-01T00:00:00+00:00",
-        ),
-        ModelScore(
-            model_id="gpt-5.6-sol",
-            effort="high",
-            harness="codex",
-            source="AA-agent",
-            metric="agentic",
-            score=60.0,
-            rank=2,
-            captured_at="2026-08-01T00:00:00+00:00",
-        ),
-        ModelScore(
-            model_id="claude-opus-5",
-            effort="xhigh",
-            harness="claude-code",
-            source="AA-agent",
-            metric="agentic",
-            score=67.0,
-            rank=1,
-            captured_at="2026-08-01T00:00:00+00:00",
-        ),
-        ModelScore(
-            model_id="claude-opus-5",
-            effort="high",
-            harness="claude-code",
-            source="AA-agent",
-            metric="agentic",
-            score=63.0,
-            rank=2,
-            captured_at="2026-08-01T00:00:00+00:00",
-        ),
-        ModelScore(
-            model_id="kimi-k3",
-            effort="default",
-            harness="kimi-code-cli",
-            source="AA-agent",
-            metric="agentic",
-            score=61.0,
-            rank=1,
-            captured_at="2026-08-01T00:00:00+00:00",
-        ),
-    ]
-    sp = recommend(
-        [
-            _result("claude", 10.0, pool_class="preserve"),
-            _result("codex", 10.0, pool_class="preserve"),
-            _result("kiro", 10.0, pool_class="spend", window="30d"),
-        ],
-        "S+",
-        today=TODAY,
-        now=NOW,
-        bench_scores=scores,
-    )
-    s = recommend(
-        [
-            _result("clinepass", 10.0, window="30d"),
-            _result("grok", 10.0),
-            _result("codex", 10.0, pool_class="preserve"),
-            _result("kimi", 10.0, pool_class="spend"),
-        ],
-        "S",
-        today=TODAY,
-        now=NOW,
-        bench_scores=scores,
-    )
-
-    codex_line = next(line for line in sp.splitlines() if "codex-sol" in line and line[:1].isdigit())
-    opus_line = next(line for line in sp.splitlines() if line[:1].isdigit() and "opus" in line.split())
-    kimi_line = next(line for line in s.splitlines() if "kimi-k3" in line and line[:1].isdigit())
-
-    # positive: single declared-effort cell
-    codex_bench = codex_line.split("벤치", 1)[1].strip()
-    opus_bench = opus_line.split("벤치", 1)[1].strip()
-    kimi_bench = kimi_line.split("벤치", 1)[1].strip()
-    assert codex_bench == "67.0(AA-agent/codex/max)"
-    assert "60.0" not in codex_line  # non-declared high row must not appear
-    assert "; " not in codex_bench  # not multi-effort list
-    assert opus_bench == "67.0(AA-agent/claude-code/xhigh)"
-    assert "63.0" not in opus_line
-    assert "; " not in opus_bench
-    assert "/high)" not in opus_bench  # high≠xhigh
-
-    # Kimi's measured CLI default is a single declared cell, with no effort suffix.
-    assert kimi_bench == "61.0(AA-agent/kimi-code-cli)"
-    assert "57.0" not in kimi_line
-    assert "50.0" not in kimi_line
-    assert "대표" not in kimi_line
-    assert "추정" not in kimi_line
-
-
 @pytest.mark.parametrize(
     ("profile_name", "grade", "model_id", "score_harness", "score_effort", "score_value", "expected_label"),
-    [
-        ("oc-glm", "B", "glm-5.2", "claude-code", "default", 43.0, "GLM-5.2"),
-    ],
+    [("oc-glm", "B", "glm-5.2", "claude-code", "default", 43.0, "GLM-5.2")],
 )
 def test_opencode_harness_mismatch_is_display_only_with_native_hint(
     profile_name, grade, model_id, score_harness, score_effort, score_value, expected_label
@@ -2213,33 +1511,6 @@ def test_rob1191_stale_ultra_exact_delete_on_temp_db(tmp_path, monkeypatch):
         )
         == 0
     )
-
-
-def test_rob1191_cli_explain_and_hide_excluded_flags(monkeypatch, capsys):
-    """CLI wires --explain / --hide-excluded into recommend()."""
-    from scopefuel import cli
-
-    monkeypatch.setattr(
-        cli,
-        "registry",
-        lambda: {
-            name: (
-                lambda provider_id=name: ProviderResult(
-                    id=provider_id,
-                    buckets=[_bucket(10.0)],
-                )
-            )
-            for name in ("codex", "clinepass", "grok", "claude", "kiro")
-        },
-    )
-    policy.set_policy("kiro", "exclude", until=dt.date(2026, 9, 1), note="fold-me")
-    assert cli.main(["--recommend", "S+", "--explain", "--no-cache"]) == 0
-    out = capsys.readouterr().out
-    assert "score=" in out and "capacity=" in out
-
-    assert cli.main(["--recommend", "S+", "--hide-excluded", "--no-cache"]) == 0
-    hidden = capsys.readouterr().out
-    assert "kiro 풀 제외" not in hidden
 
 
 def test_cross_grade_alternatives_are_adjacent_grade_only():

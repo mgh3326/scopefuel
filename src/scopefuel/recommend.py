@@ -62,7 +62,6 @@ _TTE_KNOWN_RANK = 0
 _POOL_LABEL = {
     "claude": "Claude",
     "codex": "Codex",
-    "kiro": "Kiro",
     "grok": "Grok",
     "agy": "AGY",
     "clinepass": "ClinePass",
@@ -193,7 +192,6 @@ ESTIMATE_PROVENANCE_LEGEND = (
 SONNET_ESTIMATE_REASON = (
     "Opus 5 동일 effort 실측 곡선 대비 고정 오프셋(-8~-10점) — 상하 effort 모두 대조 가능"
 )
-KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가능한 기준점 없이 단일 추정"
 HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
 HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
 KIMI_K3_LOW_ESTIMATE_REASON = (
@@ -393,22 +391,6 @@ RETIRED_PROFILES: dict[str, RetiredProfile] = {
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
-            "kiro-opus",
-            "Opus 5 (xhigh)",
-            67.0,
-            **_aa_agent_benchmark(67.0, "claude-opus-5", "xhigh", harness="claude-code"),
-            aa_agent_model_id="claude-opus-5",
-            aa_model_id="claude-opus-5",
-        ),
-        Profile(
-            "kiro-sol",
-            "GPT-5.6 Sol",
-            58.9,
-            **_openrouter_benchmark(58.9, "gpt-5.6-sol"),
-            aa_agent_model_id="gpt-5.6-sol",
-            aa_model_id="gpt-5-6-sol",
-        ),
-        Profile(
             "codex-sol",
             "GPT-5.6 Sol (max)",
             67.0,
@@ -506,13 +488,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
     ],
     "A+": [
-        Profile(
-            "kiro-sonnet",
-            "Sonnet 5",
-            53.4,
-            **_openrouter_benchmark(53.4, "sonnet-5"),
-            aa_model_id="claude-sonnet-5",
-        ),
         Profile(
             "codex-luna-max",
             "Luna (max)",
@@ -678,13 +653,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="glm-5.2",
             aa_model_id="glm-5-2",
         ),
-        Profile(
-            "kiro-haiku",
-            "Haiku 4.5",
-            35.0,
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=KIRO_HAIKU_ESTIMATE_REASON,
-        ),
         # ROB-1202: estimated + unmeasured Grok low (no lower-effort anchor to compare against).
         Profile(
             "grok",
@@ -718,7 +686,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=UNMEASURED_ANNOTATION,
             aa_agent_model_id="gpt-5.6-luna",
         ),
-        Profile("kiro-cheap", "Qwen3 Coder", None, aa_model_id="qwen3-coder-next"),
         Profile(
             "oc-sonnet46",
             "Sonnet 4.6",
@@ -917,8 +884,6 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "agy", "gemini"
     if profile in ("agy-sonnet", "agy-opus", "agy-oss"):
         return "agy", "3p"
-    if profile.startswith("kiro"):
-        return "kiro", None
     if profile.startswith("kimi-"):
         return "kimi", None
     if profile == "oc-gflash":
@@ -2151,8 +2116,7 @@ def recommend(
         """ROB-1219: a deliberately excluded pool is noise, not information.
 
         `class = exclude` is an operator decision that the pool is out of rotation
-        for a stated period (kiro: subscription ended 2026-08-01, re-evaluate after
-        the 2026-09-01 free-credit reset). Repeating a "✗ pool excluded" line in
+        for a stated period. Repeating a "✗ pool excluded" line in
         every grade tells the reader nothing they did not already decide. The
         record lives on in `policy list` (class, until, note) and in GRADE_TABLE,
         so restoring the pool is `scopefuel policy clear <pool>` — no code change.

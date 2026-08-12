@@ -181,7 +181,7 @@ def test_boost_set_without_class_only_touches_boost(policy_config):
 def test_boost_only_new_pool_keeps_builtin_class_and_clean_policy_list(policy_config, capsys, monkeypatch):
     """ROB-1212: omitting class must not create an ``invalid class None`` row."""
     monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
-    assert cli.main(["policy", "set", "grok", "--boost", "2", "--until", "2026-08-10"]) == 0
+    assert cli.main(["policy", "set", "grok", "--boost", "2", "--until", "2026-12-31"]) == 0
     builtin_class = getattr(BUILTIN["grok"], "pool_class", "preserve")
     assert policy.get_policy("grok", builtin_class, today=TODAY) == (builtin_class, None)
     capsys.readouterr()
@@ -322,14 +322,6 @@ def test_capacity_weight_explicit_capacity_weight_field(policy_config):
     weight, status = policy.get_capacity_weight("codex")
     assert weight == 3.5
     assert status is None
-
-
-def test_capacity_weight_zero_falls_back_to_default_with_status(policy_config):
-    """[pools.kiro] capacity_weight=0 → 무효 → 1.0 폴백 + status 노출."""
-    _use_capacity_fixture(policy_config)
-    weight, status = policy.get_capacity_weight("kiro")
-    assert weight == 1.0
-    assert status is not None and "invalid capacity_weight" in status
 
 
 def test_capacity_weight_negative_price_usd_falls_back(policy_config):

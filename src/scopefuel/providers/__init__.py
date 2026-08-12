@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from ..model import PoolClass, ProviderResult, _normalize_pool_class
-from . import agy, claude, clinepass, codex, grok, kimi, kiro
+from . import agy, claude, clinepass, codex, grok, kimi
 
 
 class Fetcher(Protocol):
@@ -44,7 +44,6 @@ BUILTIN: dict[str, Fetcher] = {
     "claude": _with_class(claude.fetch, "spend"),
     "codex": _with_class(codex.fetch, "spend"),
     "agy": _with_class(agy.fetch, "spend"),
-    "kiro": _with_class(kiro.fetch, "spend"),
     "clinepass": _with_class(clinepass.fetch, "spend"),
     "grok": _with_class(grok.fetch, "spend"),
     "kimi": _with_class(kimi.fetch, "spend"),
