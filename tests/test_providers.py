@@ -1008,6 +1008,29 @@ def test_grok_parse_accepts_box_and_control_residue_around_usage_lines():
     assert result.buckets[0].resets_at.endswith("19:58:00Z")
 
 
+def test_grok_parse_accepts_46_floating_pane_format():
+    """grok 4.6 CLI: 레이블·진행바·퍼센트·리셋이 플로팅 패널에 흩어져 페인트된다."""
+    text = (
+        "Context usage  Usage limit  Session info\n"
+        "Weekly limit (SuperGrok)\n"
+        "████████░░░░░░░░  \n"
+        "58%\n"
+        "Resets: August 14, 04:58\n"
+        "Session usage: no model calls yet in this session.\n"
+    )
+    result = grok.parse(text)
+    assert result.error is None
+    assert result.buckets[0].used_pct == 58.0
+    assert result.buckets[0].resets_at.endswith("19:58:00Z")
+
+
+def test_grok_parse_weekly_window_does_not_grab_other_tab_percent():
+    """레이블에서 160자 넘게 떨어진 퍼센트(다른 탭 잔재)는 집지 않는다."""
+    text = "Weekly limit (SuperGrok)\n" + ("." * 200) + "\n99%\nResets: August 14, 04:58\n"
+    result = grok.parse(text)
+    assert result.error is not None
+
+
 def test_grok_parse_infers_next_year_at_december_boundary():
     import datetime as dt
 
