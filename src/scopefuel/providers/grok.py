@@ -36,9 +36,17 @@ PTY_ROWS = 50
 PTY_COLS = 200
 
 _ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])")
-_WEEKLY = re.compile(r"Weekly\s+limit\s*:\s*(?P<used>\d+(?:\.\d+)?)\s*%", re.I)
+# grok 4.5 는 "Weekly limit: 0%" 한 줄이었지만 4.6 CLI 는 /usage 를 플로팅 패널로 그린다:
+# "Weekly limit (SuperGrok)" 레이블, 진행바, "58%" 가 각각 다른 위치에 페인트되고
+# 리셋 줄은 "Resets: August 14, 04:58" 로 바뀌었다(구형 "Next reset:" 도 계속 허용).
+# 커서 이동 시퀀스를 걷어내면 텍스트가 페인트 순서대로 이어지므로, 레이블 뒤 첫 퍼센트를
+# 비탐욕 160자 창 안에서 찾는다 — 창 제한은 다른 탭(Context usage)의 퍼센트 오인 방지다.
+_WEEKLY = re.compile(
+    r"Weekly\s+limit(?:\s*\(SuperGrok\))?\s*:?[\s\S]{0,160}?(?P<used>\d+(?:\.\d+)?)\s*%",
+    re.I,
+)
 _RESET = re.compile(
-    r"Next\s+reset\s*:\s*(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),\s*"
+    r"(?:Next\s+reset|Resets?)\s*:\s*(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),\s*"
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
     re.I,
 )
