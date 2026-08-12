@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import urllib.error
 from email.message import Message
 
@@ -31,9 +32,96 @@ def test_claude_marks_weekly_scoped_as_model_scope(fixture_json, monkeypatch, tm
 
 def test_claude_missing_credentials_is_error_with_hint(monkeypatch, tmp_path):
     monkeypatch.setattr(claude, "CREDENTIALS", tmp_path / "nope.json")
+    monkeypatch.setattr(claude, "_read_keychain", lambda: None)
     result = claude.fetch()
     assert result.error and result.hint
     assert result.buckets == []
+
+
+def test_claude_falls_back_to_keychain_when_file_absent(fixture_json, monkeypatch, tmp_path):
+    """macOS 는 파일 없이 Keychain 에만 토큰을 두기도 한다 — 그때도 측정돼야 한다."""
+    monkeypatch.setattr(claude, "CREDENTIALS", tmp_path / "nope.json")
+    monkeypatch.setattr(
+        claude,
+        "_read_keychain",
+        lambda: json.dumps({"claudeAiOauth": {"accessToken": "kc", "subscriptionType": "max"}}),
+    )
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: fixture_json("claude_usage"))
+
+    result = claude.fetch()
+    assert result.error is None
+    assert result.plan == "max"
+    assert result.source == "oauth-usage-api+keychain"
+    assert result.buckets
+
+
+def test_claude_prefers_file_over_keychain(fixture_json, monkeypatch, tmp_path):
+    creds = tmp_path / ".credentials.json"
+    creds.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "fromfile", "subscriptionType": "pro"}})
+    )
+    monkeypatch.setattr(claude, "CREDENTIALS", creds)
+    monkeypatch.setattr(claude, "_read_keychain", _unexpected_keychain_call)
+    seen: dict[str, str] = {}
+
+    def _capture(url, headers=None, **kw):
+        seen["auth"] = (headers or {})["Authorization"]
+        return fixture_json("claude_usage")
+
+    monkeypatch.setattr(claude, "request_json", _capture)
+
+    result = claude.fetch()
+    assert seen["auth"] == "Bearer fromfile"
+    assert result.plan == "pro"
+    assert result.source == "oauth-usage-api"
+
+
+def test_claude_falls_back_when_file_has_no_token(fixture_json, monkeypatch, tmp_path):
+    """빈 accessToken 파일이 남아 있어도 Keychain 으로 넘어간다."""
+    creds = tmp_path / ".credentials.json"
+    creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "   "}}))
+    monkeypatch.setattr(claude, "CREDENTIALS", creds)
+    monkeypatch.setattr(
+        claude,
+        "_read_keychain",
+        lambda: json.dumps({"claudeAiOauth": {"accessToken": "kc", "subscriptionType": "max"}}),
+    )
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: fixture_json("claude_usage"))
+
+    assert claude.fetch().source == "oauth-usage-api+keychain"
+
+
+def test_claude_keychain_reader_is_darwin_only(monkeypatch):
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(
+        claude.subprocess, "run", _unexpected_security_call
+    )
+    assert claude._read_keychain() is None
+
+
+def test_claude_keychain_reader_folds_failures_to_none(monkeypatch):
+    monkeypatch.setattr(claude.sys, "platform", "darwin")
+
+    def _boom(*a, **k):
+        raise OSError("security 없음")
+
+    monkeypatch.setattr(claude.subprocess, "run", _boom)
+    assert claude._read_keychain() is None
+
+    monkeypatch.setattr(
+        claude.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0] if a else [], 44, "", "not found"),
+    )
+    assert claude._read_keychain() is None
+
+
+def _unexpected_keychain_call():
+    raise AssertionError("파일이 쓸 수 있으면 Keychain 을 건드리지 않아야 한다")
+
+
+def _unexpected_security_call(*a, **k):
+    raise AssertionError("darwin 이 아니면 security 를 실행하지 않아야 한다")
 
 
 def test_codex_separates_additional_rate_limits(fixture_json, monkeypatch, tmp_path):
