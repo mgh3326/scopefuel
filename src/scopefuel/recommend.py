@@ -218,6 +218,14 @@ GROK_LOW_ESTIMATE_REASON = (
     "점수상 A 범위지만 미측정(추정 위의 추정)이라 B 보수 배치"
 )
 GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)"
+# ROB-1253: oc-dsflash 측정 조건(codex·max)이 실행 배선(opencode·default)보다 유리한 방향 이식 —
+# 점수(55.0)는 A+ 범위지만 방향 감쇠를 반영해 1단계 보수 하향(A). 동일-모델 쌍 실측 감쇠 근거:
+# 하네스만 다른 쌍 Muse Spark 1.2(xhigh 동일) Muse Code 61 vs Opencode 57 → −4;
+# effort만 다른 쌍 GPT-5.6 Luna(codex 동일) max 59 vs high 51 → −8.
+OC_DSFLASH_PLACEMENT_NOTE = (
+    "보수 배치(A; 점수상 A+ 범위지만 측정 조건 codex·max 가 실행 배선 opencode·default 보다 유리한 "
+    "방향 이식 — 방향 감쇠 반영 1단계 하향)"
+)
 CROSS_GRADE_MEASURED_REASON = "동급 후보가 미측정 추정일 때의 상위 급 실측 대안"
 
 
@@ -394,8 +402,19 @@ RETIRED_PROFILES: dict[str, RetiredProfile] = {
 # 배치 규칙 (두 갈래) — 근거가 무엇이냐에 따라 점수 처리가 다르다:
 # 1. AA-agent 실측: 점수를 그대로 급 점수로 사용. 하네스가 실행 하네스와 달라도
 #    표기만 harness-이식 으로 하고 점수·급은 변경하지 않음 (예: oc-sonnet46, oc-glm).
+#    단, 방향 조항(ROB-1253) — 측정 조건(하네스·effort)이 우리 실행 배선보다 유리한
+#    방향 이식이면 점수는 유지하되 1단계 보수 하향한다 (예: oc-dsflash, codex·max
+#    측정을 opencode·default 로 실행). 동일-모델 쌍 실측 감쇠 근거:
+#      - 하네스만 다른 쌍 Muse Spark 1.2(xhigh 동일): Muse Code 61 vs Opencode 57 → −4
+#      - effort만 다른 쌍 GPT-5.6 Luna(codex 동일): max 59 vs high 51 → −8
+#    중립·불리 방향 이식(측정 조건이 우리 배선보다 같거나 불리)은 점수·급 그대로
+#    (예: oc-glm 43·oc-sonnet46·agy-flash — 전부 중립~불리 방향이라 감쇠 미반영 전례).
 # 2. AA-model 지수만 (에이전트 미측정): _MODEL_ONLY_ANCHORS 로 내삽/외삽 후
 #    한 단계 보수 하향으로 배치 (예: oc-qwen37-max, oc-minimax-m3).
+#
+# 버전 앰비규어티 주의(ROB-1253): 벤더 슬러그가 무버전이면 새 모델로 조용히 재지향된다
+# (deepseek-v4-pro 사례 — 0424 프리뷰 측정치 31@claude-code 는 0813 정식 모델과 무관).
+# 급을 매길 때는 API echo 의 model 필드로 실제 서빙 모델을 확인할 것.
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
@@ -611,17 +630,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gemini-3.7-flash",
             aa_model_id="gemini-3-7-flash",
         ),
-        # ROB-1251: AA v1.3 실측 55@codex — 내삽 44.7을 대체. $0.14/M 최저가 A+.
-        # harness-이식: codex 측정 → opencode 실행.
-        # DeepSeek V4 Pro는 AA v1.3 실측 31@claude-code — Flash(55)보다 낮고 단가 12배. 배선 후보 아님.
-        Profile(
-            "oc-dsflash",
-            "DeepSeek V4 Flash",
-            55.0,
-            **_aa_agent_benchmark(55.0, "deepseek-v4-flash", "max", harness="codex"),
-            aa_agent_model_id="deepseek-v4-flash",
-            aa_model_id="deepseek-v4-flash",
-        ),
         # ROB-1252: qwen3.8-max run natively through the Claude Code CLI harness
         # (ANTHROPIC_BASE_URL -> local CLIProxyAPI -> ClinePass translation, not
         # opencode) — this is a real harness-matched measurement, no harness-이식
@@ -637,6 +645,29 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
     ],
     "A": [
+        # ROB-1251: AA v1.3 실측 55@codex(max) — 내삽 44.7을 대체. $0.14/M 최저가.
+        # ROB-1253 방향 조항: 측정 조건(codex·max)이 실행 배선(opencode·default)보다 유리한
+        # 방향 이식 — 점수(55.0)는 A+ 범위지만 방향 감쇠 반영해 A 로 1단계 보수 하향(점수는 유지).
+        # 동일-모델 쌍 실측 감쇠: 하네스 −4(Muse Spark 1.2), effort −8(GPT-5.6 Luna).
+        #
+        # ROB-1253 stale 정정 (과거 ROB-1251 주석 "DeepSeek V4 Pro는 실측 31@claude-code —
+        # Flash보다 낮고 단가 12배. 배선 후보 아님"은 stale):
+        # - "31@claude-code" 는 0424 프리뷰 측정치. 0813 정식 모델과 무관.
+        # - cline-pass/deepseek-v4-pro 슬러그는 무버전이라 0813 정식 모델
+        #   (deepseek/deepseek-v4-pro-0813)을 서빙함 (08-15 API echo 실측).
+        # - 0813 수치(Terminal-Bench 2.1 87.9 / AA intelligence max 53.2 / $0.435·$0.87)는
+        #   벤더 자체보고이며 AA 실측이 아님 — GLM-5.2($1.40/$4.40) 대비 3~5배 저렴
+        #   ("12배 비쌈"의 정반대).
+        # - 0813 은 ROB-1253 에서 cc-dspro 실험 별칭으로 배선 중이며 급표 미등재(reps 후 판정).
+        Profile(
+            "oc-dsflash",
+            "DeepSeek V4 Flash",
+            55.0,
+            **_aa_agent_benchmark(55.0, "deepseek-v4-flash", "max", harness="codex"),
+            placement_note=OC_DSFLASH_PLACEMENT_NOTE,
+            aa_agent_model_id="deepseek-v4-flash",
+            aa_model_id="deepseek-v4-flash",
+        ),
         Profile(
             "codex-sol",
             "Sol (low)",
@@ -866,6 +897,10 @@ def _boundary_checked(profile: Profile) -> bool:
     Estimated, unmeasured, and model-only rows are explicit exceptions. OpenRouter
     and AA-model values are reference scores, not the AA-agent execution scores
     used for these cuts.
+
+    ``placement_note`` does *not* exempt a row here — it only relaxes the upper
+    bound in :func:`validate_grade_table`, so a mis-entered score that is too low
+    for its grade is still caught.
     """
     return (
         profile.benchmark is not None
@@ -896,15 +931,20 @@ def validate_grade_table(table: dict[Grade, list[Profile]] | None = None) -> Non
             if not _boundary_checked(profile):
                 continue
             assert profile.benchmark is not None
+            # ROB-1253: a placement_note discloses a deliberate *downward* placement
+            # (방향 감쇠 등), so the score may sit above the grade's band. The lower
+            # bound stays enforced — a note must not hide a score that is too low.
+            allow_above_band = profile.placement_note is not None
             in_range = (lower is None or profile.benchmark >= lower) and (
-                upper is None or profile.benchmark < upper
+                upper is None or allow_above_band or profile.benchmark < upper
             )
             if not in_range:
+                expected_upper = "inf" if upper is None or allow_above_band else f"{upper}"
                 violations.append(
                     f"{profile.name} --effort {profile.launcher_effort or '-'} "
                     f"score={profile.benchmark:g} in {grade} "
                     f"(expected {lower if lower is not None else '-inf'}"
-                    f"–{upper if upper is not None else 'inf'})"
+                    f"–{expected_upper})"
                 )
     if violations:
         raise ValueError("measured grade boundary violation: " + "; ".join(violations))
@@ -1984,10 +2024,18 @@ def recommend(
         # ROB-1202 rework r1: a live AA-agent execution measurement contradicts a static
         # "estimated/unmeasured" annotation — once a real measurement exists, suppress it
         # (the cross-harness transfer note below is unrelated and still applies).
-        annotation = None if suppress_estimate else _benchmark_annotation(profile)
+        raw_annotation = _benchmark_annotation(profile)
+        annotation = None if suppress_estimate else raw_annotation
         if annotation:
             rendered += f" · {annotation}"
-        if profile.placement_note and not suppress_estimate:
+        # ROB-1253: placement_note is a grade-placement disclosure, not an estimate
+        # provenance tag.  It is suppressed only when a live measurement is replacing a
+        # *stale estimate* (profile had an estimate annotation to discard — e.g.
+        # grok-low's "추정 위의 추정" note describes the estimate, so it goes with it).
+        # When the displayed score was never an estimate (no annotation, e.g.
+        # oc-dsflash's AA-agent score), the note is about the measurement itself and
+        # must still render alongside the live score.
+        if profile.placement_note and not (suppress_estimate and raw_annotation is not None):
             rendered += f" · {profile.placement_note}"
 
         measurements = _format_benchmark_measurements(
