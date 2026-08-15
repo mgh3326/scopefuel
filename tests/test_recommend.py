@@ -18,6 +18,7 @@ from scopefuel.recommend import (
     MODEL_ONLY_ANNOTATION,
     MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
     MODEL_ONLY_INTERPOLATED_ANNOTATION,
+    OC_DSFLASH_PLACEMENT_NOTE,
     OPUS_MAX_ESCALATION_REASON,
     PRESERVE_EXCLUDE_PCT,
     PROFILE_ALIASES,
@@ -415,10 +416,13 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
     assert {"codex-terra", "codex-luna", "opus"}.issubset(aplus_names)
-    assert {"agy-flash", "oc-dsflash"}.issubset(aplus_names)  # ROB-1251: AA v1.3 실측 승급
+    assert "agy-flash" in aplus_names  # ROB-1251: AA v1.3 실측 승급
     assert "oc-minimax-m3" not in aplus_names
+    # ROB-1253: oc-dsflash는 방향 감쇠(측정 codex·max > 실행 opencode·default)로 A+→A 이동
+    assert "oc-dsflash" not in aplus_names
 
     a_names = [p.name for p in GRADE_TABLE["A"]]
+    assert "oc-dsflash" in a_names  # ROB-1253: A+에서 A 로 보수 하향
     assert "oc-sonnet46" not in a_names
 
     b_profiles = GRADE_TABLE["B"]
@@ -517,20 +521,25 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
     assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S"])
     # ROB-1222: oc-gflash는 은퇴 — C급에 없어야 함
     assert not any(p.name == "oc-gflash" for p in c_profiles)
-    # ROB-1251: agy-flash·oc-dsflash는 AA v1.3 실측으로 A+ 승급 — C급에 없어야 함
+    # ROB-1251: agy-flash는 AA v1.3 실측으로 A+ 승급 — C급에 없어야 함
+    # ROB-1253: oc-dsflash는 방향 감쇠로 A+→A 이동 — 여전히 C급엔 없음
     assert not any(p.name == "agy-flash" for p in c_profiles)
     assert not any(p.name == "oc-dsflash" for p in c_profiles)
-    # ROB-1251: agy-flash·oc-dsflash A+ 실측 배치
+    # ROB-1251: agy-flash A+ 실측 배치
     aplus_gflash = next(p for p in GRADE_TABLE["A+"] if p.name == "agy-flash")
-    aplus_dsflash = next(p for p in GRADE_TABLE["A+"] if p.name == "oc-dsflash")
     assert aplus_gflash.benchmark == 57.0
     assert aplus_gflash.model == "Gemini 3.7 Flash"
     assert aplus_gflash.benchmark_source == "AA-agent"
     assert not aplus_gflash.model_only
-    assert aplus_dsflash.benchmark == 55.0
-    assert aplus_dsflash.model == "DeepSeek V4 Flash"
-    assert aplus_dsflash.benchmark_source == "AA-agent"
-    assert not aplus_dsflash.model_only
+    # ROB-1253: oc-dsflash A 실측 배치 — 점수 55.0 유지, A+→A 보수 하향, placement_note 존재
+    a_dsflash = next(p for p in GRADE_TABLE["A"] if p.name == "oc-dsflash")
+    assert a_dsflash.benchmark == 55.0
+    assert a_dsflash.model == "DeepSeek V4 Flash"
+    assert a_dsflash.benchmark_source == "AA-agent"
+    assert not a_dsflash.model_only
+    assert a_dsflash.placement_note == OC_DSFLASH_PLACEMENT_NOTE
+    assert "방향" in a_dsflash.placement_note
+    assert not any(p.name == "oc-dsflash" for p in GRADE_TABLE["A+"])
 
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
