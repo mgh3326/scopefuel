@@ -896,16 +896,16 @@ def _boundary_checked(profile: Profile) -> bool:
 
     Estimated, unmeasured, and model-only rows are explicit exceptions. OpenRouter
     and AA-model values are reference scores, not the AA-agent execution scores
-    used for these cuts.  A profile carrying a ``placement_note`` is also exempt:
-    the note is the disclosure mechanism for a deliberate conservative downgrade
-    (ROB-1253 방향 감쇠 등), so its displayed score intentionally sits in a higher
-    numeric range than the operational grade.
+    used for these cuts.
+
+    ``placement_note`` does *not* exempt a row here — it only relaxes the upper
+    bound in :func:`validate_grade_table`, so a mis-entered score that is too low
+    for its grade is still caught.
     """
     return (
         profile.benchmark is not None
         and profile.benchmark_source == "AA-agent"
         and not profile.model_only
-        and not profile.placement_note
         and profile.benchmark_annotation not in _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS
     )
 
@@ -931,15 +931,20 @@ def validate_grade_table(table: dict[Grade, list[Profile]] | None = None) -> Non
             if not _boundary_checked(profile):
                 continue
             assert profile.benchmark is not None
+            # ROB-1253: a placement_note discloses a deliberate *downward* placement
+            # (방향 감쇠 등), so the score may sit above the grade's band. The lower
+            # bound stays enforced — a note must not hide a score that is too low.
+            allow_above_band = profile.placement_note is not None
             in_range = (lower is None or profile.benchmark >= lower) and (
-                upper is None or profile.benchmark < upper
+                upper is None or allow_above_band or profile.benchmark < upper
             )
             if not in_range:
+                expected_upper = "inf" if upper is None or allow_above_band else f"{upper}"
                 violations.append(
                     f"{profile.name} --effort {profile.launcher_effort or '-'} "
                     f"score={profile.benchmark:g} in {grade} "
                     f"(expected {lower if lower is not None else '-inf'}"
-                    f"–{upper if upper is not None else 'inf'})"
+                    f"–{expected_upper})"
                 )
     if violations:
         raise ValueError("measured grade boundary violation: " + "; ".join(violations))
