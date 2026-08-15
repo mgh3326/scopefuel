@@ -112,6 +112,11 @@ def test_profile_pool_matches_quota_guard():
     assert profile_pool("kiro-haiku") == ("kiro", None)
     assert profile_pool("oc-omni") == ("omniroute", None)
     assert profile_pool("haiku") == ("claude", None)
+    # ROB-1252: cc-qwen38/cc-glm run the Claude Code CLI harness against ClinePass
+    # (via CLIProxyAPI translation) — same quota pool as oc-*, not the claude
+    # subscription-OAuth pool.
+    assert profile_pool("cc-qwen38") == ("clinepass", None)
+    assert profile_pool("cc-glm") == ("clinepass", None)
 
 
 # ------------------------------------------------------------------ sort/ranking
@@ -2121,6 +2126,46 @@ def test_matching_kimi_harness_has_no_warning_or_native_hint():
     assert "61.0(AA-agent/kimi-code-cli)" in kimi_line
     assert "⚠️" not in kimi_line
     assert "💡" not in kimi_line
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "grade", "model_id", "effort", "score", "expected_render"),
+    [
+        ("cc-qwen38", "A+", "qwen3.8-max", "default", 57.0, "57.0(AA-agent/claude-code)"),
+        ("cc-glm", "B", "glm-5.2", "default", 43.0, "43.0(AA-agent/claude-code)"),
+    ],
+)
+def test_cc_profiles_harness_matched_have_no_warning_or_native_hint(
+    profile_name, grade, model_id, effort, score, expected_render
+):
+    """ROB-1252: cc-qwen38/cc-glm run the AA-agent-measured harness (claude-code)
+    natively — unlike oc-glm/oc-sonnet46 (opencode-hosted harness-이식), no
+    cross-harness warning or native-hint should render for these profiles."""
+    from scopefuel.bench import ModelScore
+
+    out = recommend(
+        [_result("clinepass", 10.0, pool_class="spend")],
+        grade,
+        today=TODAY,
+        now=NOW,
+        bench_scores=[
+            ModelScore(
+                model_id=model_id,
+                effort=effort,
+                harness="claude-code",
+                source="AA-agent",
+                metric="agentic",
+                score=score,
+                rank=1,
+                captured_at="2026-08-01T00:00:00+00:00",
+            )
+        ],
+    )
+    line = next(line for line in out.splitlines() if profile_name in line and line[:1].isdigit())
+    assert expected_render in line
+    assert "⚠️" not in line
+    assert "💡" not in line
+    assert "harness-이식" not in line
 
 
 def test_rob1191_stale_ultra_exact_delete_on_temp_db(tmp_path, monkeypatch):
