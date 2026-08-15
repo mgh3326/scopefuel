@@ -230,7 +230,7 @@ def _profile_actual_harness(profile: Profile) -> str | None:
         return "kimi-code-cli"
     if profile.name.startswith("codex-"):
         return "codex"
-    if profile.name in {"opus", "sonnet", "fable", "haiku"}:
+    if profile.name in {"opus", "sonnet", "fable", "haiku"} or profile.name.startswith("cc-"):
         return "claude-code"
     if profile.name.startswith("grok"):
         return "grok-build"
@@ -602,7 +602,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # ROB-1251: AA v1.3 실측 57@opencode(high) — 내삽 45.3을 대체.
         # harness-이식: opencode 측정 → agy 네이티브 실행.
         # ROB-1222에서 agy 네이티브가 우리 opencode/CLIProxy 배선보다 강함을 실측 —
-        # 이식 방향상 57은 하한에 가까움. 자체 실측 1건(3.7, rounds=0) 부함.
+        # 이식 방향상 57은 하한에 가까움. 자체 실측 1건(3.7, rounds=0) 부합.
         Profile(
             "agy-flash",
             "Gemini 3.7 Flash",
@@ -621,6 +621,19 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             **_aa_agent_benchmark(55.0, "deepseek-v4-flash", "max", harness="codex"),
             aa_agent_model_id="deepseek-v4-flash",
             aa_model_id="deepseek-v4-flash",
+        ),
+        # ROB-1252: qwen3.8-max run natively through the Claude Code CLI harness
+        # (ANTHROPIC_BASE_URL -> local CLIProxyAPI -> ClinePass translation, not
+        # opencode) — this is a real harness-matched measurement, no harness-이식
+        # annotation needed (compare oc-qwen37-max, which is the opencode-hosted,
+        # older-model sibling; unrelated profile).
+        Profile(
+            "cc-qwen38",
+            "Qwen3.8 Max (Claude Code)",
+            57.0,
+            **_aa_agent_benchmark(57.0, "qwen3.8-max", "default", harness="claude-code"),
+            aa_agent_model_id="qwen3.8-max",
+            aa_model_id="qwen3-8-max",
         ),
     ],
     "A": [
@@ -706,6 +719,21 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile(
             "oc-glm",
             "GLM-5.2",
+            43.0,
+            **_aa_agent_benchmark(43.0, "glm-5.2", "default", harness="claude-code"),
+            aa_agent_model_id="glm-5.2",
+            aa_model_id="glm-5-2",
+        ),
+        # ROB-1252: cc-glm is the SAME AA-agent measurement (glm-5.2/default = 43.0,
+        # measured on claude-code) as oc-glm directly above, but run through the
+        # matching real harness — the Claude Code CLI itself, routed via
+        # ANTHROPIC_BASE_URL -> local CLIProxyAPI -> ClinePass — instead of oc-glm's
+        # opencode harness-이식. Keep oc-glm as-is (opencode remains a valid, cheaper
+        # spawn path); cc-glm exists for callers that specifically need harness-matched
+        # scoring or the claude-code tool-loop behavior.
+        Profile(
+            "cc-glm",
+            "GLM-5.2 (Claude Code)",
             43.0,
             **_aa_agent_benchmark(43.0, "glm-5.2", "default", harness="claude-code"),
             aa_agent_model_id="glm-5.2",
@@ -930,6 +958,11 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "clinepass", None
     if profile in ("grok", "grok-hi", "grok-med", "grok45", "grok45-med", "grok46", "grok46-med"):
         return "grok", None
+    # ROB-1252: cc-qwen38/cc-glm run the Claude Code CLI harness itself against
+    # ClinePass (via CLIProxyAPI translation) — same quota pool as oc-* (both
+    # bill against ClinePass), different harness (claude-code, not opencode).
+    if profile in ("cc-qwen38", "cc-glm"):
+        return "clinepass", None
     return "", None
 
 
