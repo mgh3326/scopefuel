@@ -158,6 +158,14 @@ class Profile:
     # AA-model is queried only when the mapped AA-agent has no score.
     aa_agent_model_id: str | None = None
     aa_model_id: str | None = None
+    # ROB-1275: upstream serving-model observation for unversioned ClinePass slugs.
+    # ``served_slug`` is the request slug sent to the vendor; ``upstream_model`` is
+    # the model actually serving it as reported by the API echo (`model` field),
+    # and ``upstream_as_of`` is the ISO date that observation was taken. Groups are
+    # re-anchored silently, so the recorded value is the authoritative drift baseline.
+    served_slug: str | None = None
+    upstream_model: str | None = None
+    upstream_as_of: str | None = None
 
 
 _HARNESS_LABELS = {
@@ -642,6 +650,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             **_aa_agent_benchmark(57.0, "qwen3.8-max", "default", harness="claude-code"),
             aa_agent_model_id="qwen3.8-max",
             aa_model_id="qwen3-8-max",
+            served_slug="cline-pass/qwen3.8-max",
+            upstream_model="private/qwen3p8-max-wave",
+            upstream_as_of="2026-08-15",
         ),
     ],
     "A": [
@@ -667,6 +678,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             placement_note=OC_DSFLASH_PLACEMENT_NOTE,
             aa_agent_model_id="deepseek-v4-flash",
             aa_model_id="deepseek-v4-flash",
+            served_slug="cline-pass/deepseek-v4-flash",
+            upstream_model="deepseek/deepseek-v4-flash",
+            upstream_as_of="2026-08-15",
         ),
         Profile(
             "codex-sol",
@@ -754,6 +768,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             **_aa_agent_benchmark(43.0, "glm-5.2", "default", harness="claude-code"),
             aa_agent_model_id="glm-5.2",
             aa_model_id="glm-5-2",
+            served_slug="cline-pass/glm-5.2",
+            upstream_model="private/glm-5p2-wave",
+            upstream_as_of="2026-08-15",
         ),
         # ROB-1252: cc-glm is the SAME AA-agent measurement (glm-5.2/default = 43.0,
         # measured on claude-code) as oc-glm directly above, but run through the
@@ -769,6 +786,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             **_aa_agent_benchmark(43.0, "glm-5.2", "default", harness="claude-code"),
             aa_agent_model_id="glm-5.2",
             aa_model_id="glm-5-2",
+            served_slug="cline-pass/glm-5.2",
+            upstream_model="private/glm-5p2-wave",
+            upstream_as_of="2026-08-15",
         ),
         Profile(
             "kiro-haiku",
@@ -841,6 +861,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             ),
             placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
             aa_model_id="qwen3-7-max",
+            served_slug="cline-pass/qwen3.7-max",
         ),
         Profile(
             "oc-minimax-m3",
@@ -855,6 +876,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             ),
             placement_note="보수 배치(C; 앵커 밖 외삽)",
             aa_model_id="minimax-m3",
+            served_slug="cline-pass/minimax-m3",
         ),
         Profile(
             "oc-omni",
