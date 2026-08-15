@@ -326,8 +326,6 @@ def _interpolate_model_only_score(model_score: float) -> float:
 # fields below contain the derived values, never these AA-model originals.
 _QWEN37_DERIVED_SCORE = _interpolate_model_only_score(66.0)
 _MINIMAX_M3_DERIVED_SCORE = _interpolate_model_only_score(58.6)
-_GFLASH_DERIVED_SCORE = _interpolate_model_only_score(69.2)
-_DSFLASH_DERIVED_SCORE = _interpolate_model_only_score(69.1)
 
 
 @dataclass(frozen=True)
@@ -397,7 +395,7 @@ RETIRED_PROFILES: dict[str, RetiredProfile] = {
 # 1. AA-agent 실측: 점수를 그대로 급 점수로 사용. 하네스가 실행 하네스와 달라도
 #    표기만 harness-이식 으로 하고 점수·급은 변경하지 않음 (예: oc-sonnet46, oc-glm).
 # 2. AA-model 지수만 (에이전트 미측정): _MODEL_ONLY_ANCHORS 로 내삽/외삽 후
-#    한 단계 보수 하향으로 배치 (예: oc-qwen37-max, agy-flash, oc-minimax-m3, oc-dsflash).
+#    한 단계 보수 하향으로 배치 (예: oc-qwen37-max, oc-minimax-m3).
 GRADE_TABLE: dict[Grade, list[Profile]] = {
     "S+": [
         Profile(
@@ -601,6 +599,29 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gpt-5.6-luna",
             aa_model_id="gpt-5-6-luna",
         ),
+        # ROB-1251: AA v1.3 실측 57@opencode(high) — 내삽 45.3을 대체.
+        # harness-이식: opencode 측정 → agy 네이티브 실행.
+        # ROB-1222에서 agy 네이티브가 우리 opencode/CLIProxy 배선보다 강함을 실측 —
+        # 이식 방향상 57은 하한에 가까움. 자체 실측 1건(3.7, rounds=0) 부함.
+        Profile(
+            "agy-flash",
+            "Gemini 3.7 Flash",
+            57.0,
+            **_aa_agent_benchmark(57.0, "gemini-3.7-flash", "high", harness="opencode"),
+            aa_agent_model_id="gemini-3.7-flash",
+            aa_model_id="gemini-3-7-flash",
+        ),
+        # ROB-1251: AA v1.3 실측 55@codex — 내삽 44.7을 대체. $0.14/M 최저가 A+.
+        # harness-이식: codex 측정 → opencode 실행.
+        # DeepSeek V4 Pro는 AA v1.3 실측 31@claude-code — Flash(55)보다 낮고 단가 12배. 배선 후보 아님.
+        Profile(
+            "oc-dsflash",
+            "DeepSeek V4 Flash",
+            55.0,
+            **_aa_agent_benchmark(55.0, "deepseek-v4-flash", "max", harness="codex"),
+            aa_agent_model_id="deepseek-v4-flash",
+            aa_model_id="deepseek-v4-flash",
+        ),
     ],
     "A": [
         Profile(
@@ -761,40 +782,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             ),
             placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
             aa_model_id="qwen3-7-max",
-        ),
-        # ROB-1222: oc-gflash 은퇴(opencode/CLIProxy 하네스 에이전트 루프 미지속 실측 2회).
-        # agy 네이티브 agy-flash 로 교체. 같은 모델·같은 내삽값 승계.
-        # 표본 1건(재작업 1회 포함)으로 급을 올릴 근거 없음 — 잠정 C 배치.
-        Profile(
-            "agy-flash",
-            "Gemini 3.6 Flash",
-            _GFLASH_DERIVED_SCORE,
-            benchmark_annotation=MODEL_ONLY_INTERPOLATED_ANNOTATION,
-            model_only=True,
-            estimate_reason=(
-                "AA-model coding_index 69.2 — 68.8→43.0 / 72.4→64.0 내삽 = 45.3; "
-                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C). "
-                "하네스: agy 네이티브(oc-gflash의 opencode/CLIProxy와 다름). "
-                "agy 네이티브 실측 1건(재작업 1회), 표본 1건으로 급 조정 보류 — "
-                "reps 누적 후 B 승급 재검토."
-            ),
-            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향; 잠정)",
-            aa_model_id="gemini-3-6-flash",
-        ),
-        # ROB-1223: AA-model coding_index 69.1 — agy-flash(69.2→45.3→C)와 사실상 같은
-        # 모델 지수인데 B 에 있던 것을 정정. 에이전트 미측정이므로 보수 하향 → C.
-        Profile(
-            "oc-dsflash",
-            "DeepSeek V4 Flash",
-            _DSFLASH_DERIVED_SCORE,
-            benchmark_annotation=MODEL_ONLY_INTERPOLATED_ANNOTATION,
-            model_only=True,
-            estimate_reason=(
-                "AA-model coding_index 69.1 — 68.8→43.0 / 72.4→64.0 내삽 = 44.7; "
-                "harness 미측정이라 harness-이식, 한 단계 보수 배치(C)"
-            ),
-            placement_note="보수 배치(C; 내삽 결과 B 범위에서 한 단계 하향)",
-            aa_model_id="deepseek-v4-flash",
         ),
         Profile(
             "oc-minimax-m3",

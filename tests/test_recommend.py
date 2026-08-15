@@ -410,6 +410,7 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
     assert {"codex-terra", "codex-luna", "opus"}.issubset(aplus_names)
+    assert {"agy-flash", "oc-dsflash"}.issubset(aplus_names)  # ROB-1251: AA v1.3 실측 승급
     assert "oc-minimax-m3" not in aplus_names
 
     a_names = [p.name for p in GRADE_TABLE["A"]]
@@ -425,6 +426,9 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     assert any(p.name == "haiku" and p.launcher_effort == "low" for p in GRADE_TABLE["C"])
     assert "oc-sonnet46" in c_names
     assert c_names.index("oc-sonnet46") > 1
+    # ROB-1251: agy-flash·oc-dsflash는 A+ 승급 — C급에 없어야 함
+    assert "agy-flash" not in c_names
+    assert "oc-dsflash" not in c_names
 
 
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
@@ -497,19 +501,31 @@ def test_rob1193_boundaries_effort_variants_and_lower_tier_candidates():
 
     c_profiles = GRADE_TABLE["C"]
     qwen = next(p for p in c_profiles if p.name == "oc-qwen37-max")
-    gflash = next(p for p in c_profiles if p.name == "agy-flash")  # ROB-1222: oc-gflash -> agy-flash
     minimax = next(p for p in c_profiles if p.name == "oc-minimax-m3")
-    assert all(p.model_only and p.benchmark_source is None for p in (qwen, gflash, minimax))
+    assert all(p.model_only and p.benchmark_source is None for p in (qwen, minimax))
     assert qwen.benchmark == 40.6
-    assert gflash.benchmark == 45.3
     assert minimax.benchmark == 34.2
-    assert qwen.benchmark_annotation == gflash.benchmark_annotation == MODEL_ONLY_INTERPOLATED_ANNOTATION
+    assert qwen.benchmark_annotation == MODEL_ONLY_INTERPOLATED_ANNOTATION
     assert minimax.benchmark_annotation == MODEL_ONLY_EXTRAPOLATED_ANNOTATION
-    assert all(MODEL_ONLY_ANNOTATION not in (p.benchmark_annotation or "") for p in (qwen, gflash, minimax))
+    assert all(MODEL_ONLY_ANNOTATION not in (p.benchmark_annotation or "") for p in (qwen, minimax))
     assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S+"])
     assert not any(p.name == "oc-qwen37-max" for p in GRADE_TABLE["S"])
     # ROB-1222: oc-gflash는 은퇴 — C급에 없어야 함
     assert not any(p.name == "oc-gflash" for p in c_profiles)
+    # ROB-1251: agy-flash·oc-dsflash는 AA v1.3 실측으로 A+ 승급 — C급에 없어야 함
+    assert not any(p.name == "agy-flash" for p in c_profiles)
+    assert not any(p.name == "oc-dsflash" for p in c_profiles)
+    # ROB-1251: agy-flash·oc-dsflash A+ 실측 배치
+    aplus_gflash = next(p for p in GRADE_TABLE["A+"] if p.name == "agy-flash")
+    aplus_dsflash = next(p for p in GRADE_TABLE["A+"] if p.name == "oc-dsflash")
+    assert aplus_gflash.benchmark == 57.0
+    assert aplus_gflash.model == "Gemini 3.7 Flash"
+    assert aplus_gflash.benchmark_source == "AA-agent"
+    assert not aplus_gflash.model_only
+    assert aplus_dsflash.benchmark == 55.0
+    assert aplus_dsflash.model == "DeepSeek V4 Flash"
+    assert aplus_dsflash.benchmark_source == "AA-agent"
+    assert not aplus_dsflash.model_only
 
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
@@ -736,15 +752,14 @@ def test_rob1193_model_only_profiles_use_registered_coding_index_metric():
     minimax_line = next(
         line for line in c_output.splitlines() if "oc-minimax-m3" in line and line[:1].isdigit()
     )
-    gflash_line = next(line for line in c_output.splitlines() if "agy-flash" in line and line[:1].isdigit())
     assert "40.6(추정(내삽·harness-이식)" in qwen_line
     assert "34.2(추정(외삽·harness-이식)" in minimax_line
-    assert "45.3(추정(내삽·harness-이식)" in gflash_line
     assert "모델지수만 있음(에이전트 미측정)" in qwen_line
     assert "모델지수만 있음(에이전트 미측정)" in minimax_line
     assert "66.0" not in qwen_line and "58.6" not in minimax_line
-    assert "69.2" not in gflash_line
     assert "46.0" not in qwen_line and "44.4" not in minimax_line
+    # ROB-1251: agy-flash는 A+ 승급 — C급 출력에 없어야 함
+    assert not any("agy-flash" in line and line[:1].isdigit() for line in c_output.splitlines())
 
 
 # ------------------------------------------------------------------ AC4: C grade
