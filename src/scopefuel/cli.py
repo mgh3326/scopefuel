@@ -12,7 +12,7 @@ import json
 import sys
 import time
 
-from . import bench, recommend, render
+from . import bench, modelsverify, recommend, render
 from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -221,6 +221,13 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
     refresh_parser.add_argument("--background", action="store_true", help="즉시 반환하고 백그라운드 갱신")
     refresh_parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+
+    models_parser = subparsers.add_parser("models", help="프로필별 서빙 모델 검증")
+    models_sub = models_parser.add_subparsers(dest="models_command", required=True)
+    models_sub.add_parser(
+        "verify",
+        help="ClinePass 프로필의 요청 슬러그를 라이브 프로브로 대조 (drift 있으면 exit 1)",
+    )
 
     return parser
 
@@ -437,6 +444,13 @@ def _reps_command(args: argparse.Namespace) -> int:
     return 2
 
 
+def _models_command(args: argparse.Namespace) -> int:
+    report = modelsverify.verify()
+    print(modelsverify.format_report(report))
+    # drift 가 하나라도 있으면 CI·크론에서 잡히도록 비정상 종료.
+    return 1 if report.has_drift else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     fetchers = registry()
     parser = build_parser(list(fetchers))
@@ -458,6 +472,9 @@ def main(argv: list[str] | None = None) -> int:
         if args._worker:
             return run_worker(fetchers, args.pool)
         return spawn(args.pool, background=args.background)
+
+    if args.command == "models":
+        return _models_command(args)
 
     if args.list_providers:
         for name in default_order(list(fetchers)):
