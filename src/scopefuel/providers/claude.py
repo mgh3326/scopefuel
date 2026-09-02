@@ -33,9 +33,14 @@ BETA_HEADER = "oauth-2025-04-20"
 
 def _read_file() -> str | None:
     try:
-        return CREDENTIALS.read_text()
+        return _credentials_path().read_text()
     except OSError:
         return None
+
+
+def _credentials_path() -> pathlib.Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return pathlib.Path(configured) / ".credentials.json" if configured else CREDENTIALS
 
 
 def _read_keychain() -> str | None:
@@ -82,7 +87,7 @@ def fetch() -> ProviderResult:
             id="claude",
             error="자격증명 없음",
             hint=(
-                f"{CREDENTIALS} 없음, Keychain('{KEYCHAIN_SERVICE}')에서도 못 읽음 "
+                f"{_credentials_path()} 없음, Keychain('{KEYCHAIN_SERVICE}')에서도 못 읽음 "
                 "— claude 로그인 후 다시 시도"
             ),
         )

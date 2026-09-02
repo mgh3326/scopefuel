@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pathlib
 
 from ..http import request_json
@@ -19,11 +20,12 @@ USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 
 def fetch() -> ProviderResult:
-    if not AUTH.exists():
+    auth = _auth_path()
+    if not auth.exists():
         return ProviderResult(
-            id="codex", error="자격증명 파일 없음", hint=f"{AUTH} 없음 — `codex login` 후 재시도"
+            id="codex", error="자격증명 파일 없음", hint=f"{auth} 없음 — `codex login` 후 재시도"
         )
-    tokens = json.loads(AUTH.read_text()).get("tokens") or {}
+    tokens = json.loads(auth.read_text()).get("tokens") or {}
     token = (tokens.get("access_token") or "").strip()
     if not token:
         return ProviderResult(id="codex", error="access_token 없음", hint="`codex login` 필요")
@@ -80,6 +82,11 @@ def fetch() -> ProviderResult:
         source="wham-usage-api",
         raw=raw,
     )
+
+
+def _auth_path() -> pathlib.Path:
+    configured = os.environ.get("CODEX_HOME")
+    return pathlib.Path(configured) / "auth.json" if configured else AUTH
 
 
 def _num(value: object) -> float | None:
