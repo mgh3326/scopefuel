@@ -12,7 +12,7 @@ import json
 import sys
 import time
 
-from . import bench, recommend, render, served
+from . import bench, herdr, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -221,6 +221,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
     refresh_parser.add_argument("--background", action="store_true", help="즉시 반환하고 백그라운드 갱신")
     refresh_parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+
+    subparsers.add_parser(
+        "herdr-event",
+        help="Herdr pane 이벤트를 표시 전용 쿼타 메타데이터로 갱신 (plugin 내부용)",
+    )
 
     models_parser = subparsers.add_parser("models", help="업스트림 서빙 모델 기록/drift 검증")
     models_sub = models_parser.add_subparsers(dest="models_command", required=True)
@@ -474,6 +479,9 @@ def main(argv: list[str] | None = None) -> int:
         if args._worker:
             return run_worker(fetchers, args.pool)
         return spawn(args.pool, background=args.background)
+
+    if args.command == "herdr-event":
+        return herdr.handle_event(fetchers)
 
     if args.command == "models":
         return _models_command(args)

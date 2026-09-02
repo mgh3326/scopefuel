@@ -1,7 +1,7 @@
 id = "scopefuel.gauge"
 name = "scopefuel"
 version = "0.1.0"
-min_herdr_version = "0.7.0"
+min_herdr_version = "0.8.2"
 description = "AI 코딩 플랜의 스코프별 남은 여유(계정/모델/그룹 × 지금/이번주) 계기판"
 platforms = ["macos", "linux"]
 
@@ -24,3 +24,15 @@ id = "gauge"
 title = "scopefuel"
 placement = "overlay"
 command = ["scopefuel", "--watch", "60"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["scopefuel", "herdr-event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["scopefuel", "herdr-event"]
+
+[[events]]
+on = "pane.focused"
+command = ["scopefuel", "herdr-event"]

@@ -75,7 +75,7 @@ def test_gate_cli_ok_exit_code(monkeypatch, capsys):
 
 
 def test_gate_blocked_by_policy_exclude():
-    policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
+    policy.set_policy("claude", "exclude", until=dt.date(2099, 8, 31), note="Pro 요금제")
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
         _result("codex", 10.0, pool_class="preserve"),
@@ -85,7 +85,7 @@ def test_gate_blocked_by_policy_exclude():
     assert result.ok is False
     assert result.unmeasurable is False
     assert "정책 제외" in result.reason
-    assert "until 2026-08-31" in result.reason
+    assert "until 2099-08-31" in result.reason
     # 동일 grade(S+)의 가용 정상 후보를 대안으로 제시 (등급 낮추지 않음)
     assert result.alternatives
     assert "opus" not in result.alternatives
@@ -93,7 +93,7 @@ def test_gate_blocked_by_policy_exclude():
 
 
 def test_gate_cli_blocked_exit_3_with_stderr_alternatives(monkeypatch, capsys):
-    policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
+    policy.set_policy("claude", "exclude", until=dt.date(2099, 8, 31), note="Pro 요금제")
     providers = {
         "claude": lambda: _result("claude", 10.0, pool_class="preserve"),
         "codex": lambda: _result("codex", 10.0, pool_class="preserve"),

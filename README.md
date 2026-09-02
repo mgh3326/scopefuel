@@ -75,6 +75,18 @@ herdr plugin link ~/work/scopefuel
 - 액션 `scopefuel.check` — 한 줄 요약 출력
 - 페인 `scopefuel.gauge` — `--watch 60`으로 상시 계기판 (overlay)
 
+에이전트 pane 이벤트(`pane.agent_detected`, `pane.agent_status_changed`, `pane.focused`)에서는 해당
+pane의 agent/provider만 60초 debounce로 다시 확인해 표시 전용 metadata 토큰 `scopefuel_quota`를 보냅니다.
+Herdr sidebar에서 이 토큰을 참조하면 다음처럼 pane별 라벨을 볼 수 있습니다.
+
+```
+claude·max · now 6% · wk 97% · [Fable 100%] · credential=default
+```
+
+이 경로는 pane title, agent state, 기존 action/overlay를 바꾸지 않습니다. 이벤트가 제공하는
+`CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`HOME` 위치는 짧은 익명 credential ID로만 구분하며 경로·토큰은 metadata에
+쓰지 않습니다.
+
 ## 지원 provider
 
 | id | 경로 | 얻는 것 | 제약 |
