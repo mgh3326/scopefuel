@@ -25,14 +25,9 @@ title = "scopefuel"
 placement = "overlay"
 command = ["scopefuel", "--watch", "60"]
 
+# 이벤트 훅은 pane 당 1회(agent 최초 감지)만 둔다. status_changed/focused 훅은
+# codex 상태 플래핑 시 pane×훅 만큼 자식 프로세스를 폭주시켜 herdr 서버를 묶었다
+# (2026-09-04 실측). 갱신은 스폰 게이트·gauge 패널·CLI 가 필요 시점에 한다.
 [[events]]
 on = "pane.agent_detected"
-command = ["scopefuel", "herdr-event"]
-
-[[events]]
-on = "pane.agent_status_changed"
-command = ["scopefuel", "herdr-event"]
-
-[[events]]
-on = "pane.focused"
 command = ["scopefuel", "herdr-event"]

@@ -88,9 +88,12 @@ def test_herdr_event_ignores_unknown_agent_without_fetch_or_report(tmp_path, mon
     assert not log.exists()
 
 
-def test_manifest_keeps_existing_overlay_and_actions_and_adds_all_event_hooks():
+def test_manifest_keeps_existing_overlay_and_actions_and_only_the_detect_hook():
     text = (pathlib.Path(__file__).parent.parent / "herdr-plugin.toml").read_text()
     assert 'placement = "overlay"' in text
     assert 'id = "check"' in text and 'id = "check-now"' in text
-    for event in ("pane.agent_detected", "pane.agent_status_changed", "pane.focused"):
-        assert f'on = "{event}"' in text
+    assert 'on = "pane.agent_detected"' in text
+    # High-frequency hooks were removed on 2026-09-04: codex status flapping
+    # spawned one scopefuel process per pane per event and tied up herdr.
+    for event in ("pane.agent_status_changed", "pane.focused"):
+        assert f'on = "{event}"' not in text
