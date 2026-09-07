@@ -63,6 +63,22 @@ scopefuel --list-providers
 (`SCOPEFUEL_CACHE`로 변경). 조회가 실패하면 **6시간 이내의 마지막 스냅샷으로 폴백하되 나이를 함께
 표시**합니다 — 옛 값을 신선한 값처럼 보여주지 않는 것이 원칙입니다.
 
+## Benchmark backend
+
+벤치 점수와 대표 실행 기록은 기본적으로 로컬 SQLite를 사용합니다. 여러 노드가 같은 정본을 읽어야
+할 때만 XDG config의 `scopefuel/config.toml`에 다음을 설정합니다.
+
+```toml
+[bench]
+backend = "handoffkeep"
+cache_ttl_s = 21600
+```
+
+이 모드에서는 `HANDOFFKEEP_URL`과 `HANDOFFKEEP_TOKEN`을 사용합니다. 로컬 SQLite는 6시간 TTL의
+캐시가 되며, 읽기 실패는 캐시와 나이를 표시해 계속 동작하고, 쓰기 실패는 종료코드 2로 끝납니다.
+`scopefuel bench push-local`은 기존 로컬 점수·reps를 지우지 않고 한 번 이관할 때 사용합니다.
+급 배치는 `scopefuel bench grades set`에서 deviation reference를 반드시 함께 남겨야 합니다.
+
 ## herdr 통합
 
 `herdr-plugin.toml`이 포함되어 있어 그대로 설치할 수 있습니다.
