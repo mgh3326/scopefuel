@@ -452,6 +452,55 @@ def test_push_local_preserves_source_rows_and_rejects_local_backend(tmp_path, mo
     assert data_home / "scopefuel" / "bench.db"
 
 
+def test_push_local_is_idempotent_in_the_rep_cache(tmp_path, monkeypatch):
+    """B-3 (H1/H2, regression from round 1's B-1 fix): a second push-local must
+    not duplicate rep cache rows. push_local's write-through _RemoteRep is
+    always created_by=None (the client doesn't know its own authenticated id
+    until the next GET); _put_cached_rep must merge that anonymous echo into
+    the same-origin row _replace_cached_reps just re-fetched, not leave it
+    alongside as a second, differently-keyed placeholder row."""
+    _set_backend(tmp_path, monkeypatch, "local")
+    for number in (1, 2):
+        bench.add_rep(
+            profile="codex-terra",
+            model_id="gpt-5.6-terra",
+            task_ref=f"PR#{number}",
+            tier="T2",
+            role="impl",
+            effort="max",
+            grade="S",
+            rounds=0,
+            blockers_found=0,
+            completed=1,
+        )
+
+    _set_backend(tmp_path, monkeypatch, "handoffkeep")
+    fake = FakeHandoffkeep()
+    monkeypatch.setattr(bench, "request_json", fake.request_json)
+    assert len(fake.reps) == 1  # server fixture only, before any push
+
+    assert cli.main(["bench", "push-local"]) == 0
+    assert len(fake.reps) == 3  # fixture + 2 pushed local reps
+
+    assert cli.main(["bench", "push-local"]) == 0
+    assert len(fake.reps) == 3  # server side already idempotent (contract §3.3)
+
+    cache_db = bench.db_path()
+    conn = sqlite3.connect(cache_db)
+    try:
+        cache_row_count = conn.execute("SELECT COUNT(*) FROM bench_cache_reps").fetchone()[0]
+        origin_ids = [row[0] for row in conn.execute("SELECT origin_id FROM bench_cache_reps").fetchall()]
+    finally:
+        conn.close()
+    read = bench.read_reps()
+    ids = sorted(rep.id for rep in read)
+
+    assert cache_row_count == 3
+    assert len(read) == 3
+    assert len(origin_ids) == len(set(origin_ids))  # no duplicate origin_id rows
+    assert ids == [1, 2, 3]
+
+
 def test_grade_set_requires_deviation_and_reports_drift(handoffkeep, capsys):
     _, fake = handoffkeep
     with pytest.raises(SystemExit) as exc:

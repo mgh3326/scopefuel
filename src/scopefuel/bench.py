@@ -2066,14 +2066,35 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     is a per-machine local rowid and collides by default across machines, so
     matching on it alone would collapse two different machines' rep #N into one
     cache row (see the client id column doc comment on ``_RemoteRep``).
+
+    ``item.created_by`` is only ever ``None`` for an *anonymous* write-through
+    echo — a just-``push-local``'d or just-``add_rep``'d row, cached before the
+    next GET learns the server's identity for it. Such an echo is always this
+    process's own write for its own local ``origin_id``, never another
+    client's, so it may merge into whatever row already caches that
+    ``origin_id`` under any ``created_by`` (typically the very row this same
+    call's ``_replace_cached_reps`` pass just re-fetched) instead of piling up
+    a second, differently-keyed placeholder row for it. A cross-client
+    collision on one ``origin_id`` is only ever observed through *explicit*
+    (non-``None``) ``created_by`` values coming from a real GET, which always
+    take the exact-match branch below and so never merge with each other.
     """
-    existing = conn.execute(
-        "SELECT cache_key, server_id FROM bench_cache_reps "
-        "WHERE origin_id = ? AND created_by IS ? "
-        "ORDER BY server_id IS NULL, cache_key "
-        "LIMIT 1",
-        (item.origin_id, item.created_by),
-    ).fetchone()
+    if item.created_by is not None:
+        existing = conn.execute(
+            "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
+            "WHERE origin_id = ? AND created_by IS ? "
+            "ORDER BY server_id IS NULL, cache_key "
+            "LIMIT 1",
+            (item.origin_id, item.created_by),
+        ).fetchone()
+    else:
+        existing = conn.execute(
+            "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
+            "WHERE origin_id = ? "
+            "ORDER BY created_by IS NULL, server_id IS NULL, cache_key "
+            "LIMIT 1",
+            (item.origin_id,),
+        ).fetchone()
     if existing is not None:
         cache_key = existing["cache_key"]
     elif item.created_by is not None:
@@ -2084,7 +2105,9 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
         cache_key = f"origin:{item.origin_id}"
     existing_server_id = existing["server_id"] if existing else None
     server_id = item.server_id if item.server_id is not None else existing_server_id
-    created_by = item.created_by
+    created_by = (
+        item.created_by if item.created_by is not None else (existing["created_by"] if existing else None)
+    )
     record = item.record
     conn.execute(
         "INSERT INTO bench_cache_reps "
