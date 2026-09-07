@@ -156,6 +156,16 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     bench_import.add_argument("file", help="[[scores]] 또는 [[model_scores]] TOML 파일")
 
     bench_sub.add_parser("coverage", help="프로필별 출처(AA-agent/AA-model/openrouter) 커버리지")
+    bench_sub.add_parser("push-local", help="기존 로컬 bench 행을 handoffkeep으로 1회 이관")
+
+    grades_parser = bench_sub.add_parser("grades", help="서버 정본 급 배치 관리")
+    grades_sub = grades_parser.add_subparsers(dest="grades_command", required=True)
+    grades_set = grades_sub.add_parser("set", help="프로필의 서버 급 배치 설정")
+    grades_set.add_argument("--profile", required=True)
+    grades_set.add_argument("--grade", required=True, choices=bench.REP_GRADES)
+    grades_set.add_argument("--deviation-ref", required=True)
+    grades_set.add_argument("--boundary-version")
+    grades_sub.add_parser("list", help="서버 급 배치와 코드 표 비교")
 
     reps_parser = subparsers.add_parser("reps", help="실측 대표 실행 기록")
     reps_sub = reps_parser.add_subparsers(dest="reps_command", required=True)
@@ -318,15 +328,18 @@ def _policy_command(
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    bench_scores = bench.read_scores()
+    grade_table = bench.runtime_grade_table()
     print(
         recommend.recommend(
             results,
             args.recommend,
             today=now.date(),
             now=now,
-            bench_scores=bench.read_scores(),
+            bench_scores=bench_scores,
             explain=bool(getattr(args, "explain", False)),
             hide_excluded=bool(getattr(args, "hide_excluded", False)),
+            grade_table=grade_table,
         )
     )
     return 0
@@ -335,7 +348,19 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
-    result = recommend.gate_check(results, args.profile, today=now.date(), now=now)
+    # ``read_scores`` itself preserves the legacy local route and only enters
+    # the cache/network path for the configured canonical backend.  Passing it
+    # here keeps gate alternatives on the same benchmark view as recommend.
+    bench_scores = bench.read_scores()
+    grade_table = bench.runtime_grade_table()
+    result = recommend.gate_check(
+        results,
+        args.profile,
+        today=now.date(),
+        now=now,
+        bench_scores=bench_scores,
+        grade_table=grade_table,
+    )
 
     if result.ok:
         print(
@@ -367,6 +392,31 @@ def _bench_command(args: argparse.Namespace) -> int:
     if args.bench_command == "coverage":
         print(bench.coverage_report())
         return 0
+    if args.bench_command == "push-local":
+        try:
+            score_count, rep_count = bench.push_local()
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"bench push-local: pushed {score_count} score(s), {rep_count} rep(s)")
+        return 0
+    if args.bench_command == "grades":
+        if args.grades_command == "list":
+            print(bench.grades_report())
+            return 0
+        if args.grades_command == "set":
+            try:
+                count = bench.set_grade(
+                    profile=args.profile,
+                    grade=args.grade,
+                    deviation_ref=args.deviation_ref,
+                    boundary_version=args.boundary_version,
+                )
+            except bench.BenchError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            print(f"bench grades set: stored {count} grade(s)")
+            return 0
     if args.bench_command == "show":
         print(bench.show_scores(args.model_id))
         return 0

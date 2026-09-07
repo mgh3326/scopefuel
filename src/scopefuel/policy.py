@@ -74,6 +74,16 @@ def _write_config(config: dict) -> None:
             else:
                 lines.append(f"{key} = {_toml_string(str(value))}")
         lines.append("")
+    bench = config.get("bench")
+    if isinstance(bench, dict) and bench:
+        lines.append("[bench]")
+        backend = bench.get("backend")
+        if backend is not None:
+            lines.append(f"backend = {_toml_string(str(backend))}")
+        cache_ttl_s = bench.get("cache_ttl_s")
+        if isinstance(cache_ttl_s, (int, float)) and not isinstance(cache_ttl_s, bool):
+            lines.append(f"cache_ttl_s = {cache_ttl_s!r}")
+        lines.append("")
     pools = config.get("pools")
     if isinstance(pools, dict):
         for name in sorted(pools):
