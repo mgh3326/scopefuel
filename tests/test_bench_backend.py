@@ -452,7 +452,7 @@ def test_push_local_preserves_source_rows_and_rejects_local_backend(tmp_path, mo
     assert data_home / "scopefuel" / "bench.db"
 
 
-def test_push_local_is_idempotent_in_the_rep_cache(tmp_path, monkeypatch):
+def test_push_local_is_idempotent_in_the_rep_cache(tmp_path, monkeypatch, capsys):
     """B-3 (H1/H2, regression from round 1's B-1 fix): a second push-local must
     not duplicate rep cache rows. push_local's write-through _RemoteRep is
     always created_by=None (the client doesn't know its own authenticated id
@@ -499,6 +499,11 @@ def test_push_local_is_idempotent_in_the_rep_cache(tmp_path, monkeypatch):
     assert len(read) == 3
     assert len(origin_ids) == len(set(origin_ids))  # no duplicate origin_id rows
     assert ids == [1, 2, 3]
+
+    capsys.readouterr()  # discard push-local's stdout
+    assert cli.main(["reps", "list"]) == 0
+    out_lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(out_lines) == 3  # H2: warm reps list prints no duplicates
 
 
 def test_grade_set_requires_deviation_and_reports_drift(handoffkeep, capsys):
