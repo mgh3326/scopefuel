@@ -16,6 +16,7 @@ import pathlib
 import sqlite3
 import sys
 import tomllib
+import urllib.parse
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TextIO
@@ -38,6 +39,9 @@ REP_GRADES = ("S+", "S", "A+", "A", "B", "C")
 BENCH_BACKEND_LOCAL = "local"
 BENCH_BACKEND_HANDOFFKEEP = "handoffkeep"
 DEFAULT_CACHE_TTL_S = 6 * 60 * 60
+# CWE-319: the bearer token must never leave the process over plaintext HTTP,
+# except to a local test/dev server where "plaintext" never leaves the host.
+_HANDOFFKEEP_PLAINTEXT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _BENCH_SCOPES = frozenset({"scores", "reps", "grades"})
 _WARNED_UNKNOWN_BACKENDS: set[str] = set()
 
@@ -213,6 +217,7 @@ class ModelScore:
     captured_at: str
     time_per_task_min: float | None = None
     cost_per_task_usd: float | None = None
+    provenance: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _MODEL_SCORE_COLUMNS}
@@ -360,6 +365,7 @@ _CACHE_SCHEMA = """
           captured_at       TEXT NOT NULL,
           time_per_task_min REAL,
           cost_per_task_usd REAL,
+          provenance        TEXT NOT NULL DEFAULT '',
           PRIMARY KEY (model_id, effort, harness, source, metric)
         );
 
@@ -401,6 +407,11 @@ _CACHE_SCHEMA = """
 
 def _cache_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_CACHE_SCHEMA)
+    existing_score_cache_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(bench_cache_scores)").fetchall()
+    }
+    if "provenance" not in existing_score_cache_columns:
+        conn.execute("ALTER TABLE bench_cache_scores ADD COLUMN provenance TEXT NOT NULL DEFAULT ''")
 
 
 def _schema(conn: sqlite3.Connection) -> None:
@@ -588,6 +599,7 @@ def _validate_score(
         captured_at=_captured_at(value.captured_at),
         time_per_task_min=_measurement(value.time_per_task_min, "time_per_task_min"),
         cost_per_task_usd=_measurement(value.cost_per_task_usd, "cost_per_task_usd"),
+        provenance=_optional_text(value.provenance, "provenance"),
     )
 
 
@@ -690,11 +702,30 @@ def _stamp_cache(conn: sqlite3.Connection, scope: str, backend: BenchBackend, no
     )
 
 
+def _check_handoffkeep_scheme(url: str) -> None:
+    """Refuse to build a request URL that would send the bearer token in the clear.
+
+    ``https://`` is always allowed. ``http://`` is allowed only to
+    localhost/127.0.0.1/::1 (test and local-dev servers, where the request
+    never reaches a network). Every other scheme — including bare ``http://``
+    to a real host, or no scheme at all — is refused before any header
+    carrying the token is built.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and parsed.hostname in _HANDOFFKEEP_PLAINTEXT_HOSTS:
+        return
+    raise BenchBackendError("HANDOFFKEEP_URL must use https (http allowed only to localhost)")
+
+
 def _backend_url(backend: BenchBackend, scope: str) -> str:
     if scope not in _BENCH_SCOPES:
         raise BenchBackendError("invalid bench cache scope")
     if not backend.url or not backend.token:
         raise BenchBackendError("handoffkeep URL and token are required")
+    _check_handoffkeep_scheme(backend.url)
     return f"{backend.url.rstrip('/')}/v1/bench/{scope}"
 
 
@@ -707,12 +738,13 @@ def _handoffkeep_request(
 ) -> dict:
     """Make one authenticated bench request without exposing response bodies."""
 
+    url = _backend_url(backend, scope)
     headers = {"Authorization": f"Bearer {backend.token}"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     try:
         payload = request_json(
-            _backend_url(backend, scope),
+            url,
             method=method,
             headers=headers,
             body=body,
@@ -754,6 +786,7 @@ def _score_from_wire(value: object) -> ModelScore:
             captured_at=_captured_at(value.get("captured_at")),
             time_per_task_min=_measurement(value.get("time_per_task_min"), "time_per_task_min"),
             cost_per_task_usd=_measurement(value.get("cost_per_task_usd"), "cost_per_task_usd"),
+            provenance=_optional_text(value.get("provenance"), "provenance"),
         ),
         allow_none_score=True,
     )
@@ -787,14 +820,14 @@ def _score_to_wire(score: ModelScore) -> dict[str, object]:
         "captured_at": score.captured_at,
         "time_per_task_min": score.time_per_task_min,
         "cost_per_task_usd": score.cost_per_task_usd,
-        "provenance": "",
+        "provenance": score.provenance or "",
     }
 
 
 def _cached_scores(conn: sqlite3.Connection) -> list[ModelScore]:
     rows = conn.execute(
         "SELECT model_id, effort, harness, source, metric, score, rank, captured_at, "
-        "time_per_task_min, cost_per_task_usd FROM bench_cache_scores "
+        "time_per_task_min, cost_per_task_usd, provenance FROM bench_cache_scores "
         "ORDER BY source, metric, model_id, effort, harness"
     ).fetchall()
     return [
@@ -809,6 +842,7 @@ def _cached_scores(conn: sqlite3.Connection) -> list[ModelScore]:
             captured_at=row["captured_at"],
             time_per_task_min=row["time_per_task_min"],
             cost_per_task_usd=row["cost_per_task_usd"],
+            provenance=row["provenance"] or None,
         )
         for row in rows
     ]
@@ -818,11 +852,12 @@ def _put_cached_score(conn: sqlite3.Connection, score: ModelScore) -> None:
     conn.execute(
         "INSERT INTO bench_cache_scores "
         "(model_id, effort, harness, source, metric, score, rank, captured_at, "
-        "time_per_task_min, cost_per_task_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "time_per_task_min, cost_per_task_usd, provenance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(model_id, effort, harness, source, metric) DO UPDATE SET "
         "score = excluded.score, rank = excluded.rank, captured_at = excluded.captured_at, "
         "time_per_task_min = excluded.time_per_task_min, "
-        "cost_per_task_usd = excluded.cost_per_task_usd",
+        "cost_per_task_usd = excluded.cost_per_task_usd, "
+        "provenance = excluded.provenance",
         (
             score.model_id,
             score.effort or "",
@@ -834,6 +869,7 @@ def _put_cached_score(conn: sqlite3.Connection, score: ModelScore) -> None:
             score.captured_at,
             score.time_per_task_min,
             score.cost_per_task_usd,
+            score.provenance or "",
         ),
     )
 
@@ -2024,22 +2060,31 @@ def _cached_reps(conn: sqlite3.Connection) -> list[_RemoteRep]:
 
 
 def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
+    """Upsert one rep cache row.
+
+    Keyed by ``(created_by, origin_id)`` per contract §3.2 — ``origin_id`` alone
+    is a per-machine local rowid and collides by default across machines, so
+    matching on it alone would collapse two different machines' rep #N into one
+    cache row (see the client id column doc comment on ``_RemoteRep``).
+    """
     existing = conn.execute(
-        "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
-        "WHERE origin_id = ? ORDER BY server_id IS NULL, cache_key "
+        "SELECT cache_key, server_id FROM bench_cache_reps "
+        "WHERE origin_id = ? AND created_by IS ? "
+        "ORDER BY server_id IS NULL, cache_key "
         "LIMIT 1",
-        (item.origin_id,),
+        (item.origin_id, item.created_by),
     ).fetchone()
-    cache_key = (
-        existing["cache_key"]
-        if existing is not None
-        else (f"server:{item.server_id}" if item.server_id is not None else f"origin:{item.origin_id}")
-    )
+    if existing is not None:
+        cache_key = existing["cache_key"]
+    elif item.created_by is not None:
+        cache_key = f"{item.created_by}:{item.origin_id}"
+    elif item.server_id is not None:
+        cache_key = f"server:{item.server_id}"
+    else:
+        cache_key = f"origin:{item.origin_id}"
     existing_server_id = existing["server_id"] if existing else None
     server_id = item.server_id if item.server_id is not None else existing_server_id
-    created_by = (
-        item.created_by if item.created_by is not None else (existing["created_by"] if existing else None)
-    )
+    created_by = item.created_by
     record = item.record
     conn.execute(
         "INSERT INTO bench_cache_reps "

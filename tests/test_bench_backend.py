@@ -517,3 +517,113 @@ def test_runtime_grades_drive_recommend_and_gate(handoffkeep, monkeypatch, capsy
     assert capsys.readouterr().err.splitlines() == [
         "warning: handoffkeep bench grades failed boundary validation; using code grade table"
     ]
+
+
+def test_rep_cache_keeps_two_machines_origin_ids_apart(handoffkeep, capsys):
+    """BLOCKER-1 (G1/G2, contract §3.2): the rep cache idempotency key is
+    (created_by, origin_id), not origin_id alone — two machines' rep #7 must
+    not collapse into one (and certainly not one hybrid) cache row."""
+    _, fake = handoffkeep
+    fake.reps = [
+        dict(REP_FIXTURE, id=11, origin_id=7, created_by="client-a", task_ref="PR#A"),
+        dict(REP_FIXTURE, id=12, origin_id=7, created_by="client-b", task_ref="PR#B"),
+    ]
+
+    cold = bench.read_reps()
+    assert len(cold) == 2
+    assert {rep.task_ref for rep in cold} == {"PR#A", "PR#B"}
+    assert fake.hits[("GET", "reps")] == 1
+
+    warm = bench.read_reps()
+    assert len(warm) == 2
+    assert {rep.task_ref for rep in warm} == {"PR#A", "PR#B"}
+    assert fake.hits[("GET", "reps")] == 1  # served from cache, no second GET
+
+    cache_db = bench.db_path()
+    conn = sqlite3.connect(cache_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT cache_key, origin_id, created_by, task_ref FROM bench_cache_reps"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2
+    assert {row["cache_key"] for row in rows} == {"client-a:7", "client-b:7"}
+    assert {row["task_ref"] for row in rows} == {"PR#A", "PR#B"}
+
+    assert cli.main(["reps", "list"]) == 0
+    out = capsys.readouterr().out
+    assert sum(1 for line in out.splitlines() if "task=PR#A" in line or "task=PR#B" in line) == 2
+
+
+def test_import_preserves_unrelated_provenance(handoffkeep, tmp_path):
+    """BLOCKER-2 (G4/G5, contract §2.2 correction): _score_to_wire must round-trip
+    the provenance it read from the server, so importing one unrelated score
+    doesn't blank operator-approved attribution on other rows in the same
+    (source, metric) group when the full group is re-ranked and re-PUT."""
+    _, fake = handoffkeep
+    imported = tmp_path / "brand-new.toml"
+    imported.write_text(
+        'source = "AA-agent"\n'
+        'metric = "agentic"\n'
+        'effort = "max"\n'
+        'harness = "codex"\n'
+        'captured_at = "2026-09-07T00:00:00Z"\n'
+        "[[scores]]\n"
+        'model_id = "brand-new"\n'
+        "score = 50.0\n",
+        encoding="utf-8",
+    )
+    assert cli.main(["bench", "import", str(imported)]) == 0
+
+    server_row = next(
+        row for row in fake.scores if row["model_id"] == "claude-opus-5" and row["effort"] == "high"
+    )
+    assert server_row["provenance"] == "operator-approved manual import 2026-09-07"
+
+    cached = next(row for row in bench.read_scores("claude-opus-5") if row.effort == "high")
+    assert cached.provenance == "operator-approved manual import 2026-09-07"
+
+
+def test_handoffkeep_allows_plaintext_localhost(tmp_path, monkeypatch):
+    """SECURITY-1 (G7): the localhost/127.0.0.1/::1 http:// exception must keep
+    working — the verifier's and this repo's own fake servers depend on it."""
+    _set_backend(tmp_path, monkeypatch)
+    monkeypatch.setenv("HANDOFFKEEP_URL", "http://127.0.0.1:8000")
+    fake = FakeHandoffkeep()
+    monkeypatch.setattr(bench, "request_json", fake.request_json)
+
+    assert len(bench.read_scores()) == 2
+    assert fake.hits[("GET", "scores")] == 1
+
+
+def test_handoffkeep_rejects_plaintext_non_local_scheme(tmp_path, monkeypatch, capsys):
+    """SECURITY-1 (G7/G8, CWE-319): a non-localhost http:// HANDOFFKEEP_URL must
+    never reach the network with the bearer token — reads fail open with one
+    warning line, writes fail closed with exit code 2, and (preferred over a
+    request with no Authorization header) no request is sent at all."""
+    _set_backend(tmp_path, monkeypatch)
+    monkeypatch.setenv("HANDOFFKEEP_URL", "http://example.invalid")
+    monkeypatch.setattr(bench, "request_json", lambda *args, **kwargs: pytest.fail("network called"))
+
+    assert bench.read_scores() == []
+    assert capsys.readouterr().err.splitlines() == [
+        "warning: handoffkeep unreachable; using cached bench scores (no cached data)"
+    ]
+
+    imported = tmp_path / "plaintext.toml"
+    imported.write_text(
+        'source = "AA-agent"\n'
+        'metric = "agentic"\n'
+        'effort = "max"\n'
+        'harness = "codex"\n'
+        'captured_at = "2026-09-07T00:00:00Z"\n'
+        "[[scores]]\n"
+        'model_id = "plaintext-guard"\n'
+        "score = 50.0\n",
+        encoding="utf-8",
+    )
+    assert cli.main(["bench", "import", str(imported)]) == 2
+    err = capsys.readouterr().err
+    assert "test-token" not in err
