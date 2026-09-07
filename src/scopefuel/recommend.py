@@ -1500,20 +1500,23 @@ def _build_escalation_entry(
     )
 
 
-def _cross_grade_measured_alternatives(grade: Grade) -> list[tuple[Profile, str]]:
+def _cross_grade_measured_alternatives(
+    grade: Grade, *, grade_table: dict[Grade, list[Profile]] | None = None
+) -> list[tuple[Profile, str]]:
     """Find measured upper-grade options for an unmeasured estimate in this grade."""
 
+    table = GRADE_TABLE if grade_table is None else grade_table
     grade_index = _GRADE_ORDER.index(grade)
     if grade_index == 0:
         return []
     existing_escalation_pools = {
-        profile_pool(profile.name)[0] for profile in GRADE_TABLE[grade] if profile.gate == "escalation"
+        profile_pool(profile.name)[0] for profile in table[grade] if profile.gate == "escalation"
     }
     if not existing_escalation_pools:
         return []
 
     estimated_by_provider: dict[str, Profile] = {}
-    for profile in GRADE_TABLE[grade]:
+    for profile in table[grade]:
         if (
             profile.gate == "default"
             and profile.benchmark_source is None
@@ -1531,7 +1534,7 @@ def _cross_grade_measured_alternatives(grade: Grade) -> list[tuple[Profile, str]
     # The rule exists for the near-miss case it was built for (A+ grok medium,
     # estimated -> S grok-hi, measured 64), which is one grade up by construction.
     for upper_grade in _GRADE_ORDER[grade_index - 1 : grade_index]:
-        for profile in GRADE_TABLE[upper_grade]:
+        for profile in table[upper_grade]:
             provider_id, _ = profile_pool(profile.name)
             source_profile = estimated_by_provider.get(provider_id)
             if (
@@ -1570,9 +1573,12 @@ class GateResult:
     alternatives: tuple[str, ...] = ()
 
 
-def _find_profile(profile_name: str) -> tuple[Grade, Profile] | None:
+def _find_profile(
+    profile_name: str, *, grade_table: dict[Grade, list[Profile]] | None = None
+) -> tuple[Grade, Profile] | None:
     profile_name = PROFILE_ALIASES.get(profile_name, profile_name)
-    for grade, profiles in GRADE_TABLE.items():
+    table = GRADE_TABLE if grade_table is None else grade_table
+    for grade, profiles in table.items():
         for profile in profiles:
             if profile.name == profile_name:
                 return grade, profile
@@ -1586,9 +1592,20 @@ def _alt_candidates(
     today: dt.date,
     now: dt.datetime,
     urgency_hours: float,
+    *,
+    bench_scores: list[ModelScore] | None = None,
+    grade_table: dict[Grade, list[Profile]] | None = None,
 ) -> tuple[str, ...]:
     """같은 grade 안에서 exclude_profile 을 뺀 사용 가능한 정상(비-escalation) 후보 이름."""
-    out = recommend(providers, grade, today=today, now=now, urgency_hours=urgency_hours)
+    out = recommend(
+        providers,
+        grade,
+        today=today,
+        now=now,
+        urgency_hours=urgency_hours,
+        bench_scores=bench_scores,
+        grade_table=grade_table,
+    )
     names: list[str] = []
     for line in out.splitlines():
         if not line[:1].isdigit():
@@ -1613,6 +1630,8 @@ def gate_check(
     now: dt.datetime | None = None,
     *,
     urgency_hours: float | None = None,
+    bench_scores: list[ModelScore] | None = None,
+    grade_table: dict[Grade, list[Profile]] | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -1624,8 +1643,9 @@ def gate_check(
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
+    table = GRADE_TABLE if grade_table is None else grade_table
 
-    found = _find_profile(profile_name)
+    found = _find_profile(profile_name, grade_table=table)
     provider_id, group_name = profile_pool(profile_name)
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
@@ -1694,9 +1714,21 @@ def gate_check(
     by_id = {r.id: r for r in providers}
     result = by_id.get(provider_id)
 
+    def alternatives() -> tuple[str, ...]:
+        return _alt_candidates(
+            providers,
+            grade,
+            profile_name,
+            today,
+            now,
+            urgency_hours,
+            bench_scores=bench_scores,
+            grade_table=table,
+        )
+
     if profile.gate == "escalation":
         # 1) escalation 자격: 같은 grade 의 다른 정상 후보가 전부 소진·측정불가일 때만 진행.
-        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        alts = alternatives()
         if alts:
             return GateResult(
                 ok=False,
@@ -1722,7 +1754,7 @@ def gate_check(
             )
 
     if result is None or result.error or result.warning or result.status != "ok":
-        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        alts = alternatives()
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -1735,7 +1767,7 @@ def gate_check(
 
     matches = _matching_buckets(result, group_name)
     if not matches:
-        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        alts = alternatives()
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -1756,7 +1788,7 @@ def gate_check(
     override = get_active_override(provider_id, today=today)
 
     if effective_class == "exclude":
-        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        alts = alternatives()
         reason_parts = [f"정책 제외 ({provider_id}"]
         if override is not None and override.until:
             reason_parts.append(f"until {override.until.isoformat()}")
@@ -1776,7 +1808,7 @@ def gate_check(
     cutoff = _usage_cutoff(effective_class)
     over = _any_window_over_cutoff(states, cutoff)
     if over is not None:
-        alts = _alt_candidates(providers, grade, profile_name, today, now, urgency_hours)
+        alts = alternatives()
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -1863,17 +1895,19 @@ def recommend(
     bench_scores: list[ModelScore] | None = None,
     explain: bool = False,
     hide_excluded: bool = False,
+    grade_table: dict[Grade, list[Profile]] | None = None,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
+    table = GRADE_TABLE if grade_table is None else grade_table
     by_id = {r.id: r for r in providers}
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []
     policy_excluded: list[_PolicyExcluded] = []
     escalation: list[_EscalationEntry] = []
 
-    for profile in GRADE_TABLE[grade]:
+    for profile in table[grade]:
         # Escalation profiles → separate section, not in normal ranked candidates.
         if profile.gate == "escalation":
             escalation.append(_build_escalation_entry(profile, by_id, today, now=now))
@@ -1992,7 +2026,7 @@ def recommend(
             )
         )
 
-    for profile, reason in _cross_grade_measured_alternatives(grade):
+    for profile, reason in _cross_grade_measured_alternatives(grade, grade_table=table):
         escalation.append(
             _build_escalation_entry(
                 profile,
@@ -2011,7 +2045,7 @@ def recommend(
         imminent_first = 0 if c.imminent_exhaustion else 1
         boost_present = 0 if c.boost is not None else 1
         boost_value = c.boost if c.boost is not None else 0
-        profile_order = next((i for i, p in enumerate(GRADE_TABLE[grade]) if p.name == c.profile.name), 0)
+        profile_order = next((i for i, p in enumerate(table[grade]) if p.name == c.profile.name), 0)
         return (
             benchmark_missing,
             imminent_first,
