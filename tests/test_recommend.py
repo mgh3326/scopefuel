@@ -181,7 +181,8 @@ def test_grade_table_has_expected_a_profiles():
     assert "kimi-k3-max" not in names
     assert "kimi-k3-low" in names
     assert "oc-gflash" not in names
-    assert {"codex-sol", "codex-luna", "codex-terra"}.issubset(names)
+    assert {"codex-luna", "codex-terra"}.issubset(names)
+    assert "codex-sol" not in names
     assert "oc-sonnet46" not in names
 
 
@@ -625,9 +626,7 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
 
     a_output = recommend(providers, "A", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "codex-luna --effort high" in line for line in a_output.splitlines())
-    assert "codex-sol --effort low" in a_output
-    assert "비용효율" in a_output
-    assert not any(line[:1].isdigit() and "codex-sol --effort low" in line for line in a_output.splitlines())
+    assert "codex-sol" not in a_output
 
     b_output = recommend(providers, "B", today=TODAY, now=NOW)
     assert "codex-luna --effort medium" in b_output

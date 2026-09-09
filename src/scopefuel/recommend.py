@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import pathlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from .bench import ModelScore, display_effort, normalize_aa_model_id
+from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset, _window_seconds
 from .policy import (
     get_active_override,
@@ -209,6 +211,10 @@ KIMI_K3_LOW_ESTIMATE_REASON = (
     "(76.2→61.0, AA-agent 실측) / glm-5.2 앵커(68.8→43.0, _MODEL_ONLY_ANCHORS) 사이에서 내삽: "
     "43.0 + (72.0-68.8)/(76.2-68.8)*(61.0-43.0) = 50.8; "
     "harness-이식 아님 — 동일 모델·동일 하네스(kimi-code-cli)의 하위 effort 단계일 뿐"
+)
+KIMI_K27_CODE_ESTIMATE_REASON = (
+    "AA-model coding_index 60.8 — 에이전트 실행 실측은 없으며, "
+    "operator decision 2026-09-09 doc1144에 따라 A 배치"
 )
 # ROB-1244: 기본 모델 4.5→4.6 전환. 4.6 은 AA-agent 미발표라 전부 추정 —
 # 동일 계열·동일 하네스(grok-build) 비율 스케일: 4.5 high 실측 64.0 × (76.8/72.4) = 67.9.
@@ -424,6 +430,10 @@ RETIRED_PROFILES: dict[str, RetiredProfile] = {
 # (deepseek-v4-pro 사례 — 0424 프리뷰 측정치 31@claude-code 는 0813 정식 모델과 무관).
 # 급을 매길 때는 API echo 의 model 필드로 실제 서빙 모델을 확인할 것.
 GRADE_TABLE: dict[Grade, list[Profile]] = {
+    # 운영자 제시 근거 (2026-09-09; 최신 실측 아님): Codex 5h 한도는 Pro 20x 기준
+    # Sol 2000 / Terra 4000 / Luna 40000. AA 단가 비율 Terra=Sol 0.5x,
+    # Luna=Sol 0.05x로 한도 비율과 일치한다. Astra만 한도 2.5x가 단가 3.3x보다
+    # 빡빡한 불일치가 있다.
     "S+": [
         Profile(
             "kiro-opus",
@@ -529,6 +539,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             **_aa_agent_benchmark(61.0, "kimi-k3", "default", harness="kimi-code-cli"),
             aa_agent_model_id="kimi-k3",
         ),
+        # operator decision 2026-09-09 doc1144: Grok 4.5와 4.6은 모두
+        # input $2 / output $6 per 1M으로 동일하므로 성능이 높은 4.6을 유지한다.
         Profile(
             "grok-hi",
             "Grok 4.6",
@@ -607,6 +619,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_MEDIUM_ESTIMATE_REASON,
             aa_agent_model_id="grok-4.6",
+            aa_model_id="grok-4-6",
         ),
         Profile(
             "codex-terra",
@@ -683,17 +696,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             upstream_as_of="2026-08-15",
         ),
         Profile(
-            "codex-sol",
-            "Sol (low)",
-            54.0,
-            gate="escalation",
-            gate_reason="비용효율 — Luna high(51)은 Sol low(54)와 3점 차이 이내이며 25배 저렴",
-            **_aa_agent_benchmark(54.0, "gpt-5.6-sol", "low"),
-            launcher_effort="low",
-            aa_agent_model_id="gpt-5.6-sol",
-            aa_model_id="gpt-5-6-sol",
-        ),
-        Profile(
             "codex-luna",
             "Luna (high)",
             51.0,
@@ -746,6 +748,17 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             model_only=True,
             estimate_reason=KIMI_K3_LOW_ESTIMATE_REASON,
             aa_model_id="kimi-k3",
+        ),
+        Profile(
+            "kimi-k27-code",
+            "Kimi K2.7 Code",
+            60.8,
+            **_aa_model_benchmark(60.8, "kimi-k2-7-code"),
+            benchmark_annotation=MODEL_ONLY_ANNOTATION,
+            model_only=True,
+            estimate_reason=KIMI_K27_CODE_ESTIMATE_REASON,
+            placement_note="운영자 승인 배치(A; AA-model coding_index 60.8은 급 경계 점수가 아님)",
+            aa_model_id="kimi-k2-7-code",
         ),
     ],
     "B": [
@@ -808,6 +821,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             estimate_reason=GROK_LOW_ESTIMATE_REASON,
             placement_note=GROK_LOW_PLACEMENT_NOTE,
             aa_agent_model_id="grok-4.6",
+            aa_model_id="grok-4-6",
         ),
         # ROB-1202: extrapolated/unmeasured Haiku high estimate — not a Haiku medium placement.
         Profile(
@@ -901,6 +915,11 @@ _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
         MODEL_ONLY_ANNOTATION,
     }
 )
+_SOL_PROFILES = frozenset({"codex-sol", "kiro-sol"})
+
+# These launcher spellings exist for director-controlled workflows, but they
+# are never recommendation candidates and must fail the ordinary quota gate.
+ASTRA_ROLE_PROFILES = frozenset({"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"})
 
 
 def _grade_range(grade: Grade) -> tuple[float | None, float | None]:
@@ -939,6 +958,9 @@ def validate_grade_table(table: dict[Grade, list[Profile]] | None = None) -> Non
     for grade, profiles in table.items():
         lower, upper = _grade_range(grade)
         for profile in profiles:
+            if profile.name in _SOL_PROFILES and grade != "S+":
+                violations.append(f"{profile.name}: Sol 계열 프로필은 S+ 이외의 급에 등장할 수 없다")
+                continue
             if (
                 profile.benchmark is not None
                 and profile.benchmark_source == "AA-model"
@@ -1072,6 +1094,9 @@ class _Candidate:
     throughput_term: float = 0.0
     score: float = 0.0
     imminent_exhaustion: bool = False
+    blended_price: float | None = None
+    value_ratio: float | None = None
+    value_sort_skipped: bool = False
 
 
 @dataclass
@@ -1535,6 +1560,10 @@ def _cross_grade_measured_alternatives(
     # estimated -> S grok-hi, measured 64), which is one grade up by construction.
     for upper_grade in _GRADE_ORDER[grade_index - 1 : grade_index]:
         for profile in table[upper_grade]:
+            # Sol is an S+-only operator role. In particular, an S request
+            # must not surface S+ Sol as a cross-grade measured alternative.
+            if profile.name in _SOL_PROFILES:
+                continue
             provider_id, _ = profile_pool(profile.name)
             source_profile = estimated_by_provider.get(provider_id)
             if (
@@ -1594,6 +1623,7 @@ def _alt_candidates(
     urgency_hours: float,
     *,
     bench_scores: list[ModelScore] | None = None,
+    model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
 ) -> tuple[str, ...]:
     """같은 grade 안에서 exclude_profile 을 뺀 사용 가능한 정상(비-escalation) 후보 이름."""
@@ -1604,6 +1634,7 @@ def _alt_candidates(
         now=now,
         urgency_hours=urgency_hours,
         bench_scores=bench_scores,
+        model_prices=model_prices,
         grade_table=grade_table,
     )
     names: list[str] = []
@@ -1631,6 +1662,7 @@ def gate_check(
     *,
     urgency_hours: float | None = None,
     bench_scores: list[ModelScore] | None = None,
+    model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
@@ -1644,6 +1676,15 @@ def gate_check(
     now = now or dt.datetime.now(dt.UTC)
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
     table = GRADE_TABLE if grade_table is None else grade_table
+
+    if "astra" in profile_name.casefold():
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id="codex",
+            grade=None,
+            reason=f"{profile_name} 역할 제한 — Astra는 director 판정 전용",
+        )
 
     found = _find_profile(profile_name, grade_table=table)
     provider_id, group_name = profile_pool(profile_name)
@@ -1723,6 +1764,7 @@ def gate_check(
             now,
             urgency_hours,
             bench_scores=bench_scores,
+            model_prices=model_prices,
             grade_table=table,
         )
 
@@ -1893,6 +1935,7 @@ def recommend(
     *,
     urgency_hours: float | None = None,
     bench_scores: list[ModelScore] | None = None,
+    model_prices: Mapping[str, ModelPrice] | None = None,
     explain: bool = False,
     hide_excluded: bool = False,
     grade_table: dict[Grade, list[Profile]] | None = None,
@@ -1901,6 +1944,9 @@ def recommend(
     now = now or dt.datetime.now(dt.UTC)
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
     table = GRADE_TABLE if grade_table is None else grade_table
+    normalized_prices = {
+        normalize_aa_model_id(model_id): price for model_id, price in (model_prices or {}).items()
+    }
     by_id = {r.id: r for r in providers}
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []
@@ -2037,22 +2083,71 @@ def recommend(
             )
         )
 
+    # Reassign only the existing table slots owned by one (grade, pool) group.
+    # This changes order inside that pool without changing the sequence of pool
+    # slots relative to any other pool, even when their quota sort keys tie.
+    physical_order = {id(profile): index for index, profile in enumerate(table[grade])}
+    base_slot = {
+        id(profile): next(
+            index for index, candidate in enumerate(table[grade]) if candidate.name == profile.name
+        )
+        for profile in table[grade]
+    }
+    value_order = {id(candidate.profile): base_slot[id(candidate.profile)] for candidate in included}
+    intra_pool_rank = {id(candidate.profile): physical_order[id(candidate.profile)] for candidate in included}
+    candidates_by_pool: dict[tuple[str, str | None], list[_Candidate]] = {}
+    for candidate in included:
+        candidates_by_pool.setdefault(profile_pool(candidate.profile.name), []).append(candidate)
+
+    for pool_candidates in candidates_by_pool.values():
+        benchmark_candidates = [item for item in pool_candidates if item.profile.benchmark is not None]
+        for candidate in benchmark_candidates:
+            lookup_id = candidate.profile.aa_model_id
+            price = normalized_prices.get(normalize_aa_model_id(lookup_id)) if lookup_id else None
+            blended = price.price_1m_blended_3_to_1 if price is not None else None
+            if blended is not None and math.isfinite(blended) and blended > 0:
+                candidate.blended_price = blended
+                assert candidate.profile.benchmark is not None
+                candidate.value_ratio = candidate.profile.benchmark / blended
+
+        skip_group = any(candidate.value_ratio is None for candidate in benchmark_candidates)
+        for candidate in benchmark_candidates:
+            candidate.value_sort_skipped = skip_group
+        if skip_group:
+            continue
+
+        slots = sorted(value_order[id(candidate.profile)] for candidate in benchmark_candidates)
+        ranked = sorted(
+            benchmark_candidates,
+            key=lambda candidate: (
+                -float(candidate.value_ratio),
+                physical_order[id(candidate.profile)],
+            ),
+        )
+        for rank, (candidate, slot) in enumerate(zip(ranked, slots, strict=True)):
+            value_order[id(candidate.profile)] = slot
+            intra_pool_rank[id(candidate.profile)] = rank
+
     # 0) 소멸 임박 역전 → 1) numeric boost(하드 오버라이드) → 2) continuous score(큰 순)
-    # → 3) 표 순서(결정성). Binary 🔥 urgency 정렬 키는 연속 점수로 대체(표시는 유지).
+    # → 3) 풀 내 가성비로 재배정된 base 슬롯 → 4) 풀 내 순위(결정성).
+    # Base 슬롯은 기존 이름 기준 first-match 의미를 보존한다. 한 슬롯을 공유하는 프로필은
+    # 항상 동명이고 따라서 같은 풀이다. intra_pool_rank는 그 충돌만 풀어 AC3의 가성비
+    # 순서를 보존하며 풀 간 순서에는 영향을 주지 않는다. Binary 🔥 urgency 정렬 키는
+    # 연속 점수로 대체했다(표시는 유지).
     # Benchmark가 없는 항목은 quota boost/urgency와 무관하게 급 내 마지막으로 보낸다.
-    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int]:
+    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int, int]:
         benchmark_missing = 0 if _profile_has_benchmark_score(c.profile, bench_scores) else 1
         imminent_first = 0 if c.imminent_exhaustion else 1
         boost_present = 0 if c.boost is not None else 1
         boost_value = c.boost if c.boost is not None else 0
-        profile_order = next((i for i, p in enumerate(table[grade]) if p.name == c.profile.name), 0)
         return (
             benchmark_missing,
             imminent_first,
             boost_present,
             boost_value,
             -c.score,
-            profile_order,
+            value_order[id(c.profile)],
+            intra_pool_rank[id(c.profile)],
         )
 
     included.sort(key=sort_key)
@@ -2380,6 +2475,17 @@ def recommend(
                     f"(short={cand.throughput_window.display_window}){brake_explain}; "
                     f"제약={cand.constraint.display_window})"
                 )
+                if cand.value_ratio is not None and cand.blended_price is not None:
+                    value_line = (
+                        f"    가성비: 벤치 {cand.profile.benchmark:g} ÷ "
+                        f"혼합단가 ${cand.blended_price:g}/1M = {cand.value_ratio:.2f}"
+                    )
+                    if cand.value_sort_skipped:
+                        value_line += " · 단가 미상 포함 — 표 순서 유지"
+                    lines.append(value_line)
+                elif cand.profile.benchmark is not None:
+                    reason = "단가 미상 포함 — 표 순서 유지" if cand.value_sort_skipped else "혼합단가 미상"
+                    lines.append(f"    가성비: 혼합단가 미상 · {reason}")
                 if cand.profile.estimate_reason and not live_measured:
                     lines.append(f"    추정근거: {cand.profile.estimate_reason}")
         if not hide_excluded and not _suppress_policy_excluded(policy_excluded):
