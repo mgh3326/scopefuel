@@ -30,4 +30,5 @@ def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
     monkeypatch.setenv("SCOPEFUEL_SPEC_DIR", str(tmp_path / "specs"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     return tmp_path

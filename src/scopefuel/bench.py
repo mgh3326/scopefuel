@@ -224,6 +224,23 @@ class ModelScore:
 
 
 @dataclass(frozen=True)
+class ModelPrice:
+    model_id: str
+    price_1m_blended_3_to_1: float
+    price_1m_input_tokens: float | None
+    price_1m_output_tokens: float | None
+    captured_at: str
+
+
+# operator decision 2026-09-09 doc1144. These are the only approved static
+# AA-model price seeds; a synchronized DB row takes precedence at read time.
+AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
+    ModelPrice("kimi-k2-7-code", 1.7125, 0.95, 4.0, "2026-09-09T00:00:00+00:00"),
+    ModelPrice("grok-4-6", 3.0, 2.0, 6.0, "2026-09-09T00:00:00+00:00"),
+)
+
+
+@dataclass(frozen=True)
 class RepRecord:
     id: int
     profile: str
@@ -429,6 +446,14 @@ def _schema(conn: sqlite3.Connection) -> None:
           time_per_task_min REAL,
           cost_per_task_usd REAL,
           PRIMARY KEY (model_id, effort, harness, source, metric)
+        );
+
+        CREATE TABLE IF NOT EXISTS model_prices (
+          model_id TEXT PRIMARY KEY,
+          price_1m_blended_3_to_1 REAL,
+          price_1m_input_tokens REAL,
+          price_1m_output_tokens REAL,
+          captured_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS reps (
@@ -1010,6 +1035,60 @@ def read_scores(model_id: str | None = None, *, path: pathlib.Path | str | None 
     return _read_scores_handoffkeep(model_id, path=path, backend=backend)
 
 
+def _positive_price(value: object) -> float | None:
+    """Return a usable USD/1M value without coercing strings or booleans."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _price_from_row(row: sqlite3.Row) -> ModelPrice | None:
+    blended = _positive_price(row["price_1m_blended_3_to_1"])
+    if blended is None:
+        return None
+    return ModelPrice(
+        model_id=row["model_id"],
+        price_1m_blended_3_to_1=blended,
+        price_1m_input_tokens=_positive_price(row["price_1m_input_tokens"]),
+        price_1m_output_tokens=_positive_price(row["price_1m_output_tokens"]),
+        captured_at=row["captured_at"],
+    )
+
+
+def read_prices(*, path: pathlib.Path | str | None = None) -> dict[str, ModelPrice]:
+    """Read prices keyed by normalized base AA model id without migrating the DB.
+
+    The two operator-approved seeds are always available. Any synchronized row
+    with the same normalized base model id replaces its seed, including when the
+    DB value is higher or lower.
+    """
+
+    prices = {normalize_aa_model_id(item.model_id): item for item in AA_MODEL_PRICE_SEEDS}
+    target = pathlib.Path(path) if path is not None else db_path()
+    if str(target) == ":memory:" or not target.expanduser().exists():
+        return prices
+    conn = _readonly_connect(target)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_prices'"
+        ).fetchone()
+        if exists is None:
+            return prices
+        rows = conn.execute(
+            "SELECT model_id, price_1m_blended_3_to_1, price_1m_input_tokens, "
+            "price_1m_output_tokens, captured_at FROM model_prices ORDER BY model_id"
+        ).fetchall()
+        for row in rows:
+            price = _price_from_row(row)
+            if price is not None:
+                prices[normalize_aa_model_id(price.model_id)] = price
+        return prices
+    finally:
+        conn.close()
+
+
 def _measurement_values(score: ModelScore) -> tuple[float | None, float | None]:
     approved = _AA_AGENT_MEASUREMENT_BY_KEY.get(
         (score.model_id, score.effort, score.harness, score.source, score.metric)
@@ -1356,6 +1435,77 @@ def _aa_scores(payload: object, *, captured_at: str) -> list[ModelScore]:
     return scores
 
 
+def _price_cost_key(price: ModelPrice) -> tuple[float, float, float]:
+    """Order duplicate observations deterministically, preferring dearer data."""
+
+    return (
+        price.price_1m_blended_3_to_1,
+        price.price_1m_input_tokens or 0.0,
+        price.price_1m_output_tokens or 0.0,
+    )
+
+
+def _aa_prices(payload: object, *, captured_at: str) -> list[ModelPrice]:
+    """Extract valid AA pricing rows; malformed prices never abort score sync."""
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise BenchError("invalid Artificial Analysis response: data must be an array")
+    prices: dict[str, ModelPrice] = {}
+    for item in payload["data"]:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("slug") or item.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        pricing = item.get("pricing")
+        if not isinstance(pricing, dict):
+            continue
+        blended = _positive_price(pricing.get("price_1m_blended_3_to_1"))
+        if blended is None:
+            continue
+        base_model_id, _effort = parse_effort_suffix(model_id)
+        normalized_base = _model_id(base_model_id)
+        candidate = ModelPrice(
+            model_id=normalized_base,
+            price_1m_blended_3_to_1=blended,
+            price_1m_input_tokens=_positive_price(pricing.get("price_1m_input_tokens")),
+            price_1m_output_tokens=_positive_price(pricing.get("price_1m_output_tokens")),
+            captured_at=captured_at,
+        )
+        current = prices.get(normalized_base)
+        if current is None or _price_cost_key(candidate) > _price_cost_key(current):
+            prices[normalized_base] = candidate
+    return list(prices.values())
+
+
+def _upsert_price(conn: sqlite3.Connection, price: ModelPrice) -> None:
+    row = conn.execute(
+        "SELECT model_id, price_1m_blended_3_to_1, price_1m_input_tokens, "
+        "price_1m_output_tokens, captured_at FROM model_prices WHERE model_id = ?",
+        (price.model_id,),
+    ).fetchone()
+    existing = _price_from_row(row) if row is not None else None
+    if existing is not None and _price_cost_key(existing) >= _price_cost_key(price):
+        return
+    conn.execute(
+        "INSERT INTO model_prices "
+        "(model_id, price_1m_blended_3_to_1, price_1m_input_tokens, "
+        "price_1m_output_tokens, captured_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(model_id) DO UPDATE SET "
+        "price_1m_blended_3_to_1 = excluded.price_1m_blended_3_to_1, "
+        "price_1m_input_tokens = excluded.price_1m_input_tokens, "
+        "price_1m_output_tokens = excluded.price_1m_output_tokens, "
+        "captured_at = excluded.captured_at",
+        (
+            price.model_id,
+            price.price_1m_blended_3_to_1,
+            price.price_1m_input_tokens,
+            price.price_1m_output_tokens,
+            price.captured_at,
+        ),
+    )
+
+
 def migrate_aa_model_effort_suffixes(*, path: pathlib.Path | str | None = None) -> int:
     """ROB-1190 ②-1 백필 — 기존 AA-model 행의 model_id 접미사를 effort 컬럼으로 분리한다.
 
@@ -1429,6 +1579,7 @@ def sync_scores(
     timestamp = captured_at or _utc_now()
     payload = fetch(AA_API_URL, headers={"x-api-key": key})
     scores = _aa_scores(payload, captured_at=timestamp)
+    prices = _aa_prices(payload, captured_at=timestamp)
     backend = bench_backend()
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
         return _write_scores_handoffkeep(scores, path=path, backend=backend, recompute_ranks=True)
@@ -1438,6 +1589,8 @@ def sync_scores(
         _apply_known_aa_agent_measurements(conn)
         for score in scores:
             _upsert(conn, score)
+        for price in prices:
+            _upsert_price(conn, price)
         for metric in {score.metric for score in scores}:
             _recompute_rank(conn, "AA-model", metric)
         conn.commit()

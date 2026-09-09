@@ -214,6 +214,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
         | set(recommend.PROFILE_ALIASES)
         | set(recommend.RETIRED_PROFILES.keys())
+        | set(recommend.ASTRA_ROLE_PROFILES)
     )
     gate_parser = subparsers.add_parser(
         "gate",
@@ -329,6 +330,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
     bench_scores = bench.read_scores()
+    model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
     print(
         recommend.recommend(
@@ -337,6 +339,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             today=now.date(),
             now=now,
             bench_scores=bench_scores,
+            model_prices=model_prices,
             explain=bool(getattr(args, "explain", False)),
             hide_excluded=bool(getattr(args, "hide_excluded", False)),
             grade_table=grade_table,
@@ -352,6 +355,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     # the cache/network path for the configured canonical backend.  Passing it
     # here keeps gate alternatives on the same benchmark view as recommend.
     bench_scores = bench.read_scores()
+    model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
     result = recommend.gate_check(
         results,
@@ -359,6 +363,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         today=now.date(),
         now=now,
         bench_scores=bench_scores,
+        model_prices=model_prices,
         grade_table=grade_table,
     )
 
