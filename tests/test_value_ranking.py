@@ -293,6 +293,90 @@ def test_ac5_value_sort_preserves_pool_slot_sequence_exactly():
     assert after == ["codex-luna", "opus", "codex-terra", "kimi-k3"]
 
 
+def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
+    monkeypatch.setattr("scopefuel.recommend.get_boost", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr("scopefuel.recommend.get_capacity_weight", lambda *args, **kwargs: (1.0, None))
+    pool_scopes: dict[str, set[str | None]] = {}
+    for profiles in GRADE_TABLE.values():
+        for profile in profiles:
+            provider_id, group_name = profile_pool(profile.name)
+            assert provider_id
+            pool_scopes.setdefault(provider_id, set()).add(group_name)
+
+    providers = []
+    for provider_id, group_names in pool_scopes.items():
+        buckets = [
+            Bucket(
+                label="7d",
+                window="7d",
+                used_pct=10.0,
+                resets_at=(NOW + dt.timedelta(days=6)).isoformat(),
+                scope=Scope("account") if group_name is None else Scope("group", group_name),
+                horizon="week",
+            )
+            for group_name in group_names
+        ]
+        providers.append(ProviderResult(id=provider_id, pool_class="preserve", buckets=buckets))
+
+    def label(profile: Profile) -> str:
+        effort = f" --effort {profile.launcher_effort}" if profile.launcher_effort else ""
+        return f"{profile.name}{effort}"
+
+    expected: dict[str, list[str]] = {}
+    actual: dict[str, list[str]] = {}
+    for grade in GRADES:
+        profiles = [profile for profile in GRADE_TABLE[grade] if profile.gate != "escalation"]
+        expected[grade] = [
+            label(profile)
+            for profile in sorted(
+                profiles,
+                key=lambda profile: (
+                    profile.benchmark is None,
+                    next(
+                        index
+                        for index, candidate in enumerate(GRADE_TABLE[grade])
+                        if candidate.name == profile.name
+                    ),
+                ),
+            )
+        ]
+        actual[grade] = _ranked_labels(
+            recommend(providers, grade, today=TODAY, now=NOW, grade_table=GRADE_TABLE)
+        )
+
+    assert [
+        (index, profile.launcher_effort)
+        for index, profile in enumerate(GRADE_TABLE["A+"])
+        if profile.name == "codex-terra"
+    ] == [(2, "xhigh"), (7, "high")]
+    assert actual == expected
+
+    priced_aplus = _ranked_labels(
+        recommend(
+            providers,
+            "A+",
+            today=TODAY,
+            now=NOW,
+            grade_table=GRADE_TABLE,
+            model_prices={
+                "gpt-5-6-luna": _price("gpt-5-6-luna", 0.1),
+                "gpt-5-6-terra": _price("gpt-5-6-terra", 1.0),
+            },
+        )
+    )
+
+    def pool_sequence(labels: list[str]) -> list[str]:
+        return [profile_pool(item.split()[0])[0] for item in labels]
+
+    assert pool_sequence(priced_aplus) == pool_sequence(actual["A+"])
+    assert [item for item in priced_aplus if profile_pool(item.split()[0])[0] == "codex"] == [
+        "codex-luna-max",
+        "codex-luna --effort xhigh",
+        "codex-terra --effort xhigh",
+        "codex-terra --effort high",
+    ]
+
+
 def test_value_tie_keeps_effective_table_order_and_unscored_candidate_stays_last():
     profiles = [
         Profile("codex-terra", "Terra", 50.0, aa_model_id="terra"),

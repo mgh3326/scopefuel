@@ -2086,8 +2086,15 @@ def recommend(
     # Reassign only the existing table slots owned by one (grade, pool) group.
     # This changes order inside that pool without changing the sequence of pool
     # slots relative to any other pool, even when their quota sort keys tie.
-    table_order = {id(profile): index for index, profile in enumerate(table[grade])}
-    value_order = {id(candidate.profile): table_order[id(candidate.profile)] for candidate in included}
+    physical_order = {id(profile): index for index, profile in enumerate(table[grade])}
+    base_slot = {
+        id(profile): next(
+            index for index, candidate in enumerate(table[grade]) if candidate.name == profile.name
+        )
+        for profile in table[grade]
+    }
+    value_order = {id(candidate.profile): base_slot[id(candidate.profile)] for candidate in included}
+    intra_pool_rank = {id(candidate.profile): physical_order[id(candidate.profile)] for candidate in included}
     candidates_by_pool: dict[tuple[str, str | None], list[_Candidate]] = {}
     for candidate in included:
         candidates_by_pool.setdefault(profile_pool(candidate.profile.name), []).append(candidate)
@@ -2114,17 +2121,21 @@ def recommend(
             benchmark_candidates,
             key=lambda candidate: (
                 -float(candidate.value_ratio),
-                table_order[id(candidate.profile)],
+                physical_order[id(candidate.profile)],
             ),
         )
-        for candidate, slot in zip(ranked, slots, strict=True):
+        for rank, (candidate, slot) in enumerate(zip(ranked, slots, strict=True)):
             value_order[id(candidate.profile)] = slot
+            intra_pool_rank[id(candidate.profile)] = rank
 
     # 0) 소멸 임박 역전 → 1) numeric boost(하드 오버라이드) → 2) continuous score(큰 순)
-    # → 3) 풀 내 가성비로 재배정된 표 슬롯(결정성). Binary 🔥 urgency 정렬 키는
-    # 연속 점수로 대체(표시는 유지).
+    # → 3) 풀 내 가성비로 재배정된 base 슬롯 → 4) 풀 내 순위(결정성).
+    # Base 슬롯은 기존 이름 기준 first-match 의미를 보존한다. 한 슬롯을 공유하는 프로필은
+    # 항상 동명이고 따라서 같은 풀이다. intra_pool_rank는 그 충돌만 풀어 AC3의 가성비
+    # 순서를 보존하며 풀 간 순서에는 영향을 주지 않는다. Binary 🔥 urgency 정렬 키는
+    # 연속 점수로 대체했다(표시는 유지).
     # Benchmark가 없는 항목은 quota boost/urgency와 무관하게 급 내 마지막으로 보낸다.
-    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int]:
+    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int, int]:
         benchmark_missing = 0 if _profile_has_benchmark_score(c.profile, bench_scores) else 1
         imminent_first = 0 if c.imminent_exhaustion else 1
         boost_present = 0 if c.boost is not None else 1
@@ -2136,6 +2147,7 @@ def recommend(
             boost_value,
             -c.score,
             value_order[id(c.profile)],
+            intra_pool_rank[id(c.profile)],
         )
 
     included.sort(key=sort_key)
