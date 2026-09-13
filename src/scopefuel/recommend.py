@@ -8,6 +8,7 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 - ``oc-sonnet46`` and ``oc-oss`` route to ``agy/3p``
 - all other remaining ``oc-*`` profiles route to ``clinepass``
 - ``devin-swe2`` routes to ``devin`` (account; SWE-2 Free tag only)
+- ``oc-solar4`` routes to ``upstage`` (account; B 보수 배치, T1 한정, tester 금지)
 """
 
 from __future__ import annotations
@@ -72,6 +73,7 @@ _POOL_LABEL = {
     "omniroute": "OmniRoute",
     "kimi": "Kimi",
     "devin": "Devin",
+    "upstage": "Upstage",
 }
 
 _WINDOW_LABEL = {
@@ -251,6 +253,14 @@ DEVIN_SWE2_ESTIMATE_REASON = (
     "Terminal-Bench 4 27.3 — AA-agent 미측정. TB4 약점으로 S/S+ 배제"
 )
 DEVIN_SWE2_PLACEMENT_NOTE = "보수 배치(A+; reps 3건 전 · AA-agent 미측정)"
+
+# task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
+# opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
+UPSTAGE_SOLAR4_ESTIMATE_REASON = (
+    "AA Intelligence Index 42(모델지수, 08-06 발표) — oc-dsflash(A) 대비 지수 10 낮은 "
+    "단일 기준점 투사, opencode 하네스 AA-agent 실측 없음, 환각률 24%"
+)
+UPSTAGE_SOLAR4_PLACEMENT_NOTE = "보수 배치(B; T1 한정 · tester 금지 · reps 3건 전)"
 
 
 def _devin_swe2_profile() -> Profile:
@@ -867,6 +877,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             estimate_reason=HAIKU_HIGH_ESTIMATE_REASON,
         ),
         _devin_swe2_profile(),
+        Profile(
+            "oc-solar4",
+            "Solar Pro 4",
+            42.0,
+            benchmark_annotation=MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
+            model_only=True,
+            estimate_reason=UPSTAGE_SOLAR4_ESTIMATE_REASON,
+            placement_note=UPSTAGE_SOLAR4_PLACEMENT_NOTE,
+        ),
     ],
     "C": [
         Profile(
@@ -1072,6 +1091,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "agy", "3p"
     if profile == "oc-omni":
         return "omniroute", None
+    if profile == "oc-solar4":
+        return "upstage", None
     if profile.startswith("oc-"):
         return "clinepass", None
     if profile in ("grok", "grok-hi", "grok-med", "grok45", "grok45-med", "grok46", "grok46-med"):
