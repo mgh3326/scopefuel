@@ -12,7 +12,7 @@ from scopefuel.recommend import (
     profile_pool,
 )
 
-NOTE = "Large Trial free until 2026-09-20, 무제한 사용, 소진/전환은 운영자 정리(#211)"
+NOTE = "Free 플랜(콘솔 문서 기준 100 RPM/50K TPM)"
 
 
 def test_registry_exposes_upstage_as_spend():
