@@ -77,10 +77,7 @@ def test_parse_swe2_free_fixture_is_account_zero(fixture_text):
 
 
 def test_parse_strips_ansi_before_swe2_free_check():
-    noisy = (
-        "\x1b[1mSWE-2 (swe-2)\x1b[0m\n"
-        "  \x1b[32mswe-2-high\x1b[0m  SWE-2 High  [262K context, Free]\n"
-    )
+    noisy = "\x1b[1mSWE-2 (swe-2)\x1b[0m\n  \x1b[32mswe-2-high\x1b[0m  SWE-2 High  [262K context, Free]\n"
     result = devin.parse(noisy)
     assert result.error is None
     assert result.buckets[0].used_pct == 0.0
@@ -228,9 +225,7 @@ def test_fetch_invokes_models_list(tmp_path, monkeypatch, fixture_text):
     payload = _fixture(fixture_text)
     binary = tmp_path / "fake-devin-args"
     binary.write_text(
-        "#!/bin/sh\n"
-        '[ "$1" = models ] && [ "$2" = list ] || exit 9\n'
-        "cat <<'EOF'\n" + payload + "EOF\n"
+        '#!/bin/sh\n[ "$1" = models ] && [ "$2" = list ] || exit 9\ncat <<\'EOF\'\n' + payload + "EOF\n"
     )
     binary.chmod(binary.stat().st_mode | 0o111)
     monkeypatch.setattr(devin, "BINARY", str(binary))
