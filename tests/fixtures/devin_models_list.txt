@@ -1,0 +1,31 @@
+Available models (48 families)
+
+Claude Opus 5 (claude-opus-5)
+  aliases: opus
+  claude-opus-5-high                                                       Claude Opus 5 High  [1M context, $5 / 1M Input · $0.5 / 1M Cached input · $25 / 1M Output]
+
+GLM-5.2 (glm-5.2)
+  glm-5-2                                                                  GLM-5.2 High  [200K context, Free]
+
+SWE-1.7 Lightning (swe-1.7-lightning)
+  swe-1-7-lightning                                                        SWE-1.7 Lightning Max  [202752 context, $2.5 / 1M Input · $1 / 1M Cached input · $12.5 / 1M Output]
+
+SWE-2 (swe-2)
+  aliases: swe
+  swe-2-high                                                               SWE-2 High  [262K context, Free]
+  swe-2-medium                                                             SWE-2 Medium  [262K context, Free]
+  swe-2-max                                                                SWE-2 Max  [262K context, Free]
+
+Adaptive (adaptive)
+  adaptive                                                                 Adaptive  [$0.5 / 1M Input · $0.1 / 1M Cached input · $2 / 1M Output]
+
+SWE-1.7 (swe-1.7)
+  swe-1-7                                                                  SWE-1.7 Max  [262K context, Free]
+  swe-1-7-medium                                                           SWE-1.7 Medium  [262K context, Free]
+
+Fusion (fusion)
+  fusion-claude-fable-5-1-medium-sidekick-swe-2-medium                     Fusion (Claude Fable 5.1 Medium + SWE-2 Medium)  [1M context, $10 / 1M Input · $0.25 / 1M Cached input · $50 / 1M Output]
+  fusion-gpt-5-6-sol-high-sidekick-swe-2-high                              Fusion (GPT-5.6 Sol High Thinking + SWE-2 High)  [1M context, $1.2 / 1M Input · $0.12 / 1M Cached input · $6 / 1M Output]
+
+Pass a family slug, alias, or model UID to `--model` (e.g. `--model opus`)
+or switch models in a session with `/model <name>`.

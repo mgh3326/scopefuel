@@ -282,7 +282,7 @@ def test_kiro_expired_token_twice_keeps_error_with_login_hint(monkeypatch):
 
 
 def test_clinepass_is_appended_after_existing_builtin_providers():
-    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass", "grok", "kimi"]
+    assert list(BUILTIN) == ["claude", "codex", "agy", "kiro", "clinepass", "grok", "kimi", "devin"]
 
 
 def test_clinepass_key_precedence(monkeypatch, tmp_path):

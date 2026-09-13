@@ -7,6 +7,7 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 - ``oc-gflash`` routes to ``agy/gemini``
 - ``oc-sonnet46`` and ``oc-oss`` route to ``agy/3p``
 - all other remaining ``oc-*`` profiles route to ``clinepass``
+- ``devin-swe2`` routes to ``devin`` (account; SWE-2 Free tag only)
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ _POOL_LABEL = {
     "clinepass": "ClinePass",
     "omniroute": "OmniRoute",
     "kimi": "Kimi",
+    "devin": "Devin",
 }
 
 _WINDOW_LABEL = {
@@ -241,6 +243,33 @@ OC_DSFLASH_PLACEMENT_NOTE = (
     "방향 이식 — 방향 감쇠 반영 1단계 하향)"
 )
 CROSS_GRADE_MEASURED_REASON = "동급 후보가 미측정 추정일 때의 상위 급 실측 대안"
+# Cognition 자체 발표(비-AA provenance, AA-agent 점수가 아님):
+# FrontierCode 50.0 / Terminal-Bench 2.1 92.8 / Terminal-Bench 4 27.3.
+# TB4 장기 과제 약점 때문에 S/S+ 에는 넣지 않고, reps 3건 전까지 A+ 보수 배치.
+DEVIN_SWE2_ESTIMATE_REASON = (
+    "Cognition 자체 발표(비-AA): FrontierCode 50.0 / Terminal-Bench 2.1 92.8 / "
+    "Terminal-Bench 4 27.3 — AA-agent 미측정. TB4 약점으로 S/S+ 배제"
+)
+DEVIN_SWE2_PLACEMENT_NOTE = "보수 배치(A+; reps 3건 전 · AA-agent 미측정)"
+
+
+def _devin_swe2_profile() -> Profile:
+    """Canonical SWE-2 high row. Same object shape is copied into A+/A/B.
+
+    GRADE_TABLE is keyed by a single grade, so --recommend A+ / A / B each need
+    their own slot. S/S+ stay empty on purpose (vendor TB4 weakness, not an
+    AA-agent score).
+    """
+
+    return Profile(
+        "devin-swe2",
+        "SWE-2 (high)",
+        None,
+        benchmark_effort="high",
+        benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+        estimate_reason=DEVIN_SWE2_ESTIMATE_REASON,
+        placement_note=DEVIN_SWE2_PLACEMENT_NOTE,
+    )
 
 
 def _profile_actual_harness(profile: Profile) -> str | None:
@@ -667,6 +696,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             upstream_model="private/qwen3p8-max-wave",
             upstream_as_of="2026-08-15",
         ),
+        # Same canonical profile is listed in A+/A/B so --recommend at those
+        # grades can use the free SWE-2 lane. Not in S/S+ (vendor TB4 27.3).
+        _devin_swe2_profile(),
     ],
     "A": [
         # ROB-1251: AA v1.3 실측 55@codex(max) — 내삽 44.7을 대체. $0.14/M 최저가.
@@ -760,6 +792,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             placement_note="운영자 승인 배치(A; AA-model coding_index 60.8은 급 경계 점수가 아님)",
             aa_model_id="kimi-k2-7-code",
         ),
+        _devin_swe2_profile(),
     ],
     "B": [
         # ROB-1201: measured Luna medium (42) belongs to B (40–47).
@@ -833,6 +866,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
             estimate_reason=HAIKU_HIGH_ESTIMATE_REASON,
         ),
+        _devin_swe2_profile(),
     ],
     "C": [
         Profile(
@@ -1047,6 +1081,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     # bill against ClinePass), different harness (claude-code, not opencode).
     if profile in ("cc-qwen38", "cc-glm"):
         return "clinepass", None
+    if profile == "devin-swe2" or profile.startswith("devin-"):
+        return "devin", None
     return "", None
 
 

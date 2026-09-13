@@ -31,7 +31,7 @@ PROVIDER_TTL_S = {
     "codex": 600.0,
     "grok": 1800.0,
 }
-MAX_FETCH_WORKERS = 7  # 현재 provider 수 이하: 독립 HTTP/PTY fetch를 병렬화하되 무제한 spawn은 피한다.
+MAX_FETCH_WORKERS = 8  # 현재 provider 수 이하: 독립 HTTP/PTY fetch를 병렬화하되 무제한 spawn은 피한다.
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
 
 
