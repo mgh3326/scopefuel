@@ -59,6 +59,7 @@ def test_builtin_providers_have_pool_class_metadata():
     assert BUILTIN["clinepass"].pool_class == "spend"
     assert BUILTIN["agy"].pool_class == "spend"
     assert BUILTIN["grok"].pool_class == "spend"
+    assert BUILTIN["devin"].pool_class == "spend"
 
 
 def test_default_provider_result_is_preserve():

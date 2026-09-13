@@ -118,6 +118,7 @@ def test_profile_pool_matches_quota_guard():
     # subscription-OAuth pool.
     assert profile_pool("cc-qwen38") == ("clinepass", None)
     assert profile_pool("cc-glm") == ("clinepass", None)
+    assert profile_pool("devin-swe2") == ("devin", None)
 
 
 # ------------------------------------------------------------------ sort/ranking
