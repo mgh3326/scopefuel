@@ -6,7 +6,8 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 
 - ``oc-gflash`` routes to ``agy/gemini``
 - ``oc-sonnet46`` and ``oc-oss`` route to ``agy/3p``
-- all other remaining ``oc-*`` profiles route to ``clinepass``
+- the explicitly registered remaining ``oc-*`` profiles route to their listed pools;
+  unknown ``oc-*`` spellings are fail-closed as unknown
 - ``devin-swe2`` routes to ``devin`` (account; SWE-2 Free tag only)
 - ``oc-solar4`` routes to ``upstage`` (account; B 보수 배치, T1 한정, tester 금지)
 """
@@ -1054,6 +1055,23 @@ validate_grade_table()
 PROFILE_ALIASES: dict[str, str] = {"codex-max": "codex-sol"}
 
 
+# Keep the oc-* route surface explicit.  In particular, an unregistered spelling
+# must not inherit the ClinePass route merely because it shares the oc- prefix.
+_OC_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
+    "oc-gflash": ("agy", "gemini"),
+    "oc-sonnet46": ("agy", "3p"),
+    "oc-oss": ("agy", "3p"),
+    "oc-omni": ("omniroute", None),
+    "oc-solar4": ("upstage", None),
+    "oc-dsflash": ("clinepass", None),
+    "oc-glm": ("clinepass", None),
+    "oc-qwen37-max": ("clinepass", None),
+    "oc-minimax-m3": ("clinepass", None),
+    "oc-kimi-code": ("clinepass", None),
+    "oc-kimi-k3": ("clinepass", None),
+}
+
+
 def _profile_label(profile: Profile) -> str:
     if profile.launcher_effort:
         return f"{profile.name} --effort {profile.launcher_effort}"
@@ -1085,16 +1103,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "kiro", None
     if profile.startswith("kimi-"):
         return "kimi", None
-    if profile == "oc-gflash":
-        return "agy", "gemini"
-    if profile in ("oc-sonnet46", "oc-oss"):
-        return "agy", "3p"
-    if profile == "oc-omni":
-        return "omniroute", None
-    if profile == "oc-solar4":
-        return "upstage", None
     if profile.startswith("oc-"):
-        return "clinepass", None
+        return _OC_PROFILE_POOLS.get(profile, ("", None))
     if profile in ("grok", "grok-hi", "grok-med", "grok45", "grok45-med", "grok46", "grok46-med"):
         return "grok", None
     # ROB-1252: cc-qwen38/cc-glm run the Claude Code CLI harness itself against

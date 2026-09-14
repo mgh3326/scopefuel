@@ -22,6 +22,7 @@ from scopefuel.recommend import (
     OPUS_MAX_ESCALATION_REASON,
     PRESERVE_EXCLUDE_PCT,
     PROFILE_ALIASES,
+    RETIRED_PROFILES,
     SPEND_EXCLUDE_PCT,
     Profile,
     _brake_factor,
@@ -119,6 +120,36 @@ def test_profile_pool_matches_quota_guard():
     assert profile_pool("cc-qwen38") == ("clinepass", None)
     assert profile_pool("cc-glm") == ("clinepass", None)
     assert profile_pool("devin-swe2") == ("devin", None)
+
+
+def test_profile_pool_registered_oc_profiles_are_explicit_and_fail_closed():
+    expected = {
+        "oc-gflash": ("agy", "gemini"),
+        "oc-sonnet46": ("agy", "3p"),
+        "oc-oss": ("agy", "3p"),
+        "oc-omni": ("omniroute", None),
+        "oc-solar4": ("upstage", None),
+        "oc-dsflash": ("clinepass", None),
+        "oc-glm": ("clinepass", None),
+        "oc-qwen37-max": ("clinepass", None),
+        "oc-minimax-m3": ("clinepass", None),
+        "oc-kimi-code": ("clinepass", None),
+        "oc-kimi-k3": ("clinepass", None),
+    }
+    registered = {
+        profile.name
+        for profiles in GRADE_TABLE.values()
+        for profile in profiles
+        if profile.name.startswith("oc-")
+    }
+    registered |= {name for name in RETIRED_PROFILES if name.startswith("oc-")}
+    assert registered == set(expected)
+    for name, pool in expected.items():
+        assert profile_pool(name) == pool
+
+    assert profile_pool("oc-typo-solar4") == ("", None)
+    assert profile_pool("oc-") == ("", None)
+    assert profile_pool("oc-sonnet47") == ("", None)
 
 
 # ------------------------------------------------------------------ sort/ranking
