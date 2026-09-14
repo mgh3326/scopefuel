@@ -161,9 +161,9 @@ def _probe_banner() -> str:
     probe_workdir = Path(PROBE_WORKDIR).expanduser()
     probe_workdir.mkdir(parents=True, exist_ok=True)
     master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
     process: subprocess.Popen[bytes] | None = None
     try:
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command/argv; binary is explicit/env-configured
             [BINARY, "--respect-workspace-trust", "false"],
             cwd=probe_workdir,
