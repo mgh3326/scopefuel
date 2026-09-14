@@ -953,6 +953,19 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             gate="escalation",
             gate_reason=OC_OMNI_ESCALATION_REASON,
         ),
+        # task295: devin 계정 풀 공유 3종. profile_pool 의 `devin-` prefix 라우팅이
+        # 셋 다 devin 풀에 묶는다(신설 풀 없음). wrk `--model` 매핑:
+        # devin-glm52→glm-5-2, devin-swe17→swe-1-7, devin-ds41→deepseek-v4-1-flash-high.
+        # reps 0건이라 무점수 미측정 — C 는 benchmark=None 무점수 행의 기존 관례
+        # (codex-luna low, kiro-cheap, oc-omni)를 따른다.
+        Profile("devin-glm52", "GLM-5.2", None, benchmark_annotation=UNMEASURED_ANNOTATION),
+        Profile("devin-swe17", "SWE-1.7", None, benchmark_annotation=UNMEASURED_ANNOTATION),
+        Profile(
+            "devin-ds41",
+            "DeepSeek V4.1 Flash (high)",
+            None,
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+        ),
     ],
 }
 

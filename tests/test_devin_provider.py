@@ -11,10 +11,13 @@ from scopefuel.recommend import (
     DEVIN_SWE2_PLACEMENT_NOTE,
     ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
     GRADE_TABLE,
+    UNMEASURED_ANNOTATION,
     profile_pool,
+    recommend,
 )
 
 FREE_NOTE = "free until ~2026-10-10"
+NEW_DEVIN_PROFILES = ("devin-glm52", "devin-swe17", "devin-ds41")
 
 
 def _fixture(fixture_text) -> str:
@@ -399,3 +402,63 @@ def test_child_env_sets_term_and_pty_dimensions(monkeypatch):
     assert child_env["COLUMNS"] == "200"
     assert child_env["LINES"] == "50"
     assert child_env["TERM"] == "xterm-256color"
+
+
+# -- task295: devin 계정 풀 공유 3종 등재 ------------------------------------
+
+
+def test_task295_new_devin_profiles_are_c_only_and_unmeasured():
+    names = {grade: [p.name for p in profiles] for grade, profiles in GRADE_TABLE.items()}
+    for name in NEW_DEVIN_PROFILES:
+        assert name in names["C"]
+        for grade in ("S+", "S", "A+", "A", "B"):
+            assert name not in names[grade], (name, grade)
+
+        profile = next(p for p in GRADE_TABLE["C"] if p.name == name)
+        assert profile.benchmark is None
+        assert profile.benchmark_annotation == UNMEASURED_ANNOTATION
+        assert profile.estimate_reason is None
+        assert profile.placement_note is None
+        assert profile.aa_agent_model_id is None
+        assert profile.aa_model_id is None
+        assert profile.benchmark_model_id is None
+        assert profile.launcher_effort is None
+        assert profile.benchmark_effort is None
+
+
+def test_task295_recommend_c_lists_new_devin_profiles_as_unmeasured(fixture_text):
+    providers = [devin.parse(_fixture(fixture_text))]
+    out = recommend(providers, "C")
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    for name in NEW_DEVIN_PROFILES:
+        row = next((line for line in ranked if line.split()[1] == name), None)
+        assert row is not None, (name, out)
+        assert "미측정" in row, (name, row)
+
+
+def test_task295_profile_pool_shares_devin_pool():
+    for name in NEW_DEVIN_PROFILES:
+        assert profile_pool(name) == ("devin", None)
+
+
+def test_task295_gate_cli_ok_on_new_devin_profiles(monkeypatch, capsys, fixture_text):
+    result = devin.parse(_fixture(fixture_text))
+    monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
+
+    parser = cli.build_parser(["devin"])
+    gate = parser._subparsers._group_actions[0].choices["gate"]
+    profile_action = next(action for action in gate._actions if action.dest == "profile")
+    for name in NEW_DEVIN_PROFILES:
+        assert name in profile_action.choices
+
+        rc = cli.main(["gate", "-m", name, "--no-cache"])
+        out = capsys.readouterr()
+        assert rc == 0, (name, out)
+        assert "pool=devin" in out.out, (name, out)
+
+
+def test_task295_list_recommend_profiles_include_new_devin_profiles(capsys):
+    assert cli.main(["--list-recommend-profiles"]) == 0
+    names = capsys.readouterr().out.splitlines()
+    for name in NEW_DEVIN_PROFILES:
+        assert name in names
