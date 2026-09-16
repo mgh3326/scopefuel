@@ -70,8 +70,8 @@ def _kill_process_group_on_timeout(_signum: int, _frame: object) -> None:
 
     Probe children run in dedicated sessions (start_new_session), so killpg on
     this process's group cannot reach them; providers register each child pgid
-    in proctrack and this handler signals those groups first. Only registered
-    groups and this group are signaled — anything else is untouched.
+    in proctrack and this handler signals those groups' members first — only
+    members whose cwd is still inside the registered probe dir at signal time.
     """
 
     signal.signal(signal.SIGTERM, signal.SIG_IGN)

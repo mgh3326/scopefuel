@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import signal
 import subprocess
@@ -37,7 +38,7 @@ def test_registry_kill_registered_kills_the_group():
 
 
 def test_registry_skips_group_outside_expected_cwd(tmp_path):
-    """killpg 직전 재판별: 등록된 기대 cwd 밖에 있는 그룹은 신호를 받지 않는다."""
+    """신호 직전 재판별: 등록된 기대 cwd 밖에 있는 그룹은 신호를 받지 않는다."""
     child = _sleep_in(tmp_path / "elsewhere")
     try:
         proctrack.register(child.pid, tmp_path / "expected-elsewhere")
@@ -46,6 +47,49 @@ def test_registry_skips_group_outside_expected_cwd(tmp_path):
     finally:
         proctrack.unregister(child.pid)
         _kill_and_reap(child)
+
+
+def test_kill_registered_signals_only_members_inside_expected(tmp_path):
+    """기대 cwd 밖의 같은-그룹 구성원은 신호를 받지 않는다 — killpg 가 아니다.
+
+    그룹원 각각의 cwd 를 신호 직전에 확인해, expected 안에 있는 구성원에만
+    보낸다. 이 확인을 무력화하면 기대 밖 구성원이 죽어 assertion 이 실패한다.
+    """
+    inside = tmp_path / "expected"
+    outside = tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    # bash 리더(cwd=outside) + 배경 잡 하나(cwd=inside): 같은 pgid, 다른 cwd.
+    leader = subprocess.Popen(
+        ["bash", "-c", f'cd "{inside}" && exec sleep 60 & sleep 60 & wait'],
+        cwd=outside,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        member_in = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            cands = [p for p in proctrack.pids_with_cwd(inside) if p != leader.pid]
+            if cands:
+                member_in = cands[0]
+                break
+            time.sleep(0.05)
+        assert member_in is not None, "inside-cwd group member never appeared"
+
+        proctrack.register(leader.pid, inside)  # session leader → pgid == leader pid
+        proctrack.kill_registered(grace_s=0.05)
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and member_in in proctrack.pids_with_cwd(inside):
+            time.sleep(0.1)
+        assert member_in not in proctrack.pids_with_cwd(inside)
+        assert leader.poll() is None, "outside-cwd group leader was signaled"
+    finally:
+        proctrack.unregister(leader.pid)
+        _kill_and_reap(leader)
 
 
 def test_pids_with_cwd_matches_exact_directory_only(tmp_path):
@@ -169,16 +213,64 @@ def test_stale_sweep_skips_locked_instance_dir(tmp_path):
         _kill_and_reap(child)
 
 
-def test_stale_sweep_skips_instance_dir_without_owner_lock(tmp_path):
-    """owner 락이 없는 디렉터리는 판정 불가 — 건드리지 않는다(보수적)."""
+def test_stale_sweep_reclaims_foreign_probe_dir_with_no_locks(tmp_path):
+    """우리 네임스페이스(probe-*) 안에서 잡힌 락이 없는 디렉터리는 죽은 잔해다."""
     workdir = tmp_path / "workdir"
     unlocked = workdir / "probe-noLock"
     proc = _sleep_in(unlocked)
     try:
-        assert proctrack.kill_stale_probe_leftovers(workdir) == []
-        assert proc.poll() is None
+        killed = proctrack.kill_stale_probe_leftovers(workdir)
+        assert proc.pid in killed
+        assert not unlocked.exists()
     finally:
         _kill_and_reap(proc)
+
+
+def test_stale_sweep_skips_legacy_owner_locked_dir(tmp_path):
+    """구판본이 남긴 .owner 락이 잡힌 디렉터리도 살아있는 것으로 본다."""
+    workdir = tmp_path / "workdir"
+    legacy = workdir / "probe-legacy"
+    legacy.mkdir(parents=True)
+    lock = legacy / ".owner"
+    lock.touch()
+    fd = os.open(lock, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert proctrack.kill_stale_probe_leftovers(workdir) == []
+        assert legacy.exists()
+    finally:
+        os.close(fd)
+
+
+def test_stale_sweep_reclaims_dead_pending_dir(tmp_path):
+    """mkdtemp~flock 사이에 죽은 pending 잔해 — 락이 없으므로 회수 대상이다."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    pending = workdir / ".probe-pending-dead"
+    pending.mkdir()
+    proc = _sleep_in(pending)
+    try:
+        first = proctrack.kill_stale_probe_leftovers(workdir)
+        second = proctrack.kill_stale_probe_leftovers(workdir)
+        assert proc.pid in first
+        assert not pending.exists(), (first, second, list(workdir.iterdir()))
+    finally:
+        _kill_and_reap(proc)
+
+
+def test_stale_sweep_skips_locked_pending_dir(tmp_path):
+    """기동 중(mkdtemp~rename 사이) pending — 디렉터리 락이 잡혀 있으면 불가침."""
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    pending = workdir / ".probe-pending-starting"
+    pending.mkdir()
+    fd = os.open(pending, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert proctrack.kill_stale_probe_leftovers(workdir) == []
+        assert pending.exists()
+    finally:
+        os.close(fd)
 
 
 def test_stale_sweep_spares_prefix_sibling_and_dotdot_escape(tmp_path):

@@ -438,7 +438,7 @@ def test_probe_start_sweeps_stale_instance_dir_leftover(tmp_path, monkeypatch, f
     workdir = tmp_path / "probe-workdir"
     instance, fd = proctrack.new_probe_dir(workdir)
     leftover = subprocess.Popen(["sleep", "60"], cwd=instance, start_new_session=True)
-    os.close(fd)  # 주인 사망 — 커널이 owner 락을 푼다
+    os.close(fd)  # 주인 사망 — 커널이 디렉터리 락을 푼다
     payload = _fixture(fixture_text)
     binary = tmp_path / "fake-devin-banner-stale-inst"
     binary.write_text(_banner_probe_script(payload, banner_line=_REDRAW_LINE))

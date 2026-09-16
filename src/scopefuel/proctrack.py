@@ -4,14 +4,16 @@
 워커 자기 그룹에 대한 killpg 가 그 자식에 닿지 않는다. 네 가지 장치로 고아를 막는다:
 
 - 인스턴스 디렉터리: 프로브마다 workdir 아래 고유 디렉터리(``probe-*``)를
-  만들고 ``.owner`` 파일에 flock 을 쥔다. 자식의 cwd 는 이 디렉터리다.
-  락은 커널이 소유자 사망 시 자동 해제하므로 PID 재사용에 무관하게
-  "살아있는 프로브"를 식별한다.
-- 선제 스윕: 프로브 시작 전 workdir 루트의 cwd 잔존자와, owner 락이 풀린
-  (죽은 프로브의) 인스턴스 디렉터리 안의 잔존자만 정리한다. 락이 잡힌
-  디렉터리 — 살아있는 동시 프로브 — 에는 절대 닿지 않는다.
+  만들고 디렉터리 자체에 flock 을 쥔다(락은 inode 에 붙어 rename 을 견딘다).
+  자식의 cwd 는 이 디렉터리다. 커널이 소유자 사망 시 락을 자동 해제하므로
+  PID 재사용에 무관하게 "살아있는 프로브"를 식별한다.
+- 선제 스윕: 프로브 시작 전 workdir 루트의 cwd 잔존자와, 디렉터리 락이 풀린
+  (죽은 프로브의) ``probe-*``/``.probe-pending-*`` 디렉터리 안의 잔존자를
+  정리한다. 락이 잡힌 디렉터리 — 살아있는 동시 프로브 — 는 건너뛴다.
 - 레지스트리: provider 가 띄운 자식의 pgid 와 기대 cwd 를 등록한다.
-  refresh 타임아웃 핸들러가 os._exit 전에 등록된 그룹을 killpg 한다.
+  refresh 타임아웃 핸들러가 os._exit 전에, 등록된 그룹의 구성원 중 cwd 가
+  기대 디렉터리 안에 있는 것으로 확인된 프로세스에만 신호한다 — killpg 는
+  쓰지 않는다(같은 pgid 에 무관한 프로세스가 섞일 수 있으므로).
 - 리퍼: 분리된 감시 프로세스가 부모 사망(ppid→1)을 폴링으로 감지해 자기
   인스턴스 디렉터리만 스윕한다 — 부모가 SIGKILL/SIGHUP 로 죽어 파이썬
   정리 경로가 전혀 못 도는 경우의 최종 방어선이다.
@@ -21,11 +23,12 @@
 장수 정상 워커를 죽이지 않기 위해서다(2026-09-16 실측: 정상 작업 세션이
 이틀 이상 도는 경우가 있다).
 
-모든 신호 경로는 TOCTOU 를 막기 위해 **신호 직전에 대상을 재판별**한다.
-열거된 pid/pgid 목록은 기록일 뿐이고, 실행 조건은 kill/killpg 바로 전에
-대상의 cwd(그룹이면 그룹원의 cwd)를 다시 읽어 확인하는 것이다. 그 사이
-죽거나 다른 곳으로 옮긴 대상 — 재사용된 PID/pgid 포함 — 에는 신호가
-가지 않는다.
+모든 신호 경로는 신호 직전에 대상 cwd 를 다시 읽어 재판별한다 — 열거된
+pid 목록은 기록일 뿐이다. 다만 재판별과 os.kill 사이에는 스케줄링 창이
+남아 있다: 그 사이 대상이 종료되고 PID 가 재사용되면 신호가 다른
+프로세스에 닿을 수 있다. 이 창은 커널 지원 없이는 제거할 수 없으므로,
+재판별은 "창을 한 번의 lsof 왕복 안쪽으로 줄이는" 장치이지 원자성
+보장이 아니다.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ _PGROUPS: dict[int, Path] = {}
 
 _INSTANCE_PREFIX = "probe-"
 _PENDING_PREFIX = ".probe-pending-"
-_OWNER_LOCK = ".owner"
+_OWNER_LOCK = ".owner"  # 구판본이 남긴 잔해 — 있으면 그것도 락 대상으로 본다
 
 _LSOF_TIMEOUT_S = 10.0
 _REAPER_SWEEP_PASSES = 4
@@ -110,7 +113,7 @@ def _cwds(pids: Iterable[int] | None = None) -> dict[int, str]:
 
 
 def _cwd_of(pid: int) -> Path | None:
-    """그 pid 의 cwd 를 지금 다시 읽는다 — 신호 직전 재판별에 쓰는 유일한 소스."""
+    """그 pid 의 cwd 를 지금 다시 읽는다 — 신호 직전 재판별에 쓰는 소스."""
 
     raw = _cwds([pid]).get(pid)
     return _resolve(raw) if raw else None
@@ -147,35 +150,37 @@ def _pgid_members(pgid: int) -> list[int]:
     return members
 
 
-def _group_matches(pgid: int, expected: Path) -> bool:
-    """그룹 안에 ``expected`` 안에 cwd 를 둔 프로세스가 아직 있는가.
+def _signal_verified_members(pgid: int, expected: Path, sig: signal.Signals) -> list[int]:
+    """그룹원 각각의 cwd 를 신호 직전에 확인해, ``expected`` 안에 있는 것만 신호한다.
 
-    등록 시점과 신호 시점 사이의 pgid 재사용을 막는 killpg 직전 재판별이다.
-    기대 디렉터리 안에 있는 그룹원이 하나도 없으면 그 그룹은 우리 것이 아니다.
+    killpg 를 쓰지 않는 이유: 같은 pgid 에 기대 밖 프로세스가 섞이는 입력이
+    있다 — 세션 리더가 자기 cwd 만 옮긴 경우, 등록 후 그룹에 합류한 경우,
+    pgid 재사용. 구성원 단위로 재판별하면 이 입력들에서 무고한 프로세스는
+    전부 걸러진다. 기대 안에 있는 구성원만 우리 것이다(cwd 가 판별자).
     """
 
     want = _resolve(expected)
+    sent: list[int] = []
     for pid in {pgid, *_pgid_members(pgid)}:
         cwd = _cwd_of(pid)
-        if cwd is not None and _matches(cwd, want, nested=True):
-            return True
-    return False
+        if cwd is None or not _matches(cwd, want, nested=True):
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, sig)
+            sent.append(pid)
+    return sent
 
 
 def kill_registered(grace_s: float = 0.2) -> None:
-    """SIGTERM then SIGKILL every registered group — each re-verified before signaling."""
+    """SIGTERM then SIGKILL the verified members of every registered group."""
 
     groups = list(_PGROUPS.items())
     for pgid, expected in groups:
-        if _group_matches(pgid, expected):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pgid, signal.SIGTERM)
+        _signal_verified_members(pgid, expected, signal.SIGTERM)
     if grace_s > 0:
         time.sleep(grace_s)
     for pgid, expected in groups:
-        if _group_matches(pgid, expected):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pgid, signal.SIGKILL)
+        _signal_verified_members(pgid, expected, signal.SIGKILL)
 
 
 def kill_leftovers_at_cwd(
@@ -192,7 +197,9 @@ def kill_leftovers_at_cwd(
     The enumeration is a record only: each pid's cwd is re-read immediately
     before its signal, and the signal fires only when it still resolves
     inside ``target``. A pid that exited or moved since enumeration is
-    skipped, so a reused pid can never take the signal.
+    skipped. The check and the kill are not atomic — a pid that exits and
+    is reused inside the remaining scheduling window can still take the
+    signal; re-verification shrinks that window to one lsof round-trip.
     """
 
     want = _resolve(target)
@@ -211,26 +218,29 @@ def kill_leftovers_at_cwd(
 
 
 def new_probe_dir(workdir: Path) -> tuple[Path, int]:
-    """Create a unique instance dir under ``workdir`` and take its owner lock.
+    """Create a unique instance dir under ``workdir`` and lock the dir itself.
 
-    Returns ``(instance_dir, lock_fd)``. The caller holds ``lock_fd`` for the
-    whole probe and closes it only after the probe child is reaped — a
-    released lock is how sweepers learn the owner died. The fd is
-    non-inheritable and children spawn ``close_fds=True``, so only the probe
-    parent ever holds it. A lock that cannot be taken fails the probe
-    closed: an unprotected instance dir would look stale to sweepers.
+    Returns ``(instance_dir, lock_fd)`` where ``lock_fd`` is an open fd on the
+    directory inode holding an exclusive flock — the lock survives the rename
+    to the final name. The caller keeps ``lock_fd`` for the whole probe and
+    closes it only after the probe child is reaped; a released lock is how
+    sweepers learn the owner died. The fd is non-inheritable and children
+    spawn ``close_fds=True``, so only the probe parent holds it. A lock that
+    cannot be taken fails the probe closed: an unlocked instance dir looks
+    like dead residue to sweepers.
 
-    Ordering is the safety invariant: the dir is created under a pending
-    name sweepers never match, ``.owner`` is flocked, and only then is it
-    atomically renamed to its final ``probe-*`` name. A dir visible to a
-    sweep therefore always has its lock held — there is no window where a
-    still-starting probe's dir looks stale and gets removed.
+    Ordering: ``mkdtemp`` under a pending name → flock the directory →
+    atomic rename to the final ``probe-*`` name. The residual window is
+    between ``mkdtemp`` returning and ``flock`` succeeding — a pending dir
+    caught there by a sweeper looks lock-free and can be removed. That
+    loses nothing but the empty dir: no child exists before the lock, so
+    the failure is this probe raising at startup, never a killed process.
     """
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     pending = Path(tempfile.mkdtemp(prefix=_PENDING_PREFIX, dir=workdir))
-    fd = os.open(pending / _OWNER_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(pending, os.O_RDONLY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -247,35 +257,56 @@ def new_probe_dir(workdir: Path) -> tuple[Path, int]:
     return instance, fd
 
 
-def _instance_dirs(workdir: Path) -> list[Path]:
+def _probe_dirs(workdir: Path) -> list[Path]:
+    """Instance dirs this module can own: published ``probe-*`` and pending.
+
+    Anything else in ``workdir`` — foreign names, symlinks, plain files —
+    is not ours and is never removed.
+    """
+
     with contextlib.suppress(OSError):
         return [
             d
             for d in workdir.iterdir()
-            if d.is_dir() and not d.is_symlink() and d.name.startswith(_INSTANCE_PREFIX)
+            if d.is_dir()
+            and not d.is_symlink()
+            and d.name.startswith((_INSTANCE_PREFIX, _PENDING_PREFIX))
         ]
     return []
 
 
-def _instance_live(instance: Path) -> bool | None:
-    """True = owner lock held (live probe); False = released (stale);
-    None = indeterminate (no lock file — never swept, never removed)."""
+def _acquire_dir_locks(instance: Path) -> list[int] | None:
+    """flock the dir (and a legacy ``.owner`` if present); None when any is held.
 
-    lock = instance / _OWNER_LOCK
-    if not lock.exists():
-        return None
-    try:
-        fd = os.open(lock, os.O_RDWR)
-    except OSError:
-        return None
+    Acquiring every lock means the owner is dead — kernel-released locks
+    need no PID. The caller keeps the returned fds open through kill+rmtree
+    so the liveness check and the removal are one held-lock interval, then
+    closes them. A lock held by someone else, or a dir that cannot be
+    opened, is indeterminate → skipped.
+    """
+
+    fds: list[int] = []
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        return False
-    finally:
-        os.close(fd)
+            fd = os.open(instance, os.O_RDONLY)
+        except OSError:
+            return None
+        fds.append(fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        owner = instance / _OWNER_LOCK
+        if owner.exists():
+            try:
+                ofd = os.open(owner, os.O_RDWR)
+            except OSError:
+                return None
+            fds.append(ofd)
+            fcntl.flock(ofd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        return None
+    return fds
 
 
 def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) -> list[int]:
@@ -283,19 +314,25 @@ def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) ->
 
     Kills (a) processes whose cwd is exactly ``workdir`` — no live probe
     uses the root itself, only legacy orphans — and (b) everything inside
-    instance dirs whose owner lock is released, then removes those dirs.
-    Instance dirs still locked by a live probe, dirs without an owner lock,
-    and anything outside ``workdir`` are never touched — one probe's
-    cleanup cannot reach another probe's living child.
+    ``probe-*``/``.probe-pending-*`` dirs whose locks are all released,
+    then removes those dirs. A dir whose lock is still held — a live or
+    still-starting probe — is skipped. Names outside our two prefixes and
+    anything outside ``workdir`` are not ours and are not touched.
     """
 
     workdir = Path(workdir)
     killed = kill_leftovers_at_cwd(workdir, nested=False, exclude=exclude)
-    for instance in _instance_dirs(workdir):
-        if _instance_live(instance) is not False:
+    for instance in _probe_dirs(workdir):
+        fds = _acquire_dir_locks(instance)
+        if fds is None:
             continue
-        killed += kill_leftovers_at_cwd(instance, nested=True, exclude=exclude)
-        shutil.rmtree(instance, ignore_errors=True)
+        try:
+            killed += kill_leftovers_at_cwd(instance, nested=True, exclude=exclude)
+            shutil.rmtree(instance, ignore_errors=True)
+        finally:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
     return killed
 
 
