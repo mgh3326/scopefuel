@@ -162,27 +162,33 @@ def _probe_banner() -> str:
     자식은 전용 세션(start_new_session)에 두므로 부모의 finally killpg 외의
     경로로 나가면 고아가 된다. 그 경로들을 막는 장치:
 
-    - 시작 전 같은 workdir 을 cwd 로 쓰는 이전 잔존자를 선제 정리한다
-      (판별자는 cwd 뿐 — 나이·CPU 로 고르면 장수 정상 워커를 죽인다).
-    - 자식·리퍼 pgid 를 proctrack 에 등록해 refresh 타임아웃 핸들러가
-      os._exit 전에 회수한다.
-    - 부모 사망을 감시하는 분리 리퍼를 띄운다 — 부모가 SIGKILL/SIGHUP 로
-      죽어 파이썬 정리 경로가 전혀 못 돌 때 workdir 을 스윕한다.
+    - 프로브마다 workdir 아래 고유 인스턴스 디렉터리를 만들고 .owner flock
+      을 쥔 뒤 그것을 자식 cwd 로 쓴다. 시작 전 스윕은 workdir 루트의 잔존자와
+      락이 풀린(=주인이 죽은) 인스턴스 디렉터리 안만 정리한다 — 락이 잡힌
+      살아있는 동시 프로브의 디렉터리에는 절대 닿지 않는다(판별자는 cwd
+      뿐 — 나이·CPU 로 고르면 장수 정상 워커를 죽인다).
+    - 자식 pgid 와 기대 cwd 를 proctrack 에 등록해 refresh 타임아웃 핸들러가
+      os._exit 전에 회수한다 — 신호 직전 그룹원 cwd 를 재검증해 pgid 재사용
+      오살을 막는다.
+    - 부모 사망을 감시하는 분리 리퍼가 자기 인스턴스 디렉터리만 스윕한다 —
+      부모가 SIGKILL/SIGHUP 로 죽어 파이썬 정리 경로가 전혀 못 돌 때의
+      최종 방어선이며, 다른 프로브의 디렉터리는 모른다.
     """
 
     probe_workdir = Path(PROBE_WORKDIR).expanduser()
     probe_workdir.mkdir(parents=True, exist_ok=True)
-    proctrack.kill_leftovers_at_cwd(probe_workdir)
-    master_fd, slave_fd = pty.openpty()
+    proctrack.kill_stale_probe_leftovers(probe_workdir)
+    instance_dir, owner_fd = proctrack.new_probe_dir(probe_workdir)
+    master_fd = slave_fd = -1
     process: subprocess.Popen[bytes] | None = None
     reaper: subprocess.Popen[bytes] | None = None
     child_pgid: int | None = None
-    reaper_pgid: int | None = None
     try:
+        master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command/argv; binary is explicit/env-configured
             [BINARY, "--respect-workspace-trust", "false"],
-            cwd=probe_workdir,
+            cwd=instance_dir,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -193,13 +199,8 @@ def _probe_banner() -> str:
         with contextlib.suppress(OSError):
             child_pgid = os.getpgid(process.pid)
         if child_pgid is not None:
-            proctrack.register(child_pgid)
-        reaper = proctrack.spawn_reaper(probe_workdir, ttl_s=TIMEOUT_S + 90.0)
-        if reaper is not None:
-            with contextlib.suppress(OSError):
-                reaper_pgid = os.getpgid(reaper.pid)
-            if reaper_pgid is not None:
-                proctrack.register(reaper_pgid)
+            proctrack.register(child_pgid, instance_dir)
+        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
         os.close(slave_fd)
         slave_fd = -1
 
@@ -257,8 +258,9 @@ def _probe_banner() -> str:
                     reaper.kill()
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 reaper.wait(timeout=2.0)
-        if reaper_pgid is not None:
-            proctrack.unregister(reaper_pgid)
+        with contextlib.suppress(OSError):
+            os.close(owner_fd)
+        shutil.rmtree(instance_dir, ignore_errors=True)
         if slave_fd >= 0:
             os.close(slave_fd)
         with contextlib.suppress(OSError):

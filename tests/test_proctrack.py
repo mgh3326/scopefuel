@@ -1,4 +1,4 @@
-"""proctrack: pgid registry, cwd-discriminated sweep, orphan reaper."""
+"""proctrack: pgid registry, cwd-discriminated sweep, instance dirs, orphan reaper."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _kill_and_reap(process: subprocess.Popen) -> None:
 def test_registry_kill_registered_kills_the_group():
     child = _sleep_in(Path.cwd())
     try:
-        proctrack.register(child.pid)  # session leader → pgid == pid
+        proctrack.register(child.pid, Path.cwd())  # session leader → pgid == pid
         assert child.pid in proctrack.registered()
         proctrack.kill_registered(grace_s=0.05)
         assert child.wait(timeout=5) is not None
@@ -36,25 +36,80 @@ def test_registry_kill_registered_kills_the_group():
     assert child.pid not in proctrack.registered()
 
 
+def test_registry_skips_group_outside_expected_cwd(tmp_path):
+    """killpg 직전 재판별: 등록된 기대 cwd 밖에 있는 그룹은 신호를 받지 않는다."""
+    child = _sleep_in(tmp_path / "elsewhere")
+    try:
+        proctrack.register(child.pid, tmp_path / "expected-elsewhere")
+        proctrack.kill_registered(grace_s=0.05)
+        assert child.poll() is None
+    finally:
+        proctrack.unregister(child.pid)
+        _kill_and_reap(child)
+
+
 def test_pids_with_cwd_matches_exact_directory_only(tmp_path):
     inside = _sleep_in(tmp_path / "probe-workdir")
     outside = _sleep_in(tmp_path / "elsewhere")
+    nested = _sleep_in(tmp_path / "probe-workdir" / "deeper")
     try:
         pids = proctrack.pids_with_cwd(tmp_path / "probe-workdir")
         assert inside.pid in pids
         assert outside.pid not in pids
+        assert nested.pid not in pids
         assert os.getpid() not in pids
     finally:
         _kill_and_reap(inside)
         _kill_and_reap(outside)
+        _kill_and_reap(nested)
+
+
+def test_pids_with_cwd_nested_matches_descendants_not_prefix_siblings(tmp_path):
+    base = tmp_path / "probe-workdir"
+    sibling = tmp_path / "probe-workdir-other"  # 접두사만 같은 경로 — 안쪽이 아니다
+    inside = _sleep_in(base / "probe-x" / "deeper")
+    sibling_proc = _sleep_in(sibling)
+    try:
+        nested = proctrack.pids_with_cwd(base, nested=True)
+        assert inside.pid in nested
+        assert sibling_proc.pid not in nested
+        exact = proctrack.pids_with_cwd(base)
+        assert inside.pid not in exact
+    finally:
+        _kill_and_reap(inside)
+        _kill_and_reap(sibling_proc)
+
+
+def test_dotdot_normalized_cwd_is_not_inside_target(tmp_path):
+    target = tmp_path / "probe-workdir"
+    escaped = target / ".." / "x"  # realpath → tmp_path/x — 안쪽이 아니다
+    proc = _sleep_in(escaped)
+    try:
+        assert proc.pid not in proctrack.pids_with_cwd(target, nested=True)
+        assert proc.pid in proctrack.pids_with_cwd(tmp_path / "x")
+    finally:
+        _kill_and_reap(proc)
+
+
+def test_symlinked_cwd_resolves_into_target(tmp_path):
+    target = tmp_path / "workdir" / "probe-x"
+    target.mkdir(parents=True)
+    alias = tmp_path / "alias-to-instance"
+    alias.symlink_to(target)
+    proc = subprocess.Popen(["sleep", "60"], cwd=alias, start_new_session=True)
+    try:
+        # lsof 는 vnode 의 실제 경로를 보고한다 — 링크 경유도 안에 있는 것이다.
+        assert proc.pid in proctrack.pids_with_cwd(target, nested=True)
+    finally:
+        _kill_and_reap(proc)
 
 
 def test_kill_leftovers_at_cwd_kills_only_matching_processes(tmp_path):
     workdir = tmp_path / "probe-workdir"
-    inside = _sleep_in(workdir)
+    inside = _sleep_in(workdir / "probe-x" / "deep")
     outside = _sleep_in(tmp_path / "elsewhere")
     try:
-        killed = proctrack.kill_leftovers_at_cwd(workdir)
+        killed = proctrack.kill_leftovers_at_cwd(workdir / "probe-x", nested=True)
         assert inside.pid in killed
         assert inside.wait(timeout=5) == -signal.SIGKILL
         assert outside.poll() is None
@@ -63,9 +118,114 @@ def test_kill_leftovers_at_cwd_kills_only_matching_processes(tmp_path):
         _kill_and_reap(outside)
 
 
-def test_reaper_sweeps_workdir_when_watched_parent_dies(tmp_path):
-    workdir = tmp_path / "probe-workdir"
-    leftover = _sleep_in(workdir)
+def test_enumerated_pid_is_reverified_before_kill(tmp_path, monkeypatch):
+    """TOCTOU: 목록은 기록용 — 신호 직전 재판별에서 벗어난 대상은 죽지 않는다."""
+    target = tmp_path / "target"
+    victim = _sleep_in(tmp_path / "elsewhere")  # 실제 cwd 는 target 밖
+    monkeypatch.setattr(
+        proctrack, "pids_with_cwd", lambda *a, **k: [victim.pid] if k.get("pids") is None else []
+    )
+    try:
+        # 열거가 오래된(또는 거짓) 목록을 줘도 신호 직전 재판별에서 걸러진다.
+        assert proctrack.kill_leftovers_at_cwd(target) == []
+        assert victim.poll() is None
+    finally:
+        _kill_and_reap(victim)
+
+
+def test_enumerated_pid_that_exited_is_not_killed(tmp_path, monkeypatch):
+    """열거 후 종료된 pid — 재사용돼도 신호가 가지 않는다."""
+    victim = _sleep_in(tmp_path / "target")
+    _kill_and_reap(victim)
+    monkeypatch.setattr(proctrack, "pids_with_cwd", lambda *a, **k: [victim.pid])
+    assert proctrack.kill_leftovers_at_cwd(tmp_path / "target") == []
+
+
+def test_stale_sweep_kills_unlocked_instance_dir(tmp_path):
+    workdir = tmp_path / "workdir"
+    instance, fd = proctrack.new_probe_dir(workdir)
+    leftover = _sleep_in(instance / "deeper")
+    try:
+        os.close(fd)  # 주인 사망과 동일 — 커널이 락을 푼다
+        killed = proctrack.kill_stale_probe_leftovers(workdir)
+        assert leftover.pid in killed
+        assert leftover.wait(timeout=5) == -signal.SIGKILL
+        assert not instance.exists()
+    finally:
+        _kill_and_reap(leftover)
+
+
+def test_stale_sweep_skips_locked_instance_dir(tmp_path):
+    """락이 잡힌 디렉터리 — 살아있는 동시 프로브 — 에는 절대 닿지 않는다."""
+    workdir = tmp_path / "workdir"
+    instance, fd = proctrack.new_probe_dir(workdir)
+    child = _sleep_in(instance / "deeper")
+    try:
+        assert proctrack.kill_stale_probe_leftovers(workdir) == []
+        assert child.poll() is None
+        assert instance.exists()
+    finally:
+        os.close(fd)
+        _kill_and_reap(child)
+
+
+def test_stale_sweep_skips_instance_dir_without_owner_lock(tmp_path):
+    """owner 락이 없는 디렉터리는 판정 불가 — 건드리지 않는다(보수적)."""
+    workdir = tmp_path / "workdir"
+    unlocked = workdir / "probe-noLock"
+    proc = _sleep_in(unlocked)
+    try:
+        assert proctrack.kill_stale_probe_leftovers(workdir) == []
+        assert proc.poll() is None
+    finally:
+        _kill_and_reap(proc)
+
+
+def test_stale_sweep_spares_prefix_sibling_and_dotdot_escape(tmp_path):
+    workdir = tmp_path / "devin-probe-workdir"
+    sibling = _sleep_in(tmp_path / "devin-probe-workdir-other")
+    escapee = _sleep_in(workdir / ".." / "x")
+    try:
+        proctrack.kill_stale_probe_leftovers(workdir)
+        assert sibling.poll() is None
+        assert escapee.poll() is None
+    finally:
+        _kill_and_reap(sibling)
+        _kill_and_reap(escapee)
+
+
+def test_stale_sweep_kills_symlinked_cwd_resolving_into_stale_instance(tmp_path):
+    """링크 경유도 realpath 가 대상 안이면 안에 있는 것이다(정정된 정책)."""
+    workdir = tmp_path / "workdir"
+    instance, fd = proctrack.new_probe_dir(workdir)
+    alias = tmp_path / "alias-to-instance"
+    alias.symlink_to(instance)
+    proc = subprocess.Popen(["sleep", "60"], cwd=alias, start_new_session=True)
+    try:
+        os.close(fd)  # 주인 사망 → stale
+        killed = proctrack.kill_stale_probe_leftovers(workdir)
+        assert proc.pid in killed
+    finally:
+        _kill_and_reap(proc)
+
+
+def test_stale_sweep_spares_symlink_resolving_outside(tmp_path):
+    workdir = tmp_path / "workdir"
+    outside_real = tmp_path / "elsewhere"
+    outside_real.mkdir(parents=True)
+    alias = tmp_path / "alias-out"
+    alias.symlink_to(outside_real)
+    proc = subprocess.Popen(["sleep", "60"], cwd=alias, start_new_session=True)
+    try:
+        proctrack.kill_stale_probe_leftovers(workdir)
+        assert proc.poll() is None
+    finally:
+        _kill_and_reap(proc)
+
+
+def test_reaper_sweeps_target_dir_when_watched_parent_dies(tmp_path):
+    target = tmp_path / "probe-workdir"
+    leftover = _sleep_in(target / "deeper")
     survivor = _sleep_in(tmp_path / "elsewhere")
     parent = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
@@ -73,7 +233,7 @@ def test_reaper_sweeps_workdir_when_watched_parent_dies(tmp_path):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    reaper = proctrack.spawn_reaper(workdir, ttl_s=20, parent_pid=parent.pid)
+    reaper = proctrack.spawn_reaper(target, ttl_s=20, parent_pid=parent.pid)
     assert reaper is not None
     try:
         parent.kill()
@@ -92,9 +252,9 @@ def test_reaper_sweeps_workdir_when_watched_parent_dies(tmp_path):
 
 
 def test_reaper_expires_quietly_while_parent_alive(tmp_path):
-    workdir = tmp_path / "probe-workdir"
-    leftover = _sleep_in(workdir)
-    reaper = proctrack.spawn_reaper(workdir, ttl_s=1.0, parent_pid=os.getpid())
+    target = tmp_path / "probe-workdir"
+    leftover = _sleep_in(target)
+    reaper = proctrack.spawn_reaper(target, ttl_s=1.0, parent_pid=os.getpid())
     assert reaper is not None
     try:
         assert reaper.wait(timeout=10) == 0

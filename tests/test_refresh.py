@@ -131,7 +131,7 @@ def test_refresh_timeout_kills_registered_probe_child_in_other_session(tmp_path)
         "import os, subprocess, time\n"
         "from scopefuel import proctrack, refresh\n"
         "child = subprocess.Popen(['sleep', '30'], start_new_session=True)\n"
-        "proctrack.register(child.pid)\n"
+        "proctrack.register(child.pid, os.getcwd())\n"
         f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
         "os.environ['SCOPEFUEL_REFRESH_TIMEOUT_S'] = '0.2'\n"
         "raise SystemExit(refresh.run_worker({'grok': lambda: (time.sleep(30), None)[1]}, 'grok'))\n"
