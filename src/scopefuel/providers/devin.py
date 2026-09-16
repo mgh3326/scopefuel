@@ -32,6 +32,7 @@ import termios
 import time
 from pathlib import Path
 
+from .. import proctrack
 from ..model import Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_DEVIN_BIN") or "devin"
@@ -156,12 +157,27 @@ def _banner_result() -> ProviderResult:
 
 
 def _probe_banner() -> str:
-    """Run devin's startup banner in a PTY. 입력은 보내지 않는다 — 배너가 자기가 갱신한다."""
+    """Run devin's startup banner in a PTY. 입력은 보내지 않는다 — 배너가 자기가 갱신한다.
+
+    자식은 전용 세션(start_new_session)에 두므로 부모의 finally killpg 외의
+    경로로 나가면 고아가 된다. 그 경로들을 막는 장치:
+
+    - 시작 전 같은 workdir 을 cwd 로 쓰는 이전 잔존자를 선제 정리한다
+      (판별자는 cwd 뿐 — 나이·CPU 로 고르면 장수 정상 워커를 죽인다).
+    - 자식·리퍼 pgid 를 proctrack 에 등록해 refresh 타임아웃 핸들러가
+      os._exit 전에 회수한다.
+    - 부모 사망을 감시하는 분리 리퍼를 띄운다 — 부모가 SIGKILL/SIGHUP 로
+      죽어 파이썬 정리 경로가 전혀 못 돌 때 workdir 을 스윕한다.
+    """
 
     probe_workdir = Path(PROBE_WORKDIR).expanduser()
     probe_workdir.mkdir(parents=True, exist_ok=True)
+    proctrack.kill_leftovers_at_cwd(probe_workdir)
     master_fd, slave_fd = pty.openpty()
     process: subprocess.Popen[bytes] | None = None
+    reaper: subprocess.Popen[bytes] | None = None
+    child_pgid: int | None = None
+    reaper_pgid: int | None = None
     try:
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command/argv; binary is explicit/env-configured
@@ -174,6 +190,16 @@ def _probe_banner() -> str:
             start_new_session=True,
             env=_child_env(),
         )
+        with contextlib.suppress(OSError):
+            child_pgid = os.getpgid(process.pid)
+        if child_pgid is not None:
+            proctrack.register(child_pgid)
+        reaper = proctrack.spawn_reaper(probe_workdir, ttl_s=TIMEOUT_S + 90.0)
+        if reaper is not None:
+            with contextlib.suppress(OSError):
+                reaper_pgid = os.getpgid(reaper.pid)
+            if reaper_pgid is not None:
+                proctrack.register(reaper_pgid)
         os.close(slave_fd)
         slave_fd = -1
 
@@ -223,6 +249,16 @@ def _probe_banner() -> str:
                 else:
                     process.kill()
                 process.wait(timeout=2.0)
+        if child_pgid is not None:
+            proctrack.unregister(child_pgid)
+        if reaper is not None:
+            if reaper.poll() is None:
+                with contextlib.suppress(OSError):
+                    reaper.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                reaper.wait(timeout=2.0)
+        if reaper_pgid is not None:
+            proctrack.unregister(reaper_pgid)
         if slave_fd >= 0:
             os.close(slave_fd)
         with contextlib.suppress(OSError):

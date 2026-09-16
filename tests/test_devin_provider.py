@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
-from scopefuel import cli
+from scopefuel import cli, proctrack
 from scopefuel.providers import BUILTIN, devin
 from scopefuel.recommend import (
     DEVIN_SWE2_ESTIMATE_REASON,
@@ -402,6 +408,67 @@ def test_child_env_sets_term_and_pty_dimensions(monkeypatch):
     assert child_env["COLUMNS"] == "200"
     assert child_env["LINES"] == "50"
     assert child_env["TERM"] == "xterm-256color"
+
+
+# -- 프로브 자식 수명: 고아 방지 ----------------------------------------------
+
+
+def test_probe_start_sweeps_stale_workdir_leftover(tmp_path, monkeypatch, fixture_text):
+    """이전에 죽은 부모가 남긴 workdir 잔존자는 다음 프로브 시작 시 선제 정리된다."""
+    workdir = tmp_path / "probe-workdir"
+    workdir.mkdir()
+    leftover = subprocess.Popen(["sleep", "60"], cwd=workdir, start_new_session=True)
+    payload = _fixture(fixture_text)
+    binary = tmp_path / "fake-devin-banner-sweep"
+    binary.write_text(_banner_probe_script(payload, banner_line=_REDRAW_LINE))
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert leftover.wait(timeout=5) is not None
+    assert proctrack.pids_with_cwd(workdir) == []
+
+
+def test_sigkilled_probe_parent_leaves_no_workdir_orphans(tmp_path):
+    """부모 SIGKILL → 분리 리퍼가 workdir 잔존자를 쓴다(정리 경로는 전혀 못 돈다)."""
+    workdir = tmp_path / "probe-workdir"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    survivor = subprocess.Popen(["sleep", "60"], cwd=elsewhere, start_new_session=True)
+    fake = tmp_path / "fake-devin-hang"
+    fake.write_text("#!/bin/sh\nsleep 60\n")
+    fake.chmod(fake.stat().st_mode | 0o111)
+    helper = tmp_path / "probe_parent.py"
+    helper.write_text(
+        "from scopefuel.providers import devin\n"
+        f"devin.BINARY = {str(fake)!r}\n"
+        f"devin.PROBE_WORKDIR = {str(workdir)!r}\n"
+        "devin._probe_banner()\n"
+    )
+    parent = subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd())
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not proctrack.pids_with_cwd(workdir):
+            time.sleep(0.1)
+        assert proctrack.pids_with_cwd(workdir), "probe child never appeared in workdir"
+
+        parent.send_signal(signal.SIGKILL)
+        parent.wait(timeout=5)
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and proctrack.pids_with_cwd(workdir):
+            time.sleep(0.2)
+        assert proctrack.pids_with_cwd(workdir) == []
+        assert survivor.poll() is None
+    finally:
+        for proc in (survivor, parent):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        proctrack.kill_leftovers_at_cwd(workdir)
 
 
 # -- task295: devin 계정 풀 공유 3종 등재 ------------------------------------
