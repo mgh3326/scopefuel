@@ -123,6 +123,28 @@ def test_refresh_timeout_kills_worker_process_group(tmp_path):
     assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
 
 
+def test_refresh_timeout_kills_registered_probe_child_in_other_session(tmp_path):
+    """타임아웃 핸들러는 레지스트리의 pgid 도 정리한다 — 다른 세션의 자식도 닿는다."""
+    pid_file = tmp_path / "probe.pid"
+    helper = tmp_path / "registered_helper.py"
+    helper.write_text(
+        "import os, subprocess, time\n"
+        "from scopefuel import proctrack, refresh\n"
+        "child = subprocess.Popen(['sleep', '30'], start_new_session=True)\n"
+        "proctrack.register(child.pid, os.getcwd())\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "os.environ['SCOPEFUEL_REFRESH_TIMEOUT_S'] = '0.2'\n"
+        "raise SystemExit(refresh.run_worker({'grok': lambda: (time.sleep(30), None)[1]}, 'grok'))\n"
+    )
+    proc = subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd(), start_new_session=True)
+    proc.wait(timeout=5)
+    child_pid = int(pid_file.read_text())
+    child_state = subprocess.run(
+        ["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True, check=False
+    )
+    assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
+
+
 def test_refresh_pools_match_provider_registry():
     """refresh 가 아는 pool 은 providers.BUILTIN 에서만 파생한다 (하드코딩 목록 금지)."""
 

@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from . import cache
+from . import cache, proctrack
 from .model import ProviderResult
 from .providers import BUILTIN
 
@@ -66,10 +66,17 @@ def _timeout_seconds() -> float:
 
 
 def _kill_process_group_on_timeout(_signum: int, _frame: object) -> None:
-    """Kill the worker and every CLI/PTY child in its dedicated session."""
+    """Kill registered probe child groups, then the worker's own group.
 
-    pgid = os.getpgrp()
+    Probe children run in dedicated sessions (start_new_session), so killpg on
+    this process's group cannot reach them; providers register each child pgid
+    in proctrack and this handler signals those groups' members first — only
+    members whose cwd is still inside the registered probe dir at signal time.
+    """
+
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    proctrack.kill_registered()
+    pgid = os.getpgrp()
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, signal.SIGTERM)
     time.sleep(0.2)

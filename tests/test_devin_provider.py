@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
-from scopefuel import cli
+from scopefuel import cli, proctrack
 from scopefuel.providers import BUILTIN, devin
 from scopefuel.recommend import (
     DEVIN_SWE2_ESTIMATE_REASON,
@@ -402,6 +409,155 @@ def test_child_env_sets_term_and_pty_dimensions(monkeypatch):
     assert child_env["COLUMNS"] == "200"
     assert child_env["LINES"] == "50"
     assert child_env["TERM"] == "xterm-256color"
+
+
+# -- 프로브 자식 수명: 고아 방지 ----------------------------------------------
+
+
+def test_probe_start_sweeps_stale_workdir_leftover(tmp_path, monkeypatch, fixture_text):
+    """이전에 죽은 부모가 남긴 workdir 잔존자는 다음 프로브 시작 시 선제 정리된다."""
+    workdir = tmp_path / "probe-workdir"
+    workdir.mkdir()
+    leftover = subprocess.Popen(["sleep", "60"], cwd=workdir, start_new_session=True)
+    payload = _fixture(fixture_text)
+    binary = tmp_path / "fake-devin-banner-sweep"
+    binary.write_text(_banner_probe_script(payload, banner_line=_REDRAW_LINE))
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert leftover.wait(timeout=5) is not None
+    assert proctrack.pids_with_cwd(workdir, nested=True) == []
+
+
+def test_probe_start_sweeps_stale_instance_dir_leftover(tmp_path, monkeypatch, fixture_text):
+    """주인이 죽은 인스턴스 디렉터리 안의 잔존자도 다음 프로브 시작 시 정리된다."""
+    workdir = tmp_path / "probe-workdir"
+    instance, fd = proctrack.new_probe_dir(workdir)
+    leftover = subprocess.Popen(["sleep", "60"], cwd=instance, start_new_session=True)
+    os.close(fd)  # 주인 사망 — 커널이 디렉터리 락을 푼다
+    payload = _fixture(fixture_text)
+    binary = tmp_path / "fake-devin-banner-stale-inst"
+    binary.write_text(_banner_probe_script(payload, banner_line=_REDRAW_LINE))
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert leftover.wait(timeout=5) is not None
+    assert proctrack.pids_with_cwd(workdir, nested=True) == []
+
+
+def test_sigkilled_probe_parent_leaves_no_workdir_orphans(tmp_path):
+    """부모 SIGKILL → 분리 리퍼가 인스턴스 디렉터리 잔존자를 쓴다(정리 경로는 전혀 못 돈다)."""
+    workdir = tmp_path / "probe-workdir"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    survivor = subprocess.Popen(["sleep", "60"], cwd=elsewhere, start_new_session=True)
+    fake = tmp_path / "fake-devin-hang"
+    # SIGHUP 무시 — PTY master close 의 hangup 으로는 죽지 않아야 리퍼 기여가 증명된다.
+    fake.write_text("#!/bin/sh\ntrap '' HUP\nexec sleep 60\n")
+    fake.chmod(fake.stat().st_mode | 0o111)
+    helper = tmp_path / "probe_parent.py"
+    helper.write_text(
+        "from scopefuel.providers import devin\n"
+        f"devin.BINARY = {str(fake)!r}\n"
+        f"devin.PROBE_WORKDIR = {str(workdir)!r}\n"
+        "devin._probe_banner()\n"
+    )
+    parent = subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd())
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not proctrack.pids_with_cwd(workdir, nested=True):
+            time.sleep(0.1)
+        assert proctrack.pids_with_cwd(workdir, nested=True), "probe child never appeared in workdir"
+
+        parent.send_signal(signal.SIGKILL)
+        parent.wait(timeout=5)
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and proctrack.pids_with_cwd(workdir, nested=True):
+            time.sleep(0.2)
+        assert proctrack.pids_with_cwd(workdir, nested=True) == []
+        assert survivor.poll() is None
+    finally:
+        for proc in (survivor, parent):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        proctrack.kill_leftovers_at_cwd(workdir, nested=True)
+
+
+def _hang_probe_helper(path: Path, fake: Path, workdir: Path) -> Path:
+    helper = path
+    helper.write_text(
+        "from scopefuel.providers import devin\n"
+        f"devin.BINARY = {str(fake)!r}\n"
+        f"devin.PROBE_WORKDIR = {str(workdir)!r}\n"
+        "devin._probe_banner()\n"
+    )
+    return helper
+
+
+def test_concurrent_probes_never_kill_each_others_child(tmp_path):
+    """같은 workdir 의 동시 프로브: 시작 스윕도, 죽은 쪽의 리퍼도 다른 쪽 자식에 닿지 않는다."""
+    workdir = tmp_path / "probe-workdir"
+    workdir.mkdir()
+    fake = tmp_path / "fake-devin-hang"
+    fake.write_text("#!/bin/sh\ntrap '' HUP\nexec sleep 60\n")
+    fake.chmod(fake.stat().st_mode | 0o111)
+
+    def spawn(tag: str) -> subprocess.Popen:
+        helper = _hang_probe_helper(tmp_path / f"probe_{tag}.py", fake, workdir)
+        return subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd())
+
+    def wait_children(count: int, timeout: float = 15) -> list[int]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pids = proctrack.pids_with_cwd(workdir, nested=True)
+            if len(pids) >= count:
+                return pids
+            time.sleep(0.1)
+        return proctrack.pids_with_cwd(workdir, nested=True)
+
+    a = spawn("a")
+    b = None
+    try:
+        kids_a = wait_children(1)
+        assert len(kids_a) == 1, "probe A child never appeared"
+        child_a = kids_a[0]
+
+        b = spawn("b")
+        kids_ab = wait_children(2)
+        assert len(kids_ab) == 2, "probe B child never appeared"
+        # B 시작 스윕이 A 의 살아있는 자식을 죽이지 않았다(고정 workdir 공유에도).
+        assert child_a in kids_ab
+        child_b = next(pid for pid in kids_ab if pid != child_a)
+
+        a.send_signal(signal.SIGKILL)
+        a.wait(timeout=5)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and child_a in proctrack.pids_with_cwd(workdir, nested=True):
+            time.sleep(0.2)
+        # A 리퍼가 자기 인스턴스만 쓸었다 — B 자식은 살아 있다.
+        assert child_a not in proctrack.pids_with_cwd(workdir, nested=True)
+        assert child_b in proctrack.pids_with_cwd(workdir, nested=True)
+        assert b.poll() is None
+    finally:
+        for proc in (a, b):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+            if proc is not None:
+                proc.wait(timeout=5)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and proctrack.pids_with_cwd(workdir, nested=True):
+            time.sleep(0.2)
+        proctrack.kill_leftovers_at_cwd(workdir, nested=True)
 
 
 # -- task295: devin 계정 풀 공유 3종 등재 ------------------------------------
