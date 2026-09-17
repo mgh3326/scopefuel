@@ -9,7 +9,9 @@
   PID 재사용에 무관하게 "살아있는 프로브"를 식별한다.
 - 선제 스윕: 프로브 시작 전 workdir 루트의 cwd 잔존자와, 디렉터리 락이 풀린
   (죽은 프로브의) ``probe-*``/``.probe-pending-*`` 디렉터리 안의 잔존자를
-  정리한다. 락이 잡힌 디렉터리 — 살아있는 동시 프로브 — 는 건너뛴다.
+  정리한다. 락이 잡힌 디렉터리 — 살아있는 동시 프로브 — 는 건너뛰고,
+  ``.probe-pending-*`` 은 추가로 생성 후 ``_PENDING_GRACE_S`` 가 지나야
+  죽은 것으로 본다(락 없는 젊은 pending = 기동 중일 수 있다).
 - 레지스트리: provider 가 띄운 자식의 pgid 와 기대 cwd 를 등록한다.
   refresh 타임아웃 핸들러가 os._exit 전에, 등록된 그룹의 구성원 중 cwd 가
   기대 디렉터리 안에 있는 것으로 확인된 프로세스에만 신호한다 — killpg 는
@@ -57,6 +59,15 @@ _OWNER_LOCK = ".owner"  # 구판본이 남긴 잔해 — 있으면 그것도 락
 _LSOF_TIMEOUT_S = 10.0
 _REAPER_SWEEP_PASSES = 4
 _REAPER_SWEEP_GAP_S = 0.4
+
+# pending 디렉터리가 락 없이 존재해도 되는 기동 유예. mkdtemp→flock 구간은
+# 이 호스트에서 2000회 실측 median 136µs·max 449µs — 스케줄링 지연을 감안해
+# 30s(실측 상한의 ~5자리)로 둔다. 값이 너무 작으면 기동 중 pending 을 지워
+# 그 프로브의 startup 이 FileNotFoundError 로 실패한다(fail-closed — 이 구간엔
+# 아직 자식이 없으므로 죽는 프로세스는 없다). 너무 크면 죽은 pending 잔해가
+# 유예만큼 더 남을 뿐 — 유예가 지난 뒤의 스윕은 반드시 회수하므로 영구 누수는
+# 없다.
+_PENDING_GRACE_S = 30.0
 
 
 def register(pgid: int, cwd: Path) -> None:
@@ -230,11 +241,13 @@ def new_probe_dir(workdir: Path) -> tuple[Path, int]:
     like dead residue to sweepers.
 
     Ordering: ``mkdtemp`` under a pending name → flock the directory →
-    atomic rename to the final ``probe-*`` name. The residual window is
-    between ``mkdtemp`` returning and ``flock`` succeeding — a pending dir
-    caught there by a sweeper looks lock-free and can be removed. That
-    loses nothing but the empty dir: no child exists before the lock, so
-    the failure is this probe raising at startup, never a killed process.
+    atomic rename to the final ``probe-*`` name. Between ``mkdtemp`` and
+    ``flock`` the dir is unlocked, so sweepers protect it differently: a
+    pending dir younger than ``_PENDING_GRACE_S`` is presumed to be
+    starting and is skipped. What remains uncovered is a creator
+    stalled past the grace inside that window — then a sweeper can still
+    remove the empty dir and this probe raises at startup. That failure
+    is loud and kills nothing: no child exists before the lock.
     """
 
     workdir = Path(workdir)
@@ -309,20 +322,39 @@ def _acquire_dir_locks(instance: Path) -> list[int] | None:
     return fds
 
 
+def _pending_within_grace(path: Path) -> bool:
+    """pending dir 가 기동 유예 안인지 — 젊으면 락 부재를 주인 사망으로 읽지 않는다.
+
+    pending 디렉터리는 mkdtemp 와 rename 사이 내내 비어 있으므로 st_mtime 이
+    곧 생성 시각이다. stat 실패는 이미 사라진 것으로 간주해 유예 밖(False)으로
+    본다 — 이후 락 시도가 open 에서 실패해 자연히 건너뛴다.
+    """
+
+    try:
+        created = path.stat().st_mtime
+    except OSError:
+        return False
+    return (time.time() - created) < _PENDING_GRACE_S
+
+
 def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) -> list[int]:
     """Sweep leftovers under ``workdir`` before a probe starts.
 
     Kills (a) processes whose cwd is exactly ``workdir`` — no live probe
     uses the root itself, only legacy orphans — and (b) everything inside
     ``probe-*``/``.probe-pending-*`` dirs whose locks are all released,
-    then removes those dirs. A dir whose lock is still held — a live or
-    still-starting probe — is skipped. Names outside our two prefixes and
-    anything outside ``workdir`` are not ours and are not touched.
+    then removes those dirs. A dir whose lock is still held — a live
+    probe — is skipped, and so is a pending dir younger than
+    ``_PENDING_GRACE_S``: it may be a probe still between mkdtemp and
+    flock. Names outside our two prefixes and anything outside
+    ``workdir`` are not ours and are not touched.
     """
 
     workdir = Path(workdir)
     killed = kill_leftovers_at_cwd(workdir, nested=False, exclude=exclude)
     for instance in _probe_dirs(workdir):
+        if instance.name.startswith(_PENDING_PREFIX) and _pending_within_grace(instance):
+            continue
         fds = _acquire_dir_locks(instance)
         if fds is None:
             continue

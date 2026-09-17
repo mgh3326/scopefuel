@@ -243,11 +243,18 @@ def test_stale_sweep_skips_legacy_owner_locked_dir(tmp_path):
 
 
 def test_stale_sweep_reclaims_dead_pending_dir(tmp_path):
-    """mkdtemp~flock 사이에 죽은 pending 잔해 — 락이 없으므로 회수 대상이다."""
+    """mkdtemp~flock 사이에 죽은 pending 잔해 — 유예가 지나면 회수 대상이다.
+
+    pending 을 유예 만료 상태로 노화(mtime 을 과거로)시켜 둔다 — 이 테스트는
+    나이 기준을 무한대로 돌리는 뮤턴트에서 RED 가 되어야 하므로 grace 상수를
+    패치하지 않고 실제 나이로 통과시킨다.
+    """
     workdir = tmp_path / "workdir"
     workdir.mkdir()
     pending = workdir / ".probe-pending-dead"
     pending.mkdir()
+    old = time.time() - proctrack._PENDING_GRACE_S - 60
+    os.utime(pending, (old, old))
     proc = _sleep_in(pending)
     try:
         first = proctrack.kill_stale_probe_leftovers(workdir)
@@ -256,6 +263,21 @@ def test_stale_sweep_reclaims_dead_pending_dir(tmp_path):
         assert not pending.exists(), (first, second, list(workdir.iterdir()))
     finally:
         _kill_and_reap(proc)
+
+
+def test_stale_sweep_preserves_young_pending_dir(tmp_path):
+    """mkdtemp 직후(락 획득 전)의 pending — 기동 유예 안이므로 스윕이 지우지 않는다.
+
+    락 없는 pending 은 "기동 중" 과 "죽은 잔해" 가 구분되지 않으므로, 유예 안의
+    pending 은 살아있는 프로브로 간주한다. 이 검사를 무력화(나이 기준 제거)하면
+    이 테스트가 assertion 실패로 RED 가 된다.
+    """
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    pending = workdir / ".probe-pending-starting"
+    pending.mkdir()  # 락 없음 — mkdtemp~flock 창 그대로
+    assert proctrack.kill_stale_probe_leftovers(workdir) == []
+    assert pending.exists()
 
 
 def test_stale_sweep_skips_locked_pending_dir(tmp_path):
