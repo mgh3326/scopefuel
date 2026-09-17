@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -243,18 +244,15 @@ def test_stale_sweep_skips_legacy_owner_locked_dir(tmp_path):
 
 
 def test_stale_sweep_reclaims_dead_pending_dir(tmp_path):
-    """mkdtemp~flock 사이에 죽은 pending 잔해 — 유예가 지나면 회수 대상이다.
+    """mkdtemp~flock 사이에 죽은 pending 잔해 — 회수 대상이다(나이 무관).
 
-    pending 을 유예 만료 상태로 노화(mtime 을 과거로)시켜 둔다 — 이 테스트는
-    나이 기준을 무한대로 돌리는 뮤턴트에서 RED 가 되어야 하므로 grace 상수를
-    패치하지 않고 실제 나이로 통과시킨다.
+    살아있는 생성자는 .sweep.lock 을 쥔 채 락 없는 pending 을 만들므로,
+    스윕이 락을 잡고 열거한 락 없는 pending 은 곧 죽은 잔해다.
     """
     workdir = tmp_path / "workdir"
     workdir.mkdir()
     pending = workdir / ".probe-pending-dead"
     pending.mkdir()
-    old = time.time() - proctrack._PENDING_GRACE_S - 60
-    os.utime(pending, (old, old))
     proc = _sleep_in(pending)
     try:
         first = proctrack.kill_stale_probe_leftovers(workdir)
@@ -265,19 +263,67 @@ def test_stale_sweep_reclaims_dead_pending_dir(tmp_path):
         _kill_and_reap(proc)
 
 
-def test_stale_sweep_preserves_young_pending_dir(tmp_path):
-    """mkdtemp 직후(락 획득 전)의 pending — 기동 유예 안이므로 스윕이 지우지 않는다.
+def test_sweep_preserves_pending_during_create_window(tmp_path, monkeypatch):
+    """생성 창(mkdtemp~flock)이 벌어져도, 창 안쪽 스윕은 pending 을 지우지 않는다.
 
-    락 없는 pending 은 "기동 중" 과 "죽은 잔해" 가 구분되지 않으므로, 유예 안의
-    pending 은 살아있는 프로브로 간주한다. 이 검사를 무력화(나이 기준 제거)하면
-    이 테스트가 assertion 실패로 RED 가 된다.
+    생성자는 .sweep.lock 을 쥔 채 그 창을 지나므로 스윕은 락을 못 잡아
+    디렉터리 열거 자체를 건너뛴다 — 나이 추정 없이 창이 직렬화로 닫힌다.
+    생성자의 락 획득을 무력화하면 이 테스트가 assertion 실패로 RED 가 된다.
     """
     workdir = tmp_path / "workdir"
     workdir.mkdir()
-    pending = workdir / ".probe-pending-starting"
-    pending.mkdir()  # 락 없음 — mkdtemp~flock 창 그대로
-    assert proctrack.kill_stale_probe_leftovers(workdir) == []
-    assert pending.exists()
+    entered = threading.Event()
+    release = threading.Event()
+    state: dict = {}
+    orig_mkdtemp = proctrack.tempfile.mkdtemp
+
+    def slow_mkdtemp(*args, **kwargs):
+        d = orig_mkdtemp(*args, **kwargs)
+        state["pending"] = Path(d)
+        entered.set()
+        release.wait(timeout=30)  # 창을 인위적으로 벌린다
+        return d
+
+    monkeypatch.setattr(proctrack.tempfile, "mkdtemp", slow_mkdtemp)
+    creator = threading.Thread(target=lambda: state.setdefault("result", proctrack.new_probe_dir(workdir)))
+    creator.start()
+    try:
+        assert entered.wait(timeout=10), "creator never entered the window"
+        assert proctrack.kill_stale_probe_leftovers(workdir) == []
+        assert state["pending"].exists()
+    finally:
+        release.set()
+        creator.join(timeout=10)
+    instance, fd = state["result"]
+    os.close(fd)
+
+
+def test_sweep_is_nonblocking_while_sweep_lock_held(tmp_path):
+    """스윕은 best-effort — .sweep.lock 을 못 잡으면 기다리지 않고 건너뛴다.
+
+    생성자가 창 안에서 오래 stall 해도 스윕이 멈추면 안 된다. LOCK_NB 를
+    블로킹으로 바꾸는 뮤턴트에서 스윕이 끝나지 않아 assertion RED 가 된다.
+    """
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    pending = workdir / ".probe-pending-x"
+    pending.mkdir()
+    fd = os.open(workdir / proctrack._SWEEP_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    done = threading.Event()
+    results: list = []
+    sweeper = threading.Thread(
+        target=lambda: (results.append(proctrack.kill_stale_probe_leftovers(workdir)), done.set())
+    )
+    try:
+        sweeper.start()
+        sweeper.join(timeout=10)
+        assert done.is_set(), "sweep blocked on a held .sweep.lock"
+        assert results == [[]]
+        assert pending.exists()
+    finally:
+        os.close(fd)
+        sweeper.join(timeout=10)
 
 
 def test_stale_sweep_skips_locked_pending_dir(tmp_path):

@@ -9,9 +9,11 @@
   PID 재사용에 무관하게 "살아있는 프로브"를 식별한다.
 - 선제 스윕: 프로브 시작 전 workdir 루트의 cwd 잔존자와, 디렉터리 락이 풀린
   (죽은 프로브의) ``probe-*``/``.probe-pending-*`` 디렉터리 안의 잔존자를
-  정리한다. 락이 잡힌 디렉터리 — 살아있는 동시 프로브 — 는 건너뛰고,
-  ``.probe-pending-*`` 은 추가로 생성 후 ``_PENDING_GRACE_S`` 가 지나야
-  죽은 것으로 본다(락 없는 젊은 pending = 기동 중일 수 있다).
+  정리한다. 락이 잡힌 디렉터리 — 살아있는 동시 프로브 — 는 건너뛴다.
+  생성자는 workdir 의 ``.sweep.lock`` 을 쥔 채 mkdtemp→flock→rename 을
+  지나고 스윕은 같은 락 아래서만 인스턴스 디렉터리를 열거하므로, 락 없는
+  pending 이 스윕에 보이는 순간은 없다 — 락 없는 pending 은 곧 죽은 잔해다
+  (나이 추정 없음).
 - 레지스트리: provider 가 띄운 자식의 pgid 와 기대 cwd 를 등록한다.
   refresh 타임아웃 핸들러가 os._exit 전에, 등록된 그룹의 구성원 중 cwd 가
   기대 디렉터리 안에 있는 것으로 확인된 프로세스에만 신호한다 — killpg 는
@@ -55,19 +57,11 @@ _PGROUPS: dict[int, Path] = {}
 _INSTANCE_PREFIX = "probe-"
 _PENDING_PREFIX = ".probe-pending-"
 _OWNER_LOCK = ".owner"  # 구판본이 남긴 잔해 — 있으면 그것도 락 대상으로 본다
+_SWEEP_LOCK = ".sweep.lock"  # 생성 임계구간 ↔ 스윕 열거를 직렬화하는 workdir 락
 
 _LSOF_TIMEOUT_S = 10.0
 _REAPER_SWEEP_PASSES = 4
 _REAPER_SWEEP_GAP_S = 0.4
-
-# pending 디렉터리가 락 없이 존재해도 되는 기동 유예. mkdtemp→flock 구간은
-# 이 호스트에서 2000회 실측 median 136µs·max 449µs — 스케줄링 지연을 감안해
-# 30s(실측 상한의 ~5자리)로 둔다. 값이 너무 작으면 기동 중 pending 을 지워
-# 그 프로브의 startup 이 FileNotFoundError 로 실패한다(fail-closed — 이 구간엔
-# 아직 자식이 없으므로 죽는 프로세스는 없다). 너무 크면 죽은 pending 잔해가
-# 유예만큼 더 남을 뿐 — 유예가 지난 뒤의 스윕은 반드시 회수하므로 영구 누수는
-# 없다.
-_PENDING_GRACE_S = 30.0
 
 
 def register(pgid: int, cwd: Path) -> None:
@@ -240,33 +234,39 @@ def new_probe_dir(workdir: Path) -> tuple[Path, int]:
     cannot be taken fails the probe closed: an unlocked instance dir looks
     like dead residue to sweepers.
 
-    Ordering: ``mkdtemp`` under a pending name → flock the directory →
-    atomic rename to the final ``probe-*`` name. Between ``mkdtemp`` and
-    ``flock`` the dir is unlocked, so sweepers protect it differently: a
-    pending dir younger than ``_PENDING_GRACE_S`` is presumed to be
-    starting and is skipped. What remains uncovered is a creator
-    stalled past the grace inside that window — then a sweeper can still
-    remove the empty dir and this probe raises at startup. That failure
-    is loud and kills nothing: no child exists before the lock.
+    Ordering: take the workdir sweep lock → ``mkdtemp`` under a pending
+    name → flock the directory → atomic rename to the final ``probe-*``
+    name → release the sweep lock. Sweepers enumerate instance dirs only
+    while holding the same lock, so an unlocked pending dir is never
+    visible to a sweep: the whole create window is serialized against
+    enumeration, and any lock-free pending a sweeper can see is provably
+    creator-dead residue — there is no age or stat-result guessing. A
+    creator stalled arbitrarily long inside the window still cannot lose
+    its dir; if it dies there, the kernel releases both locks and the
+    next sweep reclaims the residue.
     """
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    pending = Path(tempfile.mkdtemp(prefix=_PENDING_PREFIX, dir=workdir))
-    fd = os.open(pending, os.O_RDONLY)
+    sweep_fd = _acquire_sweep_lock(workdir, blocking=True)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        shutil.rmtree(pending, ignore_errors=True)
-        raise
-    instance = workdir / f"{_INSTANCE_PREFIX}{pending.name.removeprefix(_PENDING_PREFIX)}"
-    try:
-        os.rename(pending, instance)
-    except OSError:
-        os.close(fd)
-        shutil.rmtree(pending, ignore_errors=True)
-        raise
+        pending = Path(tempfile.mkdtemp(prefix=_PENDING_PREFIX, dir=workdir))
+        fd = os.open(pending, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            shutil.rmtree(pending, ignore_errors=True)
+            raise
+        instance = workdir / f"{_INSTANCE_PREFIX}{pending.name.removeprefix(_PENDING_PREFIX)}"
+        try:
+            os.rename(pending, instance)
+        except OSError:
+            os.close(fd)
+            shutil.rmtree(pending, ignore_errors=True)
+            raise
+    finally:
+        os.close(sweep_fd)
     return instance, fd
 
 
@@ -281,9 +281,7 @@ def _probe_dirs(workdir: Path) -> list[Path]:
         return [
             d
             for d in workdir.iterdir()
-            if d.is_dir()
-            and not d.is_symlink()
-            and d.name.startswith((_INSTANCE_PREFIX, _PENDING_PREFIX))
+            if d.is_dir() and not d.is_symlink() and d.name.startswith((_INSTANCE_PREFIX, _PENDING_PREFIX))
         ]
     return []
 
@@ -322,19 +320,28 @@ def _acquire_dir_locks(instance: Path) -> list[int] | None:
     return fds
 
 
-def _pending_within_grace(path: Path) -> bool:
-    """pending dir 가 기동 유예 안인지 — 젊으면 락 부재를 주인 사망으로 읽지 않는다.
+def _acquire_sweep_lock(workdir: Path, *, blocking: bool) -> int | None:
+    """flock ``workdir/.sweep.lock`` — serializes create windows against sweeps.
 
-    pending 디렉터리는 mkdtemp 와 rename 사이 내내 비어 있으므로 st_mtime 이
-    곧 생성 시각이다. stat 실패는 이미 사라진 것으로 간주해 유예 밖(False)으로
-    본다 — 이후 락 시도가 open 에서 실패해 자연히 건너뛴다.
+    Returns the open fd while the lock is held (close to release), or None
+    when a non-blocking caller finds it contended — a creator or another
+    sweeper is mid-critical-section, so this cycle is skipped. A dead
+    holder's lock is released by the kernel, so a blocking caller can
+    never wait forever on a corpse.
     """
 
     try:
-        created = path.stat().st_mtime
+        fd = os.open(workdir / _SWEEP_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
-        return False
-    return (time.time() - created) < _PENDING_GRACE_S
+        if blocking:
+            raise
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) -> list[int]:
@@ -343,28 +350,34 @@ def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) ->
     Kills (a) processes whose cwd is exactly ``workdir`` — no live probe
     uses the root itself, only legacy orphans — and (b) everything inside
     ``probe-*``/``.probe-pending-*`` dirs whose locks are all released,
-    then removes those dirs. A dir whose lock is still held — a live
-    probe — is skipped, and so is a pending dir younger than
-    ``_PENDING_GRACE_S``: it may be a probe still between mkdtemp and
-    flock. Names outside our two prefixes and anything outside
-    ``workdir`` are not ours and are not touched.
+    then removes those dirs. The instance-dir pass runs only while holding
+    the workdir sweep lock, and only non-blockingly: if a creator or
+    another sweeper holds it, this cycle skips the pass rather than wait.
+    Inside the lock, an unlocked dir is provably dead — a live creator
+    holds the sweep lock through its whole unlocked-pending window. Names
+    outside our two prefixes and anything outside ``workdir`` are not
+    ours and are not touched.
     """
 
     workdir = Path(workdir)
     killed = kill_leftovers_at_cwd(workdir, nested=False, exclude=exclude)
-    for instance in _probe_dirs(workdir):
-        if instance.name.startswith(_PENDING_PREFIX) and _pending_within_grace(instance):
-            continue
-        fds = _acquire_dir_locks(instance)
-        if fds is None:
-            continue
-        try:
-            killed += kill_leftovers_at_cwd(instance, nested=True, exclude=exclude)
-            shutil.rmtree(instance, ignore_errors=True)
-        finally:
-            for fd in fds:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
+    sweep_fd = _acquire_sweep_lock(workdir, blocking=False)
+    if sweep_fd is None:
+        return killed
+    try:
+        for instance in _probe_dirs(workdir):
+            fds = _acquire_dir_locks(instance)
+            if fds is None:
+                continue
+            try:
+                killed += kill_leftovers_at_cwd(instance, nested=True, exclude=exclude)
+                shutil.rmtree(instance, ignore_errors=True)
+            finally:
+                for fd in fds:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+    finally:
+        os.close(sweep_fd)
     return killed
 
 
