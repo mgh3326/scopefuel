@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 
@@ -278,3 +279,201 @@ def test_gate_reuses_profile_pool_single_source_of_truth():
         result = gate_check([], profile, today=TODAY, now=NOW)
         expected_provider, _ = profile_pool(profile)
         assert result.provider_id == expected_provider
+
+
+# ------------------------------------------------------------------ task #461: operator-request
+
+
+def _healthy_s_plus_providers() -> list[ProviderResult]:
+    """S+ 정상 후보(codex/kiro)가 가용하고 fable 자체 pool(claude)도 정상인 픽스처."""
+    return [
+        _result("claude", 10.0, pool_class="preserve"),
+        _result("codex", 10.0, pool_class="preserve"),
+        _result("kiro", 10.0, pool_class="spend", window="30d"),
+    ]
+
+
+def test_gate_fable_denied_without_operator_request_unchanged():
+    """플래그 없음 — 대안 가용 시 기존과 동일한 이유·대안으로 exit 3."""
+    result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert "escalation 후보" in result.reason
+    assert "다른 S+ 후보가 아직 가용하므로 사용 불가" in result.reason
+    assert result.alternatives
+    # additive 기본값 — 플래그 없는 결과에는 override 감사 필드가 비어 있다
+    assert result.escalation_override is False
+    assert result.operator_request_ref is None
+    assert result.requested_by is None
+    assert result.ref_resolution is None
+
+
+def test_gate_fable_operator_request_overrides_alternative_denial():
+    """유효한 durable REF + escalation 프로필 → '대안 가용' 갈래만 건너뛰고 통과."""
+    ref = "hk:doc/decision-req/2026-09-20/fable-escalation-operator-request"
+    result = gate_check(
+        _healthy_s_plus_providers(),
+        "fable",
+        today=TODAY,
+        now=NOW,
+        operator_request=ref,
+        requested_by="operator",
+    )
+    assert result.ok is True
+    assert result.escalation_override is True
+    assert result.operator_request_ref == ref
+    assert result.requested_by == "operator"
+    assert result.ref_resolution == "unverified"
+    assert "escalation_override" in result.reason
+    assert ref in result.reason
+
+
+def test_gate_fable_operator_request_task_ref_form():
+    """hk:task/<정수> 형태도 유효한 durable REF 다."""
+    result = gate_check(
+        _healthy_s_plus_providers(),
+        "fable",
+        today=TODAY,
+        now=NOW,
+        operator_request="hk:task/461",
+    )
+    assert result.ok is True
+    assert result.operator_request_ref == "hk:task/461"
+    assert result.requested_by == "unknown"  # 미지정 시 기본값
+    assert result.ref_resolution == "unverified"
+
+
+def test_gate_fable_operator_request_still_blocked_by_exclude():
+    """override 는 '대안 가용' 갈래만 연다 — fable 자체 pool exclude 는 그대로 거부."""
+    policy.set_policy("claude", "exclude", until=dt.date(2099, 8, 31), note="Pro 요금제")
+    result = gate_check(
+        _healthy_s_plus_providers(),
+        "fable",
+        today=TODAY,
+        now=NOW,
+        operator_request="hk:task/461",
+    )
+    assert result.ok is False
+    assert "정책 제외" in result.reason
+    assert result.escalation_override is True  # 대안 거부는 건너뛰었지만 quota 검사에서 차단
+    assert result.ref_resolution == "unverified"
+
+
+def test_gate_fable_operator_request_still_blocked_by_cutoff():
+    """quota cutoff 초과는 유효한 operator-request 가 있어도 거부."""
+    providers = [
+        _result("claude", 95.0, pool_class="preserve"),  # fable pool 소진 (preserve cutoff 90%)
+        _result("codex", 10.0, pool_class="preserve"),
+        _result("kiro", 10.0, pool_class="spend", window="30d"),
+    ]
+    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/461")
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert "소진" in result.reason
+
+
+def test_gate_fable_operator_request_still_unmeasurable_on_provider_error():
+    """fable pool 측정불가는 유효한 operator-request 가 있어도 exit 4."""
+    providers = [
+        ProviderResult(id="claude", error="HTTP 503"),
+        _result("codex", 10.0, pool_class="preserve"),
+        _result("kiro", 10.0, pool_class="spend", window="30d"),
+    ]
+    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/461")
+    assert result.ok is False
+    assert result.unmeasurable is True
+    assert "측정 불가" in result.reason
+
+
+@pytest.mark.parametrize(
+    "bad_ref",
+    [
+        "",  # 빈 값
+        "please let fable run this once",  # 자유 문장
+        "hk:doc/../etc/passwd",  # 경로 탐색
+        "hk:doc/brief/2026-09-20/BAD KEY",  # 허용 문자 밖 (대문자·공백)
+        "hk:doc/" + "a" * 200,  # 길이 초과
+        "hk:task/abc",  # 정수가 아닌 task 번호
+    ],
+)
+def test_gate_operator_request_invalid_ref_rejected(bad_ref):
+    result = gate_check(
+        _healthy_s_plus_providers(),
+        "fable",
+        today=TODAY,
+        now=NOW,
+        operator_request=bad_ref,
+    )
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert "operator_request_ref_invalid" in result.reason
+
+
+def test_gate_operator_request_on_non_escalation_profile_rejected():
+    """opus 는 gate=default — 유효한 REF 도 operator_request_not_applicable 로 거부."""
+    result = gate_check(
+        _healthy_s_plus_providers(),
+        "opus",
+        today=TODAY,
+        now=NOW,
+        operator_request="hk:task/461",
+    )
+    assert result.ok is False
+    assert "operator_request_not_applicable" in result.reason
+
+
+def test_gate_operator_request_cli_fable_exit_0_with_audit_fields(monkeypatch, capsys, tmp_path):
+    providers = {
+        "claude": lambda: _result("claude", 10.0, pool_class="preserve"),
+        "codex": lambda: _result("codex", 10.0, pool_class="preserve"),
+        "kiro": lambda: _result("kiro", 10.0, pool_class="spend", window="30d"),
+    }
+    monkeypatch.setattr(cli, "registry", lambda: providers)
+    gate_file = tmp_path / "gate.json"
+    rc = cli.main(
+        [
+            "gate",
+            "-m",
+            "fable",
+            "--operator-request",
+            "hk:task/461",
+            "--requested-by",
+            "operator",
+            "--gate-output",
+            str(gate_file),
+            "--no-cache",
+        ]
+    )
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "escalation_override=true" in out.out
+    assert "operator_request_ref=hk:task/461" in out.out
+    assert "requested_by=operator" in out.out
+    assert "ref_resolution=unverified" in out.out
+
+    record = json.loads(gate_file.read_text())
+    assert record["escalation_override"] is True
+    assert record["operator_request_ref"] == "hk:task/461"
+    assert record["requested_by"] == "operator"
+    assert record["ref_resolution"] == "unverified"
+    assert record["exit_code"] == 0
+
+
+def test_gate_operator_request_cli_invalid_ref_exit_3(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": lambda: _result("claude", 10.0)})
+    rc = cli.main(["gate", "-m", "fable", "--operator-request", "hk:task/abc", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 3
+    assert "operator_request_ref_invalid" in out.err
+
+
+def test_gate_operator_request_cli_opus_exit_3_not_applicable(monkeypatch, capsys):
+    providers = {
+        "claude": lambda: _result("claude", 10.0, pool_class="preserve"),
+        "codex": lambda: _result("codex", 10.0, pool_class="preserve"),
+    }
+    monkeypatch.setattr(cli, "registry", lambda: providers)
+    rc = cli.main(["gate", "-m", "opus", "--operator-request", "hk:task/461", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 3
+    assert "operator_request_not_applicable" in out.err
