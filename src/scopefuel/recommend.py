@@ -19,6 +19,7 @@ import json
 import math
 import os
 import pathlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -1680,6 +1681,15 @@ class GateResult:
     pool_class: PoolClass | None = None
     unmeasurable: bool = False
     alternatives: tuple[str, ...] = ()
+    # task #461 — 운영자 명시 요청 경로의 감사 필드(additive).
+    # escalation_override: "같은 grade 정상 대안 가용" 거부를 operator-request 가
+    # 실제로 건너뛰었을 때만 True (대안이 없어 정상 자격으로 통과했으면 False).
+    escalation_override: bool = False
+    operator_request_ref: str | None = None
+    requested_by: str | None = None
+    # REF 해석 시도 결과. scopefuel 은 hk 저장소 클라이언트를 갖지 않으므로
+    # 주장된 REF 는 항상 "unverified" 로만 기록한다 — verified 를 주장하지 않는다.
+    ref_resolution: str | None = None
 
 
 def _find_profile(
@@ -1734,6 +1744,47 @@ def _alt_candidates(
 _ESCALATION_SKIPS_QUOTA_CHECK = frozenset({"oc-omni"})
 
 
+# ── task #461: 운영자 명시 요청(operator-request) 경로 ─────────────────────
+# --operator-request 는 durable 참조만 받는다: ``hk:doc/<key>`` 또는
+# ``hk:task/<정수>``. 자유 텍스트·경로 탐색·허용 문자 밖 입력은 전부 거부한다.
+# 이 경로는 감사 가능한 "주장"을 기록할 뿐 신원이나 동의를 증명하지 않는다.
+OPERATOR_REQUEST_REF_MAX = 128
+_OPERATOR_REQUEST_DOC_SEGMENT_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+_OPERATOR_REQUEST_TASK_RE = re.compile(r"[0-9]{1,10}")
+_REQUESTED_BY_MAX = 64
+_REQUESTED_BY_RE = re.compile(r"\S+")
+
+
+def _operator_request_ref_valid(ref: str) -> bool:
+    """durable 형태 ``hk:doc/<key>`` / ``hk:task/<정수>`` 만 허용."""
+    if not ref or len(ref) > OPERATOR_REQUEST_REF_MAX:
+        return False
+    if ref.startswith("hk:doc/"):
+        key = ref[len("hk:doc/") :]
+        # split('/') 는 빈 세그먼트(//, 선행·후행 /)와 "."/".." 를 자연히 걸러낸다 —
+        # 세그먼트 첫 문자가 [a-z0-9] 여야 하므로 "..", "." 는 통과 불가.
+        return all(_OPERATOR_REQUEST_DOC_SEGMENT_RE.fullmatch(segment) for segment in key.split("/"))
+    if ref.startswith("hk:task/"):
+        return _OPERATOR_REQUEST_TASK_RE.fullmatch(ref[len("hk:task/") :]) is not None
+    return False
+
+
+def _requested_by_valid(requested_by: str) -> bool:
+    """audit 키=값 필드에 그대로 들어가는 토큰 — 공백 없는 단일 토큰, 길이 상한."""
+    stripped = requested_by.strip()
+    return (
+        bool(stripped) and len(stripped) <= _REQUESTED_BY_MAX and bool(_REQUESTED_BY_RE.fullmatch(stripped))
+    )
+
+
+def _operator_request_audit(operator_request: str, requested_by: str, override: bool) -> str:
+    return (
+        f"escalation_override={'true' if override else 'false'} "
+        f"operator_request={operator_request} requested_by={requested_by} "
+        "ref_resolution=unverified — 기록된 주장이며 신원·동의 증명이 아니다"
+    )
+
+
 def gate_check(
     providers: list[ProviderResult],
     profile_name: str,
@@ -1744,6 +1795,8 @@ def gate_check(
     bench_scores: list[ModelScore] | None = None,
     model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
+    operator_request: str | None = None,
+    requested_by: str | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -1751,6 +1804,12 @@ def gate_check(
     자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
     (``oc-omni`` 같은 명시적 무료 레인을 제외하고) 해당 프로필 자체의 provider 측정·
     유효 class·exclude·raw cutoff 를 정상 프로필과 동일하게 검사한다.
+
+    ``operator_request``(task #461)는 escalation 프로필에서만 유효한 운영자 명시 요청의
+    durable 참조다. 유효하면 "같은 grade 정상 대안이 가용하므로 거부" 갈래 **하나만**
+    건너뛰고, 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로 적용된다. 이것은
+    감사 가능한 주장의 기록이지 신원·동의의 증명이 아니며, REF 는 항상
+    ``ref_resolution=unverified`` 로만 기록된다.
     """
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -1766,8 +1825,62 @@ def gate_check(
             reason=f"{profile_name} 역할 제한 — Astra는 director 판정 전용",
         )
 
-    found = _find_profile(profile_name, grade_table=table)
     provider_id, group_name = profile_pool(profile_name)
+
+    # task #461 입력 검증 — REF 형식이 유효하지 않으면 프로필 판정 전에 거부한다.
+    if requested_by is not None and operator_request is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=(
+                "requested_by_requires_operator_request — --requested-by 는 --operator-request 와 함께만 쓴다"
+            ),
+            requested_by=requested_by.strip() or "unknown",
+        )
+    if operator_request is not None and not _operator_request_ref_valid(operator_request):
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=(
+                f"operator_request_ref_invalid: {operator_request!r} — "
+                "hk:doc/<key> 또는 hk:task/<정수> 만 허용"
+            ),
+            operator_request_ref=operator_request,
+        )
+    if requested_by is not None and not _requested_by_valid(requested_by):
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=(
+                f"requested_by_invalid: {requested_by!r} — 공백 없는 단일 토큰, {_REQUESTED_BY_MAX}자 이하"
+            ),
+            operator_request_ref=operator_request,
+        )
+    # ``requested_by`` 미지정 시 자기신고 기본값. 신원 증명이 아니라 audit 라벨이다.
+    audit_requested_by = ((requested_by or "").strip() or "unknown") if operator_request is not None else None
+
+    found = _find_profile(profile_name, grade_table=table)
+
+    # escalation 이 아닌 프로필에 operator-request 를 주면 조용히 무시하지 않고 거부한다 —
+    # 범용 우회 플래그로 오인되는 것을 막기 위한 fail-closed.
+    if operator_request is not None and (found is None or found[1].gate != "escalation"):
+        grade_of_found = found[0] if found is not None else None
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade_of_found,
+            reason=(f"operator_request_not_applicable: {profile_name} 은 escalation 프로필이 아니다"),
+            operator_request_ref=operator_request,
+            requested_by=audit_requested_by,
+            ref_resolution="unverified",
+        )
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
         # If provider_id is unknown too, return unmeasurable.
@@ -1848,31 +1961,51 @@ def gate_check(
             grade_table=table,
         )
 
+    escalation_override = False
+    audit: dict[str, object] = {}
     if profile.gate == "escalation":
         # 1) escalation 자격: 같은 grade 의 다른 정상 후보가 전부 소진·측정불가일 때만 진행.
+        #    유효한 operator-request 가 있으면 이 "대안 가용 거부" 갈래 하나만 건너뛴다
+        #    (task #461) — 아래 일반 검사(측정불가/exclude/cutoff)는 그대로 적용된다.
         alts = alternatives()
         if alts:
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=grade,
-                reason=(
-                    f"{profile_name} 은 escalation 후보 — {profile.gate_reason or ''} "
-                    f"(다른 {grade} 후보가 아직 가용하므로 사용 불가)"
-                ),
-                alternatives=alts,
-            )
+            if operator_request is None:
+                return GateResult(
+                    ok=False,
+                    profile=profile_name,
+                    provider_id=provider_id,
+                    grade=grade,
+                    reason=(
+                        f"{profile_name} 은 escalation 후보 — {profile.gate_reason or ''} "
+                        f"(다른 {grade} 후보가 아직 가용하므로 사용 불가)"
+                    ),
+                    alternatives=alts,
+                )
+            escalation_override = True
+        if operator_request is not None:
+            audit = {
+                "escalation_override": escalation_override,
+                "operator_request_ref": operator_request,
+                "requested_by": audit_requested_by or "unknown",
+                "ref_resolution": "unverified",
+            }
         # 2) 명시적 무료 레인만 quota provider 측정 없이 즉시 통과. 나머지는 아래 일반
         #    검사(측정불가/exclude/cutoff)를 그대로 통과해야 한다 — escalation 은 게이트를
         #    우회하지 않는, 정상 후보 소진 시에만 열리는 "추가 자격"이다.
         if profile_name in _ESCALATION_SKIPS_QUOTA_CHECK:
+            reason = f"{profile_name} escalation 자격 충족 — {profile.gate_reason or ''}"
+            if operator_request is not None:
+                tag = _operator_request_audit(
+                    operator_request, audit_requested_by or "unknown", escalation_override
+                )
+                reason += f" [{tag}]"
             return GateResult(
                 ok=True,
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=grade,
-                reason=f"{profile_name} escalation 자격 충족 — {profile.gate_reason or ''}",
+                reason=reason,
+                **audit,
             )
 
     if result is None or result.error or result.warning or result.status != "ok":
@@ -1885,6 +2018,7 @@ def gate_check(
             reason=f"{provider_id} 측정 불가 (provider error/degraded)",
             unmeasurable=True,
             alternatives=alts,
+            **audit,
         )
 
     matches = _matching_buckets(result, group_name)
@@ -1898,6 +2032,7 @@ def gate_check(
             reason=f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)",
             unmeasurable=True,
             alternatives=alts,
+            **audit,
         )
 
     states = _window_states(matches, now)
@@ -1925,6 +2060,7 @@ def gate_check(
             used_pct=used_pct,
             pool_class=effective_class,
             alternatives=alts,
+            **audit,
         )
 
     cutoff = _usage_cutoff(effective_class)
@@ -1940,20 +2076,28 @@ def gate_check(
             used_pct=over.used_pct,
             pool_class=effective_class,
             alternatives=alts,
+            **audit,
         )
 
     if profile.gate == "escalation":
+        reason = (
+            f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
+            f"class={effective_class} — {profile.gate_reason or ''}"
+        )
+        if operator_request is not None:
+            tag = _operator_request_audit(
+                operator_request, audit_requested_by or "unknown", escalation_override
+            )
+            reason += f" [{tag}]"
         return GateResult(
             ok=True,
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=(
-                f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
-                f"class={effective_class} — {profile.gate_reason or ''}"
-            ),
+            reason=reason,
             used_pct=used_pct,
             pool_class=effective_class,
+            **audit,
         )
 
     return GateResult(

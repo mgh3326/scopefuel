@@ -63,6 +63,32 @@ scopefuel --list-providers
 (`SCOPEFUEL_CACHE`로 변경). 조회가 실패하면 **6시간 이내의 마지막 스냅샷으로 폴백하되 나이를 함께
 표시**합니다 — 옛 값을 신선한 값처럼 보여주지 않는 것이 원칙입니다.
 
+## gate — 프로필 스폰 판정
+
+```bash
+scopefuel gate -m fable                      # exit 0=가능 / 3=차단 / 4=측정불가
+scopefuel gate -m fable --gate-output f.json # 판정 감사 레코드(JSON)를 파일로 저장
+```
+
+escalation 프로필(`fable` 등)은 같은 grade의 정상 후보가 하나라도 가용하면 차단됩니다.
+운영자가 그 프로필을 명시 지정한 경우에만 아래 경로로 그 한 갈래를 건너뛸 수 있습니다.
+
+```bash
+scopefuel gate -m fable --operator-request hk:task/461 --requested-by operator
+```
+
+- `--operator-request REF` — durable 참조만 받습니다: `hk:doc/<key>` 또는 `hk:task/<정수>`.
+  자유 텍스트·경로 탐색·허용 문자 밖·초장 입력은 `operator_request_ref_invalid`로 거부합니다.
+  escalation이 아닌 프로필에 주면 `operator_request_not_applicable`로 거부합니다(무시하지 않음).
+- 이 경로는 **감사 가능한 주장을 기록하는 경로이며 운영자 신원이나 동의를 증명하지 않습니다.**
+  플래그를 넣는 주체가 에이전트일 수 있고 `--requested-by`도 자기신고(미지정 시 `unknown`)입니다.
+  scopefuel은 REF를 해석하지 않으므로 기록은 항상 `ref_resolution=unverified`입니다.
+- override가 적용돼도 "같은 grade 정상 대안 가용" 거부만 건너뜁니다. 측정불가·정책
+  exclude·quota cutoff 등 나머지 검사는 그대로 적용되며 실패하면 여전히 차단됩니다.
+- 통과 시 stdout 첫 줄과 `reason`, 그리고 `--gate-output` 레코드에
+  `escalation_override`·`operator_request_ref`·`requested_by`·`ref_resolution`이 남습니다.
+  이 필드가 override로 통과한 스폰을 세는 근거입니다.
+
 ## Benchmark backend
 
 벤치 점수와 대표 실행 기록은 기본적으로 로컬 SQLite를 사용합니다. 여러 노드가 같은 정본을 읽어야

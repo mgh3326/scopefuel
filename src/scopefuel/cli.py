@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import pathlib
 import sys
 import time
 
@@ -223,6 +224,24 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     gate_parser.add_argument(
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
     )
+    gate_parser.add_argument(
+        "--operator-request",
+        metavar="REF",
+        help=(
+            "escalation 프로필 전용 운영자 명시 요청 참조 (hk:doc/<key> 또는 hk:task/<정수>만 허용). "
+            "감사 가능한 주장을 기록하는 경로이며 운영자 신원·동의를 증명하지 않는다"
+        ),
+    )
+    gate_parser.add_argument(
+        "--requested-by",
+        metavar="NAME",
+        help="--operator-request 의 자기신고 요청자 이름 (기본 unknown) — 신원 증명 아님",
+    )
+    gate_parser.add_argument(
+        "--gate-output",
+        metavar="PATH",
+        help="gate 판정 감사 레코드를 JSON으로 저장할 경로",
+    )
     gate_parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
     gate_parser.add_argument(
         "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
@@ -348,6 +367,28 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     return 0
 
 
+def _gate_record(result: recommend.GateResult, exit_code: int, now: dt.datetime) -> dict:
+    """gate 판정의 감사 레코드 (``--gate-output`` JSON 본체)."""
+    return {
+        "schema": "scopefuel.gate.v1",
+        "generated_at": now.isoformat(),
+        "profile": result.profile,
+        "grade": result.grade,
+        "provider_id": result.provider_id,
+        "ok": result.ok,
+        "exit_code": exit_code,
+        "unmeasurable": result.unmeasurable,
+        "used_pct": result.used_pct,
+        "pool_class": result.pool_class,
+        "reason": result.reason,
+        "alternatives": list(result.alternatives),
+        "escalation_override": result.escalation_override,
+        "operator_request_ref": result.operator_request_ref,
+        "requested_by": result.requested_by,
+        "ref_resolution": result.ref_resolution,
+    }
+
+
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
@@ -365,13 +406,34 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         bench_scores=bench_scores,
         model_prices=model_prices,
         grade_table=grade_table,
+        operator_request=args.operator_request,
+        requested_by=args.requested_by,
     )
+    exit_code = 0 if result.ok else (4 if result.unmeasurable else 3)
+
+    if args.gate_output:
+        record = _gate_record(result, exit_code, now)
+        try:
+            pathlib.Path(args.gate_output).write_text(
+                json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+            )
+        except OSError as exc:
+            print(f"error: --gate-output 기록 실패 ({exc})", file=sys.stderr)
+            return 2
 
     if result.ok:
-        print(
+        first_line = (
             f"profile={result.profile} pool={result.provider_id} "
             f"used_pct={result.used_pct} class={result.pool_class}"
         )
+        if result.operator_request_ref is not None:
+            first_line += (
+                f" escalation_override={'true' if result.escalation_override else 'false'}"
+                f" operator_request_ref={result.operator_request_ref}"
+                f" requested_by={result.requested_by or 'unknown'}"
+                f" ref_resolution={result.ref_resolution or 'unverified'}"
+            )
+        print(first_line)
         print(result.reason)
         return 0
 
@@ -380,7 +442,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         print(f"대안({result.grade}): {', '.join(result.alternatives)}", file=sys.stderr)
     else:
         print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)
-    return 4 if result.unmeasurable else 3
+    return exit_code
 
 
 def _bench_command(args: argparse.Namespace) -> int:
