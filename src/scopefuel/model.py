@@ -219,6 +219,13 @@ class ProviderResult:
     stale: bool = False
     raw: dict | None = None
     pool_class: PoolClass = "preserve"
+    # The most recent failed automatic probe when a cached success is returned.
+    # Kept separate from ``error`` so stale fallback remains visible while
+    # callers can distinguish auth failures from retryable measurement errors.
+    last_error: str | None = None
+    # Additive local manual-observation audit metadata.  This is never written
+    # into the automatic snapshot cache.
+    manual: dict | None = None
 
     def __post_init__(self) -> None:
         self.pool_class = _normalize_pool_class(self.pool_class)
@@ -287,6 +294,10 @@ class ProviderResult:
         }
         if self.warning is not None:
             out["warning"] = self.warning
+        if self.last_error is not None:
+            out["last_error"] = self.last_error
+        if self.manual is not None:
+            out["manual"] = self.manual
         if include_raw:
             out["raw"] = self.raw
         return out

@@ -93,6 +93,10 @@ def update_entry(name: str, result: ProviderResult, now: float) -> None:
 def _to_entry(result: ProviderResult, now: float) -> dict:
     payload = result.as_dict()
     payload.pop("verdict", None)  # 판정은 읽을 때 다시 계산한다
+    # Manual observations and failed-probe details are separate audit state,
+    # never part of the last successful automatic snapshot.
+    payload.pop("manual", None)
+    payload.pop("last_error", None)
     return {"fetched_at": now, "result": payload}
 
 
@@ -208,6 +212,9 @@ def collect(
             if age <= STALE_MAX_S:
                 stale = _from_entry(entry, name, now, policy_class)
                 stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
+                stale.last_error = result.error
+                if result.hint:
+                    stale.last_error += f" — {result.hint}"
                 results[index] = stale
                 continue
 

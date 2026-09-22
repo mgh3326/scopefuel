@@ -12,8 +12,9 @@ import json
 import pathlib
 import sys
 import time
+from dataclasses import replace
 
-from . import bench, herdr, recommend, render, served
+from . import bench, herdr, manual, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -54,6 +55,13 @@ def _completed_arg(value: str) -> int:
     if normalized in {"0", "false", "no"}:
         return 0
     raise argparse.ArgumentTypeError("completed 는 0/1 이어야 합니다")
+
+
+def _manual_used_arg(value: str) -> float:
+    try:
+        return manual.parse_used_pct(value)
+    except manual.ManualError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser(available: list[str]) -> argparse.ArgumentParser:
@@ -141,6 +149,32 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
     clear_parser.add_argument("pool", help="provider pool 이름")
+
+    manual_parser = subparsers.add_parser("manual", help="로컬 수동 쿼타 관측 관리")
+    manual_sub = manual_parser.add_subparsers(dest="manual_command", required=True)
+
+    manual_set = manual_sub.add_parser("set", help="수동 관측 추가")
+    manual_set.add_argument("--pool", required=True, choices=available, help="provider pool 이름")
+    manual_set.add_argument("--used", required=True, type=_manual_used_arg, help="사용률 0..100")
+    manual_set.add_argument(
+        "--window",
+        choices=sorted(manual.WINDOW_ALIASES),
+        help="한도 창. 생략 가능한 단일-window provider는 정책에서 추론",
+    )
+    reset_group = manual_set.add_mutually_exclusive_group()
+    reset_group.add_argument("--resets-in", metavar="DURATION", help="관측 시점부터 reset까지 기간")
+    reset_group.add_argument("--resets-at", metavar="TIMESTAMP", help="reset 절대 시각")
+    manual_set.add_argument(
+        "--measured-at", required=True, metavar="TIMESTAMP|now", help="실제로 관측한 시각"
+    )
+    manual_set.add_argument("--reason", required=True, help="측정 장애 또는 정정 사유")
+    manual_set.add_argument("--ttl", default="15m", metavar="DURATION", help="효력 기간, 최대 2h")
+
+    manual_list = manual_sub.add_parser("list", help="append-only 수동 관측 이력 보기")
+    manual_list.add_argument("--pool", choices=available, help="provider pool 필터")
+
+    manual_clear = manual_sub.add_parser("clear", help="pool의 현재 수동 관측 무효화")
+    manual_clear.add_argument("--pool", required=True, choices=available, help="provider pool 이름")
 
     bench_parser = subparsers.add_parser("bench", help="출처별 벤치 점수 SQLite DB")
     bench_sub = bench_parser.add_subparsers(dest="bench_command", required=True)
@@ -345,9 +379,64 @@ def _policy_command(
     return 2
 
 
+def _manual_command(args: argparse.Namespace) -> int:
+    now = dt.datetime.now(dt.UTC)
+    try:
+        if args.manual_command == "set":
+            ttl_s = manual.parse_duration(args.ttl)
+            resets_in_s = manual.parse_duration(args.resets_in) if args.resets_in else None
+            resets_at = manual.parse_timestamp(args.resets_at, now=now) if args.resets_at else None
+            measured_at = manual.parse_timestamp(args.measured_at, now=now)
+            entry = manual.record_observation(
+                pool=args.pool,
+                used_pct=args.used,
+                window=args.window,
+                measured_at=measured_at,
+                reason=args.reason,
+                ttl_s=ttl_s,
+                resets_in_s=resets_in_s,
+                resets_at=resets_at,
+                now=now,
+            )
+            if args.json:
+                print(json.dumps(entry, indent=2, ensure_ascii=False, allow_nan=False))
+            else:
+                print(
+                    f"manual set pool={entry['pool']} window={entry['window']} "
+                    f"used_pct={entry['used_pct']:g} measured_at={entry['measured_at']} "
+                    f"expires_at={entry['expires_at']} source={manual.SOURCE} "
+                    f"source_verification={manual.SOURCE_VERIFICATION} label={manual.SOURCE_LABEL} "
+                    f"id={entry['manual_observation_id']}"
+                )
+            return 0
+        if args.manual_command == "list":
+            payload = manual.list_payload(pool=args.pool, now=now)
+            if args.json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
+            else:
+                print(manual.format_list(payload))
+            return 0
+        if args.manual_command == "clear":
+            event = manual.clear_pool(args.pool, now=now)
+            if args.json:
+                print(json.dumps(event, indent=2, ensure_ascii=False, allow_nan=False))
+            else:
+                print(
+                    f"manual clear pool={event['pool']} source={manual.SOURCE} "
+                    f"source_verification={manual.SOURCE_VERIFICATION} label={manual.SOURCE_LABEL} "
+                    f"id={event['manual_clear_id']}"
+                )
+            return 0
+    except manual.ManualError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    results = manual.apply_for_display(results, now=now)
     bench_scores = bench.read_scores()
     model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
@@ -386,12 +475,82 @@ def _gate_record(result: recommend.GateResult, exit_code: int, now: dt.datetime)
         "operator_request_ref": result.operator_request_ref,
         "requested_by": result.requested_by,
         "ref_resolution": result.ref_resolution,
+        "source": result.source,
+        "source_verification": result.source_verification,
+        "source_label": result.source_label,
+        "manual_observation_ids": list(result.manual_observation_ids),
+        "manual_observations": list(result.manual_observations),
+        "measured_at": result.measured_at,
+        "expires_at": result.expires_at,
+        "observed_age_s": result.observed_age_s,
+        "remaining_effect_s": result.remaining_effect_s,
+        "last_auto_error": result.last_auto_error,
     }
+
+
+def _gate_args(args: argparse.Namespace) -> dict:
+    return {
+        "operator_request": args.operator_request,
+        "requested_by": args.requested_by,
+    }
+
+
+def _manual_gate_audit(
+    result: recommend.GateResult,
+    resolution: manual.Resolution,
+) -> recommend.GateResult:
+    selected = resolution.selected_entries
+    observed_age_s = max(float(entry.get("age_s") or 0.0) for entry in selected)
+    remaining_effect_s = min(float(entry.get("remaining_effect_s") or 0.0) for entry in selected)
+    measured_at = min(str(entry["measured_at"]) for entry in selected)
+    expires_at = min(str(entry["expires_at"]) for entry in selected)
+    observations = tuple(
+        {
+            "manual_observation_id": entry["manual_observation_id"],
+            "account_ref": entry["account_ref"],
+            "entitlement_and_limits": entry["entitlement_and_limits"],
+            "window": entry["window"],
+            "measured_at": entry["measured_at"],
+            "entered_at": entry["entered_at"],
+            "expires_at": entry["expires_at"],
+            "supersedes_ref": entry["supersedes_ref"],
+            "status": entry["status"],
+            "source": manual.SOURCE,
+            "source_verification": manual.SOURCE_VERIFICATION,
+            "source_label": manual.SOURCE_LABEL,
+        }
+        for entry in selected
+    )
+    observation_ids = ",".join(str(entry["manual_observation_id"]) for entry in selected)
+    covered_windows = ",".join(str(entry["window"]) for entry in selected)
+    supersedes_prior = any(entry.get("supersedes_ref") is not None for entry in selected)
+    audit = (
+        f"source={manual.SOURCE} · {manual.SOURCE_LABEL} · "
+        f"수동 항목 {observation_ids} · covered limits {covered_windows} · "
+        f"supersedes {'yes' if supersedes_prior else 'no'} · "
+        f"관측 {manual.format_age_seconds(observed_age_s)} 전 · "
+        f"남은 효력 {manual.format_age_seconds(remaining_effect_s)} · "
+        f"자동 측정 마지막 오류 {resolution.last_auto_error}"
+    )
+    return replace(
+        result,
+        reason=f"{result.reason} [{audit}]",
+        source=manual.SOURCE,
+        source_verification=manual.SOURCE_VERIFICATION,
+        source_label=manual.SOURCE_LABEL,
+        manual_observation_ids=tuple(str(entry["manual_observation_id"]) for entry in selected),
+        manual_observations=observations,
+        measured_at=measured_at,
+        expires_at=expires_at,
+        observed_age_s=round(observed_age_s, 1),
+        remaining_effect_s=round(remaining_effect_s, 1),
+        last_auto_error=resolution.last_auto_error,
+    )
 
 
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
-    results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    automatic_results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
     # ``read_scores`` itself preserves the legacy local route and only enters
     # the cache/network path for the configured canonical backend.  Passing it
     # here keeps gate alternatives on the same benchmark view as recommend.
@@ -399,16 +558,84 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
     result = recommend.gate_check(
-        results,
+        automatic_results,
         args.profile,
         today=now.date(),
         now=now,
         bench_scores=bench_scores,
         model_prices=model_prices,
         grade_table=grade_table,
-        operator_request=args.operator_request,
-        requested_by=args.requested_by,
+        **_gate_args(args),
     )
+
+    # Manual observations are considered only after the automatic path is
+    # genuinely unmeasurable.  A cached automatic snapshot that already proves
+    # cutoff/exclude remains authoritative and cannot be hidden by a lower
+    # manual number.
+    if result.unmeasurable:
+        provider_id, group_name = recommend.profile_pool(args.profile)
+        target = next((item for item in automatic_results if item.id == provider_id), None)
+        if target is not None:
+            trusted_snapshot = replace(
+                target,
+                error=None,
+                warning=None,
+                stale=False,
+                manual=None,
+            )
+            snapshot_results = [
+                trusted_snapshot if item.id == provider_id else item for item in automatic_results
+            ]
+            failure_kind, _failure_text = manual.classify_automatic_failure(target)
+            confirmed_cutoff = manual.confirmed_automatic_cutoff(target, now=now)
+            snapshot_gate = (
+                recommend.gate_check(
+                    snapshot_results,
+                    args.profile,
+                    today=now.date(),
+                    now=now,
+                    bench_scores=bench_scores,
+                    model_prices=model_prices,
+                    grade_table=grade_table,
+                    **_gate_args(args),
+                )
+                if failure_kind != "auth"
+                and target.buckets
+                and (target.fetched_at is not None or confirmed_cutoff is not None)
+                else result
+            )
+            if not snapshot_gate.ok and not snapshot_gate.unmeasurable:
+                result = snapshot_gate
+            else:
+                try:
+                    resolution = manual.resolve_result(target, now=now, group_name=group_name)
+                except manual.ManualError as exc:
+                    resolution = None
+                    result = replace(result, reason=f"{result.reason} [manual store 오류: {exc}]")
+                if resolution is not None and resolution.applied:
+                    effective_results = [
+                        resolution.result if item.id == provider_id else item for item in automatic_results
+                    ]
+                    result = recommend.gate_check(
+                        effective_results,
+                        args.profile,
+                        today=now.date(),
+                        now=now,
+                        bench_scores=bench_scores,
+                        model_prices=model_prices,
+                        grade_table=grade_table,
+                        **_gate_args(args),
+                    )
+                    result = _manual_gate_audit(result, resolution)
+                elif resolution is not None:
+                    result = replace(
+                        result,
+                        reason=(
+                            f"{result.reason} "
+                            f"[manual fallback 불가: {resolution.failure_reason or 'reason unavailable'}]"
+                        ),
+                        last_auto_error=resolution.last_auto_error,
+                    )
     exit_code = 0 if result.ok else (4 if result.unmeasurable else 3)
 
     if args.gate_output:
@@ -432,6 +659,21 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 f" operator_request_ref={result.operator_request_ref}"
                 f" requested_by={result.requested_by or 'unknown'}"
                 f" ref_resolution={result.ref_resolution or 'unverified'}"
+            )
+        if result.source == manual.SOURCE:
+            windows = ",".join(str(observation["window"]) for observation in result.manual_observations)
+            supersedes_prior = any(
+                observation.get("supersedes_ref") is not None for observation in result.manual_observations
+            )
+            first_line += (
+                f" source={manual.SOURCE}"
+                f" source_verification={manual.SOURCE_VERIFICATION}"
+                " source_claim=self_reported_unverified"
+                f" manual_observation_ids={','.join(result.manual_observation_ids)}"
+                f" manual_windows={windows}"
+                f" manual_supersedes={'true' if supersedes_prior else 'false'}"
+                f" measured_at={result.measured_at}"
+                f" expires_at={result.expires_at}"
             )
         print(first_line)
         print(result.reason)
@@ -589,6 +831,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "policy":
         return _policy_command(args, fetchers, parser)
 
+    if args.command == "manual":
+        return _manual_command(args)
+
     if args.command == "gate":
         return _gate_command(args, fetchers)
 
@@ -624,6 +869,8 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         now = dt.datetime.now(dt.UTC)
         results = collect(fetchers, names, ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+        if not args.raw:
+            results = manual.apply_for_display(results, now=now)
         print(_render(results, args, now), flush=True)
         if not args.watch:
             break
