@@ -371,23 +371,17 @@ def test_fetch_probes_banner_and_appends_swe2_bucket(tmp_path, monkeypatch, fixt
     assert ("swe-2", 0.0, "week") in labels
 
 
-def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(
-    tmp_path, monkeypatch, fixture_text
-):
+def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(tmp_path, monkeypatch, fixture_text):
     payload = _fixture(fixture_text)
     banner = _new_banner_fixture(fixture_text)
     binary = tmp_path / "fake-devin-new-banner-and-models"
     binary.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = models ] && [ "$2" = list ]; then\n'
-        "  cat <<'EOF'\n"
-        + payload
-        + "EOF\n"
+        "  cat <<'EOF'\n" + payload + "EOF\n"
         "  exit 0\n"
         "fi\n"
-        "cat <<'EOF'\n"
-        + banner
-        + "EOF\n"
+        "cat <<'EOF'\n" + banner + "EOF\n"
     )
     binary.chmod(binary.stat().st_mode | 0o111)
     monkeypatch.setattr(devin, "BINARY", str(binary))
@@ -479,9 +473,7 @@ def test_unreadable_banner_keeps_provider_and_gate_fail_closed(tmp_path, monkeyp
     binary.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = models ] && [ "$2" = list ]; then\n'
-        "  cat <<'EOF'\n"
-        + payload
-        + "EOF\n"
+        "  cat <<'EOF'\n" + payload + "EOF\n"
         "  exit 0\n"
         "fi\n"
         "printf '%s\\r\\n' 'status: 92% used'\n"
