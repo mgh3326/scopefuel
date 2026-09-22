@@ -169,14 +169,21 @@ def test_manual_store_path_cannot_collide_with_automatic_snapshot(tmp_path, monk
     snapshot.write_text(sentinel, encoding="utf-8")
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(snapshot))
 
-    entry = manual.record_observation(
-        pool="devin",
-        used_pct=8.0,
-        window="daily",
-        measured_at=dt.datetime.now(dt.UTC),
-        reason="automatic snapshot path collision check",
-    )
+    entry = None
+    error = None
+    try:
+        entry = manual.record_observation(
+            pool="devin",
+            used_pct=8.0,
+            window="daily",
+            measured_at=dt.datetime.now(dt.UTC),
+            reason="automatic snapshot path collision check",
+        )
+    except manual.ManualError as exc:
+        error = str(exc)
 
+    assert error is None
+    assert entry is not None
     assert entry["pool"] == "devin"
     assert manual.manual_path() == tmp_path / "manual-observations.json"
     assert snapshot.read_text(encoding="utf-8") == sentinel
@@ -499,7 +506,9 @@ def test_reentering_same_measurement_cannot_extend_effect():
         ttl_s=manual.DEFAULT_TTL_S,
         now=now,
     )
-    with pytest.raises(manual.ManualError, match="새 --measured-at"):
+    original = manual.manual_path().read_bytes()
+    error = None
+    try:
         manual.record_observation(
             pool="devin",
             used_pct=8.0,
@@ -509,7 +518,12 @@ def test_reentering_same_measurement_cannot_extend_effect():
             ttl_s=manual.MAX_TTL_S,
             now=now + dt.timedelta(minutes=16),
         )
+    except manual.ManualError as exc:
+        error = str(exc)
 
+    assert error is not None
+    assert "새 --measured-at" in error
+    assert manual.manual_path().read_bytes() == original
     payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=16))
     assert first["expires_at"] == "2026-09-22T06:15:00.377546Z"
     assert payload["latest_valid"] == []
@@ -519,14 +533,14 @@ def test_reentering_same_measurement_cannot_extend_effect():
 
 def test_non_newer_value_correction_cannot_revive_old_observation():
     now = dt.datetime(2026, 9, 22, 6, 0, tzinfo=dt.UTC)
-    measured = now - dt.timedelta(hours=3)
+    measured = now
     first = manual.record_observation(
         pool="devin",
         used_pct=8.0,
         window="daily",
         measured_at=measured,
-        reason="old console reading",
-        ttl_s=manual.MAX_TTL_S,
+        reason="short-lived console reading",
+        ttl_s=manual.DEFAULT_TTL_S,
         now=now,
     )
 
@@ -535,14 +549,14 @@ def test_non_newer_value_correction_cannot_revive_old_observation():
         used_pct=8.01,
         window="daily",
         measured_at=measured,
-        reason="corrected transcription of the same old reading",
+        reason="corrected transcription of the expired reading",
         ttl_s=manual.MAX_TTL_S,
-        now=now + dt.timedelta(minutes=5),
+        now=now + dt.timedelta(minutes=16),
     )
 
     assert correction["supersedes"] == first["manual_observation_id"]
-    assert correction["expires_at"] == first["expires_at"] == "2026-09-22T05:00:00Z"
-    payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=5))
+    assert correction["expires_at"] == first["expires_at"] == "2026-09-22T06:15:00Z"
+    payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=16))
     assert payload["latest_valid"] == []
     assert [entry["status"] for entry in payload["entries"]] == ["superseded", "expired"]
 
