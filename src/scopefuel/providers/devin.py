@@ -53,12 +53,22 @@ _ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\(
 _SWE2_FAMILY = re.compile(r"^SWE-2\s+\(swe-2\)\s*$")
 _FAMILY_HEADER = re.compile(r"^\S.*\([^)]+\)\s*$")
 _BRACKET_TAGS = re.compile(r"\[([^\[\]]*)\]\s*$")
-# 기동 배너 두 번째 페인트: "v3000.10.21 · Pro · 100% remaining (resets in 1h 41m)".
-# 구분자는 U+00B7 middle dot. plan 문자셋은 "·" 를 포함하지 않아 백트래킹으로
-# 다음 "·" 앞에서 자연히 멈춘다.
-_BANNER_QUOTA = re.compile(
-    r"· (?P<plan>[A-Za-z][A-Za-z0-9+ .-]*) · "
-    r"(?P<remaining>\d+(?:\.\d+)?)\s*% remaining \(resets in (?P<reset>[^)]+)\)"
+# 기동 배너 두 번째 페인트의 구분자는 U+00B7 middle dot.
+_BANNER_VERSION = r"v\d+\.\d+\.\d+"
+_BANNER_PLAN = r"Pro"
+_BANNER_REMAINING = r"(?P<remaining>\d+(?:\.\d+)?)[ \t]*% remaining"
+_BANNER_RESET = r"(?P<reset>\d+(?:\.\d+)?[ \t]*[dhms](?:[ \t]+\d+(?:\.\d+)?[ \t]*[dhms])*)"
+# 3000.10.31 and earlier kept the version, plan, and quota on one rendered line.
+_BANNER_QUOTA_OLD = re.compile(
+    rf"(?m)(?<!\S){_BANNER_VERSION}[ \t]+·[ \t]+(?P<plan>{_BANNER_PLAN})[ \t]+· "
+    rf"{_BANNER_REMAINING} \(resets in {_BANNER_RESET}\)(?=[ \t]*(?:$|\n))"
+)
+# 3000.11.1 renders the version in the first paint and refreshes this complete
+# plan/quota line separately. Keep the line boundary so unrelated percentages
+# elsewhere in CLI output cannot complete the PTY probe.
+_BANNER_QUOTA_NEW = re.compile(
+    rf"(?m)^[ \t]*(?P<plan>{_BANNER_PLAN})[ \t]+·[ \t]+{_BANNER_REMAINING} "
+    rf"\(resets in {_BANNER_RESET}\)[ \t]*$"
 )
 _DURATION_PART = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[dhms])", re.IGNORECASE)
 
@@ -223,7 +233,7 @@ def _probe_banner() -> str:
                     break
                 output.extend(chunk)
                 clean = _clean(output.decode("utf-8", errors="replace"))
-                if banner_seen_at is None and _BANNER_QUOTA.search(clean):
+                if banner_seen_at is None and _banner_quota_match(clean) is not None:
                     banner_seen_at = time.monotonic()
                 if banner_seen_at is not None and time.monotonic() - banner_seen_at >= BANNER_SETTLE_S:
                     break
@@ -273,7 +283,7 @@ def _probe_banner() -> str:
 def parse_banner(text: str) -> ProviderResult:
     """기동 배너의 daily quota 세그먼트를 파싱한다. 못 읽으면 fail-closed(error)."""
     clean = _clean(text)
-    match = _BANNER_QUOTA.search(clean)
+    match = _banner_quota_match(clean)
     if match is None:
         return ProviderResult(
             id=PROVIDER_ID,
@@ -318,6 +328,19 @@ def parse_banner(text: str) -> ProviderResult:
         raw={"stdout": clean},
         pool_class="spend",
     )
+
+
+def _banner_quota_match(clean: str) -> re.Match[str] | None:
+    """Return only a complete, in-range quota line shared by probe and parser."""
+    for pattern in (_BANNER_QUOTA_OLD, _BANNER_QUOTA_NEW):
+        for match in pattern.finditer(clean):
+            try:
+                remaining = float(match["remaining"])
+            except (TypeError, ValueError):
+                continue
+            if 0 <= remaining <= 100:
+                return match
+    return None
 
 
 def _weekly_unknown_bucket() -> Bucket:
