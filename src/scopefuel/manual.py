@@ -114,7 +114,11 @@ class Resolution:
 def manual_path() -> pathlib.Path:
     from .cache import cache_path
 
-    return cache_path().parent / "manual.json"
+    snapshot = cache_path()
+    candidate = snapshot.parent / "manual.json"
+    if candidate == snapshot:
+        return snapshot.parent / "manual-observations.json"
+    return candidate
 
 
 def _lock_path() -> pathlib.Path:
@@ -156,6 +160,7 @@ def _load_unlocked() -> dict:
 
 def _validate_store(store: dict) -> None:
     known_entries: dict[str, dict] = {}
+    latest_by_key: dict[tuple[str, str], dict] = {}
     seen_observations: set[tuple[str, str, float, dt.datetime]] = set()
     current = dt.datetime.now(dt.UTC)
     for index, event in enumerate(store["history"]):
@@ -231,14 +236,22 @@ def _validate_store(store: dict) -> None:
             supersedes = event.get("supersedes")
             if "supersedes_ref" not in event or event.get("supersedes_ref") != supersedes:
                 raise ManualError(f"manual history {index} supersedes ref alias 불일치")
-            if supersedes is not None:
-                prior = known_entries.get(str(supersedes))
-                if prior is None or (prior.get("pool"), prior.get("window")) != (
-                    event.get("pool"),
-                    event.get("window"),
-                ):
-                    raise ManualError(f"manual history {index} supersedes ref 불일치")
+            key = (event["pool"], event["window"])
+            prior = latest_by_key.get(key)
+            expected_supersedes = None if prior is None else prior["manual_observation_id"]
+            if supersedes != expected_supersedes:
+                raise ManualError(f"manual history {index} supersedes ref 불일치")
+            if prior is not None:
+                prior_measured = _parse_iso(prior.get("measured_at"))
+                prior_expires = _parse_iso(prior.get("expires_at"))
+                if prior_measured is None or prior_expires is None:
+                    raise ManualError(f"manual history {index} prior timestamp 불일치")
+                if measured <= prior_measured and float(event["used_pct"]) == float(prior["used_pct"]):
+                    raise ManualError(f"manual history {index} 동일 관측 재입력")
+                if measured <= prior_measured and expires > prior_expires:
+                    raise ManualError(f"manual history {index} correction expiry 불일치")
             known_entries[observation_id] = event
+            latest_by_key[key] = event
         elif kind == "clear":
             clear_id = event.get("manual_clear_id")
             if not isinstance(clear_id, str) or not clear_id:
@@ -464,11 +477,10 @@ def _author() -> dict:
     }
 
 
-def _latest_set_id(history: list[dict], pool: str, window: str) -> str | None:
+def _latest_set(history: list[dict], pool: str, window: str) -> dict | None:
     for event in reversed(history):
         if event.get("event") == "set" and event.get("pool") == pool and event.get("window") == window:
-            value = event.get("manual_observation_id")
-            return str(value) if value else None
+            return event
     return None
 
 
@@ -512,17 +524,26 @@ def record_observation(
     with _store_lock(exclusive=True):
         store = _load_unlocked()
         history: list[dict] = store["history"]
-        if any(
+        duplicate = any(
             event.get("event") == "set"
             and event.get("pool") == pool
             and event.get("window") == normalized_window
             and float(event.get("used_pct")) == float(used_pct)
             and _parse_iso(event.get("measured_at")) == measured_at
             for event in history
-        ):
-            raise ManualError("동일 관측값을 다시 넣으려면 새 --measured-at 이 필요합니다")
+        )
+        prior = _latest_set(history, pool, normalized_window)
+        if prior is not None:
+            prior_measured = _parse_iso(prior.get("measured_at"))
+            prior_expires = _parse_iso(prior.get("expires_at"))
+            if prior_measured is None or prior_expires is None:
+                raise ManualError("이전 manual observation timestamp 불일치")
+            if duplicate or (measured_at <= prior_measured and float(prior["used_pct"]) == float(used_pct)):
+                raise ManualError("동일 관측값을 다시 넣으려면 이전 값보다 새 --measured-at 이 필요합니다")
+            if measured_at <= prior_measured:
+                expires_at = min(expires_at, prior_expires)
         observation_id = str(uuid.uuid4())
-        supersedes = _latest_set_id(history, pool, normalized_window)
+        supersedes = None if prior is None else str(prior["manual_observation_id"])
         author = _author()
         entry = {
             "event": "set",
@@ -735,10 +756,8 @@ def _required_windows(pool: str) -> frozenset[str]:
     return REQUIRED_WINDOWS.get(pool, frozenset())
 
 
-def _confirmed_account_cutoff(result: ProviderResult, *, now: dt.datetime) -> tuple[float, float] | None:
-    """Return (used, cutoff) only for a persisted successful automatic snapshot."""
-    if result.fetched_at is None:
-        return None
+def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> tuple[float, float] | None:
+    """Return an automatic account-bucket breach, including warning results."""
     from .policy import get_policy
     from .recommend import PRESERVE_EXCLUDE_PCT, SPEND_EXCLUDE_PCT
 
@@ -788,7 +807,7 @@ def resolve_result(
             failure_reason="manual CLI는 group scope를 증명하지 않음",
         )
 
-    confirmed_cutoff = _confirmed_account_cutoff(result, now=now)
+    confirmed_cutoff = confirmed_automatic_cutoff(result, now=now)
     if confirmed_cutoff is not None:
         used_pct, cutoff = confirmed_cutoff
         summary["selection"] = "automatic_cutoff"

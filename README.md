@@ -79,7 +79,8 @@ scopefuel manual clear --pool claude
 
 - 저장소는 자동 snapshot과 분리된 `~/.cache/scopefuel/manual.json`이며 권한은 0600입니다.
   `SCOPEFUEL_CACHE`를 지정하면 같은 디렉터리의 `manual.json`을 사용합니다. 이력은 append-only이고
-  clear도 삭제가 아니라 감사 이벤트입니다.
+  clear도 삭제가 아니라 감사 이벤트입니다. 자동 snapshot 자체의 이름이 `manual.json`이면 충돌을
+  피하기 위해 수동 저장소는 같은 디렉터리의 `manual-observations.json`을 사용합니다.
 - 기본 TTL은 15분, 상한은 2시간입니다. 효력은 입력 시각이 아니라 `--measured-at`부터 세며 reset
   경계가 더 이르면 거기서 끝납니다. 오래된 화면을 늦게 입력하거나 같은 값을 다시 넣어도 수명이
   새로 시작되지 않습니다.

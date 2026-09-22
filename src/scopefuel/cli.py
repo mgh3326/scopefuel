@@ -587,6 +587,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 trusted_snapshot if item.id == provider_id else item for item in automatic_results
             ]
             failure_kind, _failure_text = manual.classify_automatic_failure(target)
+            confirmed_cutoff = manual.confirmed_automatic_cutoff(target, now=now)
             snapshot_gate = (
                 recommend.gate_check(
                     snapshot_results,
@@ -598,7 +599,9 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                     grade_table=grade_table,
                     **_gate_args(args),
                 )
-                if failure_kind != "auth" and target.fetched_at is not None and target.buckets
+                if failure_kind != "auth"
+                and target.buckets
+                and (target.fetched_at is not None or confirmed_cutoff is not None)
                 else result
             )
             if not snapshot_gate.ok and not snapshot_gate.unmeasurable:

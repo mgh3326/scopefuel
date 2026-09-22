@@ -163,6 +163,25 @@ def test_real_execution_context_records_signal_presence_without_its_value(monkey
     assert secret not in manual.manual_path().read_text(encoding="utf-8")
 
 
+def test_manual_store_path_cannot_collide_with_automatic_snapshot(tmp_path, monkeypatch):
+    snapshot = tmp_path / "manual.json"
+    sentinel = '{"automatic":"snapshot"}\n'
+    snapshot.write_text(sentinel, encoding="utf-8")
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(snapshot))
+
+    entry = manual.record_observation(
+        pool="devin",
+        used_pct=8.0,
+        window="daily",
+        measured_at=dt.datetime.now(dt.UTC),
+        reason="automatic snapshot path collision check",
+    )
+
+    assert entry["pool"] == "devin"
+    assert manual.manual_path() == tmp_path / "manual-observations.json"
+    assert snapshot.read_text(encoding="utf-8") == sentinel
+
+
 def test_manual_list_and_json_show_unverified_source_and_counts(claude_error_registry, capsys):
     _set_manual(capsys)
 
@@ -270,6 +289,26 @@ def test_fresh_automatic_low_value_wins_over_manual_high_value(claude_error_regi
     assert provider["manual"]["selection"] == "automatic_fresh"
 
 
+def test_fresh_cached_automatic_older_than_manual_still_wins(capsys, monkeypatch):
+    cached_at = time.time() - 30
+    cache.collect({"claude": lambda: _automatic_claude(10.0)}, ["claude"], now=cached_at)
+    _set_claude_pair(capsys, used="95")
+
+    def unexpected_fetch():
+        raise AssertionError("fresh cache should prevent provider fetch")
+
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": unexpected_fetch})
+
+    rc = cli.main(["gate", "-m", "opus", "--cache-ttl", "3600"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "used_pct=10.0" in captured.out
+    assert "source=operator" not in captured.out
+    payload = manual.list_payload(pool="claude")
+    assert {entry["status"] for entry in payload["entries"]} == {"shadowed_by_fresh_auto"}
+
+
 def test_stale_automatic_cutoff_confirmation_cannot_be_hidden(claude_error_registry, capsys, monkeypatch):
     _set_claude_pair(capsys, used="1")
     stale = _automatic_claude(95.0, stale=True, last_error="HTTP 429 rate limit")
@@ -286,6 +325,61 @@ def test_stale_automatic_cutoff_confirmation_cannot_be_hidden(claude_error_regis
     assert provider["source"] is None
     assert provider["manual"]["selection"] == "automatic_cutoff"
     assert provider["manual"]["automatic_cutoff"] == {"used_pct": 95.0, "cutoff": 90.0}
+
+
+@pytest.mark.parametrize(
+    ("warning", "used_pct", "has_reset"),
+    [
+        ("데이터 이상 — weekly: percentUsed 100 초과 (101)", 95.0, True),
+        ("HTTP 429 — 정상으로 간주하지 않음", 100.0, False),
+    ],
+)
+def test_warning_bucket_cutoff_cannot_be_hidden_by_manual(capsys, monkeypatch, warning, used_pct, has_reset):
+    for window in ("5h", "7d", "30d"):
+        _set_manual(capsys, pool="clinepass", window=window, used="10")
+    resets_at = (dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)).isoformat() if has_reset else None
+    automatic = ProviderResult(
+        id="clinepass",
+        warning=warning,
+        buckets=[
+            Bucket(
+                label="five_hour",
+                window="5h",
+                used_pct=used_pct,
+                resets_at=resets_at,
+                scope=Scope("account"),
+                horizon="now",
+            ),
+            Bucket(
+                label="weekly",
+                window="7d",
+                used_pct=None,
+                resets_at=resets_at,
+                scope=Scope("account"),
+                horizon="week",
+            ),
+            Bucket(
+                label="monthly",
+                window="30d",
+                used_pct=40.0,
+                resets_at=resets_at,
+                scope=Scope("account"),
+                horizon="month",
+            ),
+        ],
+        pool_class="preserve",
+    )
+    monkeypatch.setattr(cli, "registry", lambda: {"clinepass": lambda: automatic})
+
+    rc = cli.main(["gate", "-m", "cc-glm", "--no-cache"])
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert f"{used_pct:g}% 소진" in captured.err
+    assert "source=operator" not in captured.err
+    resolution = manual.resolve_result(automatic, now=dt.datetime.now(dt.UTC))
+    assert resolution.applied is False
+    assert resolution.summary["selection"] == "automatic_cutoff"
 
 
 def test_measured_at_older_than_two_hours_is_expired(claude_error_registry, capsys):
@@ -394,7 +488,7 @@ def test_clear_is_append_only_and_disables_all_pool_entries(claude_error_registr
 
 
 def test_reentering_same_measurement_cannot_extend_effect():
-    now = dt.datetime(2026, 9, 22, 6, 0, tzinfo=dt.UTC)
+    now = dt.datetime(2026, 9, 22, 6, 0, 0, 377546, tzinfo=dt.UTC)
     measured = now
     first = manual.record_observation(
         pool="devin",
@@ -410,17 +504,47 @@ def test_reentering_same_measurement_cannot_extend_effect():
             pool="devin",
             used_pct=8.0,
             window="daily",
-            measured_at=measured,
+            measured_at=measured.replace(microsecond=0),
             reason="same observation entered with a longer ttl",
             ttl_s=manual.MAX_TTL_S,
-            now=now + dt.timedelta(minutes=10),
+            now=now + dt.timedelta(minutes=16),
         )
 
     payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=16))
-    assert first["expires_at"] == "2026-09-22T06:15:00Z"
+    assert first["expires_at"] == "2026-09-22T06:15:00.377546Z"
     assert payload["latest_valid"] == []
     assert len(payload["entries"]) == 1
     assert payload["entries"][0]["status"] == "expired"
+
+
+def test_non_newer_value_correction_cannot_revive_old_observation():
+    now = dt.datetime(2026, 9, 22, 6, 0, tzinfo=dt.UTC)
+    measured = now - dt.timedelta(hours=3)
+    first = manual.record_observation(
+        pool="devin",
+        used_pct=8.0,
+        window="daily",
+        measured_at=measured,
+        reason="old console reading",
+        ttl_s=manual.MAX_TTL_S,
+        now=now,
+    )
+
+    correction = manual.record_observation(
+        pool="devin",
+        used_pct=8.01,
+        window="daily",
+        measured_at=measured,
+        reason="corrected transcription of the same old reading",
+        ttl_s=manual.MAX_TTL_S,
+        now=now + dt.timedelta(minutes=5),
+    )
+
+    assert correction["supersedes"] == first["manual_observation_id"]
+    assert correction["expires_at"] == first["expires_at"] == "2026-09-22T05:00:00Z"
+    payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=5))
+    assert payload["latest_valid"] == []
+    assert [entry["status"] for entry in payload["entries"]] == ["superseded", "expired"]
 
 
 @pytest.mark.parametrize(
