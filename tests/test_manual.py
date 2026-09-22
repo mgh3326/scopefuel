@@ -12,6 +12,8 @@ import pytest
 from scopefuel import cache, cli, manual, recommend
 from scopefuel.model import Bucket, ProviderResult, Scope
 
+_REAL_EXECUTION_CONTEXT = manual._execution_context
+
 
 @pytest.fixture(autouse=True)
 def stable_audit_context(monkeypatch):
@@ -107,11 +109,13 @@ def test_manual_set_is_separate_append_only_and_records_unverified_execution_con
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     original = '{"sentinel":"automatic snapshot unchanged"}\n'
     snapshot.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("SCOPEFUEL_MANUAL", str(snapshot))
     monkeypatch.setenv("CODEX_HOME", "secret-value-must-not-be-recorded")
 
     _set_manual(capsys)
 
     assert snapshot.read_text(encoding="utf-8") == original
+    assert manual.manual_path() == snapshot.parent / "manual.json"
     store = json.loads(manual.manual_path().read_text(encoding="utf-8"))
     assert store["schema"] == manual.SCHEMA
     assert len(store["history"]) == 1
@@ -125,11 +129,38 @@ def test_manual_set_is_separate_append_only_and_records_unverified_execution_con
         "verification": "unverified",
         "label": "자기신고 · 미검증",
     }
+    assert entry["author_principal"] == entry["author"]
+    assert entry["account_ref"] == {
+        "pool": "claude",
+        "host": "local-host",
+        "verification": "unverified",
+        "local_only": True,
+    }
+    assert entry["supersedes_ref"] is None
+    assert "execution_context" in entry
     assert entry["execution_context"]["parent"] == {"pid": 4242, "name": "zsh"}
     assert entry["execution_context"]["tty"] == {"stdin": False, "stdout": False}
     assert entry["execution_context"]["agent_environment_signals"] == {"CODEX_HOME": True}
     assert "secret-value-must-not-be-recorded" not in manual.manual_path().read_text(encoding="utf-8")
     assert oct(os.stat(manual.manual_path()).st_mode & 0o777) == "0o600"
+
+
+def test_real_execution_context_records_signal_presence_without_its_value(monkeypatch):
+    secret = "secret-value-must-never-reach-manual-store"
+    monkeypatch.setattr(manual, "_execution_context", _REAL_EXECUTION_CONTEXT)
+    monkeypatch.setenv("CODEX_HOME", secret)
+
+    entry = manual.record_observation(
+        pool="devin",
+        used_pct=8.0,
+        window="daily",
+        measured_at=dt.datetime.now(dt.UTC),
+        reason="real audit context check",
+    )
+
+    signals = entry["execution_context"]["agent_environment_signals"]
+    assert signals["CODEX_HOME"] is True
+    assert secret not in manual.manual_path().read_text(encoding="utf-8")
 
 
 def test_manual_list_and_json_show_unverified_source_and_counts(claude_error_registry, capsys):
@@ -175,15 +206,37 @@ def test_gate_uses_manual_on_retryable_failure_and_emits_receipt(claude_error_re
     assert "source=operator" in captured.out
     assert "source_verification=unverified" in captured.out
     assert "자기신고 · 미검증" in captured.out
+    assert "manual_windows=5h,7d" in captured.out
+    assert "manual_supersedes=false" in captured.out
     assert "자동 측정 마지막 오류 HTTP 429 rate limit" in captured.out
     record = json.loads(gate_output.read_text(encoding="utf-8"))
     assert record["source"] == "operator"
     assert record["source_verification"] == "unverified"
     assert record["source_label"] == "자기신고 · 미검증"
     assert len(record["manual_observation_ids"]) == 2
+    assert {item["window"] for item in record["manual_observations"]} == {"5h", "7d"}
+    assert {item["status"] for item in record["manual_observations"]} == {"active"}
+    assert all(item["supersedes_ref"] is None for item in record["manual_observations"])
+    assert all(item["source_verification"] == "unverified" for item in record["manual_observations"])
     assert record["observed_age_s"] >= 0
     assert record["remaining_effect_s"] > 0
     assert record["last_auto_error"] == "HTTP 429 rate limit"
+
+
+def test_gate_receipt_exposes_manual_supersedes_reference(claude_error_registry, capsys, tmp_path):
+    _set_manual(capsys, window="5h", used="9")
+    _set_manual(capsys, window="5h", used="10")
+    _set_manual(capsys, window="7d", used="10")
+    gate_output = tmp_path / "gate.json"
+
+    assert cli.main(["gate", "-m", "opus", "--no-cache", "--gate-output", str(gate_output)]) == 0
+
+    captured = capsys.readouterr()
+    assert "manual_supersedes=true" in captured.out
+    assert "supersedes yes" in captured.out
+    observations = json.loads(gate_output.read_text(encoding="utf-8"))["manual_observations"]
+    corrected = next(item for item in observations if item["window"] == "5h")
+    assert corrected["supersedes_ref"] is not None
 
 
 def test_fresh_automatic_cutoff_cannot_be_hidden_by_manual_low_value(
@@ -198,6 +251,23 @@ def test_fresh_automatic_cutoff_cannot_be_hidden_by_manual_low_value(
     assert rc == 3
     assert "95% 소진" in captured.err
     assert "source=operator" not in captured.err
+
+
+def test_fresh_automatic_low_value_wins_over_manual_high_value(claude_error_registry, capsys, monkeypatch):
+    _set_claude_pair(capsys, used="95")
+    fresh = _automatic_claude(10.0)
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": lambda: fresh})
+
+    rc = cli.main(["gate", "-m", "opus", "--no-cache"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "used_pct=10.0" in captured.out
+    assert "source=operator" not in captured.out
+    assert cli.main(["--json", "--no-cache", "--only", "claude"]) == 0
+    provider = json.loads(capsys.readouterr().out)["providers"][0]
+    assert provider["source"] is None
+    assert provider["manual"]["selection"] == "automatic_fresh"
 
 
 def test_stale_automatic_cutoff_confirmation_cannot_be_hidden(claude_error_registry, capsys, monkeypatch):
@@ -242,6 +312,7 @@ def test_verified_auth_failure_cannot_be_hidden_by_manual(claude_error_registry,
     captured = capsys.readouterr()
     assert rc == 4
     assert "측정 불가" in captured.err
+    assert "manual fallback 불가: 검증된 auth 실패" in captured.err
     assert "source=operator" not in captured.err
 
 
@@ -265,12 +336,35 @@ def test_missing_required_five_hour_bucket_stays_fail_closed(claude_error_regist
     _set_manual(capsys, window="7d")
 
     assert cli.main(["gate", "-m", "opus", "--no-cache"]) == 4
-    capsys.readouterr()
+    assert "manual fallback 불가: 필수 manual bucket 누락: 5h" in capsys.readouterr().err
     assert cli.main(["--json", "--no-cache", "--only", "claude"]) == 1
     provider = json.loads(capsys.readouterr().out)["providers"][0]
     assert provider["status"] == "error"
     assert provider["manual"]["selection"] == "incomplete_bucket_coverage"
     assert provider["manual"]["missing_windows"] == ["5h"]
+
+
+def test_devin_weekly_observation_cannot_replace_required_daily_bucket(capsys, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {
+            "devin": lambda: ProviderResult(
+                id="devin",
+                error="startup banner parse failure",
+                pool_class="spend",
+            )
+        },
+    )
+    _set_manual(capsys, pool="devin", window="weekly", used="10")
+
+    rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+
+    assert rc == 4
+    assert "측정 불가" in capsys.readouterr().err
+    assert cli.main(["--json", "--no-cache", "--only", "devin"]) == 1
+    provider = json.loads(capsys.readouterr().out)["providers"][0]
+    assert provider["manual"]["missing_windows"] == ["1d"]
 
 
 def test_manual_used_zero_still_runs_normal_cutoff_check(claude_error_registry, capsys, monkeypatch):
@@ -299,34 +393,131 @@ def test_clear_is_append_only_and_disables_all_pool_entries(claude_error_registr
     assert {entry["status"] for entry in payload["entries"]} == {"cleared"}
 
 
-def test_reentering_same_old_measurement_does_not_extend_effect(monkeypatch):
+def test_reentering_same_measurement_cannot_extend_effect():
     now = dt.datetime(2026, 9, 22, 6, 0, tzinfo=dt.UTC)
-    measured = now - dt.timedelta(hours=3)
+    measured = now
     first = manual.record_observation(
         pool="devin",
         used_pct=8.0,
         window="daily",
         measured_at=measured,
-        reason="old console reading",
-        ttl_s=manual.MAX_TTL_S,
+        reason="console reading",
+        ttl_s=manual.DEFAULT_TTL_S,
         now=now,
     )
-    second = manual.record_observation(
-        pool="devin",
-        used_pct=8.0,
-        window="daily",
-        measured_at=measured,
-        reason="same old console reading entered again",
-        ttl_s=manual.MAX_TTL_S,
-        now=now + dt.timedelta(minutes=5),
+    with pytest.raises(manual.ManualError, match="새 --measured-at"):
+        manual.record_observation(
+            pool="devin",
+            used_pct=8.0,
+            window="daily",
+            measured_at=measured,
+            reason="same observation entered with a longer ttl",
+            ttl_s=manual.MAX_TTL_S,
+            now=now + dt.timedelta(minutes=10),
+        )
+
+    payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=16))
+    assert first["expires_at"] == "2026-09-22T06:15:00Z"
+    assert payload["latest_valid"] == []
+    assert len(payload["entries"]) == 1
+    assert payload["entries"][0]["status"] == "expired"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "devin 기동 배너가 30초 안에 쿼타 줄을 그리지 않음",
+        "devin 배너 프로브 실행 실패: resource temporarily unavailable",
+        "kiro-cli /usage 가 30초 안에 끝나지 않음",
+        "usage-limits 조회 실패 (URLError)",
+        "usage-limits HTTP 408",
+    ],
+)
+def test_known_timeout_and_transport_failures_are_manual_eligible(error):
+    kind, _ = manual.classify_automatic_failure(ProviderResult(id="provider", error=error))
+    assert kind == "transport"
+
+
+def test_devin_banner_timeout_can_use_a_complete_daily_manual_observation(capsys, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {
+            "devin": lambda: ProviderResult(
+                id="devin",
+                error="devin 기동 배너가 30초 안에 쿼타 줄을 그리지 않음",
+                pool_class="spend",
+            )
+        },
+    )
+    _set_manual(capsys, pool="devin", window="daily", used="10")
+
+    rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "source=operator" in captured.out
+    assert "자기신고 · 미검증" in captured.out
+
+
+def test_fresh_no_data_result_is_parse_failure_and_can_use_complete_manual(
+    claude_error_registry, capsys, monkeypatch
+):
+    _set_claude_pair(capsys)
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {
+            "claude": lambda: ProviderResult(
+                id="claude",
+                note="no data — automatic response had no quota buckets",
+                pool_class="preserve",
+            )
+        },
     )
 
-    assert second["supersedes"] == first["manual_observation_id"]
-    assert second["expires_at"] == first["expires_at"]
-    payload = manual.list_payload(pool="devin", now=now + dt.timedelta(minutes=5))
-    assert payload["latest_valid"] == []
-    assert payload["entries"][0]["status"] == "superseded"
-    assert payload["entries"][1]["status"] == "expired"
+    rc = cli.main(["gate", "-m", "opus", "--no-cache"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "source=operator" in captured.out
+    assert "no data" in captured.out
+    payload = manual.list_payload(pool="claude")
+    assert len(payload["latest_valid"]) == 2
+    assert {entry["status"] for entry in payload["entries"]} == {"active"}
+
+
+def test_login_hint_is_auth_failure_even_when_primary_error_looks_like_parse_failure():
+    result = ProviderResult(
+        id="kiro",
+        error="/usage 출력에서 크레딧 줄을 찾지 못함",
+        hint="kiro-cli 로그인이 필요해 보입니다 (kiro-cli login)",
+    )
+
+    kind, _ = manual.classify_automatic_failure(result)
+
+    assert kind == "auth"
+
+
+def test_stale_fallback_preserves_auth_hint_for_fail_closed_classification():
+    healthy = _automatic_claude(10.0)
+    cache.collect({"claude": lambda: healthy}, ["claude"], now=1000.0)
+
+    stale = cache.collect(
+        {
+            "claude": lambda: ProviderResult(
+                id="claude",
+                error="usage output could not be parsed",
+                hint="login required",
+            )
+        },
+        ["claude"],
+        now=1100.0,
+        ttl_s=0.0,
+    )[0]
+
+    assert stale.last_error == "usage output could not be parsed — login required"
+    assert manual.classify_automatic_failure(stale)[0] == "auth"
 
 
 def test_ttl_above_two_hours_is_rejected_without_writing(claude_error_registry, capsys):
@@ -432,4 +623,21 @@ def test_corrupt_or_verified_claim_store_fails_closed_without_overwrite(claude_e
     )
     assert rc == 2
     assert "manual history" in capsys.readouterr().err
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_future_dated_structurally_valid_store_fails_closed(claude_error_registry, capsys):
+    _set_claude_pair(capsys)
+    path = manual.manual_path()
+    store = json.loads(path.read_text(encoding="utf-8"))
+    future = dt.datetime.now(dt.UTC) + dt.timedelta(hours=12)
+    for entry in store["history"]:
+        entry["measured_at"] = future.isoformat().replace("+00:00", "Z")
+        entry["entered_at"] = future.isoformat().replace("+00:00", "Z")
+        entry["expires_at"] = (future + dt.timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+    original = json.dumps(store)
+    path.write_text(original, encoding="utf-8")
+
+    assert cli.main(["gate", "-m", "opus", "--no-cache"]) == 4
+    assert "manual store 오류" in capsys.readouterr().err
     assert path.read_text(encoding="utf-8") == original

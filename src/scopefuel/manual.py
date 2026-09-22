@@ -64,18 +64,21 @@ REQUIRED_WINDOWS = {
 _DURATION_PART = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([smhdw])", re.IGNORECASE)
 _AUTH_FAILURE = re.compile(
     r"(?<!\d)(?:401|403)(?!\d)|auth(?:entication)?\s+fail|unauthori[sz]ed|forbidden|"
-    r"(?:credential|token).*(?:invalid|expired)|인증\s*실패|자격증명",
+    r"(?:credential|token|api[ _-]?key).*(?:invalid|expired|missing|없음|유효하지)|"
+    r"login.*(?:required|needed|필요)|인증\s*실패|자격증명|로그인이?\s*필요",
     re.I,
 )
 _RATE_OR_TRANSPORT = re.compile(
     r"(?<!\d)429(?!\d)|rate[ -]?limit|too many requests|timeout|timed out|"
-    r"connection|transport|network|dns|unreachable|circuit open|urlopen|errno|"
-    r"temporarily unavailable|nodename|remote end|ssl|http\s+5\d\d",
+    r"connection|transport|network|dns|unreachable|circuit open|urlopen|urlerror|errno|"
+    r"temporarily unavailable|nodename|remote end|ssl|http\s+(?:408|5\d\d)|"
+    r"시간\s*초과|끝나지\s*않음|그리지\s*않음|연결|네트워크|전송|"
+    r"조회\s*실패|프로브\s*실행\s*실패",
     re.I,
 )
 _PARSE_FAILURE = re.compile(
     r"parse|parser|decode|malformed|json|format|expecting value|extra data|unterminated|"
-    r"파싱|형식|찾지 못|유효 범위|no data|bucket",
+    r"파싱|형식|찾지 못|유효 범위|no data|bucket|버킷|데이터\s*이상",
     re.I,
 )
 
@@ -109,8 +112,6 @@ class Resolution:
 
 
 def manual_path() -> pathlib.Path:
-    if override := os.environ.get("SCOPEFUEL_MANUAL"):
-        return pathlib.Path(os.path.expanduser(override))
     from .cache import cache_path
 
     return cache_path().parent / "manual.json"
@@ -155,6 +156,8 @@ def _load_unlocked() -> dict:
 
 def _validate_store(store: dict) -> None:
     known_entries: dict[str, dict] = {}
+    seen_observations: set[tuple[str, str, float, dt.datetime]] = set()
+    current = dt.datetime.now(dt.UTC)
     for index, event in enumerate(store["history"]):
         if not isinstance(event, dict):
             raise ManualError(f"manual history {index} 구조 불일치")
@@ -174,6 +177,19 @@ def _validate_store(store: dict) -> None:
             expires = _parse_iso(event.get("expires_at"))
             if measured is None or entered is None or expires is None:
                 raise ManualError(f"manual history {index} timestamp 불일치")
+            if measured > current + dt.timedelta(seconds=MAX_FUTURE_SKEW_S) or entered > (
+                current + dt.timedelta(seconds=MAX_FUTURE_SKEW_S)
+            ):
+                raise ManualError(f"manual history {index} future timestamp 불일치")
+            observation_key = (
+                event["pool"],
+                event["window"],
+                float(event["used_pct"]),
+                measured,
+            )
+            if observation_key in seen_observations:
+                raise ManualError(f"manual history {index} 동일 관측 재입력")
+            seen_observations.add(observation_key)
             if measured > entered + dt.timedelta(seconds=MAX_FUTURE_SKEW_S):
                 raise ManualError(f"manual history {index} future measurement 불일치")
             if expires > measured + dt.timedelta(seconds=MAX_TTL_S) or expires > entered + dt.timedelta(
@@ -185,6 +201,17 @@ def _validate_store(store: dict) -> None:
             if len(event["reason"]) > MAX_REASON_CHARS:
                 raise ManualError(f"manual history {index} reason 길이 불일치")
             _validate_audit_fields(event, index)
+            account_ref = event.get("account_ref")
+            author_principal = event.get("author_principal")
+            if (
+                not isinstance(account_ref, dict)
+                or account_ref.get("pool") != event.get("pool")
+                or account_ref.get("host") != event["author"].get("host")
+                or account_ref.get("verification") != SOURCE_VERIFICATION
+                or account_ref.get("local_only") is not True
+                or author_principal != event.get("author")
+            ):
+                raise ManualError(f"manual history {index} Q5 identity fields 불일치")
             limits = event.get("entitlement_and_limits")
             if not isinstance(limits, dict) or (
                 limits.get("window"),
@@ -195,9 +222,15 @@ def _validate_store(store: dict) -> None:
             resets_at = event.get("resets_at")
             if resets_at is not None and _parse_iso(resets_at) is None:
                 raise ManualError(f"manual history {index} reset timestamp 불일치")
-            if event.get("local_only") is not True or event.get("usage_mode") != "admission_evidence":
+            if (
+                event.get("local_only") is not True
+                or event.get("usage_mode") != "admission_evidence"
+                or event.get("evidence_ref") != "explicit-local-observation"
+            ):
                 raise ManualError(f"manual history {index} usage mode 불일치")
             supersedes = event.get("supersedes")
+            if "supersedes_ref" not in event or event.get("supersedes_ref") != supersedes:
+                raise ManualError(f"manual history {index} supersedes ref alias 불일치")
             if supersedes is not None:
                 prior = known_entries.get(str(supersedes))
                 if prior is None or (prior.get("pool"), prior.get("window")) != (
@@ -212,8 +245,11 @@ def _validate_store(store: dict) -> None:
                 raise ManualError(f"manual history {index} clear id 불일치")
             if not isinstance(event.get("pool"), str) or not event["pool"]:
                 raise ManualError(f"manual history {index} clear pool 불일치")
-            if _parse_iso(event.get("entered_at")) is None:
+            clear_entered = _parse_iso(event.get("entered_at"))
+            if clear_entered is None:
                 raise ManualError(f"manual history {index} clear timestamp 불일치")
+            if clear_entered > current + dt.timedelta(seconds=MAX_FUTURE_SKEW_S):
+                raise ManualError(f"manual history {index} clear future timestamp 불일치")
             _validate_audit_fields(event, index)
             cleared_ids = event.get("cleared_observation_ids")
             if not isinstance(cleared_ids, list) or any(
@@ -476,8 +512,18 @@ def record_observation(
     with _store_lock(exclusive=True):
         store = _load_unlocked()
         history: list[dict] = store["history"]
+        if any(
+            event.get("event") == "set"
+            and event.get("pool") == pool
+            and event.get("window") == normalized_window
+            and float(event.get("used_pct")) == float(used_pct)
+            and _parse_iso(event.get("measured_at")) == measured_at
+            for event in history
+        ):
+            raise ManualError("동일 관측값을 다시 넣으려면 새 --measured-at 이 필요합니다")
         observation_id = str(uuid.uuid4())
         supersedes = _latest_set_id(history, pool, normalized_window)
+        author = _author()
         entry = {
             "event": "set",
             "manual_observation_id": observation_id,
@@ -492,11 +538,19 @@ def record_observation(
             },
             "measured_at": _iso(measured_at),
             "entered_at": _iso(entered_at),
-            "author": _author(),
+            "author": author,
+            "author_principal": author,
+            "account_ref": {
+                "pool": pool,
+                "host": author["host"],
+                "verification": SOURCE_VERIFICATION,
+                "local_only": True,
+            },
             "reason": reason,
             "evidence_ref": "explicit-local-observation",
             "expires_at": _iso(expires_at),
             "supersedes": supersedes,
+            "supersedes_ref": supersedes,
             "source": SOURCE,
             "source_verification": SOURCE_VERIFICATION,
             "source_label": SOURCE_LABEL,
@@ -549,6 +603,8 @@ def automatic_error_text(result: ProviderResult) -> str | None:
         return result.error
     if result.warning:
         return result.warning
+    if not _has_usable_automatic_bucket(result):
+        return result.note or "no data — automatic measurement has no usable bucket"
     return None
 
 
@@ -557,24 +613,36 @@ def classify_automatic_failure(result: ProviderResult) -> tuple[str | None, str 
     if text is None:
         return None, None
     safe_text = " ".join(text.split())[:200]
-    if _AUTH_FAILURE.search(safe_text):
+    evidence = safe_text
+    if result.hint:
+        evidence = f"{evidence} {' '.join(result.hint.split())[:200]}"
+    if _AUTH_FAILURE.search(evidence):
         return "auth", safe_text
-    if _RATE_OR_TRANSPORT.search(safe_text):
+    if _RATE_OR_TRANSPORT.search(evidence):
         return "transport", safe_text
-    if _PARSE_FAILURE.search(safe_text):
+    if _PARSE_FAILURE.search(evidence):
         return "parse_error", safe_text
     return "unsupported", safe_text
 
 
-def _auto_state(result: ProviderResult) -> tuple[float | None, bool]:
-    return result.fetched_at, result.status == "ok" and not result.stale
+def _auto_state(result: ProviderResult) -> tuple[float | None, bool, bool]:
+    successful = result.error is None and result.warning is None and _has_usable_automatic_bucket(result)
+    return (
+        result.fetched_at,
+        successful and not result.stale,
+        successful,
+    )
+
+
+def _has_usable_automatic_bucket(result: ProviderResult) -> bool:
+    return any(_is_valid_used_pct(bucket.used_pct) for bucket in result.buckets)
 
 
 def _entry_views(
     store: dict,
     *,
     now: dt.datetime,
-    auto_states: dict[str, tuple[float | None, bool]] | None = None,
+    auto_states: dict[str, tuple[float | None, bool, bool]] | None = None,
 ) -> list[dict]:
     history = store.get("history") or []
     auto_states = auto_states or {}
@@ -605,13 +673,15 @@ def _entry_views(
         view = dict(event)
         measured = _parse_iso(event.get("measured_at"))
         expires = _parse_iso(event.get("expires_at"))
-        auto_fetched, auto_fresh = auto_states.get(str(event.get("pool") or ""), (None, False))
+        auto_fetched, auto_fresh, auto_success = auto_states.get(
+            str(event.get("pool") or ""), (None, False, False)
+        )
         auto_time = dt.datetime.fromtimestamp(auto_fetched, tz=dt.UTC) if auto_fetched is not None else None
         replacement = later_replacement.get(index)
         if replacement is not None:
             status, replacement_id = replacement
             view["replacement_ref"] = replacement_id
-        elif measured is not None and auto_time is not None and auto_time > measured:
+        elif auto_success and measured is not None and auto_time is not None and auto_time > measured:
             status = "superseded_by_auto"
         elif expires is None or expires <= current:
             status = "expired"
@@ -706,7 +776,7 @@ def resolve_result(
     annotated = replace(result, manual=summary) if summary is not None else result
     if summary is None:
         return Resolution(annotated, False, None, failure_reason="manual observation 없음")
-    if result.status == "ok" and not result.stale:
+    if result.status == "ok" and not result.stale and _has_usable_automatic_bucket(result):
         summary["selection"] = "automatic_fresh"
         return Resolution(annotated, False, summary, failure_reason="fresh automatic measurement 우선")
     if group_name is not None:
@@ -826,7 +896,7 @@ def apply_for_display(results: list[ProviderResult], *, now: dt.datetime) -> lis
     return [resolve_result(result, now=now, store=store).result for result in results]
 
 
-def _automatic_states_from_cache(now: dt.datetime) -> dict[str, tuple[float | None, bool]]:
+def _automatic_states_from_cache(now: dt.datetime) -> dict[str, tuple[float | None, bool, bool]]:
     from .cache import DEFAULT_TTL_S as AUTO_DEFAULT_TTL_S
     from .cache import PROVIDER_TTL_S, cache_path
 
@@ -834,7 +904,7 @@ def _automatic_states_from_cache(now: dt.datetime) -> dict[str, tuple[float | No
         raw = json.loads(cache_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    states: dict[str, tuple[float | None, bool]] = {}
+    states: dict[str, tuple[float | None, bool, bool]] = {}
     current_epoch = _as_utc(now).timestamp()
     if not isinstance(raw, dict):
         return states
@@ -845,8 +915,19 @@ def _automatic_states_from_cache(now: dt.datetime) -> dict[str, tuple[float | No
             fetched = float(entry.get("fetched_at"))
         except (TypeError, ValueError):
             continue
+        payload = entry.get("result")
+        buckets = payload.get("buckets") if isinstance(payload, dict) else None
+        successful = (
+            isinstance(payload, dict)
+            and not payload.get("error")
+            and not payload.get("warning")
+            and isinstance(buckets, list)
+            and any(
+                isinstance(bucket, dict) and _is_valid_used_pct(bucket.get("used_pct")) for bucket in buckets
+            )
+        )
         ttl = PROVIDER_TTL_S.get(str(pool), AUTO_DEFAULT_TTL_S)
-        states[str(pool)] = (fetched, current_epoch - fetched <= ttl)
+        states[str(pool)] = (fetched, successful and current_epoch - fetched <= ttl, successful)
     return states
 
 

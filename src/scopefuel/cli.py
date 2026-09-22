@@ -479,6 +479,7 @@ def _gate_record(result: recommend.GateResult, exit_code: int, now: dt.datetime)
         "source_verification": result.source_verification,
         "source_label": result.source_label,
         "manual_observation_ids": list(result.manual_observation_ids),
+        "manual_observations": list(result.manual_observations),
         "measured_at": result.measured_at,
         "expires_at": result.expires_at,
         "observed_age_s": result.observed_age_s,
@@ -503,8 +504,30 @@ def _manual_gate_audit(
     remaining_effect_s = min(float(entry.get("remaining_effect_s") or 0.0) for entry in selected)
     measured_at = min(str(entry["measured_at"]) for entry in selected)
     expires_at = min(str(entry["expires_at"]) for entry in selected)
+    observations = tuple(
+        {
+            "manual_observation_id": entry["manual_observation_id"],
+            "account_ref": entry["account_ref"],
+            "entitlement_and_limits": entry["entitlement_and_limits"],
+            "window": entry["window"],
+            "measured_at": entry["measured_at"],
+            "entered_at": entry["entered_at"],
+            "expires_at": entry["expires_at"],
+            "supersedes_ref": entry["supersedes_ref"],
+            "status": entry["status"],
+            "source": manual.SOURCE,
+            "source_verification": manual.SOURCE_VERIFICATION,
+            "source_label": manual.SOURCE_LABEL,
+        }
+        for entry in selected
+    )
+    observation_ids = ",".join(str(entry["manual_observation_id"]) for entry in selected)
+    covered_windows = ",".join(str(entry["window"]) for entry in selected)
+    supersedes_prior = any(entry.get("supersedes_ref") is not None for entry in selected)
     audit = (
         f"source={manual.SOURCE} · {manual.SOURCE_LABEL} · "
+        f"수동 항목 {observation_ids} · covered limits {covered_windows} · "
+        f"supersedes {'yes' if supersedes_prior else 'no'} · "
         f"관측 {manual.format_age_seconds(observed_age_s)} 전 · "
         f"남은 효력 {manual.format_age_seconds(remaining_effect_s)} · "
         f"자동 측정 마지막 오류 {resolution.last_auto_error}"
@@ -516,6 +539,7 @@ def _manual_gate_audit(
         source_verification=manual.SOURCE_VERIFICATION,
         source_label=manual.SOURCE_LABEL,
         manual_observation_ids=tuple(str(entry["manual_observation_id"]) for entry in selected),
+        manual_observations=observations,
         measured_at=measured_at,
         expires_at=expires_at,
         observed_age_s=round(observed_age_s, 1),
@@ -600,6 +624,15 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         **_gate_args(args),
                     )
                     result = _manual_gate_audit(result, resolution)
+                elif resolution is not None:
+                    result = replace(
+                        result,
+                        reason=(
+                            f"{result.reason} "
+                            f"[manual fallback 불가: {resolution.failure_reason or 'reason unavailable'}]"
+                        ),
+                        last_auto_error=resolution.last_auto_error,
+                    )
     exit_code = 0 if result.ok else (4 if result.unmeasurable else 3)
 
     if args.gate_output:
@@ -625,10 +658,17 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 f" ref_resolution={result.ref_resolution or 'unverified'}"
             )
         if result.source == manual.SOURCE:
+            windows = ",".join(str(observation["window"]) for observation in result.manual_observations)
+            supersedes_prior = any(
+                observation.get("supersedes_ref") is not None for observation in result.manual_observations
+            )
             first_line += (
                 f" source={manual.SOURCE}"
                 f" source_verification={manual.SOURCE_VERIFICATION}"
                 " source_claim=self_reported_unverified"
+                f" manual_observation_ids={','.join(result.manual_observation_ids)}"
+                f" manual_windows={windows}"
+                f" manual_supersedes={'true' if supersedes_prior else 'false'}"
                 f" measured_at={result.measured_at}"
                 f" expires_at={result.expires_at}"
             )

@@ -213,6 +213,8 @@ def collect(
                 stale = _from_entry(entry, name, now, policy_class)
                 stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
                 stale.last_error = result.error
+                if result.hint:
+                    stale.last_error += f" — {result.hint}"
                 results[index] = stale
                 continue
 

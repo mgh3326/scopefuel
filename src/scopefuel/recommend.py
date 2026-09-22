@@ -1695,6 +1695,7 @@ class GateResult:
     source_verification: str | None = None
     source_label: str | None = None
     manual_observation_ids: tuple[str, ...] = ()
+    manual_observations: tuple[dict[str, object], ...] = ()
     measured_at: str | None = None
     expires_at: str | None = None
     observed_age_s: float | None = None

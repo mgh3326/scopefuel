@@ -86,6 +86,9 @@ scopefuel manual clear --pool claude
 - `source=operator`는 인증된 사람 신원이 아닙니다. 저장 항목, `manual list`, `--json`, gate receipt에
   항상 **자기신고 · 미검증**으로 표시합니다. 부모 프로세스 pid와 이름, 짧은 조상 요약, stdin/stdout
   TTY 여부, 알려진 에이전트 환경 변수의 존재 여부만 기록하며 환경 변수 값은 기록하지 않습니다.
+- 향후 hub 스키마와 맞추기 위한 `account_ref`와 `author_principal`도 로컬 host/pool 및 OS 사용자
+  기반의 **미검증 placeholder**일 뿐입니다. hub가 승격할 때 인증된 계정 binding과 human identity로
+  대체해야 하며, 로컬 값을 verified identity로 받아들이면 안 됩니다.
 - 자동 측정이 fresh이면 자동 값이 우선합니다. 401/403, 자동 cutoff 초과 확정, 정책 exclude는 수동
   값으로 숨길 수 없습니다. 필수 bucket이 모두 있어야 하며 없는 5h나 daily 값을 0으로 합성하지 않습니다.
 - 이 파일은 **현재 호스트에서만** 효력이 있습니다. 다른 기기로 전파되지 않으므로 각 기기에 별도로
