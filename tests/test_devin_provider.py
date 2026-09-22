@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -33,6 +34,10 @@ def _fixture(fixture_text) -> str:
 
 def _banner_fixture(fixture_text) -> str:
     return fixture_text("devin_banner")
+
+
+def _new_banner_fixture(fixture_text) -> str:
+    return fixture_text("devin_banner_3000_11_1")
 
 
 def _without_swe2_free(text: str) -> str:
@@ -280,9 +285,37 @@ def test_parse_banner_real_fixture_reads_daily_and_marks_weekly_unknown(fixture_
     assert labels["weekly"].note == devin.WEEKLY_UNKNOWN_NOTE
 
 
+def test_parse_banner_observed_3000_11_1_fixture_reads_daily(fixture_text):
+    result = devin.parse_banner(_new_banner_fixture(fixture_text))
+
+    assert result.error is None
+    assert result.plan == "Pro"
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 8.0
+    assert labels["daily"].note == "remaining 92%; resets in 5d 5h"
+    assert labels["weekly"].used_pct is None
+
+
+def test_parse_banner_rejects_unrelated_partial_unknown_and_out_of_range_text(fixture_text):
+    full = _new_banner_fixture(fixture_text)
+    partial = full[: full.index("Pro · 92% remaining")]
+    cases = [
+        partial,
+        "status: 92% remaining (resets in 5d 5h)",
+        "Team · 92% remaining (resets in 5d 5h)",
+        "Pro · 101% remaining (resets in 5d 5h)",
+        "Pro · 92% remaining (resets in someday)",
+    ]
+
+    for text in cases:
+        result = devin.parse_banner(text)
+        assert result.error is not None, text
+        assert result.buckets == [], text
+
+
 def test_parse_banner_format_mismatch_does_not_guess_used_pct():
     """AC5 형식 불일치 케이스: 배너는 있으나 쿼타 세그먼트가 다른 형식이면 fail-closed."""
-    mutated = "v3000.10.21 · Pro · quota 100 percent (resets in 1h 41m)"
+    mutated = "v3000.10.31 · Pro · quota 100 percent (resets in 1h 41m)"
 
     result = devin.parse_banner(mutated)
 
@@ -310,13 +343,13 @@ def _banner_probe_script(payload: str, *, banner_line: str) -> str:
         "  cat <<'EOF'\n" + payload + "EOF\n"
         "  exit 0\n"
         "fi\n"
-        "printf '%s\\r\\n' 'v3000.10.21'\n"
+        "printf '%s\\r\\n' 'v3000.10.31'\n"
         "sleep 0.05\n"
         f"printf '%s\\r\\n' '{banner_line}'\n"
     )
 
 
-_REDRAW_LINE = "\x1b[7A\x1b[Jv3000.10.21 · Pro · 100% remaining (resets in 1h 41m)"
+_REDRAW_LINE = "\x1b[7A\x1b[Jv3000.10.31 · Pro · 100% remaining (resets in 1h 41m)"
 
 
 def test_fetch_probes_banner_and_appends_swe2_bucket(tmp_path, monkeypatch, fixture_text):
@@ -334,6 +367,33 @@ def test_fetch_probes_banner_and_appends_swe2_bucket(tmp_path, monkeypatch, fixt
     assert result.source == "cli:banner+cli:models list"
     labels = [(b.label, b.used_pct, b.horizon) for b in result.buckets]
     assert ("daily", 0.0, "now") in labels
+    assert ("weekly", None, "week") in labels
+    assert ("swe-2", 0.0, "week") in labels
+
+
+def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(tmp_path, monkeypatch, fixture_text):
+    payload = _fixture(fixture_text)
+    banner = _new_banner_fixture(fixture_text)
+    binary = tmp_path / "fake-devin-new-banner-and-models"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = models ] && [ "$2" = list ]; then\n'
+        "  cat <<'EOF'\n" + payload + "EOF\n"
+        "  exit 0\n"
+        "fi\n"
+        "cat <<'EOF'\n" + banner + "EOF\n"
+    )
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert result.warning is None
+    assert result.plan == "Pro"
+    assert result.source == "cli:banner+cli:models list"
+    labels = {(b.label, b.used_pct, b.horizon) for b in result.buckets}
+    assert ("daily", 8.0, "now") in labels
     assert ("weekly", None, "week") in labels
     assert ("swe-2", 0.0, "week") in labels
 
@@ -361,7 +421,7 @@ def test_probe_banner_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypat
     binary.write_text(
         "#!/bin/sh\n"
         'printf \'LINES=%s COLUMNS=%s TERM=%s\\r\\n\' "$LINES" "$COLUMNS" "$TERM"\n'
-        "printf '%s\\r\\n' 'v3000.10.21'\n"
+        "printf '%s\\r\\n' 'v3000.10.31'\n"
         "sleep 0.05\n"
         f"printf '%s\\r\\n' '{_REDRAW_LINE}'\n"
     )
@@ -400,6 +460,37 @@ def test_banner_probe_timeout_is_reported_as_error(tmp_path, monkeypatch):
 
     assert result.error and "안에" in result.error
     assert result.buckets == []
+
+
+def test_banner_probe_timeout_is_finite():
+    assert math.isfinite(devin.TIMEOUT_S)
+    assert devin.TIMEOUT_S > 0
+
+
+def test_unreadable_banner_keeps_provider_and_gate_fail_closed(tmp_path, monkeypatch, capsys, fixture_text):
+    payload = _fixture(fixture_text)
+    binary = tmp_path / "fake-devin-unreadable-banner"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = models ] && [ "$2" = list ]; then\n'
+        "  cat <<'EOF'\n" + payload + "EOF\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\r\\n' 'status: 92% used'\n"
+    )
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert result.warning is not None
+    assert not any(bucket.label == "daily" and bucket.used_pct is not None for bucket in result.buckets)
+    monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
+    rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 4
+    assert "측정 불가" in out.err
 
 
 def test_child_env_sets_term_and_pty_dimensions(monkeypatch):
