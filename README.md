@@ -34,7 +34,8 @@ agy  [ok] 그룹별 독립: 3p 57.3% / gemini 7.4%
 - **horizon — 언제의 이야기인가**: `now`(5시간급 창) / `week`(주간급 창).
   "지금 워커를 띄울 수 있나"와 "이번 주 예산이 남았나"는 다른 질문이고, 라우팅 결정도 갈립니다.
 
-이 도구는 **읽기 전용**입니다. 토큰을 갱신하거나 한도를 조작하지 않습니다.
+provider와 계정에는 **읽기 전용**입니다. 토큰을 갱신하거나 provider 한도를 조작하지 않습니다.
+`manual` 명령만 로컬 감사 파일에 운영자가 본 관측을 추가합니다.
 
 ## 설치
 
@@ -62,6 +63,34 @@ scopefuel --list-providers
 캐시는 provider별 60초(`--cache-ttl`), 위치는 `~/.cache/scopefuel/snapshots.json`
 (`SCOPEFUEL_CACHE`로 변경). 조회가 실패하면 **6시간 이내의 마지막 스냅샷으로 폴백하되 나이를 함께
 표시**합니다 — 옛 값을 신선한 값처럼 보여주지 않는 것이 원칙입니다.
+
+## manual — 로컬 수동 관측
+
+자동 측정이 429, 파싱 오류, 전송 오류로 막혔을 때 화면에서 직접 본 값을 짧게 공급할 수 있습니다.
+
+```bash
+scopefuel manual set --pool claude --window 5h --used 18 \
+  --measured-at now --resets-in 3h40m --reason "usage 화면 확인"
+scopefuel manual set --pool claude --window 7d --used 77 \
+  --measured-at now --resets-at 2026-09-25T00:00:00Z --reason "usage 화면 확인" --ttl 30m
+scopefuel manual list
+scopefuel manual clear --pool claude
+```
+
+- 저장소는 자동 snapshot과 분리된 `~/.cache/scopefuel/manual.json`이며 권한은 0600입니다.
+  `SCOPEFUEL_CACHE`를 지정하면 같은 디렉터리의 `manual.json`을 사용합니다. 이력은 append-only이고
+  clear도 삭제가 아니라 감사 이벤트입니다.
+- 기본 TTL은 15분, 상한은 2시간입니다. 효력은 입력 시각이 아니라 `--measured-at`부터 세며 reset
+  경계가 더 이르면 거기서 끝납니다. 오래된 화면을 늦게 입력하거나 같은 값을 다시 넣어도 수명이
+  새로 시작되지 않습니다.
+- `source=operator`는 인증된 사람 신원이 아닙니다. 저장 항목, `manual list`, `--json`, gate receipt에
+  항상 **자기신고 · 미검증**으로 표시합니다. 부모 프로세스 pid와 이름, 짧은 조상 요약, stdin/stdout
+  TTY 여부, 알려진 에이전트 환경 변수의 존재 여부만 기록하며 환경 변수 값은 기록하지 않습니다.
+- 자동 측정이 fresh이면 자동 값이 우선합니다. 401/403, 자동 cutoff 초과 확정, 정책 exclude는 수동
+  값으로 숨길 수 없습니다. 필수 bucket이 모두 있어야 하며 없는 5h나 daily 값을 0으로 합성하지 않습니다.
+- 이 파일은 **현재 호스트에서만** 효력이 있습니다. 다른 기기로 전파되지 않으므로 각 기기에 별도로
+  입력해야 합니다. 향후 계정별 hub 저장소가 이 스키마를 승격하기 전까지 중앙 인증이나 동기화를
+  주장하지 않습니다.
 
 ## gate — 프로필 스폰 판정
 

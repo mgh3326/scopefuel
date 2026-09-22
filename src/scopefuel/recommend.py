@@ -1690,6 +1690,16 @@ class GateResult:
     # REF 해석 시도 결과. scopefuel 은 hk 저장소 클라이언트를 갖지 않으므로
     # 주장된 REF 는 항상 "unverified" 로만 기록한다 — verified 를 주장하지 않는다.
     ref_resolution: str | None = None
+    # task #579 — local manual quota observation audit fields (additive).
+    source: str | None = None
+    source_verification: str | None = None
+    source_label: str | None = None
+    manual_observation_ids: tuple[str, ...] = ()
+    measured_at: str | None = None
+    expires_at: str | None = None
+    observed_age_s: float | None = None
+    remaining_effect_s: float | None = None
+    last_auto_error: str | None = None
 
 
 def _find_profile(
