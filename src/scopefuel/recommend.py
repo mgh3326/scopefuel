@@ -1037,7 +1037,16 @@ _SOL_PROFILES = frozenset({"codex-sol", "kiro-sol"})
 
 # These launcher spellings exist for director-controlled workflows, but they
 # are never recommendation candidates and must fail the ordinary quota gate.
+# task #527: this set IS the astra model identification — membership decides
+# the role gate, not a substring match on the profile name (a name containing
+# "astra" but absent here is an ordinary profile).
 ASTRA_ROLE_PROFILES = frozenset({"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"})
+
+# task #527 / decision 2376: the only purposes for which an astra identity may
+# proceed to the quota check — director 판정 · architect 자문 · 운영자 요청
+# 자문. Compared after strip().casefold(); anything else (including a missing
+# purpose) is a role denial, independent of quota state.
+ASTRA_ALLOWED_PURPOSES = frozenset({"director", "architect", "operator-request"})
 
 # ROB-591: profiles that are operator-explicit consultation-only — never a
 # GRADE_TABLE entry, never a recommendation/escalation candidate, but an
@@ -1165,7 +1174,10 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     """Return (provider_id, group_name_if_group_scope)."""
     if profile in ("opus", "sonnet", "fable", "haiku"):
         return "claude", None
-    if profile.startswith("codex") or profile == "claudex":
+    # ASTRA_ROLE_PROFILES 멤버(런처 철자 + 모델 id gpt-6-astra)는 전부 같은
+    # codex pool 의 모델을 가리킨다 — 허용 용도의 astra 게이트가 어느 철자로도
+    # 같은 쿼타를 본다.
+    if profile.startswith("codex") or profile == "claudex" or profile in ASTRA_ROLE_PROFILES:
         return "codex", None
     if profile in ("agy", "agy-flash", "agy-flash-med", "agy-pro"):
         return "agy", "gemini"
@@ -1748,6 +1760,11 @@ class GateResult:
     # REF 해석 시도 결과. scopefuel 은 hk 저장소 클라이언트를 갖지 않으므로
     # 주장된 REF 는 항상 "unverified" 로만 기록한다 — verified 를 주장하지 않는다.
     ref_resolution: str | None = None
+    # task #527 — astra role gate. True only for role denials (astra identity
+    # outside ASTRA_ALLOWED_PURPOSES): the CLI maps this to exit 5 so callers
+    # can tell it apart from a quota/policy refusal (exit 3) — the two must
+    # never share an exit code (hk:doc decision/2026-09-21/…-approved).
+    role_denied: bool = False
     # task #579 — local manual quota observation audit fields (additive).
     source: str | None = None
     source_verification: str | None = None
@@ -1866,6 +1883,7 @@ def gate_check(
     grade_table: dict[Grade, list[Profile]] | None = None,
     operator_request: str | None = None,
     requested_by: str | None = None,
+    purpose: str | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -1879,20 +1897,37 @@ def gate_check(
     건너뛰고, 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로 적용된다. 이것은
     감사 가능한 주장의 기록이지 신원·동의의 증명이 아니며, REF 는 항상
     ``ref_resolution=unverified`` 로만 기록된다.
+
+    ``purpose``(task #527)는 astra 역할 게이트의 용도 입력이다. ASTRA_ROLE_PROFILES
+    멤버(모델 식별 — 이름 substring 이 아니다)는 ``purpose`` 가
+    ASTRA_ALLOWED_PURPOSES 에 속할 때만 아래 쿼타 검사로 진행하고, 그 외(미지정·
+    오타·builder/worker/tester 등)에는 쿼타와 무관하게 ``role_denied=True`` 로
+    거부한다. 비-astra 프로필에서는 무시된다.
     """
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
     table = GRADE_TABLE if grade_table is None else grade_table
 
-    if "astra" in profile_name.casefold():
-        return GateResult(
-            ok=False,
-            profile=profile_name,
-            provider_id="codex",
-            grade=None,
-            reason=f"{profile_name} 역할 제한 — Astra는 director 판정 전용",
-        )
+    # task #527: astra 판별은 ASTRA_ROLE_PROFILES 멤버십(모델 식별)이다 — 이름에
+    # "astra" 가 든 무관 프로필은 여기에 걸리지 않는다. 허용 용도가 아니면 쿼타
+    # 상태와 무관하게 역할 거부(role_denied → CLI exit 5) — 쿼타 거부(exit 3)와
+    # 같은 rc 로 나가면 호출자가 "쿼타 소진"으로 오독한다(ARCHITECT.md:6 결함).
+    if profile_name in ASTRA_ROLE_PROFILES:
+        normalized_purpose = (purpose or "").strip().casefold()
+        if normalized_purpose not in ASTRA_ALLOWED_PURPOSES:
+            shown = purpose.strip() if purpose and purpose.strip() else "미지정"
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id="codex",
+                grade=None,
+                reason=(
+                    f"role_restricted: {profile_name} — astra 는 허용 용도 전용 "
+                    f"({', '.join(sorted(ASTRA_ALLOWED_PURPOSES))}); purpose={shown}"
+                ),
+                role_denied=True,
+            )
 
     provider_id, group_name = profile_pool(profile_name)
 
