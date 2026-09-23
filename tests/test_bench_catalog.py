@@ -9,6 +9,7 @@ and a flag meant for quota snapshots that reaches the catalog's cache.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
@@ -486,3 +487,47 @@ def test_a_profile_keyed_only_on_its_default_row_still_lands(catalog_server):
 
     table = bench.runtime_grade_table()
     assert any(p.name == "grok-hi" for p in table["S"])
+
+
+def test_a_ttl_above_the_stale_ceiling_cannot_keep_serving_the_cache(catalog_server):
+    """`catalog_stale_max_s` is the safety bound; a larger TTL must not outrank it."""
+
+    _, fake = catalog_server
+    config = bench.pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "scopefuel" / "config.toml"
+    config.write_text(
+        '[bench]\nbackend = "handoffkeep"\ncatalog_ttl_s = 1000000000000\ncatalog_stale_max_s = 60\n',
+        encoding="utf-8",
+    )
+    bench.read_catalog()
+    _age_catalog_cache(172800)
+    fake.offline = True
+
+    view = bench.read_catalog()
+    assert view.source == "snapshot"
+    assert view.stale is True
+
+
+def test_a_cache_stamped_in_the_future_is_refetched_not_trusted_forever(catalog_server):
+    """A stamp ahead of the clock is a broken cache, not a very fresh one.
+
+    Clamping its age to 0 pinned the host to that cache permanently — no server
+    change ever arrived again.
+    """
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute(
+            "UPDATE bench_cache_meta SET fetched_at = ? WHERE scope = 'catalog'",
+            ("9999-01-01T00:00:00+00:00",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    bench.reset_catalog_memo()
+
+    fake.catalog = [_row("opus", "high", "claude-opus-99", "claude", "S+")]
+    view = bench.read_catalog()
+    assert view.source == "server"
+    assert any(entry.model_id == "claude-opus-99" for entry in view.entries)

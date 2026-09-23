@@ -46,6 +46,9 @@ DEFAULT_CACHE_TTL_S = 6 * 60 * 60
 # demotion is always labelled ``stale`` (2558: a down server is not free rein).
 DEFAULT_CATALOG_TTL_S = 60 * 60
 DEFAULT_CATALOG_STALE_MAX_S = 24 * 60 * 60
+# Tolerance for a cache stamp ahead of the local clock before it is treated as
+# corrupt rather than fresh. NTP steps and container clock drift are seconds.
+_CACHE_CLOCK_SKEW_S = 60.0
 # CWE-319: the bearer token must never leave the process over plaintext HTTP,
 # except to a local test/dev server where "plaintext" never leaves the host.
 _HANDOFFKEEP_PLAINTEXT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -2391,11 +2394,21 @@ def _read_catalog_uncached(backend: BenchBackend, *, path: pathlib.Path | str | 
     if row is not None and row["endpoint_id"] == backend.endpoint_id:
         fetched_at = _cached_at(row["fetched_at"])
         if fetched_at is not None:
-            age_s = max(0.0, (now - fetched_at).total_seconds())
+            age = (now - fetched_at).total_seconds()
+            # A stamp from the future is not a very fresh cache, it is a broken
+            # one — a clock skew or a corrupted row. Clamping it to age 0 pinned
+            # the host to that cache forever and no server change ever arrived.
+            age_s = age if age >= -_CACHE_CLOCK_SKEW_S else None
+            if age_s is not None:
+                age_s = max(0.0, age_s)
     if age_s is None:
         cached = []
 
-    if cached and age_s is not None and age_s < backend.catalog_ttl_s:
+    # ``catalog_stale_max_s`` is a ceiling on trusting the cache at all, so a TTL
+    # configured above it must not be able to keep serving a cache the ceiling
+    # has already condemned.
+    fresh_before = min(backend.catalog_ttl_s, backend.catalog_stale_max_s)
+    if cached and age_s is not None and age_s < fresh_before:
         return CatalogView(
             entries=tuple(cached),
             source=CATALOG_SOURCE_CACHE,

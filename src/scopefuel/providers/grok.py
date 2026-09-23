@@ -239,6 +239,20 @@ def _probe_once() -> str:
                 # pty — and replacing the real TimeoutExpired with its own.
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     process.wait(timeout=2.0)
+        # The direct child exiting is not the end of the probe's descendants. A
+        # CLI that backgrounds a helper and returns 0 leaves that helper running,
+        # and the block above skips entirely because ``process.poll()`` is not
+        # None — the success path leaked where the timeout path did not. Sweep
+        # the instance directory unconditionally, by cwd, before it is removed:
+        # after this returns, proctrack has no cwd left to recognise them by.
+        # The direct child exiting is not the end of the probe's descendants. A
+        # CLI that backgrounds a helper and returns 0 leaves that helper running,
+        # and the block above skips entirely because ``process.poll()`` is not
+        # None — the success path leaked where the timeout path did not. Sweep
+        # the instance directory unconditionally, by cwd, before it is removed:
+        # once it is gone proctrack has no cwd left to recognise them by.
+        with contextlib.suppress(OSError):
+            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
         if child_pgid is not None:
             proctrack.unregister(child_pgid)
         if reaper is not None:

@@ -245,6 +245,27 @@ def _default_effort(profile: str, rows: list[CatalogEntry]) -> tuple[str, str]:
     return chosen, chosen
 
 
+def _normalize_effort(effort: str | None) -> str | None:
+    """Fold an effort to the spelling the catalog is keyed on.
+
+    Rung names are a closed lowercase vocabulary, so ``HIGH`` and ``"high "``
+    name the same rung. Matching them raw let a caller miss an exact gated row
+    and land on the profile's default placement instead — a gate bypass spelled
+    with a capital letter.
+    """
+
+    if effort is None:
+        return None
+    normalized = effort.strip().lower()
+    return normalized or None
+
+
+def _retired_rung(view: CatalogView, profile: str, effort: str) -> bool:
+    return any(
+        entry.profile == profile and entry.effort == effort and entry.retired_at for entry in view.entries
+    )
+
+
 def resolve_launch(
     profile: str,
     *,
@@ -256,9 +277,9 @@ def resolve_launch(
     """Resolve one launch against the canon, refusing to widen while stale.
 
     Raises :class:`LaunchError` rather than inventing a value: an unknown
-    profile, an effort rung the catalog does not carry, or a non-default gate
-    without ``--operator-request``.  A server outage is not an argument for any
-    of those (hk:doc 2558 — a down server is not free dispatch).
+    profile, a rung the catalog retired, or a gate the caller has not been
+    cleared for. A server outage is not an argument for any of those (hk:doc
+    2558 — a down server is not free dispatch).
     """
 
     view = read_catalog(path=path) if view is None else view
@@ -270,32 +291,34 @@ def resolve_launch(
             + (" (catalog=stale — bundled snapshot only)" if view.stale else "")
         )
 
-    if effort:
-        matched = [row for row in rows if row.effort == effort]
-        if not matched:
-            # The catalog enumerates rungs to say where each one is *placed*, not
-            # to list which rungs the CLI accepts — ``wrk -m codex`` runs Sol at
-            # effort high, a rung the grade table has never placed. A rung the
-            # catalog says nothing about is answered from the profile's default
-            # placement rather than refused, which keeps the launcher's existing
-            # spellings working and never grants more than that default row
-            # already grants. An *enumerated* rung still wins exactly, so a rung
-            # the operator did gate keeps its gate.
-            fallback_effort, _ = _default_effort(canonical, rows)
-            matched = [row for row in rows if row.effort == fallback_effort]
-            if not matched:
-                available = ", ".join(sorted(r.effort or "(default)" for r in rows))
-                raise LaunchError(
-                    f"profile '{profile}' has no '{effort}' rung in the catalog (have: {available})"
-                )
-        row = matched[0]
-        resolved_effort = effort
+    requested = _normalize_effort(effort)
+    if requested:
+        resolved_effort = requested
+        fallback_effort, _ = _default_effort(canonical, rows)
     else:
-        catalog_effort, resolved_effort = _default_effort(canonical, rows)
-        matched = [row for row in rows if row.effort == catalog_effort]
+        fallback_effort, resolved_effort = _default_effort(canonical, rows)
+
+    # The row whose gate and grade apply is the row for the rung actually being
+    # launched. Resolving the rung first and only then looking it up is what
+    # keeps `policy launch opus` (no --effort, default rung high) from landing on
+    # the profile-default row's permissive gate while the canon has gated the
+    # high rung specifically.
+    matched = [row for row in rows if row.effort == resolved_effort]
+    if not matched:
+        if _retired_rung(view, canonical, resolved_effort):
+            raise LaunchError(f"profile '{profile}' rung '{resolved_effort}' is retired in the catalog")
+        # The catalog enumerates rungs to say where each one is *placed*, not to
+        # list which rungs the CLI accepts — ``wrk -m codex`` runs Sol at effort
+        # high, a rung the grade table has never placed. A rung the catalog says
+        # nothing about takes the profile's default placement, which is never
+        # more permissive than that default row already is.
+        matched = [row for row in rows if row.effort == fallback_effort]
         if not matched:
-            raise LaunchError(f"profile '{profile}' has no resolvable default rung in the catalog")
-        row = matched[0]
+            available = ", ".join(sorted(r.effort or "(default)" for r in rows))
+            raise LaunchError(
+                f"profile '{profile}' has no '{resolved_effort}' rung in the catalog (have: {available})"
+            )
+    row = matched[0]
 
     # The gate rules. consult_only always needs an explicit operator request.
     # A non-default gate under a stale catalog needs one too: the snapshot saying

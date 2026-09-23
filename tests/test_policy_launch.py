@@ -174,3 +174,76 @@ def test_stale_json_discloses_the_source(stale_catalog, capsys):
     assert payload["catalog"]["stale"] is True
     assert payload["catalog"]["source"] == "snapshot"
     assert "catalog=stale" in captured.err
+
+
+# --- independent tester findings (#593 verify r1) ---------------------------
+
+
+def _view(*entries, source="server", backend="handoffkeep"):
+    return bench.CatalogView(entries=tuple(entries), source=source, backend=backend)
+
+
+def _entry(profile, effort, grade, gate="default", retired_at=None):
+    return bench.CatalogEntry(
+        profile=profile,
+        effort=effort,
+        model_id="claude-opus-5-5",
+        pool="claude",
+        grade=grade,
+        gate=gate,
+        retired_at=retired_at,
+    )
+
+
+def test_omitting_the_effort_flag_does_not_bypass_that_rungs_gate():
+    """The gate that applies is the gate on the rung actually being launched.
+
+    With (opus, high) gated consult_only and a permissive profile-default row
+    present, `policy launch opus` resolved its default rung to high and then read
+    the *default row's* gate — launching precisely the rung the operator had
+    gated, as long as the caller omitted --effort.
+    """
+
+    view = _view(
+        _entry("opus", "high", "S+", gate="consult_only"),
+        _entry("opus", "", "S+"),
+    )
+    with pytest.raises(launch.LaunchError, match="consult_only"):
+        launch.resolve_launch("opus", view=view)
+    with pytest.raises(launch.LaunchError, match="consult_only"):
+        launch.resolve_launch("opus", effort="high", view=view)
+
+
+@pytest.mark.parametrize("spelling", ["HIGH", "high ", " High", "HiGh"])
+def test_effort_spelling_does_not_bypass_a_gate(spelling):
+    """Rung names are a closed lowercase vocabulary; matching them raw let a
+    capital letter miss the gated row and fall through to the default placement."""
+
+    view = _view(
+        _entry("opus", "medium", "A"),
+        _entry("opus", "high", "S+", gate="consult_only"),
+    )
+    with pytest.raises(launch.LaunchError, match="consult_only"):
+        launch.resolve_launch("opus", effort=spelling, view=view)
+
+
+def test_a_retired_rung_is_refused_not_served_by_the_default_row():
+    """Retiring a rung has to mean something. Without this the default row
+    silently answered for the rung the operator had just withdrawn."""
+
+    view = _view(
+        _entry("opus", "high", "S+", retired_at="2026-09-23T00:00:00Z"),
+        _entry("opus", "", "S+"),
+    )
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch("opus", effort="high", view=view)
+
+
+def test_a_gated_rung_still_resolves_with_an_operator_request():
+    view = _view(
+        _entry("opus", "high", "S+", gate="consult_only"),
+        _entry("opus", "", "S+"),
+    )
+    decision = launch.resolve_launch("opus", operator_request=True, view=view)
+    assert decision.effort == "high"
+    assert decision.gate == "consult_only"

@@ -169,3 +169,33 @@ def test_a_sigkilled_probe_leaves_no_orphan(tmp_path):
         for pid in proctrack.pids_with_cwd(workdir, nested=True):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
+
+
+def test_a_backgrounded_grandchild_does_not_survive_a_successful_probe(tmp_path, monkeypatch):
+    """The success path leaked where the timeout path did not.
+
+    A CLI that backgrounds a helper and returns 0 leaves the direct child dead,
+    so the kill block is skipped entirely — and the instance directory is then
+    removed, taking with it the only thing proctrack identifies descendants by.
+    """
+
+    workdir = tmp_path / "grok-probe-workdir"
+    pidfile = tmp_path / "grandchild.pid"
+    fake = tmp_path / "fake-grok-backgrounder"
+    fake.write_text(f"#!/bin/sh\nsleep 120 &\necho $! > {pidfile}\nexit 0\n")
+    fake.chmod(fake.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(grok, "BINARY", str(fake))
+    monkeypatch.setattr(grok, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(grok, "TIMEOUT_S", 2.0)
+    monkeypatch.setattr(grok, "STARTUP_DELAY_S", 0.05)
+
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        grok._probe_once()
+
+    pid = int(pidfile.read_text())
+    try:
+        assert _wait_gone([pid], timeout=10) == [], "a backgrounded grandchild outlived a successful probe"
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
