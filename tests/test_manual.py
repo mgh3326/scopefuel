@@ -395,7 +395,8 @@ def test_measured_at_older_than_two_hours_is_expired(claude_error_registry, caps
 
     rc = cli.main(["gate", "-m", "opus", "--no-cache"])
     assert rc == 4
-    assert "측정 불가" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "측정 불가" in err or "속도 제한" in err  # #576: 429 는 속도 제한으로 구분 표기
 
     assert cli.main(["--json", "manual", "list"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -712,8 +713,13 @@ def test_cache_stale_fallback_preserves_structured_last_error_without_persisting
     )
     assert second[0].stale is True
     assert second[0].last_error == "HTTP 429 rate limit"
-    snapshot_text = cache.cache_path().read_text(encoding="utf-8")
-    assert "last_error" not in snapshot_text
+    # #576: 실패 감사(last_error*)는 엔트리 수준에 기록되지만, 저장된 정상 스냅샷
+    # payload(result)에는 절대 섞이지 않는다.
+    entry = json.loads(cache.cache_path().read_text(encoding="utf-8"))["claude"]
+    assert "last_error" not in entry["result"]
+    assert entry["last_error"] == "HTTP 429 rate limit"
+    assert entry["last_error_at"] == 1100.0
+    assert entry["last_error_kind"] == "rate_limited"
 
 
 def test_corrupt_or_verified_claim_store_fails_closed_without_overwrite(claude_error_registry, capsys):

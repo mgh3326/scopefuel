@@ -34,6 +34,10 @@ class FetcherWrapper:
     def __call__(self) -> ProviderResult:
         return self.fn()  # type: ignore[no-any-return]
 
+    def __getattr__(self, name: str) -> object:
+        # 감싼 callable의 부가 probe(예: current_account_fp)를 그대로 노출한다.
+        return getattr(self.fn, name)
+
 
 def _with_class(fn: object, pool_class: PoolClass) -> Fetcher:
     """callable을 감싸 pool_class 메타데이터를 부여한다."""
