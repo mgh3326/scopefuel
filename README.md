@@ -166,7 +166,16 @@ $ scopefuel bench push-catalog seed.json   # 운영자 토큰 전용
 
 서버 불가·stale은 "마지막으로 확인된 정본의 재현"까지만 허용합니다: `consult_only`는 절대 완화되지
 않고, stale 상태의 비-`default` gate는 `--operator-request`를 요구합니다("서버 다운 ≠ 자유 배정").
-정본이 아닌 값으로 동작하는 경로는 모두 `catalog=stale`로 표시됩니다.
+
+정본이 아닌 출처는 세 가지로 구분해 표시하며, `stale`은 그중 하나뿐입니다 — 셋을 뭉뚱그리면
+"서버가 죽었다"와 "이 호스트는 원래 서버를 안 본다"가 같은 경고가 되어 둘 다 무시됩니다.
+
+| `catalog.source` | 뜻 | `stale` |
+|---|---|---|
+| `cache` | TTL 내 캐시, 또는 서버 불가지만 `catalog_stale_max_s` 이내 — 정본의 사본 | false |
+| `unsupported` | 엔드포인트가 404 — 그 배포본에 카탈로그 라우트가 없다. `/v1/bench/grades` 투영으로 계속 | false |
+| `snapshot` (backend=local) | 이 호스트는 정본을 읽도록 설정돼 있지 않다 | false |
+| `snapshot` (backend=handoffkeep) | 읽어야 할 정본을 잃었다 | **true** |
 
 호스트 전환 방법·실패 정책·머지 후 실행 절차는
 [docs/catalog-server-mode.md](docs/catalog-server-mode.md)를 보세요.

@@ -49,8 +49,10 @@ Not fail-open and not fail-closed — the axis is *what the action does*, not
 * **Widening fails closed.** A server being down is never the reason something
   became easier to start (hk:doc 2558, "a down server is not free dispatch"):
   * `gate = consult_only` is never relaxed — `--operator-request` always required;
-  * while `catalog=stale`, any non-`default` gate requires `--operator-request`,
-    even if the snapshot says `default`: the canon may have raised that gate since;
+  * while `catalog=stale`, ordinary `default`-gate launches carry on unchanged
+    (rc 0, labelled) — only a non-`default` gate additionally requires
+    `--operator-request`, even where the snapshot says the gate is `default`,
+    because the canon may have raised it since the last successful read;
   * a profile absent from the snapshot is refused (`rc 3`), never defaulted.
 * **Disclosure is the precondition.** Every non-canonical path is labelled —
   `scopefuel --recommend` prints a `catalog=…` line, `policy launch --json`
@@ -58,9 +60,15 @@ Not fail-open and not fail-closed — the axis is *what the action does*, not
   the spawn brief header. Fail-open without a label is just fail-open.
 
 **Known limit:** a stale host reverts to the snapshot's *placements*. If an
-operator had demoted a profile server-side, a long outage restores the
-pre-demotion placement. `catalog_stale_max_s` bounds the window and the label
-makes it visible, but the snapshot cannot preserve a demotion it never saw.
+operator had demoted a profile server-side, an outage restores the pre-demotion
+placement — and `catalog_stale_max_s` does **not** bound how long that lasts. It
+only bounds how long the *cache* is still trusted; past it the host switches to
+the bundled snapshot and stays there for as long as the server is unreachable.
+What the setting buys is that the switch happens, visibly, rather than a stale
+cache being served indefinitely. The snapshot cannot preserve a demotion it never
+saw, so the mitigation is the label, not the timeout: a host reporting
+`catalog=stale` is dispatching from reviewed-at-merge-time placements, and
+restoring the canon is the only thing that restores the demotion.
 
 ## Switching a host to server mode
 
@@ -152,23 +160,42 @@ mode with no `[bench]` section at all.
 $ scopefuel bench catalog status
 backend=handoffkeep reason=auto-credentials      # or reason=configured
 
-# 1. record the placement
+# 1. record the placement on the legacy grades route. The server mirrors this
+#    into the catalog's *profile-default* row (effort ""), which is what a
+#    pre-catalog client reads.
 $ scopefuel bench grades set \
     --profile opus \
     --grade S+ \
     --deviation-ref hk:doc/note/2026-09-23/model-refresh-opus55-gpt6-grok47
 
-# 2. confirm — server and code columns must agree, with no ⚠ drift line
+# 2. 🔴 the grades route moves ONLY that default row. runtime_grade_table() places
+#    opus from its per-rung catalog rows (high/xhigh/medium/max), so once the
+#    catalog is seeded the rungs must be written on the catalog route too, or
+#    `--recommend` will not move. Write the rungs you intend to place:
+$ cat > /tmp/opus-s-plus.json <<'JSON'
+{"catalog": [
+  {"profile": "opus", "effort": "high",  "model_id": "claude-opus-5-5", "pool": "claude",
+   "grade": "S+", "gate": "default", "decided_by": "operator-desk",
+   "deviation_ref": "hk:doc/note/2026-09-23/model-refresh-opus55-gpt6-grok47"},
+  {"profile": "opus", "effort": "xhigh", "model_id": "claude-opus-5-5", "pool": "claude",
+   "grade": "S+", "gate": "default", "decided_by": "operator-desk",
+   "deviation_ref": "hk:doc/note/2026-09-23/model-refresh-opus55-gpt6-grok47"}
+]}
+JSON
+$ HANDOFFKEEP_TOKEN="$HANDOFFKEEP_TOKEN_operator" scopefuel bench push-catalog /tmp/opus-s-plus.json
+
+# 3. confirm — server and code columns must agree, with no ⚠ drift line
 $ scopefuel bench grades list
 profile server table
 opus server=S+ table=S+
+$ scopefuel bench catalog list | grep '^S+ opus'
 
-# 3. confirm the launcher consumes it
+# 4. confirm the launcher consumes it
 $ scopefuel policy launch opus --json
 {"catalog":{"source":"server","stale":false,...},"effort":"high","model_id":"claude-opus-5-5",...}
 ```
 
-Step 1 writes to handoffkeep. Nothing in the #593 PRs performs a server write.
+Steps 1 and 2 write to handoffkeep. Nothing in the #593 PRs performs a server write.
 
 ## Quota measurement note
 

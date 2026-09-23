@@ -459,3 +459,30 @@ def test_a_non_404_http_error_is_an_outage_not_a_missing_route(catalog_server, m
     view = bench.read_catalog()
     assert view.source == "snapshot"
     assert view.stale is True
+
+
+def test_a_legacy_grades_write_does_not_add_a_phantom_candidate(catalog_server):
+    """`bench grades set` mirrors into the catalog's profile-default row. With
+    enumerated rungs already present, admitting that row too would list the
+    profile twice — once with an effort and once without."""
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    fake.catalog = _seed_rows() + [_row("opus", "", "claude-opus-5-5", "claude", "S+")]
+    _age_catalog_cache(3601)
+
+    table = bench.runtime_grade_table()
+    opus_rows = [p for profiles in table.values() for p in profiles if p.name == "opus"]
+    assert sorted(p.launcher_effort for p in opus_rows) == ["high", "xhigh"]
+
+
+def test_a_profile_keyed_only_on_its_default_row_still_lands(catalog_server):
+    """The skip above must not drop a profile whose single row *is* the default."""
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    fake.catalog = _seed_rows() + [_row("grok-hi", "", "grok-4.7", "grok", "S", score=67.9)]
+    _age_catalog_cache(3601)
+
+    table = bench.runtime_grade_table()
+    assert any(p.name == "grok-hi" for p in table["S"])

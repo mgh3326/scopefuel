@@ -2636,9 +2636,18 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
         for profile in profiles:
             templates.setdefault((profile.name, profile.launcher_effort or ""), profile)
 
+    # A profile-default row (effort "") is the legacy /v1/bench/grades projection
+    # of the profile's default placement, not an extra launchable rung. Once the
+    # same profile carries enumerated rungs, admitting both would list it twice —
+    # once with an effort and once without — and a `bench grades set` during the
+    # rollout would silently add that phantom candidate.
+    enumerated = {entry.profile for entry in live if entry.effort}
+
     proposed: dict[str, list] = {grade: [] for grade in GRADE_TABLE}
     for entry in sorted(live, key=_catalog_sort_key):
         if entry.gate == "consult_only":
+            continue
+        if not entry.effort and entry.profile in enumerated:
             continue
         if entry.grade not in proposed:
             return None
