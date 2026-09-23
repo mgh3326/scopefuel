@@ -14,7 +14,7 @@ import sys
 import time
 from dataclasses import replace
 
-from . import bench, herdr, manual, recommend, render, served
+from . import bench, herdr, launch, manual, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -150,6 +150,22 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
     clear_parser.add_argument("pool", help="provider pool 이름")
 
+    launch_parser = policy_sub.add_parser(
+        "launch",
+        help="프로필의 정본 model_id·기본 effort·pool·gate (wrk 등 런처가 소비)",
+    )
+    launch_parser.add_argument("profile", help="카탈로그 프로필 이름")
+    launch_parser.add_argument(
+        "--effort",
+        help="effort 단계를 명시 고정 (생략 시 카탈로그·런처 기본값)",
+    )
+    launch_parser.add_argument("--json", action="store_true", help="JSON 한 줄로 출력")
+    launch_parser.add_argument(
+        "--operator-request",
+        action="store_true",
+        help="운영자 명시 요청 — consult_only 및 stale 상태의 비-default gate 에 필요",
+    )
+
     manual_parser = subparsers.add_parser("manual", help="로컬 수동 쿼타 관측 관리")
     manual_sub = manual_parser.add_subparsers(dest="manual_command", required=True)
 
@@ -201,6 +217,25 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     grades_set.add_argument("--deviation-ref", required=True)
     grades_set.add_argument("--boundary-version")
     grades_sub.add_parser("list", help="서버 급 배치와 코드 표 비교")
+
+    push_catalog = bench_sub.add_parser(
+        "push-catalog", help="(profile, effort) 카탈로그를 handoffkeep 에 기록 — 운영자 토큰"
+    )
+    push_catalog.add_argument("json", nargs="?", help="카탈로그 행 JSON 파일 (C1 스키마)")
+    push_catalog.add_argument(
+        "--emit-seed",
+        action="store_true",
+        help="쓰지 않고, 번들 스냅샷에서 만든 최초 시드 JSON 을 stdout 으로",
+    )
+    push_catalog.add_argument(
+        "--decided-by", help="--emit-seed 가 각 행에 넣을 provenance (카탈로그 route 필수 필드)"
+    )
+    push_catalog.add_argument("--deviation-ref", help="--emit-seed 가 각 행에 넣을 근거 참조 (예: hk:doc/…)")
+
+    catalog_parser = bench_sub.add_parser("catalog", help="정본 카탈로그 조회")
+    catalog_sub = catalog_parser.add_subparsers(dest="catalog_command", required=True)
+    catalog_sub.add_parser("list", help="카탈로그 행 전체")
+    catalog_sub.add_parser("status", help="backend·카탈로그 출처·stale·미커버 프로필")
 
     reps_parser = subparsers.add_parser("reps", help="실측 대표 실행 기록")
     reps_sub = reps_parser.add_subparsers(dest="reps_command", required=True)
@@ -370,6 +405,9 @@ def _policy_command(
         print(f"{args.pool} -> {', '.join(parts)}")
         return 0
 
+    if args.policy_command == "launch":
+        return _policy_launch_command(args)
+
     if args.policy_command == "clear":
         if clear_policy(args.pool):
             print(f"{args.pool} policy cleared")
@@ -441,6 +479,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     bench_scores = bench.read_scores()
     model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
+    catalog = bench.read_catalog()
     print(
         recommend.recommend(
             results,
@@ -454,6 +493,10 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             grade_table=grade_table,
         )
     )
+    # Provenance line, always printed: a table that silently came from the
+    # bundled snapshot instead of the canon is the failure this whole change
+    # exists to make impossible to miss (hk:doc 2558).
+    print(catalog.label)
     return 0
 
 
@@ -688,6 +731,67 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     return exit_code
 
 
+def _policy_launch_command(args: argparse.Namespace) -> int:
+    """Resolve one launch. rc 3 is a refusal, rc 2 is a usage/plumbing error.
+
+    The two are kept apart because a launcher has to react differently: rc 3
+    means "the canon says no" (do not start), rc 2 means "scopefuel could not
+    answer" (fall back to the bundled values and say so).
+    """
+
+    try:
+        decision = launch.resolve_launch(
+            args.profile,
+            effort=args.effort,
+            operator_request=bool(args.operator_request),
+        )
+    except launch.LaunchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except bench.BenchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if decision.catalog_stale:
+        print(
+            "warning: catalog=stale — resolved from the bundled snapshot, not the server",
+            file=sys.stderr,
+        )
+    if args.json:
+        print(json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(decision.render())
+    return 0
+
+
+def _seed_catalog_json(args: argparse.Namespace) -> int:
+    decided_by = args.decided_by or "operator-seed"
+    deviation_ref = args.deviation_ref or "hk:doc/task/2026-09-23/scopefuel-catalog-server-canonical"
+    rows = []
+    for entry in launch.snapshot_entries():
+        row = entry.as_dict()
+        row["decided_by"] = decided_by
+        row["deviation_ref"] = deviation_ref
+        rows.append(row)
+    print(json.dumps({"catalog": rows}, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _push_catalog_command(args: argparse.Namespace) -> int:
+    if args.emit_seed:
+        return _seed_catalog_json(args)
+    if not args.json:
+        print("error: push-catalog needs a JSON file (or --emit-seed)", file=sys.stderr)
+        return 2
+    try:
+        written = bench.push_catalog(args.json)
+    except bench.BenchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"catalog rows written: {written}")
+    return 0
+
+
 def _bench_command(args: argparse.Namespace) -> int:
     if args.bench_command == "sync":
         return bench.run_sync(stderr=sys.stderr)
@@ -727,6 +831,18 @@ def _bench_command(args: argparse.Namespace) -> int:
                 return 2
             print(f"bench grades set: stored {count} grade(s)")
             return 0
+    if args.bench_command == "push-catalog":
+        return _push_catalog_command(args)
+
+    if args.bench_command == "catalog":
+        if args.catalog_command == "list":
+            print(bench.catalog_report())
+            return 0
+        if args.catalog_command == "status":
+            print(bench.catalog_status_report())
+            return 0
+        return 2
+
     if args.bench_command == "show":
         print(bench.show_scores(args.model_id))
         return 0

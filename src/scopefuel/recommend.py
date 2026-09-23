@@ -1022,6 +1022,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
 
 
 _GRADE_ORDER: tuple[Grade, ...] = ("S+", "S", "A+", "A", "B", "C")
+# Public alias: the launch catalog ranks grades with the same ladder and must
+# not keep a second copy of it.
+REP_GRADES_ORDER: tuple[Grade, ...] = _GRADE_ORDER
 _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
     {
         UNMEASURED_ANNOTATION,

@@ -525,6 +525,15 @@ def test_ac16_runtime_rejects_remote_sol_move_and_falls_back_without_network(mon
             endpoint_id="fixture",
         ),
     )
+    # The canonical catalog route is not part of this test's subject: it asserts
+    # the *grades* projection's boundary rejection, which is the path a host hits
+    # while talking to a deployment that predates the catalog (#592 merged, not
+    # deployed). Answer that route the way such a server does.
+    monkeypatch.setattr(
+        bench,
+        "_fetch_catalog",
+        lambda backend: (_ for _ in ()).throw(bench.BenchRouteMissing("no catalog route")),
+    )
     monkeypatch.setattr(
         bench,
         "read_grades",
