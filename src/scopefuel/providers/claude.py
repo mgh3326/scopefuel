@@ -14,6 +14,7 @@ Keychain(`Claude Code-credentials`)에만 토큰을 두며, 그 경우 파일은
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import time
 
-from ..http import request_json
+from ..http import classify_error, request_json
 from ..model import Bucket, ProviderResult, Scope
 
 CREDENTIALS = pathlib.Path.home() / ".claude" / ".credentials.json"
@@ -80,12 +81,32 @@ def _load_oauth() -> tuple[dict, str] | None:
     return None
 
 
+def _account_fp(oauth: dict) -> str | None:
+    """로컬 자격 지문 — 토큰 원문은 저장하지 않는다.
+
+    자문 2558: 토큰 갱신과 계정 변경을 로컬에서 구별할 수 없으므로 지문이 바뀌면
+    전부 '계정/구독 변경 의심'으로 fail-closed 처리한다.
+    """
+    token = (oauth.get("accessToken") or "").strip()
+    if not token:
+        return None
+    plan = str(oauth.get("subscriptionType") or "")
+    return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16]
+
+
+def current_account_fp() -> str | None:
+    """네트워크 없이 로컬 자격 파일만으로 지문을 계산한다 (backoff 중 계정 검증용)."""
+    loaded = _load_oauth()
+    return None if loaded is None else _account_fp(loaded[0])
+
+
 def fetch() -> ProviderResult:
     loaded = _load_oauth()
     if loaded is None:
         return ProviderResult(
             id="claude",
             error="자격증명 없음",
+            error_kind="credentials",
             hint=(
                 f"{_credentials_path()} 없음, Keychain('{KEYCHAIN_SERVICE}')에서도 못 읽음 "
                 "— claude 로그인 후 다시 시도"
@@ -93,17 +114,32 @@ def fetch() -> ProviderResult:
         )
     oauth, origin = loaded
     token = oauth["accessToken"].strip()
+    fp = _account_fp(oauth)
 
-    raw = request_json(
-        USAGE_URL,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "anthropic-beta": BETA_HEADER,
-            "User-Agent": "scopefuel",
-        },
-    )
+    try:
+        raw = request_json(
+            USAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "anthropic-beta": BETA_HEADER,
+                "User-Agent": "scopefuel",
+            },
+        )
+    except Exception as exc:
+        # 429·5xx·네트워크·인증 실패를 분류해 게이트가 "속도 제한"과
+        # "측정 불가"를 구분한다(실패 결과에도 지문을 실어 stale 수용 판정에 쓴다).
+        kind, status, retry_after = classify_error(exc)
+        return ProviderResult(
+            id="claude",
+            error=str(exc),
+            error_kind=kind,
+            http_status=status,
+            retry_after_s=retry_after,
+            account_fp=fp,
+            hint="usage API 속도 제한" if kind == "rate_limited" else None,
+        )
 
     buckets: list[Bucket] = []
     five = raw.get("five_hour") or {}
@@ -159,7 +195,12 @@ def fetch() -> ProviderResult:
         note=note,
         source="oauth-usage-api" if origin == "file" else f"oauth-usage-api+{origin}",
         raw=raw,
+        http_status=200,
+        account_fp=fp,
     )
+
+
+fetch.current_account_fp = current_account_fp  # noqa: B010 — 로컬 전용 probe
 
 
 def _num(value: object) -> float | None:

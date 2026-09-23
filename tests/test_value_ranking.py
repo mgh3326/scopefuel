@@ -425,14 +425,17 @@ def test_ac8_astra_is_absent_and_role_gate_denies_even_with_quota(monkeypatch, c
     )
     provider = _provider("codex", used=0.0)
     for profile_name in ASTRA_ROLE_PROFILES:
+        # task #527: 용도 미지정은 허용 용도가 아니다 — 쿼타가 비어 있어도 역할 거부.
         result = gate_check([provider], profile_name, today=TODAY, now=NOW)
         assert result.ok is False
         assert result.unmeasurable is False
-        assert "director 판정 전용" in result.reason
+        assert result.role_denied is True
+        assert "role_restricted" in result.reason
 
     monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: provider})
-    assert cli.main(["gate", "-m", "codex-astra", "--no-cache"]) == 3
-    assert "director 판정 전용" in capsys.readouterr().err
+    # 역할 거부는 exit 5 — 쿼타/정책 차단(exit 3)과 같은 rc 로 나가지 않는다.
+    assert cli.main(["gate", "-m", "codex-astra", "--no-cache"]) == 5
+    assert "role_restricted" in capsys.readouterr().err
 
 
 def test_ac9_operator_price_seeds_and_kimi_k27_code_a_candidate(tmp_path):

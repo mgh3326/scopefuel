@@ -289,10 +289,20 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     gate_parser = subparsers.add_parser(
         "gate",
-        help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가)",
+        help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가/5=역할 거부)",
     )
     gate_parser.add_argument(
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
+    )
+    gate_parser.add_argument(
+        "--purpose",
+        metavar="PURPOSE",
+        help=(
+            "astra 역할 제한 프로필의 사용 용도 "
+            f"({'|'.join(sorted(recommend.ASTRA_ALLOWED_PURPOSES))}). "
+            "허용 용도만 쿼타 검사로 진행하고 미지정·그 외 값은 역할 거부(exit 5) — "
+            "비-astra 프로필에서는 무시"
+        ),
     )
     gate_parser.add_argument(
         "--operator-request",
@@ -500,7 +510,9 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     return 0
 
 
-def _gate_record(result: recommend.GateResult, exit_code: int, now: dt.datetime) -> dict:
+def _gate_record(
+    result: recommend.GateResult, exit_code: int, now: dt.datetime, purpose: str | None = None
+) -> dict:
     """gate 판정의 감사 레코드 (``--gate-output`` JSON 본체)."""
     return {
         "schema": "scopefuel.gate.v1",
@@ -511,6 +523,7 @@ def _gate_record(result: recommend.GateResult, exit_code: int, now: dt.datetime)
         "ok": result.ok,
         "exit_code": exit_code,
         "unmeasurable": result.unmeasurable,
+        "stale_accepted": result.stale_accepted,
         "used_pct": result.used_pct,
         "pool_class": result.pool_class,
         "reason": result.reason,
@@ -519,6 +532,8 @@ def _gate_record(result: recommend.GateResult, exit_code: int, now: dt.datetime)
         "operator_request_ref": result.operator_request_ref,
         "requested_by": result.requested_by,
         "ref_resolution": result.ref_resolution,
+        "role_denied": result.role_denied,
+        "purpose": purpose,
         "source": result.source,
         "source_verification": result.source_verification,
         "source_label": result.source_label,
@@ -536,6 +551,7 @@ def _gate_args(args: argparse.Namespace) -> dict:
     return {
         "operator_request": args.operator_request,
         "requested_by": args.requested_by,
+        "purpose": args.purpose,
     }
 
 
@@ -680,10 +696,10 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         ),
                         last_auto_error=resolution.last_auto_error,
                     )
-    exit_code = 0 if result.ok else (4 if result.unmeasurable else 3)
+    exit_code = 0 if result.ok else (5 if result.role_denied else (4 if result.unmeasurable else 3))
 
     if args.gate_output:
-        record = _gate_record(result, exit_code, now)
+        record = _gate_record(result, exit_code, now, purpose=args.purpose)
         try:
             pathlib.Path(args.gate_output).write_text(
                 json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
@@ -697,6 +713,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             f"profile={result.profile} pool={result.provider_id} "
             f"used_pct={result.used_pct} class={result.pool_class}"
         )
+        if result.stale_accepted:
+            first_line += " stale_accepted=true"
         if result.operator_request_ref is not None:
             first_line += (
                 f" escalation_override={'true' if result.escalation_override else 'false'}"
@@ -724,7 +742,15 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         return 0
 
     print(result.reason, file=sys.stderr)
-    if result.alternatives:
+    if result.role_denied:
+        # task #527: a role denial is not a quota refusal — print no
+        # "alternatives exhausted" line (the profile has no grade) and say
+        # what would actually change the answer.
+        print(
+            "역할 거부 — 쿼타와 무관. 허용 용도로 --purpose 를 지정해야 쿼타 검사로 진행한다",
+            file=sys.stderr,
+        )
+    elif result.alternatives:
         print(f"대안({result.grade}): {', '.join(result.alternatives)}", file=sys.stderr)
     else:
         print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)

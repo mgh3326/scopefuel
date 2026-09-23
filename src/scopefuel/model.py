@@ -226,6 +226,21 @@ class ProviderResult:
     # Additive local manual-observation audit metadata.  This is never written
     # into the automatic snapshot cache.
     manual: dict | None = None
+    # task #576 — 실패 분류·관측 필드(additive). 게이트의 stale 수용 사유는
+    # rate_limited/server/network 뿐이다 — auth·credentials·http·unknown 은
+    # 절대 수용 사유가 되지 않는다.
+    error_kind: str | None = None
+    http_status: int | None = None
+    retry_after_s: float | None = None
+    # 로컬 자격 지문 — 스냅샷과 같은 계정인지 판별하는 용도. 원문 자격의 해시라서
+    # 로컬 캐시 파일에만 저장하고 as_dict/--json 출력에는 싣지 않는다.
+    account_fp: str | None = None
+    # stale 폴백 결과에서: 스냅샷 지문과 이번 시도 지문의 일치 여부.
+    # None = provider 가 지문을 제공하지 않아 계정 동일성을 증명할 수 없다.
+    account_fp_match: bool | None = None
+    last_error_at: float | None = None
+    # host-local backoff 창의 끝(epoch). 창 안에서는 어느 경로도 네트워크를 치지 않는다.
+    backoff_until: float | None = None
 
     def __post_init__(self) -> None:
         self.pool_class = _normalize_pool_class(self.pool_class)
@@ -296,6 +311,18 @@ class ProviderResult:
             out["warning"] = self.warning
         if self.last_error is not None:
             out["last_error"] = self.last_error
+        if self.error_kind is not None:
+            out["error_kind"] = self.error_kind
+        if self.http_status is not None:
+            out["http_status"] = self.http_status
+        if self.retry_after_s is not None:
+            out["retry_after_s"] = self.retry_after_s
+        if self.last_error_at is not None:
+            out["last_error_at"] = self.last_error_at
+        if self.backoff_until is not None:
+            out["backoff_until"] = self.backoff_until
+        if self.account_fp_match is not None:
+            out["account_fp_match"] = self.account_fp_match
         if self.manual is not None:
             out["manual"] = self.manual
         if include_raw:

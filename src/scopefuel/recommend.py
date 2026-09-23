@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from . import cache, manual
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset, _window_seconds
 from .policy import (
@@ -1046,7 +1047,16 @@ _SOL_PROFILES = frozenset({"codex-sol", "kiro-sol"})
 
 # These launcher spellings exist for director-controlled workflows, but they
 # are never recommendation candidates and must fail the ordinary quota gate.
+# task #527: this set IS the astra model identification — membership decides
+# the role gate, not a substring match on the profile name (a name containing
+# "astra" but absent here is an ordinary profile).
 ASTRA_ROLE_PROFILES = frozenset({"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"})
+
+# task #527 / decision 2376: the only purposes for which an astra identity may
+# proceed to the quota check — director 판정 · architect 자문 · 운영자 요청
+# 자문. Compared after strip().casefold(); anything else (including a missing
+# purpose) is a role denial, independent of quota state.
+ASTRA_ALLOWED_PURPOSES = frozenset({"director", "architect", "operator-request"})
 
 # ROB-591: profiles that are operator-explicit consultation-only — never a
 # GRADE_TABLE entry, never a recommendation/escalation candidate, but an
@@ -1190,7 +1200,10 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     """Return (provider_id, group_name_if_group_scope)."""
     if profile in ("opus", "sonnet", "fable", "haiku"):
         return "claude", None
-    if profile.startswith("codex") or profile == "claudex":
+    # ASTRA_ROLE_PROFILES 멤버(런처 철자 + 모델 id gpt-6-astra)는 전부 같은
+    # codex pool 의 모델을 가리킨다 — 허용 용도의 astra 게이트가 어느 철자로도
+    # 같은 쿼타를 본다.
+    if profile.startswith("codex") or profile == "claudex" or profile in ASTRA_ROLE_PROFILES:
         return "codex", None
     if profile in ("agy", "agy-flash", "agy-flash-med", "agy-pro"):
         return "agy", "gemini"
@@ -1304,6 +1317,77 @@ def _matching_buckets(result: ProviderResult, group_name: str | None) -> list[tu
         assert isinstance(bucket.used_pct, (int, float))
         out.append((float(bucket.used_pct), bucket.window, bucket.resets_at))
     return out
+
+
+_RATE_LIMITED_RE = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many requests", re.I)
+
+
+def _stale_failure_kind(result: ProviderResult) -> str | None:
+    """stale 수용이 가능한 실패 사유 — "rate_limited" | "transport" | None(수용 불가).
+
+    수용 사유는 429·5xx·네트워크뿐이다. auth·credentials·parse·분류 불가는
+    전부 None — 어떤 실패인지 모르는 값으로 게이트를 열지 않는다.
+    """
+    kind = result.error_kind
+    if kind == "rate_limited":
+        return "rate_limited"
+    if kind in ("server", "network", "transport"):
+        text = result.last_error or result.error or ""
+        return "rate_limited" if _RATE_LIMITED_RE.search(text) else "transport"
+    if kind is not None:
+        return None
+    kind, _ = manual.classify_automatic_failure(result)
+    if kind != "transport":
+        return None
+    text = result.last_error or result.error or ""
+    return "rate_limited" if _RATE_LIMITED_RE.search(text) else "transport"
+
+
+def _stale_accepted(result: ProviderResult | None, group_name: str | None, now: dt.datetime) -> str | None:
+    """stale_accepted 명시 수용 분기. 수용 시 실패 사유를 돌려주고 아니면 None.
+
+    조건(전부 필수 — 하나라도 어긋나면 기존처럼 거부): stale 폴백 결과이고,
+    실패 사유가 429/5xx/네트워크이며, 나이가 cache.STALE_MAX_S(6h) 이하이고,
+    계정 지문이 일치(account_fp_match is True — 지문이 없는 provider·구형식
+    엔트리는 수용하지 않는다)하고, 필수 bucket(manual.REQUIRED_WINDOWS)이 전부
+    있고, 매칭 bucket 의 reset 회차가 경과하지 않았을 때.
+    """
+    if result is None or not result.stale or result.error or result.warning:
+        return None
+    kind = _stale_failure_kind(result)
+    if kind is None:
+        return None
+    if result.account_fp_match is not True:
+        return None
+    if result.age_s is None or result.age_s > cache.STALE_MAX_S:
+        return None
+    matches = _matching_buckets(result, group_name)
+    if not matches:
+        return None
+    covered = {window for _used, window, _reset in matches}
+    if not manual.REQUIRED_WINDOWS.get(result.id, frozenset()) <= covered:
+        return None
+    now_utc = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
+    for _used, _window, reset_at in matches:
+        reset = _parse_reset(reset_at)
+        if reset is None or reset <= now_utc:
+            return None
+    return kind
+
+
+def _stale_tag(result: ProviderResult, kind: str) -> str:
+    label = "속도 제한" if kind == "rate_limited" else "조회 실패"
+    age = cache.format_age(result.age_s) or "?"
+    return f"stale_accepted — {label}, 마지막 값 {age}"
+
+
+def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str:
+    """측정 불가 사유 — 429 는 '속도 제한'으로 구분해 보고한다(#576 AC1)."""
+    if result is not None and _stale_failure_kind(result) == "rate_limited":
+        if result.stale and result.age_s is not None:
+            return f"{provider_id} 속도 제한 — 마지막 값 {cache.format_age(result.age_s)} 수용 불가"
+        return f"{provider_id} 속도 제한 — 마지막 정상 값 없음"
+    return f"{provider_id} 측정 불가 (provider error/degraded)"
 
 
 def _reset_display(iso: str | None) -> str:
@@ -1664,8 +1748,9 @@ def _build_escalation_entry(
             reason_parts.append(override.note)
         status_notes.append(", ".join(reason_parts) + ")")
 
-    if result is None or result.error or result.warning or result.status != "ok":
-        status_notes.append("측정 불가")
+    accepted = _stale_accepted(result, group_name, now)
+    if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
+        status_notes.append(_unmeasurable_reason(provider_id, result))
     else:
         matches = _matching_buckets(result, group_name)
         if not matches:
@@ -1678,7 +1763,10 @@ def _build_escalation_entry(
             if over is not None:
                 status_notes.append(f"{over.used_pct:g}% 소진 (reset {_reset_display(over.reset_at)})")
             else:
-                status_notes.append(f"사용 {_format_windows_display(states, constraint)}")
+                note = f"사용 {_format_windows_display(states, constraint)}"
+                if accepted is not None:
+                    note += f" [{_stale_tag(result, accepted)}]"
+                status_notes.append(note)
 
     return _EscalationEntry(
         profile=profile,
@@ -1773,6 +1861,11 @@ class GateResult:
     # REF 해석 시도 결과. scopefuel 은 hk 저장소 클라이언트를 갖지 않으므로
     # 주장된 REF 는 항상 "unverified" 로만 기록한다 — verified 를 주장하지 않는다.
     ref_resolution: str | None = None
+    # task #527 — astra role gate. True only for role denials (astra identity
+    # outside ASTRA_ALLOWED_PURPOSES): the CLI maps this to exit 5 so callers
+    # can tell it apart from a quota/policy refusal (exit 3) — the two must
+    # never share an exit code (hk:doc decision/2026-09-21/…-approved).
+    role_denied: bool = False
     # task #579 — local manual quota observation audit fields (additive).
     source: str | None = None
     source_verification: str | None = None
@@ -1784,6 +1877,8 @@ class GateResult:
     observed_age_s: float | None = None
     remaining_effect_s: float | None = None
     last_auto_error: str | None = None
+    # task #576 — stale_accepted 명시 수용. True 면 reason 에 나이·사유가 적힌다.
+    stale_accepted: bool = False
 
 
 def _find_profile(
@@ -1891,6 +1986,7 @@ def gate_check(
     grade_table: dict[Grade, list[Profile]] | None = None,
     operator_request: str | None = None,
     requested_by: str | None = None,
+    purpose: str | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -1904,20 +2000,37 @@ def gate_check(
     건너뛰고, 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로 적용된다. 이것은
     감사 가능한 주장의 기록이지 신원·동의의 증명이 아니며, REF 는 항상
     ``ref_resolution=unverified`` 로만 기록된다.
+
+    ``purpose``(task #527)는 astra 역할 게이트의 용도 입력이다. ASTRA_ROLE_PROFILES
+    멤버(모델 식별 — 이름 substring 이 아니다)는 ``purpose`` 가
+    ASTRA_ALLOWED_PURPOSES 에 속할 때만 아래 쿼타 검사로 진행하고, 그 외(미지정·
+    오타·builder/worker/tester 등)에는 쿼타와 무관하게 ``role_denied=True`` 로
+    거부한다. 비-astra 프로필에서는 무시된다.
     """
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
     table = GRADE_TABLE if grade_table is None else grade_table
 
-    if "astra" in profile_name.casefold():
-        return GateResult(
-            ok=False,
-            profile=profile_name,
-            provider_id="codex",
-            grade=None,
-            reason=f"{profile_name} 역할 제한 — Astra는 director 판정 전용",
-        )
+    # task #527: astra 판별은 ASTRA_ROLE_PROFILES 멤버십(모델 식별)이다 — 이름에
+    # "astra" 가 든 무관 프로필은 여기에 걸리지 않는다. 허용 용도가 아니면 쿼타
+    # 상태와 무관하게 역할 거부(role_denied → CLI exit 5) — 쿼타 거부(exit 3)와
+    # 같은 rc 로 나가면 호출자가 "쿼타 소진"으로 오독한다(ARCHITECT.md:6 결함).
+    if profile_name in ASTRA_ROLE_PROFILES:
+        normalized_purpose = (purpose or "").strip().casefold()
+        if normalized_purpose not in ASTRA_ALLOWED_PURPOSES:
+            shown = purpose.strip() if purpose and purpose.strip() else "미지정"
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id="codex",
+                grade=None,
+                reason=(
+                    f"role_restricted: {profile_name} — astra 는 허용 용도 전용 "
+                    f"({', '.join(sorted(ASTRA_ALLOWED_PURPOSES))}); purpose={shown}"
+                ),
+                role_denied=True,
+            )
 
     provider_id, group_name = profile_pool(profile_name)
 
@@ -1990,13 +2103,14 @@ def gate_check(
         # Profile known to profile_pool but not in GRADE_TABLE: check quota only.
         by_id = {r.id: r for r in providers}
         result = by_id.get(provider_id)
-        if result is None or result.error or result.warning or result.status != "ok":
+        accepted = _stale_accepted(result, group_name, now)
+        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
             return GateResult(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=None,
-                reason=f"{provider_id} 측정 불가 (provider error/degraded)",
+                reason=_unmeasurable_reason(provider_id, result),
                 unmeasurable=True,
             )
         matches = _matching_buckets(result, group_name)
@@ -2048,14 +2162,18 @@ def gate_check(
                 used_pct=over.used_pct,
                 pool_class=effective_class,
             )
+        reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+        if accepted is not None:
+            reason += f" [{_stale_tag(result, accepted)}]"
         return GateResult(
             ok=True,
             profile=profile_name,
             provider_id=provider_id,
             grade=None,
-            reason=f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}",
+            reason=reason,
             used_pct=used_pct,
             pool_class=effective_class,
+            stale_accepted=accepted is not None,
         )
 
     grade, profile = found
@@ -2122,14 +2240,15 @@ def gate_check(
                 **audit,
             )
 
-    if result is None or result.error or result.warning or result.status != "ok":
+    accepted = _stale_accepted(result, group_name, now)
+    if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
         alts = alternatives()
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=f"{provider_id} 측정 불가 (provider error/degraded)",
+            reason=_unmeasurable_reason(provider_id, result),
             unmeasurable=True,
             alternatives=alts,
             **audit,
@@ -2198,6 +2317,8 @@ def gate_check(
             f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
             f"class={effective_class} — {profile.gate_reason or ''}"
         )
+        if accepted is not None:
+            reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
             tag = _operator_request_audit(
                 operator_request, audit_requested_by or "unknown", escalation_override
@@ -2211,17 +2332,22 @@ def gate_check(
             reason=reason,
             used_pct=used_pct,
             pool_class=effective_class,
+            stale_accepted=accepted is not None,
             **audit,
         )
 
+    reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+    if accepted is not None:
+        reason += f" [{_stale_tag(result, accepted)}]"
     return GateResult(
         ok=True,
         profile=profile_name,
         provider_id=provider_id,
         grade=grade,
-        reason=f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}",
+        reason=reason,
         used_pct=used_pct,
         pool_class=effective_class,
+        stale_accepted=accepted is not None,
     )
 
 
@@ -2301,8 +2427,16 @@ def recommend(
         provider_label = _provider_label(provider_id, group_name)
 
         result = by_id.get(provider_id)
-        if result is None or result.error or result.warning or result.status != "ok":
-            excluded.append(_Excluded(profile, "측정 불가", provider_id=provider_id, kind="unmeasurable"))
+        accepted = _stale_accepted(result, group_name, now)
+        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
+            excluded.append(
+                _Excluded(
+                    profile,
+                    _unmeasurable_reason(provider_id, result),
+                    provider_id=provider_id,
+                    kind="unmeasurable",
+                )
+            )
             continue
 
         matches = _matching_buckets(result, group_name)
@@ -2392,7 +2526,10 @@ def recommend(
                 throughput_window=throughput_window,
                 brake=brake,
                 brake_window=brake_window,
-                windows_display=_format_windows_display(states, constraint),
+                windows_display=(
+                    _format_windows_display(states, constraint)
+                    + (f" [{_stale_tag(result, accepted)}]" if accepted is not None else "")
+                ),
                 used_pct=used_pct,
                 remaining_pct=remaining_pct,
                 pool_class=effective_class,
@@ -2747,7 +2884,8 @@ def recommend(
             if kind == "exhausted":
                 label = f"{provider_id} 풀 소진"
             elif kind == "unmeasurable":
-                label = f"{provider_id} 측정 불가"
+                # 429 등 구분된 사유가 있으면 그대로 보여준다(#576) — 없으면 기존 문구.
+                label = reason if reason and reason != "측정 불가" else f"{provider_id} 측정 불가"
             else:
                 label = provider_id or group[0].profile.name
             if kind == "unmeasurable":
