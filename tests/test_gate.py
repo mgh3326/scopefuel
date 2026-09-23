@@ -545,3 +545,186 @@ def test_gate_operator_request_cli_opus_exit_3_not_applicable(monkeypatch, capsy
     out = capsys.readouterr()
     assert rc == 3
     assert "operator_request_not_applicable" in out.err
+
+
+# ------------------------------------------------------------------ task #527: astra purpose gate
+#
+# astra 는 모델 식별(ASTRA_ROLE_PROFILES 멤버십)로 판별되고 --purpose 가
+# ASTRA_ALLOWED_PURPOSES 일 때만 쿼타 검사로 진행한다. 역할 거부(exit 5)는
+# 쿼타 거부(exit 3)와 rc·reason 토큰 양쪽으로 구별된다.
+
+
+def test_astra_role_profiles_membership_pinned():
+    """뮤턴트 핀: ASTRA_ROLE_PROFILES 를 비우거나 줄이면 이 단언이 RED 다.
+
+    아래 테스트들이 세트를 순회하는 이유로, 빈 세트는 거부 단언을 vacuous 하게
+    만든다 — 멤버십 자체를 정확히 고정한다."""
+    from scopefuel.recommend import ASTRA_ROLE_PROFILES
+
+    assert frozenset(
+        {"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"}
+    ) == ASTRA_ROLE_PROFILES
+
+
+def test_astra_allowed_purposes_pinned():
+    """decision 2376 의 세 범주와 1:1 — 새 용도 추가·제거는 이 단언을 건드려야 한다."""
+    from scopefuel.recommend import ASTRA_ALLOWED_PURPOSES
+
+    assert frozenset({"director", "architect", "operator-request"}) == ASTRA_ALLOWED_PURPOSES
+
+
+@pytest.mark.parametrize(
+    "profile_name", ["codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"]
+)
+def test_gate_astra_allowed_purpose_passes_quota_check(profile_name):
+    """AC: 허용 용도 + 쿼타 여유 → 통과. builder-*/captain-* 는 런처 철자가 아니라
+    역할 세트 멤버십으로 판별된다(wrk 측 tombstone 과 별개)."""
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    for purpose in ("director", "architect", "operator-request"):
+        result = gate_check(providers, profile_name, today=TODAY, now=NOW, purpose=purpose)
+        assert result.ok is True, (profile_name, purpose, result.reason)
+        assert result.role_denied is False
+        assert result.provider_id == "codex"
+
+
+def test_gate_astra_allowed_purpose_quota_exhausted_is_quota_denial():
+    """AC: 허용 용도 + 쿼타 소진 → 쿼타 거부 — 역할 거부와 정확히 구별."""
+    providers = [_result("codex", 95.0, pool_class="preserve")]
+    result = gate_check(providers, "codex-astra", today=TODAY, now=NOW, purpose="architect")
+    assert result.ok is False
+    assert result.role_denied is False  # 역할 거부가 아니다
+    assert result.unmeasurable is False
+    assert "소진" in result.reason
+
+
+@pytest.mark.parametrize("purpose", [None, "", "  ", "builder", "worker", "tester", "architct"])
+def test_gate_astra_disallowed_or_missing_purpose_is_role_denial(purpose):
+    """AC: builder/worker/tester·오타·미지정 용도 → 역할 거부 (쿼타 여유와 무관)."""
+    providers = [_result("codex", 0.0, pool_class="preserve")]
+    result = gate_check(providers, "codex-astra", today=TODAY, now=NOW, purpose=purpose)
+    assert result.ok is False
+    assert result.role_denied is True
+    assert result.unmeasurable is False
+    assert result.reason.startswith("role_restricted:")
+    # 허용 용도 목록이 reason 에 실려 호출자가 자기수정할 수 있다
+    assert "architect" in result.reason
+
+
+def test_gate_astra_purpose_comparison_is_casefold_normalized():
+    """용도 비교는 strip+casefold — 'Architect' 도 허용 용도다."""
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    result = gate_check(providers, "codex-astra", today=TODAY, now=NOW, purpose="  Architect ")
+    assert result.ok is True
+    assert result.role_denied is False
+
+
+def test_gate_astra_role_denial_and_quota_denial_have_exact_distinct_rc(monkeypatch, capsys):
+    """AC 핵심: 같은 프로필·같은 게이트에서 역할 거부(rc 5)와 쿼타 거부(rc 3)가
+    다른 종료코드로 나간다 — 부분 문자열이 아니라 rc 의 정확 비교."""
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"codex": lambda: _result("codex", 10.0, pool_class="preserve")},
+    )
+    rc_role = cli.main(["gate", "-m", "codex-astra", "--purpose", "builder", "--no-cache"])
+    err_role = capsys.readouterr().err
+    assert rc_role == 5
+    assert "role_restricted:" in err_role
+    assert "역할 거부" in err_role
+
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"codex": lambda: _result("codex", 95.0, pool_class="preserve")},
+    )
+    rc_quota = cli.main(["gate", "-m", "codex-astra", "--purpose", "architect", "--no-cache"])
+    err_quota = capsys.readouterr().err
+    assert rc_quota == 3
+    assert "소진" in err_quota
+
+    assert rc_role != rc_quota
+
+
+def test_gate_astra_role_denial_cli_exit_5_and_gate_output(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"codex": lambda: _result("codex", 10.0, pool_class="preserve")},
+    )
+    gate_file = tmp_path / "gate.json"
+    rc = cli.main(
+        [
+            "gate",
+            "-m",
+            "codex-astra",
+            "--purpose",
+            "worker",
+            "--gate-output",
+            str(gate_file),
+            "--no-cache",
+        ]
+    )
+    assert rc == 5
+    record = json.loads(gate_file.read_text())
+    assert record["role_denied"] is True
+    assert record["purpose"] == "worker"
+    assert record["exit_code"] == 5
+
+
+def test_gate_astra_cli_allowed_purpose_exit_0(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"codex": lambda: _result("codex", 10.0, pool_class="preserve")},
+    )
+    rc = cli.main(["gate", "-m", "codex-astra", "--purpose", "architect", "--no-cache"])
+    assert rc == 0
+    assert "pool=codex" in capsys.readouterr().out
+
+
+def test_gate_astra_name_substring_alone_is_not_role_denied():
+    """AC: 이름에 astra 가 든 무관 프로필(세트 비멤버)은 역할 거부되지 않는다.
+
+    뮤턴트 방향 ②: `"astra" in profile_name.casefold()` 매칭을 복원하면 이
+    테스트가 RED 다 — codex-astra-foo 는 codex pool 로 정상 쿼타 검사를 받는다."""
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    result = gate_check(providers, "codex-astra-foo", today=TODAY, now=NOW)
+    assert result.role_denied is False
+    assert result.ok is True
+
+
+def test_gate_astra_model_spelling_is_role_gated_and_quota_checked():
+    """gpt-6-astra(모델 철자)도 같은 게이트: 용도 없으면 역할 거부, 허용 용도면
+    codex pool 쿼타 검사로 진행한다."""
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    denied = gate_check(providers, "gpt-6-astra", today=TODAY, now=NOW)
+    assert denied.role_denied is True
+    allowed = gate_check(providers, "gpt-6-astra", today=TODAY, now=NOW, purpose="director")
+    assert allowed.ok is True
+    assert allowed.provider_id == "codex"
+
+
+def test_gate_astra_operator_request_still_not_applicable():
+    """⑤ 회귀: 허용 용도를 줘도 --operator-request 는 escalation 전용이라
+    astra 에서는 여전히 operator_request_not_applicable 로 거부된다."""
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    result = gate_check(
+        providers,
+        "codex-astra",
+        today=TODAY,
+        now=NOW,
+        purpose="architect",
+        operator_request="hk:task/461",
+    )
+    assert result.ok is False
+    assert result.role_denied is False
+    assert "operator_request_not_applicable" in result.reason
+
+
+def test_gate_purpose_ignored_for_non_astra_profile():
+    """비-astra 프로필에서 --purpose 는 판정을 바꾸지 않는다."""
+    providers = [_result("codex", 10.0, pool_class="preserve")]
+    plain = gate_check(providers, "codex-max", today=TODAY, now=NOW)
+    with_purpose = gate_check(providers, "codex-max", today=TODAY, now=NOW, purpose="builder")
+    assert with_purpose.ok == plain.ok is True
+    assert with_purpose.role_denied is False
