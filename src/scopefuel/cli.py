@@ -250,6 +250,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         | set(recommend.PROFILE_ALIASES)
         | set(recommend.RETIRED_PROFILES.keys())
         | set(recommend.ASTRA_ROLE_PROFILES)
+        | set(recommend.CONSULT_ONLY_PROFILES)
     )
     gate_parser = subparsers.add_parser(
         "gate",

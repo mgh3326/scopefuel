@@ -226,18 +226,37 @@ KIMI_K27_CODE_ESTIMATE_REASON = (
 # 동일 계열·동일 하네스(grok-build) 비율 스케일: 4.5 high 실측 64.0 × (76.8/72.4) = 67.9.
 # S+ 범위(≥65)지만 에이전트 미측정이라 한 단계 보수(S). AA-agent 발표 시 bench sync 로 복원.
 GROK_HI_ESTIMATE_REASON = (
-    "grok-4.6: 4.5 high 실측 64.0 × 동일 하네스 coding 비율(76.8/72.4) = 67.9 — "
+    "grok-4.7: 4.5 high 실측 64.0 × 동일 하네스 coding 비율(76.8/72.4) = 67.9 — "
     "S+ 범위지만 에이전트 미측정이라 S 보수 배치"
 )
 GROK_HI_PLACEMENT_NOTE = "보수 배치(S; 비율 스케일 67.9 는 S+ 범위 — AA-agent 발표 시 승급 재검토)"
 GROK_MEDIUM_ESTIMATE_REASON = (
-    "grok-4.6 high 추정(67.9)에서 4.5 effort 곡선 비율(56/64)로 투사 = 59.4 — 하위 effort 미측정"
+    "grok-4.7 high 추정(67.9)에서 4.5 effort 곡선 비율(56/64)로 투사 = 59.4 — 하위 effort 미측정"
 )
 GROK_LOW_ESTIMATE_REASON = (
-    "grok-4.6 high 추정(67.9)에서 4.5 effort 곡선 비율(49/64)로 투사 = 52.0 — "
+    "grok-4.7 high 추정(67.9)에서 4.5 effort 곡선 비율(49/64)로 투사 = 52.0 — "
     "점수상 A 범위지만 미측정(추정 위의 추정)이라 B 보수 배치"
 )
 GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)"
+
+# ROB-591: Opus 5.5 / GPT-6 Sol / GPT-6 Luna 카탈로그 ID 전환. 신규 ID는
+# AA-agent 미발표라 이전 세대 실측 곡선에 동일 오프셋을 유지한 추정치를 쓴다.
+# AA-agent 실측 발표 시 bench sync로 대체한다.
+OPUS_5_5_ESTIMATE_REASON = (
+    "claude-opus-5-5: AA-agent 미발표 — 벤더 릴리스 노트의 AA Intelligence Index 델타를 "
+    "claude-opus-5 동일 effort 실측 곡선에 동일 오프셋으로 적용한 추정치"
+)
+SOL_GPT6_ESTIMATE_REASON = (
+    "gpt-6-sol: AA-agent 미발표 — 모델 ID만 gpt-5.6-sol → gpt-6-sol 로 전환, "
+    "실측 곡선(점수/effort)은 동일 오프셋 추정으로 유지"
+)
+LUNA_GPT6_ESTIMATE_REASON = (
+    "gpt-6-luna: AA-agent 미발표 — 모델 ID만 gpt-5.6-luna → gpt-6-luna 로 전환, "
+    "실측 곡선(점수/effort)은 동일 오프셋 추정으로 유지"
+)
+LUNA_GPT6_LOW_ESTIMATE_REASON = (
+    "gpt-6-luna (low): gpt-5.6-luna 와 마찬가지로 AA-agent 실측 없음 — 모델 ID만 전환, 무점수 미측정 유지"
+)
 # ROB-1253: oc-dsflash 측정 조건(codex·max)이 실행 배선(opencode·default)보다 유리한 방향 이식 —
 # 점수(55.0)는 A+ 범위지만 방향 감쇠를 반영해 1단계 보수 하향(A). 동일-모델 쌍 실측 감쇠 근거:
 # 하네스만 다른 쌍 Muse Spark 1.2(xhigh 동일) Muse Code 61 vs Opencode 57 → −4;
@@ -486,85 +505,88 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         Profile(
             "kiro-sol",
-            "GPT-5.6 Sol",
+            "GPT-6 Sol",
             58.9,
-            **_openrouter_benchmark(58.9, "gpt-5.6-sol"),
-            aa_agent_model_id="gpt-5.6-sol",
-            aa_model_id="gpt-5-6-sol",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SOL_GPT6_ESTIMATE_REASON,
+            aa_agent_model_id="gpt-6-sol",
+            aa_model_id="gpt-6-sol",
         ),
         Profile(
             "codex-sol",
-            "GPT-5.6 Sol (max)",
+            "GPT-6 Sol (max)",
             67.0,
-            **_aa_agent_benchmark(67.0, "gpt-5.6-sol", "max"),
+            benchmark_effort="max",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SOL_GPT6_ESTIMATE_REASON,
             launcher_effort="max",
-            aa_agent_model_id="gpt-5.6-sol",
-            aa_model_id="gpt-5-6-sol",
+            aa_agent_model_id="gpt-6-sol",
+            aa_model_id="gpt-6-sol",
         ),
+        # ROB-591: opus --effort high must physically precede xhigh/medium below so
+        # the pool-tie-break (identical quota score, identical value_order) makes it
+        # the first ordinary Opus candidate shown for S+ (see recommend() sort_key).
         Profile(
             "opus",
-            "Opus 5 (xhigh)",
+            "Opus 5.5 (high)",
             67.0,
-            **_aa_agent_benchmark(67.0, "claude-opus-5", "xhigh", harness="claude-code"),
-            launcher_effort="xhigh",
-            aa_agent_model_id="claude-opus-5",
-            aa_model_id="claude-opus-5",
+            benchmark_effort="high",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=OPUS_5_5_ESTIMATE_REASON,
+            launcher_effort="high",
+            aa_agent_model_id="claude-opus-5-5",
+            aa_model_id="claude-opus-5-5",
         ),
         Profile(
             "opus",
-            "Opus 5 (max)",
+            "Opus 5.5 (xhigh)",
+            69.0,
+            benchmark_effort="xhigh",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=OPUS_5_5_ESTIMATE_REASON,
+            launcher_effort="xhigh",
+            aa_agent_model_id="claude-opus-5-5",
+            aa_model_id="claude-opus-5-5",
+        ),
+        Profile(
+            "opus",
+            "Opus 5.5 (medium)",
             66.0,
+            benchmark_effort="medium",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=OPUS_5_5_ESTIMATE_REASON,
+            launcher_effort="medium",
+            aa_agent_model_id="claude-opus-5-5",
+            aa_model_id="claude-opus-5-5",
+        ),
+        Profile(
+            "opus",
+            "Opus 5.5 (max)",
+            69.0,
             gate="escalation",
             gate_reason=OPUS_MAX_ESCALATION_REASON,
-            **_aa_agent_benchmark(66.0, "claude-opus-5", "max", harness="claude-code"),
+            benchmark_effort="max",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=OPUS_5_5_ESTIMATE_REASON,
             launcher_effort="max",
-            aa_agent_model_id="claude-opus-5",
-            aa_model_id="claude-opus-5",
+            aa_agent_model_id="claude-opus-5-5",
+            aa_model_id="claude-opus-5-5",
         ),
         Profile(
             "codex-sol",
-            "GPT-5.6 Sol (xhigh)",
+            "GPT-6 Sol (xhigh)",
             65.0,
             gate="escalation",
             gate_reason=CODEX_SOL_XHIGH_ESCALATION_REASON,
-            **_aa_agent_benchmark(65.0, "gpt-5.6-sol", "xhigh"),
+            benchmark_effort="xhigh",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SOL_GPT6_ESTIMATE_REASON,
             launcher_effort="xhigh",
-            aa_agent_model_id="gpt-5.6-sol",
-            aa_model_id="gpt-5-6-sol",
-        ),
-        Profile(
-            "fable",
-            "Fable 5",
-            59.9,
-            gate="escalation",
-            gate_reason=(
-                "Opus 5 대비 2배 가격 — 2h+ 자율실행 / Opus5 실패 후 / "
-                "고위험 1회성 / 서브에이전트 다수일 때만"
-            ),
-            **_openrouter_benchmark(59.9, "fable-5"),
-            aa_agent_model_id="claude-fable-5",
-            aa_model_id="claude-fable-5",
+            aa_agent_model_id="gpt-6-sol",
+            aa_model_id="gpt-6-sol",
         ),
     ],
     "S": [
-        Profile(
-            "opus",
-            "Opus 5 (high)",
-            63.0,
-            **_aa_agent_benchmark(63.0, "claude-opus-5", "high", harness="claude-code"),
-            launcher_effort="high",
-            aa_agent_model_id="claude-opus-5",
-            aa_model_id="claude-opus-5",
-        ),
-        Profile(
-            "opus",
-            "Opus 5 (medium)",
-            62.0,
-            **_aa_agent_benchmark(62.0, "claude-opus-5", "medium", harness="claude-code"),
-            launcher_effort="medium",
-            aa_agent_model_id="claude-opus-5",
-            aa_model_id="claude-opus-5",
-        ),
         Profile(
             "codex-terra-max",
             "Terra (max)",
@@ -584,15 +606,30 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # input $2 / output $6 per 1M으로 동일하므로 성능이 높은 4.6을 유지한다.
         Profile(
             "grok-hi",
-            "Grok 4.6",
+            "Grok 4.7",
             67.9,
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             model_only=True,
             estimate_reason=GROK_HI_ESTIMATE_REASON,
             placement_note=GROK_HI_PLACEMENT_NOTE,
             benchmark_effort="high",
-            aa_agent_model_id="grok-4.6",
-            aa_model_id="grok-4-6",
+            aa_agent_model_id="grok-4.7",
+            aa_model_id="grok-4-7",
+        ),
+        # ROB-591: moved from A+ (was Opus 5 (low), escalation, score 57) —
+        # Opus 5.5 refresh raises the low-effort score into S range.
+        Profile(
+            "opus",
+            "Opus 5.5 (low)",
+            62.0,
+            gate="escalation",
+            gate_reason="비용효율 — Sonnet high(추정) 우선; 쿼타 여유 시",
+            benchmark_effort="low",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=OPUS_5_5_ESTIMATE_REASON,
+            launcher_effort="low",
+            aa_agent_model_id="claude-opus-5-5",
+            aa_model_id="claude-opus-5-5",
         ),
     ],
     "A+": [
@@ -607,9 +644,11 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "codex-luna-max",
             "Luna (max)",
             59.0,
-            **_aa_agent_benchmark(59.0, "gpt-5.6-luna", "max"),
-            aa_agent_model_id="gpt-5.6-luna",
-            aa_model_id="gpt-5-6-luna",
+            benchmark_effort="max",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=LUNA_GPT6_ESTIMATE_REASON,
+            aa_agent_model_id="gpt-6-luna",
+            aa_model_id="gpt-6-luna",
         ),
         Profile(
             "codex-terra",
@@ -619,17 +658,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             launcher_effort="xhigh",
             aa_agent_model_id="gpt-5.6-terra",
             aa_model_id="gpt-5-6-terra",
-        ),
-        Profile(
-            "opus",
-            "Opus 5 (low)",
-            57.0,
-            gate="escalation",
-            gate_reason="비용효율 — Sonnet high(추정) 우선; 쿼타 여유 시",
-            **_aa_agent_benchmark(57.0, "claude-opus-5", "low", harness="claude-code"),
-            launcher_effort="low",
-            aa_agent_model_id="claude-opus-5",
-            aa_model_id="claude-opus-5",
         ),
         Profile(
             "sonnet",
@@ -653,14 +681,14 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         Profile(
             "grok",
-            "Grok 4.6 (medium)",
+            "Grok 4.7 (medium)",
             59.4,
             launcher_effort="medium",
             benchmark_effort="medium",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_MEDIUM_ESTIMATE_REASON,
-            aa_agent_model_id="grok-4.6",
-            aa_model_id="grok-4-6",
+            aa_agent_model_id="grok-4.7",
+            aa_model_id="grok-4-7",
         ),
         Profile(
             "codex-terra",
@@ -675,10 +703,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "codex-luna",
             "Luna (xhigh)",
             55.0,
-            **_aa_agent_benchmark(55.0, "gpt-5.6-luna", "xhigh"),
+            benchmark_effort="xhigh",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=LUNA_GPT6_ESTIMATE_REASON,
             launcher_effort="xhigh",
-            aa_agent_model_id="gpt-5.6-luna",
-            aa_model_id="gpt-5-6-luna",
+            aa_agent_model_id="gpt-6-luna",
+            aa_model_id="gpt-6-luna",
         ),
         # ROB-1251: AA v1.3 실측 57@opencode(high) — 내삽 45.3을 대체.
         # harness-이식: opencode 측정 → agy 네이티브 실행.
@@ -743,10 +773,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "codex-luna",
             "Luna (high)",
             51.0,
-            **_aa_agent_benchmark(51.0, "gpt-5.6-luna", "high"),
+            benchmark_effort="high",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=LUNA_GPT6_ESTIMATE_REASON,
             launcher_effort="high",
-            aa_agent_model_id="gpt-5.6-luna",
-            aa_model_id="gpt-5-6-luna",
+            aa_agent_model_id="gpt-6-luna",
+            aa_model_id="gpt-6-luna",
         ),
         Profile(
             "codex-terra",
@@ -812,10 +844,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "codex-luna",
             "Luna (medium)",
             42.0,
-            **_aa_agent_benchmark(42.0, "gpt-5.6-luna", "medium"),
+            benchmark_effort="medium",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=LUNA_GPT6_ESTIMATE_REASON,
             launcher_effort="medium",
-            aa_agent_model_id="gpt-5.6-luna",
-            aa_model_id="gpt-5-6-luna",
+            aa_agent_model_id="gpt-6-luna",
+            aa_model_id="gpt-6-luna",
         ),
         # ROB-1223: AA-agent 실측 43.0(claude-code/default) — opencode 하네스 이식.
         # oc-sonnet46 과 동일 표기 방식. 실측 기반이므로 보수 하향 없음.
@@ -858,15 +892,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # ROB-1202: estimated + unmeasured Grok low (no lower-effort anchor to compare against).
         Profile(
             "grok",
-            "Grok 4.6 (low)",
+            "Grok 4.7 (low)",
             52.0,
             launcher_effort="low",
             benchmark_effort="low",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=GROK_LOW_ESTIMATE_REASON,
             placement_note=GROK_LOW_PLACEMENT_NOTE,
-            aa_agent_model_id="grok-4.6",
-            aa_model_id="grok-4-6",
+            aa_agent_model_id="grok-4.7",
+            aa_model_id="grok-4-7",
         ),
         # ROB-1202: extrapolated/unmeasured Haiku high estimate — not a Haiku medium placement.
         Profile(
@@ -896,8 +930,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             None,
             launcher_effort="low",
             benchmark_effort="low",
-            benchmark_annotation=UNMEASURED_ANNOTATION,
-            aa_agent_model_id="gpt-5.6-luna",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            estimate_reason=LUNA_GPT6_LOW_ESTIMATE_REASON,
+            aa_agent_model_id="gpt-6-luna",
         ),
         Profile("kiro-cheap", "Qwen3 Coder", None, aa_model_id="qwen3-coder-next"),
         Profile(
@@ -988,6 +1023,14 @@ _SOL_PROFILES = frozenset({"codex-sol", "kiro-sol"})
 # These launcher spellings exist for director-controlled workflows, but they
 # are never recommendation candidates and must fail the ordinary quota gate.
 ASTRA_ROLE_PROFILES = frozenset({"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"})
+
+# ROB-591: profiles that are operator-explicit consultation-only — never a
+# GRADE_TABLE entry, never a recommendation/escalation candidate, but an
+# explicit `gate -m <profile>` / spawn must still evaluate normally (unlike
+# ASTRA_ROLE_PROFILES, which is role-restricted and always rejected by gate_check).
+# profile_pool() still routes these; gate_check's "not in GRADE_TABLE" (D3) path
+# does the quota-only check.
+CONSULT_ONLY_PROFILES = frozenset({"fable"})
 
 
 def _grade_range(grade: Grade) -> tuple[float | None, float | None]:
