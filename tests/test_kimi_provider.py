@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pathlib
+
 from scopefuel.providers import kimi
 
 SAMPLE = "\x1b[2KWeekly: 75% left (resets in 5d 12h)\r\n\x1b[2K5h: 30% left (resets in 2h 10m)\r\n"
@@ -92,7 +94,14 @@ def test_fetch_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypatch):
     assert "LINES=50" in result.raw["stdout"] or "COLUMNS=200" in result.raw["stdout"]
 
 
-def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch):
+def test_fetch_auto_accepts_trust_in_a_per_probe_instance_dir(tmp_path, monkeypatch):
+    """Each probe gets a fresh flocked ``probe-*`` instance dir as child cwd.
+
+    #608: the child's cwd moved from the shared workdir to a per-probe
+    instance directory so proctrack can identify its descendants. The fake's
+    ``.trusted`` marker therefore does not survive between probes — the trust
+    prompt reappears and is auto-accepted every run.
+    """
     binary = tmp_path / "fake-kimi-trust"
     binary.write_text(
         "#!/bin/sh\n"
@@ -125,10 +134,19 @@ def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch
     assert second.error is None
     assert "Trust this folder?" in first_output
     assert "TRUST_ACCEPTED" in first_output
-    assert "Trust this folder?" not in second_output
-    assert "TRUST_ALREADY_ACCEPTED" in second_output
-    assert f"CWD={workdir}" in first_output
-    assert f"CWD={workdir}" in second_output
+    assert "Trust this folder?" in second_output
+    assert "TRUST_ACCEPTED" in second_output
+    cwds = [
+        pathlib.Path(line.removeprefix("CWD=").strip())
+        for line in (first_output + second_output).splitlines()
+        if line.startswith("CWD=")
+    ]
+    assert len(cwds) == 2
+    for cwd in cwds:
+        assert cwd.resolve().parent == workdir.resolve()
+        assert cwd.name.startswith("probe-")
+    # Probe exit removes the instance dirs; only the sweep lock file remains.
+    assert [p for p in workdir.iterdir() if p.name.startswith("probe-")] == []
     assert [(bucket.label, bucket.used_pct) for bucket in second.buckets] == [
         ("5h", 50.0),
         ("weekly", 20.0),

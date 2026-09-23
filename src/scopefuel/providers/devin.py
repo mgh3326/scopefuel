@@ -85,6 +85,7 @@ def fetch() -> ProviderResult:
             hint="Devin CLI 설치 후 다시 시도 (SCOPEFUEL_DEVIN_BIN 으로 경로 지정 가능)",
         )
 
+    proctrack.log_probe_call(Path(PROBE_WORKDIR).expanduser(), PROVIDER_ID)
     banner = _banner_result()
     models = _fetch_models_list()
 

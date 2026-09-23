@@ -25,6 +25,7 @@ import termios
 import time
 from pathlib import Path
 
+from .. import proctrack
 from ..model import Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_KIMI_BIN") or "kimi"
@@ -51,6 +52,36 @@ _RATE_LIMIT = re.compile(r"\b(?:429|too\s+many\s+requests|rate[- ]?limited)\b", 
 _PLAN = re.compile(r"\b(?:plan|tier)\s*[:|]\s*(?P<plan>[A-Za-z][A-Za-z0-9+ -]*)", re.IGNORECASE)
 
 
+@contextlib.contextmanager
+def _single_probe_lock(workdir: Path):
+    """Admit one kimi probe at a time, per pool.
+
+    2026-09-23: a caller polling every ~15s outran a 30s grok probe, so each
+    round started another CLI while the previous one was still running — 22
+    of them on desktop. kimi's PTY probe has the same shape, so it gets the
+    same bound: a second caller is told the pool is busy instead of adding
+    to the pile. The lock is an flock on a file descriptor, so the kernel
+    releases it if the holder is SIGKILLed.
+    """
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(workdir / ".probe.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def fetch() -> ProviderResult:
     """Read Kimi usage once; errors are reported without retrying the CLI."""
 
@@ -63,8 +94,20 @@ def fetch() -> ProviderResult:
             pool_class="spend",
         )
 
+    workdir = Path(PROBE_WORKDIR).expanduser()
+    proctrack.log_probe_call(workdir, "kimi")
     try:
-        output = _probe_once()
+        with _single_probe_lock(workdir) as acquired:
+            if not acquired:
+                # Not an error: another probe is already measuring this pool.
+                return ProviderResult(
+                    id="kimi",
+                    error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                    hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+                    source="cli:/usage",
+                    pool_class="spend",
+                )
+            output = _probe_once()
     except subprocess.TimeoutExpired:
         return ProviderResult(
             id="kimi",
@@ -85,17 +128,41 @@ def fetch() -> ProviderResult:
 
 
 def _probe_once() -> str:
-    """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice."""
+    """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice.
 
-    probe_workdir = Path(PROBE_WORKDIR).expanduser()
-    probe_workdir.mkdir(parents=True, exist_ok=True)
-    master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
+    The child runs in its own session, so nothing the parent's own process
+    group receives reaches it: if scopefuel is SIGKILLed mid-probe — which is
+    how a polling caller's own timeout ends a slow round — the Python cleanup
+    below never runs and the kimi child is reparented to init and keeps
+    burning CPU. That is the 2026-09-23 desktop incident's shape (22 grok
+    orphans, load 28); kimi's PTY probe shares it.
+
+    The four devices that bound it are proctrack's, already proven on the
+    devin probe (be0c0a9) and the grok probe (#593):
+
+    * a per-probe instance directory, flocked, used as the child's cwd — cwd
+      is the only identifier that cannot kill an unrelated long-lived worker;
+    * a pre-probe sweep of leftovers from probes whose owner has died;
+    * pgid + expected-cwd registration, so refresh's timeout handler can
+      reclaim the child before ``os._exit``;
+    * a detached reaper that watches for the parent's death — the last line
+      of defence, and the only one that survives SIGKILL of this process.
+    """
+
+    workdir = Path(PROBE_WORKDIR).expanduser()
+    workdir.mkdir(parents=True, exist_ok=True)
+    proctrack.kill_stale_probe_leftovers(workdir)
+    instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
+    master_fd = slave_fd = -1
     process: subprocess.Popen[bytes] | None = None
+    reaper: subprocess.Popen[bytes] | None = None
+    child_pgid: int | None = None
     try:
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command/input; binary is explicit/env-configured
             [BINARY],
-            cwd=probe_workdir,
+            cwd=instance_dir,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -103,6 +170,11 @@ def _probe_once() -> str:
             start_new_session=True,
             env=_child_env(),
         )
+        with contextlib.suppress(OSError):
+            child_pgid = os.getpgid(process.pid)
+        if child_pgid is not None:
+            proctrack.register(child_pgid, instance_dir)
+        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
         os.close(slave_fd)
         slave_fd = -1
 
@@ -187,9 +259,33 @@ def _probe_once() -> str:
                         os.killpg(process_group, signal.SIGKILL)
                 else:
                     process.kill()
-                process.wait(timeout=2.0)
+                # A wait() that times out here used to escape the finally block,
+                # skipping every cleanup line below it — including closing the
+                # pty — and replacing the real TimeoutExpired with its own.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+        # The direct child exiting is not the end of the probe's descendants. A
+        # CLI that backgrounds a helper and returns 0 leaves that helper running,
+        # and the block above skips entirely because ``process.poll()`` is not
+        # None — the success path leaked where the timeout path did not. Sweep
+        # the instance directory unconditionally, by cwd, before it is removed:
+        # once it is gone proctrack has no cwd left to recognise them by.
+        with contextlib.suppress(OSError):
+            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
+        if child_pgid is not None:
+            proctrack.unregister(child_pgid)
+        if reaper is not None:
+            if reaper.poll() is None:
+                with contextlib.suppress(OSError):
+                    reaper.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                reaper.wait(timeout=2.0)
+        with contextlib.suppress(OSError):
+            os.close(owner_fd)
+        shutil.rmtree(instance_dir, ignore_errors=True)
         if slave_fd >= 0:
-            os.close(slave_fd)
+            with contextlib.suppress(OSError):
+                os.close(slave_fd)
         with contextlib.suppress(OSError):
             os.close(master_fd)
 

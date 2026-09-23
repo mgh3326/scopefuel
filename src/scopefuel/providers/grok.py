@@ -103,6 +103,7 @@ def fetch() -> ProviderResult:
     if shutil.which(BINARY) is None:
         return _degraded(f"{BINARY} 실행 파일 없음", credential)
     workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
+    proctrack.log_probe_call(workdir, "grok")
     try:
         with _single_probe_lock(workdir) as acquired:
             if not acquired:

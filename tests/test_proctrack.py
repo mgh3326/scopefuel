@@ -383,6 +383,27 @@ def test_stale_sweep_spares_symlink_resolving_outside(tmp_path):
         _kill_and_reap(proc)
 
 
+def test_log_probe_call_appends_one_identifying_line(tmp_path):
+    """#608: every probe attempt leaves one line — caller path, pid, time."""
+    workdir = tmp_path / "probe-workdir"
+
+    proctrack.log_probe_call(workdir, "kimi")
+
+    lines = (workdir / "probe-calls.log").read_text().splitlines()
+    assert len(lines) == 1
+    line = lines[0]
+    assert "probe=kimi" in line
+    assert f"pid={os.getpid()}" in line
+    assert f"ppid={os.getppid()}" in line
+    assert "argv=" in line and "parent=" in line and "via=" in line
+
+
+def test_log_probe_call_never_raises_on_unwritable_workdir(tmp_path, monkeypatch):
+    """A probe must not fail because its audit line could not be written."""
+    monkeypatch.setattr(Path, "mkdir", lambda *a, **k: (_ for _ in ()).throw(OSError("ro")))
+    proctrack.log_probe_call(tmp_path / "nope", "kimi")
+
+
 def test_reaper_sweeps_target_dir_when_watched_parent_dies(tmp_path):
     target = tmp_path / "probe-workdir"
     leftover = _sleep_in(target / "deeper")

@@ -29,17 +29,23 @@ account 버킷의 최대값을 차단으로 본다). 두 풀이 있으면 **합�
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import fcntl
 import os
+import pathlib
 import re
 import shutil
+import signal
 import subprocess
 
+from .. import proctrack
 from ..model import Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_KIRO_BIN") or "kiro-cli"
 PROBE_INPUT = "/usage\n/quit\n"
 TIMEOUT_S = 30.0
+PROBE_WORKDIR = pathlib.Path.home() / ".local" / "share" / "scopefuel" / "kiro-probe-workdir"
 
 # 플랜 크레딧은 월 단위로 리셋된다. scopefuel 의 창 표기에는 '월'이 없어 30d 로 적는다
 # (pace 계산이 달 길이만큼 어긋날 수 있다 — 리셋 시각 자체는 실제 값을 쓴다).
@@ -55,6 +61,36 @@ _PLAN_NAME = re.compile(r"\|\s*KIRO ([A-Z+ ]+?)\s*$", re.MULTILINE)
 _EXPIRED = re.compile(r"Token expired|AccessDenied", re.IGNORECASE)
 
 
+@contextlib.contextmanager
+def _single_probe_lock(workdir: pathlib.Path):
+    """Admit one kiro probe at a time, per pool.
+
+    2026-09-23: a caller polling every ~15s outran a 30s grok probe, so each
+    round started another CLI while the previous one was still running — 22
+    of them on desktop. kiro's CLI probe has the same shape, so it gets the
+    same bound: a second caller is told the pool is busy instead of adding
+    to the pile. The lock is an flock on a file descriptor, so the kernel
+    releases it if the holder is SIGKILLed.
+    """
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(workdir / ".probe.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def fetch() -> ProviderResult:
     if shutil.which(BINARY) is None:
         return ProviderResult(
@@ -62,37 +98,112 @@ def fetch() -> ProviderResult:
             error=f"{BINARY} 실행 파일 없음",
             hint="kiro-cli 설치 후 다시 시도 (SCOPEFUEL_KIRO_BIN 으로 경로 지정 가능)",
         )
-    result = _probe_once()
-    if result.error and _EXPIRED.search((result.raw or {}).get("stdout", "")):
-        # 만료된 액세스 토큰은 CLI 호출 자체가 갱신한다(실측: 1회 실패 → 재호출 성공).
-        # 갱신은 CLI 몫이고 scopefuel 은 여전히 아무것도 쓰지 않는다.
-        retried = _probe_once()
-        if not retried.error:
+    workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
+    proctrack.log_probe_call(workdir, "kiro")
+    with _single_probe_lock(workdir) as acquired:
+        if not acquired:
+            # Not an error: another probe is already measuring this pool.
+            return ProviderResult(
+                id="kiro",
+                error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                hint="kiro-cli 를 직접 실행해 로그인 상태를 확인하세요",
+                source="cli:/usage",
+            )
+        result = _probe_once()
+        if result.error and _EXPIRED.search((result.raw or {}).get("stdout", "")):
+            # 만료된 액세스 토큰은 CLI 호출 자체가 갱신한다(실측: 1회 실패 → 재호출 성공).
+            # 갱신은 CLI 몫이고 scopefuel 은 여전히 아무것도 쓰지 않는다.
+            retried = _probe_once()
+            if not retried.error:
+                return retried
+            retried.hint = "kiro-cli 를 직접 실행해 로그인 상태를 확인하세요 (kiro-cli login)"
             return retried
-        retried.hint = "kiro-cli 를 직접 실행해 로그인 상태를 확인하세요 (kiro-cli login)"
-        return retried
-    return result
+        return result
 
 
 def _probe_once() -> ProviderResult:
+    """Run ``kiro-cli`` with ``/usage`` on stdin, inside proctrack's device chain.
+
+    The child runs in its own session with a per-probe instance directory as
+    its cwd — the same four devices the devin (be0c0a9) and grok (#593)
+    probes carry: a pre-probe sweep of dead probes' leftovers, a flocked
+    instance dir that identifies live probe processes by cwd, pgid+cwd
+    registration so refresh's timeout handler can reclaim the child before
+    ``os._exit``, and a detached reaper for the case where this process is
+    SIGKILLed and no Python cleanup runs at all.
+    """
+
+    workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
+    workdir.mkdir(parents=True, exist_ok=True)
+    proctrack.kill_stale_probe_leftovers(workdir)
+    instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
+    process: subprocess.Popen[str] | None = None
+    reaper: subprocess.Popen[bytes] | None = None
+    child_pgid: int | None = None
     try:
-        proc = subprocess.run(  # noqa: S603 - 사용자 PATH 의 kiro-cli, 입력은 고정 문자열
+        process = subprocess.Popen(  # noqa: S603 - 사용자 PATH 의 kiro-cli, 입력은 고정 문자열
             [BINARY],
-            input=PROBE_INPUT,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=TIMEOUT_S,
+            cwd=instance_dir,
+            close_fds=True,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        return ProviderResult(
-            id="kiro",
-            error=f"{BINARY} /usage 가 {TIMEOUT_S:.0f}초 안에 끝나지 않음",
-            hint="kiro-cli 를 직접 실행해 로그인/네트워크 상태를 확인하세요",
-        )
+        with contextlib.suppress(OSError):
+            child_pgid = os.getpgid(process.pid)
+        if child_pgid is not None:
+            proctrack.register(child_pgid, instance_dir)
+        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
+        try:
+            stdout, stderr = process.communicate(input=PROBE_INPUT, timeout=TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return ProviderResult(
+                id="kiro",
+                error=f"{BINARY} /usage 가 {TIMEOUT_S:.0f}초 안에 끝나지 않음",
+                hint="kiro-cli 를 직접 실행해 로그인/네트워크 상태를 확인하세요",
+            )
+        return parse(stdout + stderr)
     except OSError as exc:
         return ProviderResult(id="kiro", error=f"{BINARY} 실행 실패: {exc}")
-
-    return parse(proc.stdout + proc.stderr)
+    finally:
+        if process is not None and process.poll() is None:
+            process_group = None
+            with contextlib.suppress(OSError):
+                process_group = os.getpgid(process.pid)
+            try:
+                if process_group is not None:
+                    os.killpg(process_group, signal.SIGTERM)
+                process.wait(timeout=2.0)
+            except (subprocess.TimeoutExpired, OSError):
+                if process_group is not None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(process_group, signal.SIGKILL)
+                else:
+                    process.kill()
+                # A wait() that times out here must not escape the finally
+                # block — every cleanup line below it still has to run.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+        # The direct child exiting is not the end of the probe's descendants:
+        # a CLI that backgrounds a helper and returns 0 leaves that helper
+        # running. Sweep the instance directory unconditionally, by cwd,
+        # before it is removed — once it is gone proctrack has no cwd left
+        # to recognise them by.
+        with contextlib.suppress(OSError):
+            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
+        if child_pgid is not None:
+            proctrack.unregister(child_pgid)
+        if reaper is not None:
+            if reaper.poll() is None:
+                with contextlib.suppress(OSError):
+                    reaper.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                reaper.wait(timeout=2.0)
+        with contextlib.suppress(OSError):
+            os.close(owner_fd)
+        shutil.rmtree(instance_dir, ignore_errors=True)
 
 
 def parse(text: str) -> ProviderResult:
