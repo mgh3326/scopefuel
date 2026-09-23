@@ -355,6 +355,10 @@ def collect(
     (#576: 예전에는 빈 dict 를 통째로 저장해 다른 provider 의 정상 값까지 사라졌다).
     """
     now = time.time() if now is None else now
+    # task #578 — 측정 전에 계정 binding 을 고정한다(미등록이면 빈 dict, 동작 불변).
+    from . import quota_v2
+
+    v2_identities = quota_v2.capture_identities(names, now)
     cache = _load()
     backoff = _load_backoff()
     results: list[ProviderResult | None] = [None] * len(names)
@@ -453,6 +457,9 @@ def collect(
 
     if successes or failures:
         _merge_results(successes, failures, now)
+        # 이번 호출에서 실제로 시도한 결과만 account-scoped v2 저장소에 추가한다
+        # (캐시 히트·backoff 는 여기 오지 않는다). legacy 캐시와는 별 파일이다.
+        quota_v2.record_fetch(successes, failures, measured_at=now, identities=v2_identities)
     return [result for result in results if result is not None]
 
 

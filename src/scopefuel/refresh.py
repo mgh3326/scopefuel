@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from . import cache, proctrack
+from . import cache, proctrack, quota_v2
 from .http import classify_error
 from .model import ProviderResult
 from .providers import BUILTIN
@@ -107,10 +107,12 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
                 print(f"refresh: pool={pool} backoff 중 — {remaining:.0f}s 뒤 허용, 네트워크 호출 생략")
                 return 0
             fetcher = fetchers[pool]
+            v2_identities = quota_v2.capture_identities([pool], now)
             result = _fetch(fetcher, pool)
             if result.error or result.warning:
                 detail = result.error or result.warning
                 cache.record_failure(pool, result, now)
+                quota_v2.record_fetch({}, {pool: result}, measured_at=now, identities=v2_identities)
                 print(
                     f"refresh: pool={pool} failed: status={result.http_status or '-'} "
                     f"kind={result.error_kind or '-'} detail={detail}",
@@ -125,6 +127,7 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
             result.age_s = 0.0
             result.stale = False
             cache.update_entry(pool, result, now)
+            quota_v2.record_fetch({pool: result}, {}, measured_at=now, identities=v2_identities)
             print(f"refresh: pool={pool} updated fetched_at={now:.6f}", flush=True)
             return 0
         finally:
