@@ -351,49 +351,59 @@ def _base_limit_id(bucket: Bucket) -> str:
     return f"{bucket.scope.kind}:{_slug(name) if name else '-'}:{_slug(bucket.window)}"
 
 
-def _limit_ids(buckets: list[Bucket]) -> list[str]:
-    """Stable, unique limit ids that depend only on what identifies a limit.
+LIMIT_ID_MAX = 128
+LIMIT_ID_HASH_HEX = 32  # 128 bits of the full identity; never a short or truncated hash
 
-    ``scope:ref:window`` names a limit. When several buckets share it, each
-    gets a short hash of its fixed identity (raw label, scope ref, window,
-    horizon) — never of its position or its current value, so reordering or a
-    changing usage cannot swap ids. Ids are bounded to 128 characters and a
-    final pass keeps them unique even if two buckets are identical.
+
+class DuplicateLimitError(ValueError):
+    """Two buckets share one fixed identity but report different values."""
+
+
+def limit_id(bucket: Bucket) -> str:
+    """The bucket's limit id — a function of its own fixed identity only.
+
+    A readable ``scope:ref:window`` prefix (cut to fit) followed by 128 bits of
+    SHA-256 over the *untruncated* identity: raw label, scope ref, window and
+    horizon (the scope kind leads the prefix, which is never cut that short).
+    The suffix is unconditional, so an id never depends on which other buckets
+    arrived, their order, or any value. Cutting the prefix cannot merge two
+    limits because the hash covers everything that was cut.
     """
+    raw = "\x00".join(
+        (bucket.label or "", bucket.scope.name or "", bucket.window or "", bucket.horizon or "")
+    )
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:LIMIT_ID_HASH_HEX]
+    prefix = _base_limit_id(bucket)[: LIMIT_ID_MAX - LIMIT_ID_HASH_HEX - 1]
+    return f"{prefix}:{digest}"
 
-    def bounded(prefix: str, suffix: str = "") -> str:
-        return prefix[: 128 - len(suffix)] + suffix
 
-    def fingerprint(bucket: Bucket) -> str:
-        raw = "\x00".join(
-            (bucket.label or "", bucket.scope.name or "", bucket.window or "", bucket.horizon or "")
-        )
-        return hashlib.sha256(raw.encode()).hexdigest()[:10]
+def _dedupe_limits(rows: list[dict]) -> list[dict]:
+    """Collapse buckets that are the same limit reported twice.
 
-    bases = [_base_limit_id(b) for b in buckets]
-    ids = [
-        bounded(base) if bases.count(base) == 1 else bounded(base, f":{fingerprint(bucket)}")
-        for base, bucket in zip(bases, buckets, strict=True)
-    ]
-    seen: set[str] = set()
-    for index, value in enumerate(ids):
-        candidate, n = value, 2
-        while candidate in seen:  # identical buckets: nothing fixed tells them apart
-            candidate, n = bounded(value, f"-{n}"), n + 1
-        ids[index] = candidate
-        seen.add(candidate)
-    return ids
+    Equal ids mean equal fixed identity. Identical values are one limit; any
+    difference cannot be ordered or attributed, so the whole measurement is
+    refused rather than numbered by position.
+    """
+    out: dict[str, dict] = {}
+    for row in rows:
+        seen = out.get(row["limit_id"])
+        if seen is None:
+            out[row["limit_id"]] = row
+        elif seen != row:
+            raise DuplicateLimitError(row["limit_id"])
+    return list(out.values())
 
 
 def buckets_to_v2(buckets: list[Bucket]) -> list[dict]:
+    """Envelope buckets. Raises DuplicateLimitError for conflicting twins."""
     out: list[dict] = []
-    for bucket, limit_id in zip(buckets, _limit_ids(buckets), strict=True):
+    for bucket in buckets:
         name = bucket.scope.name if bucket.scope.kind != "account" else None
         reset = _normalize_reset(bucket.resets_at)
         window = bucket.window if WINDOW_RE.match(bucket.window or "") else "?"
         out.append(
             {
-                "limit_id": limit_id,
+                "limit_id": limit_id(bucket),
                 "label": bucket.label[:128] if bucket.label else None,
                 "scope": {"kind": bucket.scope.kind, "ref": name},
                 "horizon": bucket.horizon if bucket.horizon in HORIZONS else "week",
@@ -404,7 +414,7 @@ def buckets_to_v2(buckets: list[Bucket]) -> list[dict]:
                 "observed_at": None,
             }
         )
-    return out
+    return _dedupe_limits(out)
 
 
 _RATE_TEXT = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many requests", re.I)
@@ -448,7 +458,13 @@ def observation_from_result(
     """Build a v2 envelope. ``measured_at`` is the fetch time, never render time."""
     status = status_for(result)
     error_ref = None
-    if status not in MEASURING:
+    buckets: list[dict] = []
+    if status in MEASURING:
+        try:
+            buckets = buckets_to_v2(result.buckets)
+        except DuplicateLimitError:
+            status, error_ref = "parse_error", "parse_error:duplicate_limit"
+    else:
         error_ref = status + (f":http_{result.http_status}" if isinstance(result.http_status, int) else "")
     return {
         "schema": OBSERVATION_SCHEMA,
@@ -462,7 +478,7 @@ def observation_from_result(
         "measured_at": _iso(measured_at),
         "received_at": None,
         "status": status,
-        "buckets": buckets_to_v2(result.buckets) if status in MEASURING else [],
+        "buckets": buckets,
         "error_ref": error_ref,
         "lease_epoch": None,
     }

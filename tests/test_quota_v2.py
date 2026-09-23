@@ -90,7 +90,9 @@ def _enroll(*bindings: dict, machine: str = "node-a") -> None:
     )
 
 
-def _identity(account: str = ACCOUNT_A, revision: int = 1, machine: str = "node-a", label=None) -> dict:
+def _identity(
+    account: str = ACCOUNT_A, revision: int = 1, machine: str = "node-a", label=None, at: dt.datetime = T0
+) -> dict:
     return {
         "provider": "claude",
         "account_ref": account,
@@ -98,8 +100,8 @@ def _identity(account: str = ACCOUNT_A, revision: int = 1, machine: str = "node-
         "binding_revision": revision,
         "machine_id": machine,
         "local_slot_ref": "slot-0000000000000000",
-        "verified_at": _iso(T0 - dt.timedelta(hours=1)),
-        "valid_until": _iso(T0 + dt.timedelta(days=1)),
+        "verified_at": _iso(at - dt.timedelta(hours=1)),
+        "valid_until": _iso(at + dt.timedelta(days=1)),
         "label": label,
     }
 
@@ -255,7 +257,8 @@ def test_two_nodes_gate_cli_shadow_matches_and_merges_one_account(tmp_path, monk
     merged = quota_v2.account_observations("claude", ACCOUNT_A)
     assert sorted(o["source_machine"] for o in merged) == ["node-a", "node-b"]
     for obs in merged:  # account 7d and model 7d kept on both nodes' rows
-        assert {"account:-:7d", "model:opus:7d", "account:-:5h"} <= {b["limit_id"] for b in obs["buckets"]}
+        prefixes = {b["limit_id"].rsplit(":", 1)[0] for b in obs["buckets"]}
+        assert {"account:-:7d", "model:opus:7d", "account:-:5h"} <= prefixes
 
     rc, _out, _err = _run_gate(monkeypatch, capsys, lambda: pytest.fail("TTL hit must not fetch"))
     assert rc == 0
@@ -290,7 +293,7 @@ def test_same_slot_rebind_a_to_b_never_lets_a_snapshot_pass_b(slot_env, monkeypa
 
     # Pure evaluate: B identity + only A observations → never admitted.
     a_rows = quota_v2.account_observations("claude", ACCOUNT_A)
-    v2 = quota_v2.evaluate(_snapshot(_identity(ACCOUNT_B, 2), a_rows), "opus", now=dt.datetime.now(dt.UTC))
+    v2 = quota_v2.evaluate(_snapshot(_identity(ACCOUNT_B, 2, at=now), a_rows), "opus", now=now)
     assert not v2.gate.ok and v2.code == "NO_SAMPLE" and v2.excluded["other_account"] == len(a_rows)
 
 
@@ -466,7 +469,7 @@ def test_label_is_an_alias_not_a_key(slot_env):
     assert work.as_dict() == personal.as_dict()
     # A label never selects a binding: two bindings on one slot is ambiguous.
     _enroll(_binding(slot_env, ACCOUNT_A, 1, label="회사"), _binding(slot_env, ACCOUNT_B, 2, label="회사"))
-    identity, reason = quota_v2.resolve_identity("claude", dt.datetime.now(dt.UTC).timestamp())
+    identity, reason = quota_v2.resolve_identity("claude", T0.timestamp())
     assert identity is None and reason == "ambiguous"
 
 
@@ -475,7 +478,7 @@ def test_two_slots_of_one_provider_on_one_machine_stay_apart(tmp_path):
     slot_2 = quota_v2.slot_locator("claude", {"CLAUDE_CONFIG_DIR": str(tmp_path / "two"), "HOME": "/h"})
     assert slot_1 != slot_2
     _enroll(_binding(slot_1, ACCOUNT_A, 1), _binding(slot_2, ACCOUNT_B, 2))
-    now = dt.datetime.now(dt.UTC).timestamp()
+    now = (T0 + dt.timedelta(minutes=1)).timestamp()  # fixture clock: bindings run T0..T0+24h
     first, _ = quota_v2.resolve_identity(
         "claude", now, env={"CLAUDE_CONFIG_DIR": str(tmp_path / "one"), "HOME": "/h"}
     )
@@ -488,7 +491,9 @@ def test_two_slots_of_one_provider_on_one_machine_stay_apart(tmp_path):
 
 def test_envelope_keeps_every_limit_and_rejects_email_account():
     obs = _obs("obs-e", T0)
-    assert [b["limit_id"] for b in obs["buckets"]] == ["account:-:5h", "account:-:7d", "model:opus:7d"]
+    ids = [b["limit_id"] for b in obs["buckets"]]
+    assert [i.rsplit(":", 1)[0] for i in ids] == ["account:-:5h", "account:-:7d", "model:opus:7d"]
+    assert all(len(i.rsplit(":", 1)[1]) == quota_v2.LIMIT_ID_HASH_HEX for i in ids)
     assert all(b["window_instance"] != "unknown" for b in obs["buckets"])
     bad = dict(obs, account_ref="someone@example.com")
     assert not quota_v2.validate_observation(bad)
@@ -656,39 +661,34 @@ def test_v2_hook_failure_never_reaches_the_real_gate(hook, slot_env, monkeypatch
 
 
 def test_limit_ids_do_not_depend_on_bucket_order():
-    """SF-4: two limits sharing scope/window keep their ids when reordered.
-    Buckets identical in every fixed field cannot be told apart; they only
-    need distinct ids."""
+    """SF-4: two limits sharing scope/window keep their ids when reordered."""
     first = Bucket("7d weekly", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
     second = Bucket("7d rolling", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
     forward = {b["label"]: b["limit_id"] for b in quota_v2.buckets_to_v2([first, second])}
     backward = {b["label"]: b["limit_id"] for b in quota_v2.buckets_to_v2([second, first])}
     assert forward == backward and len(set(forward.values())) == 2
-    twin_a = Bucket("7d", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
-    twin_b = Bucket("7d", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
-    assert len(set(quota_v2._limit_ids([twin_a, twin_b]))) == 2
 
 
 # ---------------------------------------------------------------- round 3 (t578-verify r2 findings)
 
 
 def test_limit_ids_stay_unique_and_bounded_so_no_observation_is_dropped(slot_env):
-    """R2-SF-1: colliding slugs, suffix look-alikes and long labels must still
-    give unique ids — a duplicate would drop the whole envelope."""
+    """R2-SF-1: colliding slugs, suffix look-alikes and long labels still give
+    unique ids — a duplicate would drop the whole envelope."""
     reset = _iso(T0 + dt.timedelta(days=3))
     long_a, long_b = "x" * 121 + "a", "x" * 121 + "b"
-    for labels in (("requests", "Requests", "requests-1"), (long_a, long_b), ("same", "same")):
+    for labels in (("requests", "Requests", "requests-1"), (long_a, long_b)):
         buckets = [
             Bucket(label, "7d", 10.0 * (i + 1), reset, Scope("model", label), "week")
             for i, label in enumerate(labels)
         ] + [Bucket(label, "7d", 50.0, reset, Scope("account"), "week") for label in labels]
-        ids = quota_v2._limit_ids(buckets)
+        ids = [quota_v2.limit_id(b) for b in buckets]
         assert len(set(ids)) == len(ids) and all(len(i) <= 128 for i in ids)
         identity = quota_v2.Identity("claude", ACCOUNT_A, "unknown", 1, "node-a", "slot-x", 0.0, 1e12)
         obs = quota_v2.observation_from_result(
             ProviderResult(id="claude", buckets=buckets), identity, measured_at=T0.timestamp()
         )
-        assert quota_v2.validate_observation(obs)
+        assert obs["status"] == "success" and quota_v2.validate_observation(obs)
         assert quota_v2.append_observations([obs]) == 1
 
 
@@ -701,7 +701,7 @@ def test_limit_ids_do_not_move_when_usage_changes():
             Bucket("A B", "7d", first, reset, Scope("account"), "week"),
             Bucket("A-B", "7d", second, reset, Scope("account"), "week"),
         ]
-        return {b.label: i for b, i in zip(pair, quota_v2._limit_ids(pair), strict=True)}
+        return {b["label"]: b["limit_id"] for b in quota_v2.buckets_to_v2(pair)}
 
     low_high, high_low = ids(10.0, 90.0), ids(90.0, 10.0)
     assert low_high == high_low and len(set(low_high.values())) == 2
@@ -716,3 +716,114 @@ def test_same_instant_own_auth_failure_is_not_cleared_by_input_order(order):
     rows = [auth, success] if order == "auth_first" else [success, auth]
     v2 = quota_v2.evaluate(_snapshot(_identity(), rows), "opus", now=T0 + dt.timedelta(seconds=10))
     assert v2.code == "AUTH_BLOCKED" and not v2.gate.ok
+
+
+# ---------------------------------------------------------------- round 4 (t578-verify r3 findings)
+
+_R3_REFS = ("x" * 122 + "a", "x" * 122 + "b")
+_R3_LABELS = ("limit-763944", "limit-1182207")  # 40-bit prefix collision found by the tester
+
+
+def _r3_pair_decision(extra_first: list[Bucket], extra_second: list[Bucket], common: list[Bucket]) -> tuple:
+    def identity(machine: str, revision: int) -> quota_v2.Identity:
+        return quota_v2.Identity(
+            "claude",
+            ACCOUNT_A,
+            "unknown",
+            revision,
+            machine,
+            "slot-x",
+            (T0 - dt.timedelta(hours=1)).timestamp(),
+            (T0 + dt.timedelta(days=1)).timestamp(),
+        )
+
+    def observation(oid: str, machine: str, revision: int, extra: list[Bucket]) -> dict:
+        return quota_v2.observation_from_result(
+            ProviderResult(id="claude", buckets=common + extra),
+            identity(machine, revision),
+            measured_at=T0.timestamp(),
+            observation_id=oid,
+        )
+
+    first = observation("obs-first", "node-a", 1, extra_first)
+    second = observation("obs-second", "node-b", 2, extra_second)
+
+    def code(rows: list[dict]) -> str:
+        snapshot = {
+            "schema": quota_v2.SNAPSHOT_SCHEMA,
+            "identities": {"claude": identity("node-a", 1).as_dict()},
+            "observations": rows,
+        }
+        return quota_v2.evaluate(snapshot, "opus", now=T0 + dt.timedelta(seconds=10)).code
+
+    return first, second, code([first]), code([first, second])
+
+
+def test_long_model_refs_cut_at_128_keep_distinct_ids_across_nodes():
+    """R3-SF-1 (tester long_scope_order): two 123-char model refs that share
+    their first 122 characters, sent in opposite order by two nodes."""
+    reset = _iso(T0 + dt.timedelta(days=4))
+    common = [
+        Bucket("5h", "5h", 10, _iso(T0 + dt.timedelta(hours=3)), Scope("account"), "now"),
+        Bucket("7d all", "7d", 10, reset, Scope("account"), "week"),
+        Bucket("7d Opus", "7d", 10, reset, Scope("model", "Opus"), "week"),
+    ]
+    extra_a = Bucket("model A", "7d", 10, reset, Scope("model", _R3_REFS[0]), "week")
+    extra_b = Bucket("model B", "7d", 80, reset, Scope("model", _R3_REFS[1]), "week")
+    first, second, alone, paired = _r3_pair_decision([extra_a, extra_b], [extra_b, extra_a], common)
+    ids_first = {b["label"]: b["limit_id"] for b in first["buckets"]}
+    ids_second = {b["label"]: b["limit_id"] for b in second["buckets"]}
+    assert ids_first == ids_second and len(set(ids_first.values())) == len(ids_first)
+    assert all(len(i) <= 128 for i in ids_first.values())
+    assert quota_v2.validate_observation(first) and quota_v2.validate_observation(second)
+    assert (alone, paired) == ("OK", "OK")
+
+
+def test_forty_bit_hash_collision_pair_keeps_distinct_ids_across_nodes():
+    """R3-SF-1 (tester hash_collision_effect): labels whose old 10-hex suffix
+    collided must get different ids and must not turn two agreeing nodes into
+    CONFLICT."""
+    reset = _iso(T0 + dt.timedelta(days=4))
+    a = Bucket(_R3_LABELS[0], "7d", 10, reset, Scope("account"), "week")
+    b = Bucket(_R3_LABELS[1], "7d", 20, reset, Scope("account"), "week")
+    common = [
+        Bucket("5h", "5h", 10, _iso(T0 + dt.timedelta(hours=3)), Scope("account"), "now"),
+        Bucket("7d Opus", "7d", 10, reset, Scope("model", "Opus"), "week"),
+    ]
+    assert quota_v2.limit_id(a) != quota_v2.limit_id(b)
+    first, second, alone, paired = _r3_pair_decision([a, b], [b, a], common)
+    assert {x["label"]: x["limit_id"] for x in first["buckets"]} == {
+        x["label"]: x["limit_id"] for x in second["buckets"]
+    }
+    assert (alone, paired) == ("OK", "OK")
+
+
+def test_limit_id_does_not_change_when_another_bucket_appears():
+    """r3 observation: an id depends on its own bucket only, not on the set."""
+    reset = _iso(T0 + dt.timedelta(days=4))
+    requests = Bucket("requests", "7d", 10, reset, Scope("account"), "week")
+    tokens = Bucket("tokens", "7d", 50, reset, Scope("account"), "week")
+    alone = quota_v2.buckets_to_v2([requests])[0]["limit_id"]
+    together = {b["label"]: b["limit_id"] for b in quota_v2.buckets_to_v2([tokens, requests])}
+    assert together["requests"] == alone == quota_v2.limit_id(requests)
+
+
+def test_identical_twins_are_one_limit_and_conflicting_twins_refuse_the_measurement():
+    """No position numbering: the same limit reported twice with the same
+    value is one bucket; with different values the measurement is refused."""
+    reset = _iso(T0 + dt.timedelta(days=4))
+    identity = quota_v2.Identity("claude", ACCOUNT_A, "unknown", 1, "node-a", "slot-x", 0.0, 1e12)
+    same = [Bucket("same", "7d", 10, reset, Scope("account"), "week")] * 2
+    obs = quota_v2.observation_from_result(
+        ProviderResult(id="claude", buckets=same), identity, measured_at=T0.timestamp()
+    )
+    assert obs["status"] == "success" and len(obs["buckets"]) == 1
+    differing = [
+        Bucket("same", "7d", 10, reset, Scope("account"), "week"),
+        Bucket("same", "7d", 50, reset, Scope("account"), "week"),
+    ]
+    obs = quota_v2.observation_from_result(
+        ProviderResult(id="claude", buckets=differing), identity, measured_at=T0.timestamp()
+    )
+    assert obs["status"] == "parse_error" and obs["buckets"] == []
+    assert obs["error_ref"] == "parse_error:duplicate_limit" and quota_v2.validate_observation(obs)
