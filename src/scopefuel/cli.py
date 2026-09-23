@@ -165,6 +165,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         action="store_true",
         help="운영자 명시 요청 — consult_only 및 stale 상태의 비-default gate 에 필요",
     )
+    launch_parser.add_argument(
+        "--purpose",
+        help="호출자가 선언한 용도 (task #527). astra 정체성에 한해 허용 용도이면 "
+        "consult_only 를 충족한다 — fable 에는 적용되지 않는다",
+    )
 
     manual_parser = subparsers.add_parser("manual", help="로컬 수동 쿼타 관측 관리")
     manual_sub = manual_parser.add_subparsers(dest="manual_command", required=True)
@@ -770,6 +775,7 @@ def _policy_launch_command(args: argparse.Namespace) -> int:
             args.profile,
             effort=args.effort,
             operator_request=bool(args.operator_request),
+            purpose=getattr(args, "purpose", None),
         )
     except launch.LaunchError as exc:
         print(f"error: {exc}", file=sys.stderr)

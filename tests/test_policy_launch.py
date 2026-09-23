@@ -265,3 +265,54 @@ def test_a_rung_the_catalog_defines_is_accepted_even_if_this_build_predates_it()
 
     view = _view(_entry("opus", "ultra2", "S+"), _entry("opus", "high", "S+"))
     assert launch.resolve_launch("opus", effort="ultra2", view=view).effort == "ultra2"
+
+
+# --- #527 x #593: purpose satisfies consult_only for astra, and ONLY astra ----
+
+
+@pytest.mark.parametrize("purpose", ["director", "architect", "operator-request", "ARCHITECT", " director "])
+def test_an_allowed_purpose_satisfies_astras_consult_only(purpose):
+    """A bare `wrk spawn -m codex-astra` is the architect counsel path: wrk
+    defaults the purpose, the quota gate admits it, and the catalog must admit it
+    too — otherwise two spellings of one restriction become cumulative and an
+    approved invocation dies between them."""
+
+    decision = launch.resolve_launch("codex-astra", purpose=purpose)
+    assert decision.model_id == "gpt-6-astra"
+    assert decision.effort == "xhigh"
+
+
+@pytest.mark.parametrize("purpose", [None, "", "builder", "worker", "tester", "arch"])
+def test_a_purpose_outside_the_527_list_does_not_satisfy_astra(purpose):
+    with pytest.raises(launch.LaunchError, match="consult_only"):
+        launch.resolve_launch("codex-astra", purpose=purpose)
+
+
+@pytest.mark.parametrize("purpose", ["architect", "director", "operator-request"])
+def test_a_purpose_never_satisfies_fables_consult_only(purpose):
+    """🔴 #527 AC⑤ — fable's escalation gate must not be relaxed. The purpose rule
+    is astra's identity only; a purpose string must never become a second key to
+    fable. Removing the astra restriction makes this test fail, which is the
+    point: the restriction is the test's subject.
+    """
+
+    with pytest.raises(launch.LaunchError, match="consult_only"):
+        launch.resolve_launch("fable", purpose=purpose)
+    # ...and the remedy it names must not advertise a purpose for fable.
+    try:
+        launch.resolve_launch("fable", purpose=purpose)
+    except launch.LaunchError as exc:
+        assert "--purpose" not in str(exc)
+
+    # The one key that does work is unchanged.
+    assert launch.resolve_launch("fable", operator_request=True).model_id == "claude-fable-5-1"
+
+
+def test_the_purpose_vocabulary_is_527s_not_a_second_copy():
+    """Two copies of a permission list drift, and the drift direction is
+    'more allowed than intended'."""
+
+    from scopefuel import recommend
+
+    assert launch.ASTRA_ALLOWED_PURPOSES is recommend.ASTRA_ALLOWED_PURPOSES
+    assert launch.ASTRA_ROLE_PROFILES is recommend.ASTRA_ROLE_PROFILES

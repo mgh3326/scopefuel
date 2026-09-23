@@ -31,7 +31,14 @@ from .bench import (
     CatalogView,
     read_catalog,
 )
-from .recommend import GRADE_TABLE, PROFILE_ALIASES, REP_GRADES_ORDER, profile_pool
+from .recommend import (
+    ASTRA_ALLOWED_PURPOSES,
+    ASTRA_ROLE_PROFILES,
+    GRADE_TABLE,
+    PROFILE_ALIASES,
+    REP_GRADES_ORDER,
+    profile_pool,
+)
 
 GATE_DEFAULT = "default"
 GATE_ESCALATION = "escalation"
@@ -295,6 +302,29 @@ def _known_rung(effort: str, entries: tuple[CatalogEntry, ...] | list[CatalogEnt
     return effort in CATALOG_EFFORT_RANKS or any(entry.effort == effort for entry in entries)
 
 
+def _consult_only_satisfied(profile: str, *, operator_request: bool, purpose: str | None) -> bool:
+    """Whether a ``consult_only`` row may proceed.
+
+    An explicit operator request always satisfies it. For an **astra** identity
+    only, a declared purpose does too — task #527 made a bare
+    ``wrk spawn -m codex-astra`` the architect counsel path (wrk injects
+    ``--purpose architect``) and the quota gate admits it, so requiring an
+    operator request on top would break an approved invocation. The vocabulary
+    is #527's, imported rather than restated: two copies of a permission list
+    drift, and the drift direction is "more allowed than intended".
+
+    This applies to astra and nothing else. ``fable``'s consult_only stays
+    satisfiable only by ``--operator-request`` — #527 AC⑤ forbids relaxing that
+    escalation gate, and a purpose string must never become a second key to it.
+    """
+
+    if operator_request:
+        return True
+    if profile not in ASTRA_ROLE_PROFILES:
+        return False
+    return (purpose or "").strip().casefold() in ASTRA_ALLOWED_PURPOSES
+
+
 def _retired_rung(view: CatalogView, profile: str, effort: str) -> bool:
     return any(
         entry.profile == profile and entry.effort == effort and entry.retired_at for entry in view.entries
@@ -306,6 +336,7 @@ def resolve_launch(
     *,
     effort: str | None = None,
     operator_request: bool = False,
+    purpose: str | None = None,
     path: str | None = None,
     view: CatalogView | None = None,
 ) -> LaunchDecision:
@@ -382,9 +413,17 @@ def resolve_launch(
     # "default" is not evidence, because the canon may have raised that gate
     # since — and an unreachable server must never be the reason a profile got
     # easier to start.
-    if row.gate == GATE_CONSULT_ONLY and not operator_request:
+    if row.gate == GATE_CONSULT_ONLY and not _consult_only_satisfied(
+        canonical, operator_request=operator_request, purpose=purpose
+    ):
+        remedy = (
+            "declare an allowed --purpose (" + ", ".join(sorted(ASTRA_ALLOWED_PURPOSES)) + ")"
+            " or pass --operator-request"
+            if canonical in ASTRA_ROLE_PROFILES
+            else "pass --operator-request"
+        )
         raise LaunchError(
-            f"profile '{profile}' is consult_only; pass --operator-request"
+            f"profile '{profile}' is consult_only; {remedy}"
             + (f" ({row.gate_reason})" if row.gate_reason else "")
         )
     if (view.stale or from_snapshot) and row.gate != GATE_DEFAULT and not operator_request:
