@@ -11,6 +11,7 @@ from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     BRAKE_KNEE_PCT,
     CODEX_SOL_XHIGH_ESCALATION_REASON,
+    ESTIMATED_EXTRAPOLATED_ANNOTATION,
     GRADE_BOUNDARIES,
     GRADE_DISCRIM,
     GRADE_TABLE,
@@ -253,10 +254,8 @@ def test_exclude_clear_restores_claude_candidates():
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     ranked_names = [line.split()[1] for line in out.splitlines() if line[:1].isdigit()]
     assert "opus" in ranked_names
-    # fable is escalation, not a normal candidate — but present in escalation section
-    assert not any(line[:1].isdigit() and "fable" in line for line in out.splitlines())
-    assert "⚠ 승급 후보" in out
-    assert "fable" in out
+    # ROB-591: fable left GRADE_TABLE entirely — never appears, escalation or normal.
+    assert "fable" not in out
     assert not any("정책 제외" in line for line in out.splitlines())
 
 
@@ -353,7 +352,8 @@ def test_all_policy_excluded_shows_emergency_block():
     assert "✗ 정책 가용 후보 없음" in out
     assert "⚠ 비상 후보 (정책상 제외 — 사용 시 근거를 이슈에 기록할 것)" in out
     assert "pool=claude" in out and "until=2026-08-31" in out
-    assert "opus" in out and "fable" in out and "codex-sol" in out
+    # ROB-591: fable left GRADE_TABLE — no longer a policy-excluded emergency candidate.
+    assert "opus" in out and "codex-sol" in out
     # no ranked normal candidates
     assert not any(line[:1].isdigit() for line in out.splitlines())
 
@@ -378,7 +378,8 @@ def test_no_config_backcompat_sort_and_output():
 
 
 def test_ac1_sp_recommend_with_claude_exclude():
-    """AC1: --recommend S+ shows kiro-opus/codex-sol as normal, fable in escalation+reason+exclude."""
+    """AC1: --recommend S+ shows kiro-opus/codex-sol as normal, opus --effort max in
+    escalation+reason+exclude (fable no longer participates — ROB-591)."""
     policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
@@ -405,26 +406,25 @@ def test_ac1_sp_recommend_with_claude_exclude():
     # kiro-sol is also a normal candidate (different pool fallback)
     assert any("kiro-sol" in line for line in ranked)
 
-    # fable is in escalation section with reason
+    # ROB-591: fable left GRADE_TABLE entirely — it never appears, escalation or normal.
+    assert "fable" not in out
+
+    # opus --effort max is in escalation section with its own reason
     assert "⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)" in out
-    assert "fable" in out
-    assert "Opus 5 대비 2배 가격" in out
+    assert OPUS_MAX_ESCALATION_REASON in out
 
-    # fable NOT in normal candidates
-    assert not any(line[:1].isdigit() and "fable" in line for line in lines)
-
-    # Claude exclude status shown alongside fable escalation
-    fable_section = False
+    # Claude exclude status shown alongside the opus --effort max escalation entry
+    opus_max_section = False
     for i, line in enumerate(lines):
-        if "fable" in line and "pool=claude" in line:
-            fable_section = True
+        if "opus --effort max" in line and "pool=claude" in line:
+            opus_max_section = True
             # next lines should have gate_reason and policy-excluded status
             remaining = "\n".join(lines[i:])
-            assert "Opus 5 대비 2배 가격" in remaining
+            assert OPUS_MAX_ESCALATION_REASON in remaining
             assert "정책 제외" in remaining
             assert "until 2026-08-31" in remaining
             break
-    assert fable_section
+    assert opus_max_section
 
     # opus is default-gate, policy-excluded → folded pool line, not in escalation
     # ROB-1219: excluded pools are suppressed, not folded into a per-grade line
@@ -448,7 +448,10 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
-    assert {"codex-terra", "codex-luna", "opus"}.issubset(aplus_names)
+    assert {"codex-terra", "codex-luna"}.issubset(aplus_names)
+    # ROB-591: opus --effort low moved from A+ (escalation, 57) to S (escalation, 62)
+    # as part of the Opus 5.5 refresh — see test_ac1b_opus_low_moved_to_s below.
+    assert not any(p.name == "opus" for p in GRADE_TABLE["A+"])
     assert "agy-flash" in aplus_names  # ROB-1251: AA v1.3 실측 승급
     assert "oc-minimax-m3" not in aplus_names
     # ROB-1253: oc-dsflash는 방향 감쇠(측정 codex·max > 실행 opencode·default)로 A+→A 이동
@@ -473,11 +476,28 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     assert "oc-dsflash" not in c_names
 
 
+def test_ac1b_opus_low_moved_to_s():
+    """ROB-591: opus --effort low is now S (escalation, 62), not A+ (escalation, 57)."""
+    s_low = next(p for p in GRADE_TABLE["S"] if p.name == "opus")
+    assert s_low.launcher_effort == "low"
+    assert s_low.benchmark == 62.0
+    assert s_low.gate == "escalation"
+    assert s_low.model == "Opus 5.5 (low)"
+    assert s_low.aa_agent_model_id == "claude-opus-5-5"
+    assert s_low.aa_model_id == "claude-opus-5-5"
+    # CodeRabbit #68: the pre-move gate_reason named Sonnet 5 (high), an A+
+    # candidate — that's not an S alternative and must not survive the move.
+    assert "Sonnet" not in (s_low.gate_reason or "")
+    assert s_low.gate_reason is not None
+    for alt in ("Terra", "Kimi K3", "Grok"):
+        assert alt in s_low.gate_reason
+
+
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     providers = [_result("codex", 10.0, pool_class="preserve")]
     measured = [
         bench.ModelScore(
-            model_id="gpt-5.6-luna",
+            model_id="gpt-6-luna",
             effort="max",
             harness="codex",
             source="AA-agent",
@@ -507,13 +527,29 @@ def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
 def test_rob1193_splus_default_and_escalation_efforts_have_exact_reasons():
     defaults = [p for p in GRADE_TABLE["S+"] if p.gate == "default"]
     escalations = [p for p in GRADE_TABLE["S+"] if p.gate == "escalation"]
-    opus_default = next(p for p in defaults if p.name == "opus")
+    opus_defaults = [p for p in defaults if p.name == "opus"]
     sol_default = next(p for p in defaults if p.name == "codex-sol")
     opus_escalation = next(p for p in escalations if p.name == "opus")
     sol_escalation = next(p for p in escalations if p.name == "codex-sol")
-    assert opus_default.launcher_effort == "xhigh"
+
+    # ROB-591: opus --effort high must be the FIRST ordinary (default-gate) Opus row
+    # in physical list order — that is what recommend()'s sort_key tie-break uses to
+    # decide which "opus" candidate is shown first for --recommend S+ --brief.
+    assert [p.launcher_effort for p in opus_defaults] == ["high", "xhigh", "medium"]
+    assert {p.launcher_effort: p.benchmark for p in opus_defaults} == {
+        "high": 67.0,
+        "xhigh": 69.0,
+        "medium": 66.0,
+    }
+    for p in opus_defaults:
+        assert p.aa_agent_model_id == "claude-opus-5-5"
+        assert p.aa_model_id == "claude-opus-5-5"
+        assert p.model == f"Opus 5.5 ({p.launcher_effort})"
+        assert p.benchmark_annotation == ESTIMATED_EXTRAPOLATED_ANNOTATION
+
     assert sol_default.launcher_effort == "max"
     assert opus_escalation.launcher_effort == "max"
+    assert opus_escalation.benchmark == 69.0
     assert opus_escalation.gate_reason == OPUS_MAX_ESCALATION_REASON
     assert sol_escalation.launcher_effort == "xhigh"
     assert sol_escalation.gate_reason == CODEX_SOL_XHIGH_ESCALATION_REASON
@@ -642,16 +678,25 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
         _result("grok", 10.0),
     ]
 
+    # ROB-591: opus high/xhigh/medium moved to S+; only opus --effort low (escalation)
+    # remains in S.
+    sp_output = recommend(providers, "S+", today=TODAY, now=NOW)
+    assert any(line[:1].isdigit() and "opus --effort high" in line for line in sp_output.splitlines())
+    assert any(line[:1].isdigit() and "opus --effort medium" in line for line in sp_output.splitlines())
+
     s_output = recommend(providers, "S", today=TODAY, now=NOW)
-    assert "opus --effort high" in s_output
-    assert "opus --effort medium" in s_output
+    assert "opus --effort low" in s_output
+    assert not any(line[:1].isdigit() and "opus --effort low" in line for line in s_output.splitlines())
+    assert not any(
+        "opus --effort high" in line or "opus --effort medium" in line for line in s_output.splitlines()
+    )
 
     aplus_output = recommend(providers, "A+", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in aplus_output.splitlines())
     assert "sonnet --effort xhigh" in aplus_output
-    assert "opus --effort low" in aplus_output
+    # ROB-591: opus --effort low no longer lives in A+ at all (moved to S).
+    assert "opus --effort low" not in aplus_output
     assert "벤치 55.0(추정(내삽))" in aplus_output
-    assert not any(line[:1].isdigit() and "opus --effort low" in line for line in aplus_output.splitlines())
     # ROB-1202: Grok medium relocated here — estimated + unmeasured, not the raw high score.
     assert any(line[:1].isdigit() and "grok --effort medium" in line for line in aplus_output.splitlines())
     assert "벤치 59.4(추정(외삽))" in aplus_output
@@ -963,29 +1008,34 @@ def test_escalation_profiles_not_in_normal_candidates():
             assert "oc-oss" not in line
 
 
-def test_fable_escalation_shows_reason_and_pool_status():
+def test_opus_max_escalation_shows_reason_and_pool_status():
+    """ROB-591: opus --effort max (escalation) is the S+ escalation row with a claude-pool
+    status line — fable no longer serves this role (it left GRADE_TABLE entirely)."""
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
     ]
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     lines = out.splitlines()
     assert "⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)" in out
-    assert any("fable" in line for line in lines)
-    assert "Opus 5 대비 2배 가격" in out
-    # fable pool is available → status shows usage (multi-window display after ROB-1191)
+    assert any("opus --effort max" in line for line in lines)
+    assert "fable" not in out
+    assert OPUS_MAX_ESCALATION_REASON in out
+    # own pool is available → status shows usage (multi-window display after ROB-1191)
     assert any("사용 " in line and "10%" in line for line in lines)
 
 
-def test_fable_escalation_with_policy_exclude_shows_both():
-    """When fable's pool is policy-excluded, both escalation reason and exclude status show."""
+def test_opus_max_escalation_with_policy_exclude_shows_both():
+    """When opus --effort max's own pool is policy-excluded, both escalation reason and
+    exclude status show (ROB-591: fable no longer serves this role)."""
     policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
     providers = [
         _result("claude", 10.0, pool_class="preserve"),
     ]
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     assert "⚠ 승급 후보" in out
-    assert "fable" in out
-    assert "Opus 5 대비 2배 가격" in out
+    assert "fable" not in out
+    assert any("opus --effort max" in line for line in out.splitlines())
+    assert OPUS_MAX_ESCALATION_REASON in out
     assert "정책 제외" in out
     assert "until 2026-08-31" in out
 
@@ -1465,12 +1515,18 @@ def test_rob1210_budget_window_drives_capacity_waste_and_explain():
 
 
 def test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool():
-    """The short-window waste illusion no longer outranks a higher weekly budget waste."""
+    """The short-window waste illusion no longer outranks a higher weekly budget waste.
+
+    ROB-591: uses codex (codex-terra-max) instead of claude (opus) as the weekly+5h
+    pool under test — opus's only grade-S row is now escalation-gated (opus --effort
+    low), so it is no longer a *normal* ranked candidate at grade S. The waste-score
+    math itself is pool-agnostic, so this substitution preserves the exact assertions.
+    """
     out = recommend(
         [
             # The old constraint-based score would count almost all 5h remainder as waste.
             _result_windows_with_resets(
-                "claude",
+                "codex",
                 [(10.0, "5h", 0.5), (40.0, "7d", 68.0)],
             ),
             # Weekly-only control: 80% remains and the slow pace leaves 66.4% at risk.
@@ -1483,15 +1539,15 @@ def test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool():
     )
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert ranked[0].find("grok-hi") >= 0
-    assert ranked[1].find("opus") >= 0
+    assert ranked[1].find("codex-terra-max") >= 0
     grok_explain = next(
         line for line in out.splitlines() if line.strip().startswith("score=") and "66.40" in line
     )
-    claude_explain = next(
+    codex_explain = next(
         line for line in out.splitlines() if line.strip().startswith("score=") and "32.80" in line
     )
     assert "waste×50=66.40 (budget=주)" in grok_explain
-    assert "waste×50=32.80 (budget=주)" in claude_explain
+    assert "waste×50=32.80 (budget=주)" in codex_explain
 
 
 def test_rob1210_imminent_exhaustion_uses_budget_window():
@@ -1672,11 +1728,15 @@ def test_rob1210_knee_or_more_short_remaining_has_no_score_penalty():
 
 
 def test_rob1210_brake_reverses_rank_against_weekly_only_pool():
-    """A progressing 5h depletion moves the braked multi-window pool below weekly-only."""
+    """A progressing 5h depletion moves the braked multi-window pool below weekly-only.
+
+    ROB-591: uses codex (codex-terra-max) instead of claude (opus) — see
+    test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool above.
+    """
     out = recommend(
         [
             _result_windows_with_resets(
-                "claude",
+                "codex",
                 [(70.0, "5h", 0.5), (10.0, "7d", 68.0)],
             ),
             _result_windows_with_resets("grok", [(20.0, "7d", 68.0)]),
@@ -1688,7 +1748,7 @@ def test_rob1210_brake_reverses_rank_against_weekly_only_pool():
     )
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert ranked[0].find("grok-hi") >= 0
-    assert ranked[1].find("opus") >= 0
+    assert ranked[1].find("codex-terra-max") >= 0
     assert "score=3420.00" in out
     assert "score=2554.50" in out
     assert "× brake=0.60 (5h 잔여 30% < knee 50%)" in out
@@ -1736,11 +1796,14 @@ def test_rob1210_cutoff_still_excludes_at_existing_threshold(pool_class, cutoff)
 
 
 def test_rob1210_explain_only_shows_brake_when_below_knee():
-    """The explain line names the brake source below knee and stays quiet at brake=1."""
+    """The explain line names the brake source below knee and stays quiet at brake=1.
+
+    ROB-591: uses codex instead of claude — see the ROB-1210 tests above.
+    """
     braked = recommend(
         [
             _result_windows_with_resets(
-                "claude",
+                "codex",
                 [(70.0, "5h", 0.5), (10.0, "7d", 68.0)],
             )
         ],
@@ -1921,7 +1984,7 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
 
     scores = [
         ModelScore(
-            model_id="gpt-5.6-sol",
+            model_id="gpt-6-sol",
             effort="max",
             harness="codex",
             source="AA-agent",
@@ -1931,7 +1994,7 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
             captured_at="2026-08-01T00:00:00+00:00",
         ),
         ModelScore(
-            model_id="gpt-5.6-sol",
+            model_id="gpt-6-sol",
             effort="high",
             harness="codex",
             source="AA-agent",
@@ -1941,7 +2004,7 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
             captured_at="2026-08-01T00:00:00+00:00",
         ),
         ModelScore(
-            model_id="claude-opus-5",
+            model_id="claude-opus-5-5",
             effort="xhigh",
             harness="claude-code",
             source="AA-agent",
@@ -1951,7 +2014,7 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
             captured_at="2026-08-01T00:00:00+00:00",
         ),
         ModelScore(
-            model_id="claude-opus-5",
+            model_id="claude-opus-5-5",
             effort="high",
             harness="claude-code",
             source="AA-agent",
@@ -2006,10 +2069,12 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
     assert codex_bench == "67.0(AA-agent/codex/max)"
     assert "60.0" not in codex_line  # non-declared high row must not appear
     assert "; " not in codex_bench  # not multi-effort list
-    assert opus_bench == "67.0(AA-agent/claude-code/xhigh)"
-    assert "63.0" not in opus_line
+    # ROB-591: "opus" token line list order puts --effort high first (see AC1 ordering
+    # requirement), so the declared-effort cell under test here is high (63.0), not xhigh.
+    assert opus_bench == "63.0(AA-agent/claude-code/high)"
+    assert "67.0" not in opus_line
     assert "; " not in opus_bench
-    assert "/high)" not in opus_bench  # high≠xhigh
+    assert "/xhigh)" not in opus_bench  # xhigh≠high
 
     # Kimi's measured CLI default is a single declared cell, with no effort suffix.
     assert kimi_bench == "61.0(AA-agent/kimi-code-cli)"
@@ -2104,7 +2169,7 @@ def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reaso
 
     live_scores = [
         ModelScore(
-            model_id="grok-4.6",
+            model_id="grok-4.7",
             effort=effort,
             harness="grok-build",
             source="AA-agent",

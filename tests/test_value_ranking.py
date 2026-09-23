@@ -234,7 +234,7 @@ def test_ac2_invalid_prices_do_not_abort_scores_or_promote_partial_group(tmp_pat
 
 def test_ac3_aplus_codex_pool_orders_luna_max_before_terra_xhigh_by_value():
     prices = {
-        "gpt-5-6-luna": _price("gpt-5-6-luna", 0.1),
+        "gpt-6-luna": _price("gpt-6-luna", 0.1),  # ROB-591: codex-luna-max aa_model_id
         "gpt-5-6-terra": _price("gpt-5-6-terra", 1.0),
     }
     output = recommend([_provider("codex")], "A+", today=TODAY, now=NOW, model_prices=prices)
@@ -348,7 +348,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         (index, profile.launcher_effort)
         for index, profile in enumerate(GRADE_TABLE["A+"])
         if profile.name == "codex-terra"
-    ] == [(2, "xhigh"), (7, "high")]
+    ] == [(2, "xhigh"), (6, "high")]  # ROB-591: opus --effort low left A+ (moved to S)
     assert actual == expected
 
     priced_aplus = _ranked_labels(
@@ -359,7 +359,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             now=NOW,
             grade_table=GRADE_TABLE,
             model_prices={
-                "gpt-5-6-luna": _price("gpt-5-6-luna", 0.1),
+                "gpt-6-luna": _price("gpt-6-luna", 0.1),  # ROB-591: codex-luna-max aa_model_id
                 "gpt-5-6-terra": _price("gpt-5-6-terra", 1.0),
             },
         )
@@ -471,7 +471,9 @@ def test_ac9_operator_price_seeds_and_kimi_k27_code_a_candidate(tmp_path):
     assert profile.placement_note and "운영자 승인 배치(A" in profile.placement_note
 
 
-def test_ac10_grok_46_remains_and_43_is_not_registered():
+def test_ac10_grok_47_remains_and_46_is_not_registered():
+    """ROB-591: Grok 4.6 → 4.7 refresh — same "old generation purged" invariant this
+    test previously checked for the 4.5 → 4.6 refresh (4.3 was two generations stale)."""
     grok_profiles = [
         profile
         for profiles in GRADE_TABLE.values()
@@ -482,7 +484,11 @@ def test_ac10_grok_46_remains_and_43_is_not_registered():
     assert all(
         "4.3" not in profile.model and "4-3" not in (profile.aa_model_id or "") for profile in grok_profiles
     )
-    assert any(profile.model == "Grok 4.6" for profile in grok_profiles)
+    assert all(
+        "4.6" not in profile.model and "4-6" not in (profile.aa_model_id or "") for profile in grok_profiles
+    )
+    assert any(profile.model == "Grok 4.7" for profile in grok_profiles)
+    assert all(profile.aa_agent_model_id in (None, "grok-4.7") for profile in grok_profiles)
 
 
 def test_ac14_explain_shows_value_math_and_partial_unknown_reason_only_in_explain():

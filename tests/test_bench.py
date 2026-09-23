@@ -363,15 +363,22 @@ def test_fresh_show_persists_grade_seed_idempotently_and_preserves_newer_value(b
     assert "99.0" in shown
 
 
-def test_fresh_show_uses_normalized_luna_model_id_and_preserves_display_name(bench_home):
+def test_fresh_show_uses_normalized_terra_model_id_and_preserves_display_name(bench_home):
+    """ROB-591: codex-luna-max is now an estimated row (benchmark_model_id=None, no
+    static seed) since its GPT-6 Luna ID is AA-agent unmeasured — codex-terra-max
+    (still AA-agent measured) exercises this seed→show round trip instead."""
     from scopefuel.recommend import GRADE_TABLE
 
     luna = next(profile for profile in GRADE_TABLE["A+"] if profile.name == "codex-luna-max")
     assert luna.model == "Luna (max)"
-    assert luna.benchmark_model_id == "gpt-5.6-luna"
+    assert luna.benchmark_model_id is None  # estimated (gpt-6-luna, AA-agent 미발표)
+
+    terra = next(profile for profile in GRADE_TABLE["S"] if profile.name == "codex-terra-max")
+    assert terra.model == "Terra (max)"
+    assert terra.benchmark_model_id == "gpt-5.6-terra"
     bench.seed_scores()
-    shown = bench.show_scores("gpt-5.6-luna")
-    assert "59.0" in shown and "max" in shown
+    shown = bench.show_scores("gpt-5.6-terra")
+    assert "62.0" in shown and "max" in shown
 
 
 def test_read_scores_missing_db_has_no_filesystem_side_effect(bench_home):
@@ -395,7 +402,9 @@ def test_read_scores_and_show_keep_existing_db_mtime(bench_home):
     before = path.stat().st_mtime_ns
 
     assert bench.read_scores()
-    assert "59.0" in bench.show_scores("gpt-5.6-luna")
+    # ROB-591: gpt-5.6-luna no longer has a seed source (codex-luna-max is now an
+    # estimated gpt-6-luna row) — gpt-5.6-terra (still AA-agent measured) instead.
+    assert "62.0" in bench.show_scores("gpt-5.6-terra")
 
     assert path.stat().st_mtime_ns == before
 
@@ -993,15 +1002,17 @@ def test_source_specific_aa_agent_mapping_wins_over_openrouter(bench_home):
 
     scores = [
         _score(
-            model_id="claude-opus-5",
+            model_id="claude-opus-5-5",
             source="AA-agent",
             metric="agentic",
+            # ROB-591: opus --effort high is the first "opus" line in list order now
+            # (see AC1 ordering requirement), not xhigh — match that declared effort.
             score=66.0,
-            effort="xhigh",  # matches Profile.benchmark_effort for opus (ROB-1191)
+            effort="high",
             harness="claude-code",
         ),
         _score(
-            model_id="claude-opus-5",
+            model_id="claude-opus-5-5",
             source="AA-model",
             metric="coding_index",
             score=78.0,
@@ -1021,7 +1032,7 @@ def test_source_specific_aa_agent_mapping_wins_over_openrouter(bench_home):
     )
     assert "AA-agent" in opus_line
     assert "AA-model" not in opus_line
-    assert "xhigh" in opus_line
+    assert "high" in opus_line
 
 
 def test_codex_aa_model_matching_ignores_unspecified_effort(bench_home):
@@ -1029,7 +1040,7 @@ def test_codex_aa_model_matching_ignores_unspecified_effort(bench_home):
 
     scores = [
         _score(
-            model_id="gpt-5-6-luna",
+            model_id="gpt-6-luna",
             source="AA-model",
             metric="coding_index",
             score=99.0,
@@ -1037,7 +1048,7 @@ def test_codex_aa_model_matching_ignores_unspecified_effort(bench_home):
             harness=None,
         ),
         _score(
-            model_id="gpt-5-6-luna",
+            model_id="gpt-6-luna",
             source="AA-model",
             metric="coding_index",
             score=62.0,

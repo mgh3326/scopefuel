@@ -103,11 +103,17 @@ scopefuel gate -m fable                      # exit 0=가능 / 3=차단 / 4=측�
 scopefuel gate -m fable --gate-output f.json # 판정 감사 레코드(JSON)를 파일로 저장
 ```
 
-escalation 프로필(`fable` 등)은 같은 grade의 정상 후보가 하나라도 가용하면 차단됩니다.
-운영자가 그 프로필을 명시 지정한 경우에만 아래 경로로 그 한 갈래를 건너뛸 수 있습니다.
+`fable`은 급표(GRADE_TABLE) 밖의 운영자 명시 자문 전용 프로필입니다(ROB-591,
+`CONSULT_ONLY_PROFILES`). `--recommend`의 후보·승급 후보에는 나오지 않고, 명시한
+`gate -m fable`은 쿼타·cutoff·provider 상태·policy `exclude`만으로 판정합니다(escalation이
+아니므로 `--operator-request`는 `operator_request_not_applicable`로 거부).
+
+escalation 프로필(GRADE_TABLE의 `gate="escalation"` 행, 예: `oc-omni`)은 같은 grade의 정상
+후보가 하나라도 가용하면 차단됩니다. 운영자가 그 프로필을 명시 지정한 경우에만 아래 경로로 그
+한 갈래를 건너뛸 수 있습니다.
 
 ```bash
-scopefuel gate -m fable --operator-request hk:task/461 --requested-by operator
+scopefuel gate -m oc-omni --operator-request hk:task/461 --requested-by operator
 ```
 
 - `--operator-request REF` — durable 참조만 받습니다: `hk:doc/<key>` 또는 `hk:task/<정수>`.

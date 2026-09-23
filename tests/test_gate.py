@@ -150,25 +150,25 @@ def test_gate_escalation_profile_ok_when_no_normal_candidates():
     assert "escalation 자격 충족" in result.reason
 
 
-def test_gate_escalation_fable_still_blocked_by_own_pool_exclude():
-    """BLOCKER 수정: escalation 자격 충족해도 fable 자체 pool(claude) exclude 는 그대로 검사한다."""
+def test_gate_fable_consult_only_blocked_by_pool_policy_exclude():
+    """ROB-591 BLOCKER fix: fable left GRADE_TABLE (explicit-consult-only), but an
+    active policy exclude on its own pool must still fail-closed — scoped narrowly
+    to CONSULT_ONLY_PROFILES, not every D3 ("not in GRADE_TABLE") profile (a retired
+    oc-* spelling, for instance, keeps its ordinary D3 behavior unchanged — see
+    test_gate_oc_oss_not_in_grade_table_* below)."""
     policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
-    providers = [
-        _result("claude", 10.0, pool_class="preserve"),
-        _result("codex", 95.0, pool_class="preserve"),  # codex-max 소진 (preserve cutoff 90%)
-        _result(
-            "kiro", 99.5, pool_class="spend", window="30d"
-        ),  # kiro-opus/kiro-sol 도 소진 (spend cutoff 99%)
-    ]
-    result = gate_check(providers, "fable", today=TODAY, now=NOW)
+    result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
     assert result.ok is False
+    assert result.grade is None
     assert result.unmeasurable is False
     assert "정책 제외" in result.reason
     assert "until 2026-08-31" in result.reason
+    assert "Pro 요금제" in result.reason
+    assert result.pool_class == "exclude"
 
 
-def test_gate_escalation_fable_still_blocked_by_own_pool_unmeasurable():
-    """BLOCKER 수정: escalation 자격 충족해도 fable 자체 pool(claude) 측정불가면 exit 4."""
+def test_gate_fable_consult_only_still_blocked_by_own_pool_unmeasurable():
+    """ROB-591: the D3 path still checks the profile's own pool measurability."""
     providers = [
         ProviderResult(id="claude", error="HTTP 503"),
         _result("codex", 95.0, pool_class="preserve"),  # codex-max 소진
@@ -178,6 +178,28 @@ def test_gate_escalation_fable_still_blocked_by_own_pool_unmeasurable():
     assert result.ok is False
     assert result.unmeasurable is True
     assert "측정 불가" in result.reason
+
+
+def test_gate_fable_consult_only_accepted_when_healthy():
+    """AC1: explicit `scopefuel gate -m fable` remains accepted under healthy provider
+    input (own pool ok) — it is never a GRADE_TABLE recommendation (grade is None),
+    but an explicit launch is still evaluated normally."""
+    result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.grade is None
+    assert result.provider_id == "claude"
+
+
+def test_gate_fable_consult_only_blocked_by_own_pool_cutoff():
+    providers = [
+        _result("claude", 95.0, pool_class="preserve"),  # fable pool 소진 (preserve cutoff 90%)
+        _result("codex", 10.0, pool_class="preserve"),
+        _result("kiro", 10.0, pool_class="spend", window="30d"),
+    ]
+    result = gate_check(providers, "fable", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert "소진" in result.reason
 
 
 def test_gate_oc_oss_not_in_grade_table_passes_quota_check():
@@ -293,9 +315,41 @@ def _healthy_s_plus_providers() -> list[ProviderResult]:
     ]
 
 
-def test_gate_fable_denied_without_operator_request_unchanged():
-    """플래그 없음 — 대안 가용 시 기존과 동일한 이유·대안으로 exit 3."""
-    result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
+# ROB-591: fable left GRADE_TABLE and is no longer escalation-gated (see the
+# fable_consult_only_* tests above/below), so it can no longer exercise the task
+# #461 operator-request override mechanism end to end. Every remaining
+# GRADE_TABLE escalation profile shares its launcher name with a default-gate
+# sibling (_find_profile matches by name and returns the first list entry, which
+# is always the default-gate row — see recommend.py), so gate_check(providers,
+# name, ...) can no longer resolve any of them unambiguously by name either. A
+# minimal synthetic grade_table with one uniquely-named escalation profile keeps
+# this operator-request coverage generic (not fable-specific) and unambiguous.
+def _escalation_grade_table() -> dict[str, list]:
+    from scopefuel.recommend import Profile
+
+    return {
+        "S+": [
+            Profile("codex-sol", "Test Normal", 60.0),
+            Profile(
+                "opus",
+                "Test Escalation",
+                55.0,
+                gate="escalation",
+                gate_reason="test escalation reason",
+            ),
+        ],
+        "S": [],
+        "A+": [],
+        "A": [],
+        "B": [],
+        "C": [],
+    }
+
+
+def test_gate_escalation_denied_without_operator_request():
+    """플래그 없음 — 대안 가용 시 escalation 프로필은 exit 3 (이유·대안 포함)."""
+    table = _escalation_grade_table()
+    result = gate_check(_healthy_s_plus_providers(), "opus", today=TODAY, now=NOW, grade_table=table)
     assert result.ok is False
     assert result.unmeasurable is False
     assert "escalation 후보" in result.reason
@@ -308,16 +362,18 @@ def test_gate_fable_denied_without_operator_request_unchanged():
     assert result.ref_resolution is None
 
 
-def test_gate_fable_operator_request_overrides_alternative_denial():
+def test_gate_escalation_operator_request_overrides_alternative_denial():
     """유효한 durable REF + escalation 프로필 → '대안 가용' 갈래만 건너뛰고 통과."""
-    ref = "hk:doc/decision-req/2026-09-20/fable-escalation-operator-request"
+    table = _escalation_grade_table()
+    ref = "hk:doc/decision-req/2026-09-20/escalation-operator-request"
     result = gate_check(
         _healthy_s_plus_providers(),
-        "fable",
+        "opus",
         today=TODAY,
         now=NOW,
         operator_request=ref,
         requested_by="operator",
+        grade_table=table,
     )
     assert result.ok is True
     assert result.escalation_override is True
@@ -328,14 +384,16 @@ def test_gate_fable_operator_request_overrides_alternative_denial():
     assert ref in result.reason
 
 
-def test_gate_fable_operator_request_task_ref_form():
+def test_gate_escalation_operator_request_task_ref_form():
     """hk:task/<정수> 형태도 유효한 durable REF 다."""
+    table = _escalation_grade_table()
     result = gate_check(
         _healthy_s_plus_providers(),
-        "fable",
+        "opus",
         today=TODAY,
         now=NOW,
         operator_request="hk:task/461",
+        grade_table=table,
     )
     assert result.ok is True
     assert result.operator_request_ref == "hk:task/461"
@@ -343,15 +401,17 @@ def test_gate_fable_operator_request_task_ref_form():
     assert result.ref_resolution == "unverified"
 
 
-def test_gate_fable_operator_request_still_blocked_by_exclude():
-    """override 는 '대안 가용' 갈래만 연다 — fable 자체 pool exclude 는 그대로 거부."""
+def test_gate_escalation_operator_request_still_blocked_by_exclude():
+    """override 는 '대안 가용' 갈래만 연다 — escalation 프로필 자체 pool exclude 는 그대로 거부."""
+    table = _escalation_grade_table()
     policy.set_policy("claude", "exclude", until=dt.date(2099, 8, 31), note="Pro 요금제")
     result = gate_check(
         _healthy_s_plus_providers(),
-        "fable",
+        "opus",
         today=TODAY,
         now=NOW,
         operator_request="hk:task/461",
+        grade_table=table,
     )
     assert result.ok is False
     assert "정책 제외" in result.reason
@@ -359,27 +419,33 @@ def test_gate_fable_operator_request_still_blocked_by_exclude():
     assert result.ref_resolution == "unverified"
 
 
-def test_gate_fable_operator_request_still_blocked_by_cutoff():
+def test_gate_escalation_operator_request_still_blocked_by_cutoff():
     """quota cutoff 초과는 유효한 operator-request 가 있어도 거부."""
+    table = _escalation_grade_table()
     providers = [
-        _result("claude", 95.0, pool_class="preserve"),  # fable pool 소진 (preserve cutoff 90%)
+        _result("claude", 95.0, pool_class="preserve"),  # 자체 pool 소진 (preserve cutoff 90%)
         _result("codex", 10.0, pool_class="preserve"),
         _result("kiro", 10.0, pool_class="spend", window="30d"),
     ]
-    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/461")
+    result = gate_check(
+        providers, "opus", today=TODAY, now=NOW, operator_request="hk:task/461", grade_table=table
+    )
     assert result.ok is False
     assert result.unmeasurable is False
     assert "소진" in result.reason
 
 
-def test_gate_fable_operator_request_still_unmeasurable_on_provider_error():
-    """fable pool 측정불가는 유효한 operator-request 가 있어도 exit 4."""
+def test_gate_escalation_operator_request_still_unmeasurable_on_provider_error():
+    """pool 측정불가는 유효한 operator-request 가 있어도 exit 4."""
+    table = _escalation_grade_table()
     providers = [
         ProviderResult(id="claude", error="HTTP 503"),
         _result("codex", 10.0, pool_class="preserve"),
         _result("kiro", 10.0, pool_class="spend", window="30d"),
     ]
-    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/461")
+    result = gate_check(
+        providers, "opus", today=TODAY, now=NOW, operator_request="hk:task/461", grade_table=table
+    )
     assert result.ok is False
     assert result.unmeasurable is True
     assert "측정 불가" in result.reason
@@ -422,11 +488,13 @@ def test_gate_operator_request_on_non_escalation_profile_rejected():
     assert "operator_request_not_applicable" in result.reason
 
 
-def test_gate_operator_request_cli_fable_exit_0_with_audit_fields(monkeypatch, capsys, tmp_path):
+def test_gate_operator_request_cli_oc_omni_exit_0_with_audit_fields(monkeypatch, capsys, tmp_path):
+    """ROB-591: fable is no longer GRADE_TABLE-escalation-gated, so this end-to-end
+    CLI test (real argparse choices, real GRADE_TABLE) uses oc-omni — the one
+    remaining real escalation profile whose launcher name is unique (no default-gate
+    sibling shares it) — to exercise the operator-request override mechanism."""
     providers = {
-        "claude": lambda: _result("claude", 10.0, pool_class="preserve"),
-        "codex": lambda: _result("codex", 10.0, pool_class="preserve"),
-        "kiro": lambda: _result("kiro", 10.0, pool_class="spend", window="30d"),
+        "kiro": lambda: _result("kiro", 10.0, pool_class="spend", window="30d"),  # kiro-cheap alt 가용
     }
     monkeypatch.setattr(cli, "registry", lambda: providers)
     gate_file = tmp_path / "gate.json"
@@ -434,7 +502,7 @@ def test_gate_operator_request_cli_fable_exit_0_with_audit_fields(monkeypatch, c
         [
             "gate",
             "-m",
-            "fable",
+            "oc-omni",
             "--operator-request",
             "hk:task/461",
             "--requested-by",
