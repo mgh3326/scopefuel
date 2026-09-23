@@ -225,37 +225,47 @@ KIMI_K27_CODE_ESTIMATE_REASON = (
 # ROB-1244: 기본 모델 4.5→4.6 전환. 4.6 은 AA-agent 미발표라 전부 추정 —
 # 동일 계열·동일 하네스(grok-build) 비율 스케일: 4.5 high 실측 64.0 × (76.8/72.4) = 67.9.
 # S+ 범위(≥65)지만 에이전트 미측정이라 한 단계 보수(S). AA-agent 발표 시 bench sync 로 복원.
+# ROB-591 note: hk:doc note/2026-09-23/model-refresh-opus55-gpt6-grok47 §1 — the
+# operator's model-refresh note records the vendor-reported/AA-model delta for each
+# generation step below (Opus 5→5.5, Sol 5.6→6, Luna 5.6→6, Grok 4.6→4.7). None of
+# the four new IDs has an AA-agent execution measurement yet, so every row below
+# carries the prior generation's AA-agent curve forward at the same score, with the
+# §1 delta cited as the basis for assuming performance parity-or-better — not
+# a bare "ID changed" note. AA-agent 실측 발표 시 bench sync로 대체한다.
 GROK_HI_ESTIMATE_REASON = (
     "grok-4.7: 4.5 high 실측 64.0 × 동일 하네스 coding 비율(76.8/72.4) = 67.9 — "
-    "S+ 범위지만 에이전트 미측정이라 S 보수 배치"
+    "S+ 범위지만 에이전트 미측정이라 S 보수 배치. 4.6→4.7 세대 전환(hk:doc "
+    "note/2026-09-23/model-refresh-opus55-gpt6-grok47 §1 벤더 발표 근거)은 동일 하네스 "
+    "coding 벤치 우위만 보고되어 4.6 추정 곡선을 그대로 유지"
 )
 GROK_HI_PLACEMENT_NOTE = "보수 배치(S; 비율 스케일 67.9 는 S+ 범위 — AA-agent 발표 시 승급 재검토)"
 GROK_MEDIUM_ESTIMATE_REASON = (
-    "grok-4.7 high 추정(67.9)에서 4.5 effort 곡선 비율(56/64)로 투사 = 59.4 — 하위 effort 미측정"
+    "grok-4.7 high 추정(67.9)에서 4.5 effort 곡선 비율(56/64)로 투사 = 59.4 — 하위 effort "
+    "미측정. 4.6→4.7 전환 근거는 GROK_HI_ESTIMATE_REASON과 동일(§1)"
 )
 GROK_LOW_ESTIMATE_REASON = (
     "grok-4.7 high 추정(67.9)에서 4.5 effort 곡선 비율(49/64)로 투사 = 52.0 — "
-    "점수상 A 범위지만 미측정(추정 위의 추정)이라 B 보수 배치"
+    "점수상 A 범위지만 미측정(추정 위의 추정)이라 B 보수 배치. 4.6→4.7 전환 근거는 "
+    "GROK_HI_ESTIMATE_REASON과 동일(§1)"
 )
 GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)"
 
-# ROB-591: Opus 5.5 / GPT-6 Sol / GPT-6 Luna 카탈로그 ID 전환. 신규 ID는
-# AA-agent 미발표라 이전 세대 실측 곡선에 동일 오프셋을 유지한 추정치를 쓴다.
-# AA-agent 실측 발표 시 bench sync로 대체한다.
 OPUS_5_5_ESTIMATE_REASON = (
-    "claude-opus-5-5: AA-agent 미발표 — 벤더 릴리스 노트의 AA Intelligence Index 델타를 "
-    "claude-opus-5 동일 effort 실측 곡선에 동일 오프셋으로 적용한 추정치"
+    "claude-opus-5-5: AA-agent 미발표 — claude-opus-5→5.5 세대 전환의 벤더 릴리스 노트 AA "
+    "Intelligence Index 델타(hk:doc note/2026-09-23/model-refresh-opus55-gpt6-grok47 §1)를 "
+    "claude-opus-5 실측 곡선에 effort별로 다른 오프셋으로 적용한 추정치 — 오프셋이 균일하지 않다: "
+    "xhigh 67→69(+2) · high 63→67(+4) · medium 62→66(+4) · max 66→69(+3) · low 57→62(+5), "
+    "모두 §1이 보고한 effort별 벤더 벤치마크 개선폭을 그대로 반영"
 )
 SOL_GPT6_ESTIMATE_REASON = (
-    "gpt-6-sol: AA-agent 미발표 — 모델 ID만 gpt-5.6-sol → gpt-6-sol 로 전환, "
-    "실측 곡선(점수/effort)은 동일 오프셋 추정으로 유지"
+    "gpt-6-sol: AA-agent 미발표 — gpt-5.6-sol→6(5.6→6) 세대 전환의 AA-model 델타/벤더 근거"
+    "(hk:doc note/2026-09-23/model-refresh-opus55-gpt6-grok47 §1)를 5.6 실측 곡선에 동일 오프셋으로 "
+    "적용한 추정치 — 점수/effort 는 5.6 실측 값 이월"
 )
 LUNA_GPT6_ESTIMATE_REASON = (
-    "gpt-6-luna: AA-agent 미발표 — 모델 ID만 gpt-5.6-luna → gpt-6-luna 로 전환, "
-    "실측 곡선(점수/effort)은 동일 오프셋 추정으로 유지"
-)
-LUNA_GPT6_LOW_ESTIMATE_REASON = (
-    "gpt-6-luna (low): gpt-5.6-luna 와 마찬가지로 AA-agent 실측 없음 — 모델 ID만 전환, 무점수 미측정 유지"
+    "gpt-6-luna: AA-agent 미발표 — gpt-5.6-luna→6(5.6→6) 세대 전환의 AA-model 델타/벤더 근거"
+    "(hk:doc note/2026-09-23/model-refresh-opus55-gpt6-grok47 §1)를 5.6 실측 곡선에 동일 오프셋으로 "
+    "적용한 추정치 — 점수/effort 는 5.6 실측 값 이월"
 )
 # ROB-1253: oc-dsflash 측정 조건(codex·max)이 실행 배선(opencode·default)보다 유리한 방향 이식 —
 # 점수(55.0)는 A+ 범위지만 방향 감쇠를 반영해 1단계 보수 하향(A). 동일-모델 쌍 실측 감쇠 근거:
@@ -503,14 +513,15 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="claude-opus-5",
             aa_model_id="claude-opus-5",
         ),
+        # ROB-591: kiro-sol stays on the pre-refresh gpt-5.6-sol baseline — the
+        # catalog-refresh scope is Codex Sol rows only (codex-sol), not Kiro.
         Profile(
             "kiro-sol",
-            "GPT-6 Sol",
+            "GPT-5.6 Sol",
             58.9,
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=SOL_GPT6_ESTIMATE_REASON,
-            aa_agent_model_id="gpt-6-sol",
-            aa_model_id="gpt-6-sol",
+            **_openrouter_benchmark(58.9, "gpt-5.6-sol"),
+            aa_agent_model_id="gpt-5.6-sol",
+            aa_model_id="gpt-5-6-sol",
         ),
         Profile(
             "codex-sol",
@@ -623,7 +634,10 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "Opus 5.5 (low)",
             62.0,
             gate="escalation",
-            gate_reason="비용효율 — Sonnet high(추정) 우선; 쿼타 여유 시",
+            # CodeRabbit #68: the old A+ reason ("Sonnet high 우선") named a
+            # Sonnet-grade alternative that doesn't exist at S — point at the
+            # real S-grade normal candidates instead.
+            gate_reason="비용효율 — Terra max/Kimi K3/Grok 4.7 우선; 쿼타 여유 시",
             benchmark_effort="low",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=OPUS_5_5_ESTIMATE_REASON,
@@ -924,15 +938,16 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
     ],
     "C": [
+        # ROB-591: codex-luna low stays on the pre-refresh gpt-5.6-luna baseline —
+        # the catalog-refresh scope is the max/xhigh/high/medium Luna rows only.
         Profile(
             "codex-luna",
             "Luna (low)",
             None,
             launcher_effort="low",
             benchmark_effort="low",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
-            estimate_reason=LUNA_GPT6_LOW_ESTIMATE_REASON,
-            aa_agent_model_id="gpt-6-luna",
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+            aa_agent_model_id="gpt-5.6-luna",
         ),
         Profile("kiro-cheap", "Qwen3 Coder", None, aa_model_id="qwen3-coder-next"),
         Profile(
@@ -1976,6 +1991,26 @@ def gate_check(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
+        # ROB-591: fail-closed on an active policy exclude, scoped narrowly to
+        # CONSULT_ONLY_PROFILES (fable) only — the D3 path's ordinary "not in
+        # GRADE_TABLE" behavior for every other profile (e.g. a retired oc-*
+        # spelling) is unchanged.
+        if profile_name in CONSULT_ONLY_PROFILES and effective_class == "exclude":
+            override = get_active_override(provider_id, today=today)
+            reason_parts = [f"정책 제외 ({provider_id}"]
+            if override is not None and override.until:
+                reason_parts.append(f"until {override.until.isoformat()}")
+            if override is not None and override.note:
+                reason_parts.append(override.note)
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=", ".join(reason_parts) + ")",
+                used_pct=used_pct,
+                pool_class=effective_class,
+            )
         cutoff = _usage_cutoff(effective_class)
         over = _any_window_over_cutoff(states, cutoff)
         if over is not None:

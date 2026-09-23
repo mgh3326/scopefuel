@@ -150,21 +150,20 @@ def test_gate_escalation_profile_ok_when_no_normal_candidates():
     assert "escalation 자격 충족" in result.reason
 
 
-def test_gate_fable_consult_only_not_blocked_by_pool_policy_exclude():
-    """ROB-591: fable left GRADE_TABLE (explicit-consult-only) and now takes the same
-    D3 "not in GRADE_TABLE" path as a retired oc-* profile (see
-    test_gate_oc_oss_not_in_grade_table_* below) — that path does not special-case
-    a policy 'exclude' class, so it falls back to the preserve cutoff instead of
-    denying with "정책 제외". This is a pre-existing D3 characteristic (fable never
-    exercised it before, since it used to be a GRADE_TABLE escalation row with its
-    own exclude check) — documented here, not a regression introduced by this test.
-    """
+def test_gate_fable_consult_only_blocked_by_pool_policy_exclude():
+    """ROB-591 BLOCKER fix: fable left GRADE_TABLE (explicit-consult-only), but an
+    active policy exclude on its own pool must still fail-closed — scoped narrowly
+    to CONSULT_ONLY_PROFILES, not every D3 ("not in GRADE_TABLE") profile (a retired
+    oc-* spelling, for instance, keeps its ordinary D3 behavior unchanged — see
+    test_gate_oc_oss_not_in_grade_table_* below)."""
     policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
     result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
-    assert result.ok is True
+    assert result.ok is False
     assert result.grade is None
-    # effective_class label still reports "exclude", but the D3 cutoff math treats
-    # it the same as "preserve" (90%) — no exclude-specific denial branch exists here.
+    assert result.unmeasurable is False
+    assert "정책 제외" in result.reason
+    assert "until 2026-08-31" in result.reason
+    assert "Pro 요금제" in result.reason
     assert result.pool_class == "exclude"
 
 

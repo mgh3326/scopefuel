@@ -485,6 +485,12 @@ def test_ac1b_opus_low_moved_to_s():
     assert s_low.model == "Opus 5.5 (low)"
     assert s_low.aa_agent_model_id == "claude-opus-5-5"
     assert s_low.aa_model_id == "claude-opus-5-5"
+    # CodeRabbit #68: the pre-move gate_reason named Sonnet 5 (high), an A+
+    # candidate — that's not an S alternative and must not survive the move.
+    assert "Sonnet" not in (s_low.gate_reason or "")
+    assert s_low.gate_reason is not None
+    for alt in ("Terra", "Kimi K3", "Grok"):
+        assert alt in s_low.gate_reason
 
 
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
