@@ -423,9 +423,19 @@ _RATE_TEXT = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many requests", r
 def status_for(result: ProviderResult) -> str:
     """Six-way v2 status of one automatic attempt."""
     if result.error is None and not result.stale:
-        if not any(_is_valid_used_pct(b.used_pct) for b in result.buckets):
+        valid = any(_is_valid_used_pct(b.used_pct) for b in result.buckets)
+        if result.warning:
+            from . import manual
+
+            classified, _ = manual.classify_automatic_failure(result)
+            if classified == "auth":
+                return "auth_error"  # an auth warning is never a value (CodeRabbit)
+            if valid:
+                return "partial"
+            if classified == "transport":
+                return "rate_limited" if _RATE_TEXT.search(result.warning) else "transport_error"
             return "parse_error"
-        return "partial" if result.warning else "success"
+        return "success" if valid else "parse_error"
     kind = result.error_kind
     text = result.last_error or result.error or ""
     if kind == "rate_limited":
@@ -763,12 +773,68 @@ def _buckets_from_v2(rows: list[dict]) -> list[Bucket]:
     ]
 
 
-def _values(obs: dict) -> list:
-    return sorted((b["limit_id"], b.get("used_pct"), b.get("reset_at")) for b in obs["buckets"])
+def _identity_key(bucket: dict) -> tuple:
+    """A bucket's fixed identity as the evaluator sees it (design (a)).
+
+    Matching uses these fields, not the limit_id string, so old-format ids
+    (``account:-:7d``) and hashed ids name the same limit (R4-SF-2).
+    """
+    scope = bucket["scope"]
+    return (
+        scope["kind"],
+        scope.get("ref") or "",
+        bucket["window"],
+        bucket["horizon"],
+        bucket.get("label") or "",
+    )
+
+
+def _merge_values(observations: list[dict]) -> dict | None:
+    """Union of the limits reported at one instant, or None on a value conflict."""
+    merged: dict[tuple, dict] = {}
+    for obs in observations:
+        for bucket in obs["buckets"]:
+            key = _identity_key(bucket)
+            seen = merged.get(key)
+            value = (bucket.get("used_pct"), bucket.get("reset_at"))
+            if seen is not None and (seen.get("used_pct"), seen.get("reset_at")) != value:
+                return None
+            merged.setdefault(key, bucket)
+    return merged
 
 
 def _unusable(provider: str, code: str, error_kind: str | None, pool_class: PoolClass) -> ProviderResult:
     return ProviderResult(id=provider, error=f"quota-v2 {code}", error_kind=error_kind, pool_class=pool_class)
+
+
+# Design (b) row T: at one instant there is no ordering evidence, so the worst
+# status of the instant stands for it. "conflict" covers duplicate_limit and
+# differing values for one limit.
+_CLASS_RANK = {"success": 0, "availability": 1, "partial": 2, "parse": 3, "conflict": 4}
+_AVAILABILITY = frozenset({"rate_limited", "transport_error"})
+
+
+def _status_class(obs: dict) -> str:
+    status = obs["status"]
+    if status == "success":
+        return "success"
+    if status in _AVAILABILITY:
+        return "availability"
+    if status == "partial":
+        return "partial"
+    if obs.get("error_ref") == "parse_error:duplicate_limit":
+        return "conflict"
+    return "parse"
+
+
+def _instant_class(group: list[dict]) -> tuple[str, dict | None]:
+    """Worst class of one instant, and the merged success values if any."""
+    successes = [o for o in group if o["status"] == "success"]
+    merged = _merge_values(successes) if successes else None
+    worst = max((_status_class(o) for o in group), key=_CLASS_RANK.__getitem__)
+    if successes and merged is None:
+        worst = "conflict"
+    return worst, merged
 
 
 def _select(
@@ -778,15 +844,16 @@ def _select(
     now: dt.datetime,
     pool_class: PoolClass,
 ) -> _Selection:
+    """Design (b), row by row. Order of the input list never matters (PERM-1)."""
     identity = _snapshot_identity(identity_raw, provider, now)
-    if identity is None:
+    if identity is None:  # row I
         return _Selection(None, "IDENTITY_UNKNOWN")
-    excluded = {"invalid": 0, "other_account": 0, "future": 0}
-    candidates: dict[str, dict] = {}
+    excluded = {"invalid": 0, "other_account": 0, "future": 0, "other_slot_auth": 0}
+    unique: dict[str, dict] = {}
     for obs in observations:
         if not isinstance(obs, dict) or obs.get("provider") != provider:
             continue
-        if not validate_observation(obs):
+        if not validate_observation(obs):  # row X
             excluded["invalid"] += 1
             continue
         if (
@@ -800,10 +867,7 @@ def _select(
         if (measured - now).total_seconds() > MAX_FUTURE_SKEW_S:
             excluded["future"] += 1
             continue
-        candidates.setdefault(obs["observation_id"], obs)
-    rows = sorted(candidates.values(), key=lambda o: _parse_time(o["measured_at"]))  # type: ignore[arg-type,return-value]
-    measuring = [o for o in rows if o["status"] in MEASURING]
-    base = {"identity": identity, "excluded": excluded}
+        unique[json.dumps(obs, sort_keys=True)] = obs
 
     def own_slot(obs: dict) -> bool:
         return (
@@ -811,117 +875,137 @@ def _select(
             and obs["source_binding_revision"] == identity["binding_revision"]
         )
 
-    def failure_after(point: dt.datetime | None) -> dict | None:
-        found = None
-        for obs in rows:
-            if obs["status"] in MEASURING:
-                continue
-            at = _parse_time(obs["measured_at"])
-            if point is not None and at is not None and at <= point:
-                continue
-            found = obs
-        return found
+    def at(obs: dict) -> dt.datetime:
+        moment = _parse_time(obs["measured_at"])
+        assert moment is not None
+        return moment
 
-    # The execution slot's own auth failure stands until that same slot
-    # measures again: a later value from another node, or a later 429 on this
-    # slot, does not clear it. Another node's expired credential does not
-    # block this one.
-    own_auth = None
-    # Within one instant there is no evidence which came last, so an auth
-    # failure is ordered after a measurement taken at the same time.
-    for obs in sorted(rows, key=lambda o: (_parse_time(o["measured_at"]), o["status"] == "auth_error")):
-        if not own_slot(obs):
-            continue
+    def ids(group: Iterable[dict]) -> tuple[str, ...]:
+        return tuple(sorted({o["observation_id"] for o in group}))
+
+    rows = list(unique.values())
+    base = {"identity": identity, "excluded": excluded}
+
+    # Row A: the execution slot's latest state; at one instant auth is later.
+    own_state = None
+
+    def own_order(obs: dict) -> tuple:
+        # total order: instant, auth last within an instant, then content (PERM-1)
+        return (
+            at(obs),
+            obs["status"] == "auth_error",
+            obs["observation_id"],
+            json.dumps(obs, sort_keys=True),
+        )
+
+    for obs in sorted((o for o in rows if own_slot(o)), key=own_order):
         if obs["status"] == "auth_error":
-            own_auth = obs
+            own_state = obs
         elif obs["status"] in MEASURING:
-            own_auth = None
-    if own_auth is not None:
+            own_state = None
+    if own_state is not None:
         return _Selection(
             _unusable(provider, "AUTH_BLOCKED", "auth", pool_class),
             "AUTH_BLOCKED",
-            observation_ids=(own_auth["observation_id"],),
+            observation_ids=(own_state["observation_id"],),
             **base,
         )
-    if not measuring:
-        failure = failure_after(None)
-        error_kind = _FAILURE_KIND.get(failure["status"]) if failure else None
-        return _Selection(_unusable(provider, "NO_SAMPLE", error_kind, pool_class), "NO_SAMPLE", **base)
-    latest = measuring[-1]
-    latest_at = _parse_time(latest["measured_at"])
-    assert latest_at is not None
-    twins = [o for o in measuring if _parse_time(o["measured_at"]) == latest_at]
-    if any(o["status"] != latest["status"] or _values(o) != _values(latest) for o in twins):
-        # Same instant, different values, no way to order them: never pick
-        # the friendlier one.
-        return _Selection(
-            _unusable(provider, "CONFLICT", "parse", pool_class),
-            "CONFLICT",
-            observation_ids=tuple(o["observation_id"] for o in twins),
-            **base,
-        )
-    if latest["status"] == "partial":
-        # The newest measurement is incomplete. Falling back to an older
-        # complete one could hide a higher value the partial one shows, so
-        # it is not admission evidence (the legacy gate refuses a warning
-        # result the same way).
-        return _Selection(
-            _unusable(provider, "PARTIAL", "parse", pool_class),
-            "PARTIAL",
-            observation_ids=(latest["observation_id"],),
-            measured_at=latest["measured_at"],
-            **base,
-        )
-    age = (now - latest_at).total_seconds()
+    # Row O (and a cleared own auth): auth failures are not quota evidence.
+    excluded["other_slot_auth"] = sum(1 for o in rows if o["status"] == "auth_error" and not own_slot(o))
+    rows = [o for o in rows if o["status"] != "auth_error"]
+    if not rows:  # row N
+        return _Selection(_unusable(provider, "NO_SAMPLE", None, pool_class), "NO_SAMPLE", **base)
+
+    instants: dict[dt.datetime, list[dict]] = {}
+    for obs in rows:
+        instants.setdefault(at(obs), []).append(obs)
+    ordered = sorted(instants.items(), key=lambda item: item[0], reverse=True)
     ttl = cache.PROVIDER_TTL_S.get(provider, cache.DEFAULT_TTL_S)
-    result = ProviderResult(
-        id=provider,
-        buckets=_buckets_from_v2(latest["buckets"]),
-        source="quota-v2",
-        fetched_at=latest_at.timestamp(),
-        age_s=age,
-        pool_class=pool_class,
-    )
-    ids = (latest["observation_id"],)
-    if age <= ttl:
+    stop_codes = {
+        "conflict": ("CONFLICT", "parse"),
+        "parse": ("PARSE_FAILED", "parse"),
+        "partial": ("PARTIAL", "parse"),
+    }
+
+    newest_at, newest = ordered[0]
+    newest_class, newest_values = _instant_class(newest)
+    if newest_class in stop_codes:  # rows C, P, Q (T for ties)
+        code, kind = stop_codes[newest_class]
         return _Selection(
-            result,
-            "FRESH",
-            observation_ids=ids,
-            measured_at=latest["measured_at"],
-            age_s=age,
-            freshness="fresh",
-            **base,
+            _unusable(provider, code, kind, pool_class), code, observation_ids=ids(newest), **base
         )
-    failure = failure_after(latest_at)
-    if failure is None or failure["status"] not in ("rate_limited", "transport_error"):
-        # Old value and no evidence the measurement itself is failing: stage 1
-        # has no refresh intent, so this is not admission evidence.
+
+    def result_for(moment: dt.datetime, values: dict, *, stale: bool) -> ProviderResult:
+        buckets = [values[key] for key in sorted(values)]
+        return ProviderResult(
+            id=provider,
+            buckets=_buckets_from_v2(buckets),
+            source="quota-v2",
+            fetched_at=moment.timestamp(),
+            age_s=(now - moment).total_seconds(),
+            stale=stale,
+            pool_class=pool_class,
+        )
+
+    if newest_class == "success":  # rows F, E
+        assert newest_values is not None
+        age = (now - newest_at).total_seconds()
+        measured = _iso(newest_at.timestamp())
+        if age <= ttl:
+            return _Selection(
+                result_for(newest_at, newest_values, stale=False),
+                "FRESH",
+                observation_ids=ids(newest),
+                measured_at=measured,
+                age_s=age,
+                freshness="fresh",
+                **base,
+            )
         return _Selection(
-            ProviderResult(
-                id=provider, error="quota-v2 STALE_EXPIRED", error_kind="parse", pool_class=pool_class
-            ),
+            _unusable(provider, "STALE_EXPIRED", "parse", pool_class),
             "STALE_EXPIRED",
-            observation_ids=ids,
-            measured_at=latest["measured_at"],
+            observation_ids=ids(newest),
+            measured_at=measured,
             age_s=age,
             freshness="stale",
             **base,
         )
-    result.stale = True
-    result.error_kind = _FAILURE_KIND[failure["status"]]
-    result.last_error = failure.get("error_ref") or failure["status"]
-    # Identity is proven by the account binding, not by a credential hash.
-    result.account_fp_match = True
-    return _Selection(
-        result,
-        "STALE",
-        observation_ids=(*ids, failure["observation_id"]),
-        measured_at=latest["measured_at"],
-        age_s=age,
-        freshness="stale",
-        **base,
-    )
+
+    # Rows S, S', N: the newest instant is an availability failure. Walk back
+    # through availability failures only; the first other instant decides.
+    failures: list[dict] = []
+    for moment, group in ordered:
+        group_class, values = _instant_class(group)
+        failures.extend(o for o in group if o["status"] in _AVAILABILITY)
+        if group_class in stop_codes:  # row S': an intervening error wins (OLD-1)
+            code, kind = stop_codes[group_class]
+            return _Selection(
+                _unusable(provider, code, kind, pool_class), code, observation_ids=ids(group), **base
+            )
+        if values is None:
+            continue  # a pure availability-failure instant
+        # The newest success, with every later observation an availability failure.
+        result = result_for(moment, values, stale=True)
+        result.error_kind = (
+            "rate_limited" if any(o["status"] == "rate_limited" for o in failures) else "network"
+        )
+        # Reached only after an availability-failure instant, so ``failures``
+        # is non-empty; stay total anyway rather than crash on a broken caller.
+        newest_failure = max(failures, key=lambda o: (at(o), o["observation_id"]), default=None)
+        if newest_failure is not None:
+            result.last_error = newest_failure.get("error_ref") or newest_failure["status"]
+        result.account_fp_match = True  # identity is proven by the binding, not a credential hash
+        return _Selection(
+            result,
+            "STALE",
+            observation_ids=ids([*group, *failures]),
+            measured_at=_iso(moment.timestamp()),
+            age_s=(now - moment).total_seconds(),
+            freshness="stale",
+            **base,
+        )
+    kind = "rate_limited" if any(o["status"] == "rate_limited" for o in failures) else "network"
+    return _Selection(_unusable(provider, "NO_SAMPLE", kind, pool_class), "NO_SAMPLE", **base)
 
 
 def evaluate(
