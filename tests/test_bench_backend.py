@@ -96,6 +96,10 @@ class FakeHandoffkeep:
         self.scores = self._copy(SCORE_FIXTURES)
         self.reps = [self._copy(REP_FIXTURE)]
         self.grades = [self._copy(GRADE_FIXTURE)]
+        # Production handoffkeep predates the catalog route (#592 is merged but
+        # not deployed), so the default fake answers it the way that server does:
+        # 404. Tests that exercise the canonical catalog set ``catalog`` first.
+        self.catalog: list[dict] | None = None
         self.hits: Counter[tuple[str, str]] = Counter()
         self.put_bodies: list[tuple[str, dict]] = []
         self.offline = False
@@ -107,7 +111,7 @@ class FakeHandoffkeep:
 
     @staticmethod
     def _scope(url: str) -> str:
-        for scope in ("scores", "reps", "grades"):
+        for scope in ("scores", "reps", "grades", "catalog"):
             if url.rstrip("/").endswith(f"/v1/bench/{scope}"):
                 return scope
         raise AssertionError(f"unexpected URL: {url}")
@@ -120,6 +124,8 @@ class FakeHandoffkeep:
         self.hits[(method, scope)] += 1
         if self.offline:
             raise OSError("offline")
+        if scope == "catalog" and self.catalog is None:
+            raise HttpError(404, "not found")
         if method == "GET":
             return {scope: self._copy(getattr(self, scope))}
         assert method == "PUT"
@@ -154,6 +160,23 @@ class FakeHandoffkeep:
                     self.reps.append(stored)
                 else:
                     self.reps[self.reps.index(match)] = stored
+        elif scope == "catalog":
+            self.catalog = [] if self.catalog is None else self.catalog
+            for row in rows:
+                stored = self._copy(row)
+                # decided_by is caller-supplied provenance on this route; the
+                # real server rejects a blank one rather than filling it in.
+                assert str(stored.get("decided_by") or "").strip(), "catalog PUT needs decided_by"
+                stored.setdefault("decided_at", "2026-09-23T00:00:00Z")
+                key = (stored.get("profile"), stored.get("effort") or "")
+                match = next(
+                    (old for old in self.catalog if (old.get("profile"), old.get("effort") or "") == key),
+                    None,
+                )
+                if match is None:
+                    self.catalog.append(stored)
+                else:
+                    self.catalog[self.catalog.index(match)] = stored
         else:
             for row in rows:
                 stored = self._copy(row)

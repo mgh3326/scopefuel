@@ -38,11 +38,24 @@ REP_GRADES = ("S+", "S", "A+", "A", "B", "C")
 
 BENCH_BACKEND_LOCAL = "local"
 BENCH_BACKEND_HANDOFFKEEP = "handoffkeep"
+BENCH_BACKEND_AUTO = "auto"
 DEFAULT_CACHE_TTL_S = 6 * 60 * 60
+# Catalog freshness. Below ``DEFAULT_CATALOG_TTL_S`` the cache is served without
+# a request; past it the server is re-read.  Only past ``DEFAULT_CATALOG_STALE_MAX_S``
+# does an unreachable server demote the client to the bundled snapshot, and that
+# demotion is always labelled ``stale`` (2558: a down server is not free rein).
+DEFAULT_CATALOG_TTL_S = 60 * 60
+DEFAULT_CATALOG_STALE_MAX_S = 24 * 60 * 60
+# Tolerance for a cache stamp ahead of the local clock before it is treated as
+# corrupt rather than fresh. NTP steps and container clock drift are seconds.
+_CACHE_CLOCK_SKEW_S = 60.0
 # CWE-319: the bearer token must never leave the process over plaintext HTTP,
 # except to a local test/dev server where "plaintext" never leaves the host.
 _HANDOFFKEEP_PLAINTEXT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_BENCH_SCOPES = frozenset({"scores", "reps", "grades"})
+_BENCH_SCOPES = frozenset({"scores", "reps", "grades", "catalog"})
+CATALOG_GATES = ("default", "escalation", "consult_only")
+# "" is the profile-default row and sorts first; the named rungs are ordered.
+CATALOG_EFFORT_RANKS: dict[str, int] = {"": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
 _WARNED_UNKNOWN_BACKENDS: set[str] = set()
 
 # ROB-1190 ②-1: AA-model slug 의 effort 접미사. 순서가 중요하다 — "non-reasoning" 이
@@ -168,6 +181,16 @@ class BenchBackendError(BenchError):
     """A handoffkeep operation failed without changing the local cache."""
 
 
+class BenchRouteMissing(BenchBackendError):
+    """The deployment does not serve this route (404), as opposed to being down.
+
+    During the catalog rollout these are genuinely different states: production
+    handoffkeep predates ``/v1/bench/catalog``, so a 404 means "no canon exists
+    here yet, keep using the grades projection" — labelling that ``stale`` would
+    stamp every spawn brief with a warning about a server that is working fine.
+    """
+
+
 @dataclass(frozen=True)
 class BenchBackend:
     """Resolved benchmark storage settings.
@@ -181,6 +204,15 @@ class BenchBackend:
     url: str | None
     token: str | None
     endpoint_id: str
+    # The catalog has its own lifetimes: it is the launch/placement canon and is
+    # re-read hourly, while scores/reps/grades keep the slower ``cache_ttl_s``.
+    catalog_ttl_s: float = DEFAULT_CATALOG_TTL_S
+    catalog_stale_max_s: float = DEFAULT_CATALOG_STALE_MAX_S
+    # Why this mode was selected ("configured" | "auto-credentials" | "auto-local"
+    # | "auto-local-insecure-url"), so ``bench catalog status`` can explain a
+    # host's mode without the reader having to guess.
+    reason: str = "configured"
+    allow_plaintext_url: bool = False
 
 
 @dataclass(frozen=True)
@@ -287,32 +319,83 @@ def bench_backend(*, stderr: TextIO | None = None) -> BenchBackend:
     config = load_config()
     raw_bench = config.get("bench") if isinstance(config, dict) else None
     bench_config = raw_bench if isinstance(raw_bench, dict) else {}
-    raw_name = bench_config.get("backend", BENCH_BACKEND_LOCAL)
+    raw_name = bench_config.get("backend", BENCH_BACKEND_AUTO)
     name = raw_name.strip().lower() if isinstance(raw_name, str) else ""
-    if name not in {BENCH_BACKEND_LOCAL, BENCH_BACKEND_HANDOFFKEEP}:
+    if name not in {BENCH_BACKEND_LOCAL, BENCH_BACKEND_HANDOFFKEEP, BENCH_BACKEND_AUTO}:
         warning_key = repr(raw_name)
         if warning_key not in _WARNED_UNKNOWN_BACKENDS:
             print("warning: unknown bench backend; using local", file=stderr or sys.stderr)
             _WARNED_UNKNOWN_BACKENDS.add(warning_key)
         name = BENCH_BACKEND_LOCAL
 
-    raw_ttl = bench_config.get("cache_ttl_s", DEFAULT_CACHE_TTL_S)
-    try:
-        ttl = float(raw_ttl)
-    except (TypeError, ValueError):
-        ttl = float(DEFAULT_CACHE_TTL_S)
-    if not math.isfinite(ttl) or ttl < 0:
-        ttl = float(DEFAULT_CACHE_TTL_S)
-
-    if name == BENCH_BACKEND_LOCAL:
-        return BenchBackend(name=name, cache_ttl_s=ttl, url=None, token=None, endpoint_id="")
+    ttl = _config_seconds(bench_config.get("cache_ttl_s"), DEFAULT_CACHE_TTL_S)
+    catalog_ttl = _config_seconds(bench_config.get("catalog_ttl_s"), DEFAULT_CATALOG_TTL_S)
+    catalog_stale_max = _config_seconds(bench_config.get("catalog_stale_max_s"), DEFAULT_CATALOG_STALE_MAX_S)
 
     # Do not normalize before hashing: the configured URL itself identifies the
     # endpoint, while only its non-reversible digest is kept in SQLite.
-    url = os.environ.get("HANDOFFKEEP_URL")
-    token = os.environ.get("HANDOFFKEEP_TOKEN")
+    url, token = _handoffkeep_credentials()
+
+    # #593: ``auto`` is the default so a host that already holds handoffkeep
+    # credentials reads the canonical catalog without a per-host config edit.
+    # The failure mode this avoids is the quiet one — one machine left in local
+    # mode keeps dispatching from its bundled table and nothing says so. A host
+    # with no credentials is exactly as local as before, and an explicit
+    # ``backend = "local"`` still pins local.
+    allow_plaintext = bench_config.get("allow_plaintext_url") is True
+    if name == BENCH_BACKEND_AUTO:
+        if not (url and token):
+            name, reason = BENCH_BACKEND_LOCAL, "auto-local"
+        elif not _plaintext_allowed(url, allow_plaintext=allow_plaintext):
+            # Credentials exist but the endpoint would carry the bearer token in
+            # the clear.  Auto-enabling would turn every request into an error;
+            # staying local keeps the host working and ``bench catalog status``
+            # names the blocker instead of hiding it behind a request failure.
+            name, reason = BENCH_BACKEND_LOCAL, "auto-local-insecure-url"
+        else:
+            name, reason = BENCH_BACKEND_HANDOFFKEEP, "auto-credentials"
+    else:
+        reason = "configured"
+
+    if name == BENCH_BACKEND_LOCAL:
+        return BenchBackend(
+            name=name,
+            cache_ttl_s=ttl,
+            url=None,
+            token=None,
+            endpoint_id="",
+            catalog_ttl_s=catalog_ttl,
+            catalog_stale_max_s=catalog_stale_max,
+            reason=reason,
+            allow_plaintext_url=allow_plaintext,
+        )
+
     endpoint_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16] if url else ""
-    return BenchBackend(name=name, cache_ttl_s=ttl, url=url, token=token, endpoint_id=endpoint_id)
+    return BenchBackend(
+        name=name,
+        cache_ttl_s=ttl,
+        url=url,
+        token=token,
+        endpoint_id=endpoint_id,
+        catalog_ttl_s=catalog_ttl,
+        catalog_stale_max_s=catalog_stale_max,
+        reason=reason,
+        allow_plaintext_url=allow_plaintext,
+    )
+
+
+def _config_seconds(raw: object, default: float) -> float:
+    """Read a non-negative finite second count, falling back to ``default``."""
+
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value) or value < 0:
+        return float(default)
+    return value
 
 
 def db_path() -> pathlib.Path:
@@ -363,7 +446,7 @@ def _backfill_table_grade(conn: sqlite3.Connection) -> None:
 
 _CACHE_SCHEMA = """
         CREATE TABLE IF NOT EXISTS bench_cache_meta (
-          scope       TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades')),
+          scope       TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
           fetched_at  TEXT NOT NULL,
           endpoint_id TEXT NOT NULL DEFAULT ''
         );
@@ -419,10 +502,66 @@ _CACHE_SCHEMA = """
           decided_at       TEXT,
           decided_by       TEXT
         );
+
+        -- #593: the canonical (profile, effort) launch/placement catalog.
+        -- bench_cache_grades above stays as the pre-catalog projection so a
+        -- client talking to a pre-#592 server keeps working unchanged.
+        CREATE TABLE IF NOT EXISTS bench_cache_catalog (
+          profile              TEXT NOT NULL,
+          effort               TEXT NOT NULL DEFAULT '',
+          model_id             TEXT NOT NULL DEFAULT '',
+          pool                 TEXT NOT NULL DEFAULT '',
+          grade                TEXT NOT NULL,
+          score                REAL,
+          gate                 TEXT NOT NULL DEFAULT 'default',
+          gate_reason          TEXT,
+          benchmark_source     TEXT,
+          benchmark_annotation TEXT,
+          boundary_version     TEXT,
+          deviation_ref        TEXT NOT NULL DEFAULT '',
+          decided_at           TEXT,
+          decided_by           TEXT,
+          retired_at           TEXT,
+          PRIMARY KEY (profile, effort)
+        );
 """
 
 
+def _migrate_cache_meta_scopes(conn: sqlite3.Connection) -> None:
+    """Widen ``bench_cache_meta``'s scope CHECK to admit ``catalog``.
+
+    ``CREATE TABLE IF NOT EXISTS`` never revises an existing table's
+    constraints, so a database created before #593 still carries
+    ``CHECK (scope IN ('scores','reps','grades'))`` and rejects every catalog
+    stamp. Only an already-created, already-narrow table is rebuilt; the rows
+    are carried over, so the rebuild is idempotent and loses no cache age.
+    """
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bench_cache_meta'"
+    ).fetchone()
+    if row is None:
+        return
+    existing_sql = row[0] or ""
+    if "catalog" in existing_sql:
+        return
+    conn.executescript(
+        """
+        CREATE TABLE bench_cache_meta_new (
+          scope       TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
+          fetched_at  TEXT NOT NULL,
+          endpoint_id TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO bench_cache_meta_new(scope, fetched_at, endpoint_id)
+          SELECT scope, fetched_at, endpoint_id FROM bench_cache_meta;
+        DROP TABLE bench_cache_meta;
+        ALTER TABLE bench_cache_meta_new RENAME TO bench_cache_meta;
+        """
+    )
+
+
 def _cache_schema(conn: sqlite3.Connection) -> None:
+    _migrate_cache_meta_scopes(conn)
     conn.executescript(_CACHE_SCHEMA)
     existing_score_cache_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(bench_cache_scores)").fetchall()
@@ -727,22 +866,88 @@ def _stamp_cache(conn: sqlite3.Connection, scope: str, backend: BenchBackend, no
     )
 
 
-def _check_handoffkeep_scheme(url: str) -> None:
-    """Refuse to build a request URL that would send the bearer token in the clear.
+def _plaintext_allowed(url: str, *, allow_plaintext: bool) -> bool:
+    """Whether a request URL may carry the bearer token (CWE-319).
 
     ``https://`` is always allowed. ``http://`` is allowed only to
-    localhost/127.0.0.1/::1 (test and local-dev servers, where the request
-    never reaches a network). Every other scheme — including bare ``http://``
-    to a real host, or no scheme at all — is refused before any header
-    carrying the token is built.
+    localhost/127.0.0.1/::1 (test and local-dev servers, where the request never
+    reaches a network), or — when the operator has explicitly opted in with
+    ``[bench] allow_plaintext_url = true`` — to any host. The opt-in exists for
+    a handoffkeep endpoint reached over a WireGuard tunnel (a Tailscale
+    100.64.0.0/10 address), where the transport is already encrypted end to end;
+    it is off by default and never enabled by auto-detection, because "the
+    operator says this link is private" is a claim only the operator can make.
     """
 
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    if parsed.hostname in _HANDOFFKEEP_PLAINTEXT_HOSTS:
+        return True
+    return allow_plaintext
+
+
+def _check_handoffkeep_scheme(url: str, *, allow_plaintext: bool = False) -> None:
+    """Refuse to build a request URL that would send the bearer token in the clear."""
+
+    if _plaintext_allowed(url, allow_plaintext=allow_plaintext):
         return
-    if parsed.scheme == "http" and parsed.hostname in _HANDOFFKEEP_PLAINTEXT_HOSTS:
-        return
-    raise BenchBackendError("HANDOFFKEEP_URL must use https (http allowed only to localhost)")
+    raise BenchBackendError(
+        "HANDOFFKEEP_URL must use https (http allowed only to localhost, or to a "
+        "private tunnel with [bench] allow_plaintext_url = true)"
+    )
+
+
+def handoffkeep_dotenv_path() -> pathlib.Path:
+    """Where the handoffkeep CLI keeps its endpoint credentials."""
+
+    override = os.environ.get("HANDOFFKEEP_CONFIG")
+    if override:
+        return pathlib.Path(os.path.expanduser(override))
+    base = os.environ.get("XDG_CONFIG_HOME") or (pathlib.Path.home() / ".config")
+    return pathlib.Path(base) / "handoffkeep" / "config.env"
+
+
+def _handoffkeep_credentials() -> tuple[str | None, str | None]:
+    """Resolve the handoffkeep endpoint, environment first, then the CLI's config.
+
+    #593: the credentials that make a host server-canonical already exist on
+    every host that runs ``handoffkeep`` — but in ``config.env``, not in the
+    process environment. Reading the same file is what lets a host switch to the
+    canonical catalog with no per-host scopefuel edit. The environment still
+    wins, so a shell can point one command at a different endpoint.
+    """
+
+    env_url = os.environ.get("HANDOFFKEEP_URL")
+    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
+    if env_url or env_token:
+        # An environment override is all-or-nothing. Completing a half-set pair
+        # from config.env would send the stored bearer token to whatever host the
+        # environment named — setting one variable would be enough to redirect
+        # the credential (CWE-522). An incomplete pair resolves to local instead,
+        # and ``bench catalog status`` says which half is missing.
+        return env_url, env_token
+    url: str | None = None
+    token: str | None = None
+    try:
+        raw = handoffkeep_dotenv_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return url, token
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip("'\"")
+        if not value:
+            continue
+        if key.strip() == "HANDOFFKEEP_URL" and not url:
+            url = value
+        elif key.strip() == "HANDOFFKEEP_TOKEN" and not token:
+            token = value
+    return url, token
 
 
 def _backend_url(backend: BenchBackend, scope: str) -> str:
@@ -750,7 +955,7 @@ def _backend_url(backend: BenchBackend, scope: str) -> str:
         raise BenchBackendError("invalid bench cache scope")
     if not backend.url or not backend.token:
         raise BenchBackendError("handoffkeep URL and token are required")
-    _check_handoffkeep_scheme(backend.url)
+    _check_handoffkeep_scheme(backend.url, allow_plaintext=backend.allow_plaintext_url)
     return f"{backend.url.rstrip('/')}/v1/bench/{scope}"
 
 
@@ -775,7 +980,11 @@ def _handoffkeep_request(
             body=body,
             timeout=20.0,
         )
-    except (HttpError, OSError, TypeError, ValueError) as exc:
+    except HttpError as exc:
+        if exc.status == 404:
+            raise BenchRouteMissing(f"handoffkeep has no /v1/bench/{scope} route") from exc
+        raise BenchBackendError("handoffkeep request failed") from exc
+    except (OSError, TypeError, ValueError) as exc:
         raise BenchBackendError("handoffkeep request failed") from exc
     if not isinstance(payload, dict):
         raise BenchBackendError("handoffkeep returned an invalid response")
@@ -1912,13 +2121,630 @@ def set_grade(
     return len(written)
 
 
+# ---------------------------------------------------------------------------
+# #593: the canonical (profile, effort) catalog.
+#
+# handoffkeep ``/v1/bench/catalog`` (schema v12) owns model ids, grade
+# placement, pool and gate. ``recommend.GRADE_TABLE`` is demoted to a bundled
+# offline snapshot. Three states, never two: a single "fresh?" boolean cannot
+# express both "the cache is a copy of the canon" and "we are down to the
+# bundled table", and conflating them is how a dead server turns into free
+# dispatch (2558).
+#   fresh    age < catalog_ttl_s            — cache served, no request
+#   cached   ttl <= age < stale_max         — refetch attempted, cache on failure
+#   snapshot age >= stale_max, or no cache  — bundled table, labelled ``stale``
+# ---------------------------------------------------------------------------
+
+CATALOG_SOURCE_SERVER = "server"
+CATALOG_SOURCE_CACHE = "cache"
+CATALOG_SOURCE_SNAPSHOT = "snapshot"
+# The endpoint answered, and answered that it has no catalog route.
+CATALOG_SOURCE_UNSUPPORTED = "unsupported"
+
+_CATALOG_COLUMNS = (
+    "profile",
+    "effort",
+    "model_id",
+    "pool",
+    "grade",
+    "score",
+    "gate",
+    "gate_reason",
+    "benchmark_source",
+    "benchmark_annotation",
+    "boundary_version",
+    "deviation_ref",
+    "decided_at",
+    "decided_by",
+    "retired_at",
+)
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    """One canonical (profile, effort) row, mirroring the server wire shape."""
+
+    profile: str
+    effort: str
+    model_id: str
+    pool: str
+    grade: str
+    score: float | None = None
+    gate: str = "default"
+    gate_reason: str | None = None
+    benchmark_source: str | None = None
+    benchmark_annotation: str | None = None
+    boundary_version: str | None = None
+    deviation_ref: str = ""
+    decided_at: str | None = None
+    decided_by: str | None = None
+    retired_at: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.profile, self.effort)
+
+    def as_dict(self) -> dict[str, object]:
+        return {column: getattr(self, column) for column in _CATALOG_COLUMNS}
+
+
+@dataclass(frozen=True)
+class CatalogView:
+    """A catalog read plus the provenance every consumer has to disclose."""
+
+    entries: tuple[CatalogEntry, ...]
+    source: str
+    age_s: float | None = None
+    backend: str = BENCH_BACKEND_LOCAL
+    reason: str = ""
+
+    @property
+    def local_only(self) -> bool:
+        """True when this host is not configured to read the canon at all.
+
+        A local-backend host is not *lagging* the canon — it has none, by
+        configuration.  Keeping the two apart matters: losing a canon you were
+        reading is a reason to stop widening gates, whereas never having had one
+        is the status quo and must not newly break a local host's launches.
+        """
+
+        return self.backend == BENCH_BACKEND_LOCAL
+
+    @property
+    def stale(self) -> bool:
+        """True when the bundled snapshot stands in for a canon we should have.
+
+        Not every snapshot read is stale. A local-only host has no canon by
+        configuration, and a server that has no catalog route has none to be
+        behind — only losing a canon this host was supposed to read is stale, and
+        only that justifies refusing to widen a gate.
+        """
+
+        return self.source == CATALOG_SOURCE_SNAPSHOT and not self.local_only
+
+    @property
+    def label(self) -> str:
+        if self.source == CATALOG_SOURCE_UNSUPPORTED:
+            return "catalog=unsupported (server has no catalog route; using bench grades)"
+        if self.source == CATALOG_SOURCE_SNAPSHOT:
+            if self.local_only:
+                return "catalog=snapshot (local backend — server catalog not in use)"
+            return "catalog=stale (snapshot)"
+        if self.age_s is None:
+            return f"catalog={self.source}"
+        return f"catalog={self.source} (age {self.age_s / 3600.0:.1f}h)"
+
+    def by_key(self) -> dict[tuple[str, str], CatalogEntry]:
+        return {entry.key: entry for entry in self.entries}
+
+    def profiles(self) -> set[str]:
+        return {entry.profile for entry in self.entries}
+
+
+def _catalog_score(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchError("catalog score must be a finite number")
+    score = float(value)
+    if not math.isfinite(score) or score < 0.0 or score > 100.0:
+        raise BenchError("catalog score must be between 0 and 100")
+    return score
+
+
+def _catalog_from_wire(value: object) -> CatalogEntry:
+    if not isinstance(value, dict):
+        raise BenchError("invalid handoffkeep catalog row")
+    profile = _text(value.get("profile"), "profile")
+    grade = _text(value.get("grade"), "grade")
+    assert profile is not None and grade is not None
+    if grade not in REP_GRADES:
+        raise BenchError("invalid handoffkeep catalog grade")
+    gate = _optional_text(value.get("gate"), "gate") or "default"
+    if gate not in CATALOG_GATES:
+        raise BenchError("invalid handoffkeep catalog gate")
+    effort = _optional_text(value.get("effort"), "effort") or ""
+    return CatalogEntry(
+        profile=profile,
+        effort=effort,
+        model_id=_optional_text(value.get("model_id"), "model_id") or "",
+        pool=_optional_text(value.get("pool"), "pool") or "",
+        grade=grade,
+        score=_catalog_score(value.get("score")),
+        gate=gate,
+        gate_reason=_optional_text(value.get("gate_reason"), "gate_reason"),
+        benchmark_source=_optional_text(value.get("benchmark_source"), "benchmark_source"),
+        benchmark_annotation=_optional_text(value.get("benchmark_annotation"), "benchmark_annotation"),
+        boundary_version=_optional_text(value.get("boundary_version"), "boundary_version"),
+        deviation_ref=_optional_text(value.get("deviation_ref"), "deviation_ref") or "",
+        decided_at=_optional_text(value.get("decided_at"), "decided_at"),
+        decided_by=_optional_text(value.get("decided_by"), "decided_by"),
+        retired_at=_optional_text(value.get("retired_at"), "retired_at"),
+    )
+
+
+def _catalog_from_payload(payload: dict) -> list[CatalogEntry]:
+    values = payload.get("catalog")
+    if not isinstance(values, list):
+        raise BenchBackendError("handoffkeep returned invalid catalog data")
+    try:
+        return [_catalog_from_wire(value) for value in values]
+    except BenchError as exc:
+        raise BenchBackendError("handoffkeep returned invalid catalog data") from exc
+
+
+def _fetch_catalog(backend: BenchBackend) -> list[CatalogEntry]:
+    return _catalog_from_payload(_handoffkeep_request(backend, "catalog"))
+
+
+def _catalog_to_wire(entry: CatalogEntry) -> dict[str, object]:
+    value = entry.as_dict()
+    # decided_by is caller-supplied provenance on this route and the server
+    # rejects a blank one; everything else may legitimately be null.
+    return value
+
+
+def _cached_catalog(conn: sqlite3.Connection) -> list[CatalogEntry]:
+    columns = ", ".join(_CATALOG_COLUMNS)
+    rows = conn.execute(f"SELECT {columns} FROM bench_cache_catalog ORDER BY profile, effort").fetchall()
+    return [CatalogEntry(**{column: row[column] for column in _CATALOG_COLUMNS}) for row in rows]
+
+
+def _put_cached_catalog(conn: sqlite3.Connection, entry: CatalogEntry) -> None:
+    columns = ", ".join(_CATALOG_COLUMNS)
+    placeholders = ", ".join("?" for _ in _CATALOG_COLUMNS)
+    updates = ", ".join(
+        f"{column} = excluded.{column}" for column in _CATALOG_COLUMNS if column not in ("profile", "effort")
+    )
+    conn.execute(
+        f"INSERT INTO bench_cache_catalog ({columns}) VALUES ({placeholders}) "
+        f"ON CONFLICT(profile, effort) DO UPDATE SET {updates}",
+        tuple(getattr(entry, column) for column in _CATALOG_COLUMNS),
+    )
+
+
+def _commit_catalog_cache(
+    *, path: pathlib.Path | str | None, entries: list[CatalogEntry], backend: BenchBackend
+) -> None:
+    conn = _cache_connect(path)
+    try:
+        now = _cache_now()
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM bench_cache_catalog")
+        for entry in entries:
+            _put_cached_catalog(conn, entry)
+        _stamp_cache(conn, "catalog", backend, now)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# One resolved catalog per process. Without this, ``--recommend`` and a gate
+# check inside the same command can straddle the TTL boundary and disagree —
+# one admitting on the old grade while the other launches the new model.
+_CATALOG_MEMO: dict[tuple[str, str, str], CatalogView] = {}
+
+
+def reset_catalog_memo() -> None:
+    """Drop the per-process catalog memo (tests, and long-lived --watch loops)."""
+
+    _CATALOG_MEMO.clear()
+
+
+def read_catalog(*, path: pathlib.Path | str | None = None) -> CatalogView:
+    """Read the canonical catalog, disclosing which of the three states served it.
+
+    Never raises for an unreachable server: the bundled snapshot is a reviewed
+    copy of the last canon, so a handoffkeep outage degrades the fleet rather
+    than stopping it. What the outage must not do is widen anything — that rule
+    lives with the consumers (``scopefuel.launch``), which refuse to relax a
+    non-default gate while this view is stale.
+    """
+
+    backend = bench_backend()
+    memo_key = (str(path or ""), backend.name, backend.endpoint_id)
+    memoized = _CATALOG_MEMO.get(memo_key)
+    if memoized is not None:
+        return memoized
+
+    view = _read_catalog_uncached(backend, path=path)
+    _CATALOG_MEMO[memo_key] = view
+    return view
+
+
+def _read_catalog_uncached(backend: BenchBackend, *, path: pathlib.Path | str | None) -> CatalogView:
+    if backend.name == BENCH_BACKEND_LOCAL:
+        return CatalogView(
+            entries=catalog_snapshot(),
+            source=CATALOG_SOURCE_SNAPSHOT,
+            age_s=None,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    conn = _cache_connect(path)
+    try:
+        now = _cache_now()
+        cached = _cached_catalog(conn)
+        row = conn.execute(
+            "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = 'catalog'"
+        ).fetchone()
+    except sqlite3.Error:
+        cached, row = [], None
+    finally:
+        conn.close()
+
+    age_s: float | None = None
+    if row is not None and row["endpoint_id"] == backend.endpoint_id:
+        fetched_at = _cached_at(row["fetched_at"])
+        if fetched_at is not None:
+            age = (now - fetched_at).total_seconds()
+            # A stamp from the future is not a very fresh cache, it is a broken
+            # one — a clock skew or a corrupted row. Clamping it to age 0 pinned
+            # the host to that cache forever and no server change ever arrived.
+            age_s = age if age >= -_CACHE_CLOCK_SKEW_S else None
+            if age_s is not None:
+                age_s = max(0.0, age_s)
+    if age_s is None:
+        cached = []
+
+    # ``catalog_stale_max_s`` is a ceiling on trusting the cache at all, so a TTL
+    # configured above it must not be able to keep serving a cache the ceiling
+    # has already condemned.
+    fresh_before = min(backend.catalog_ttl_s, backend.catalog_stale_max_s)
+    if cached and age_s is not None and age_s < fresh_before:
+        return CatalogView(
+            entries=tuple(cached),
+            source=CATALOG_SOURCE_CACHE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    try:
+        entries = _fetch_catalog(backend)
+        _commit_catalog_cache(path=path, entries=entries, backend=backend)
+        return CatalogView(
+            entries=tuple(entries),
+            source=CATALOG_SOURCE_SERVER,
+            age_s=0.0,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+    except BenchRouteMissing:
+        return CatalogView(
+            entries=catalog_snapshot(),
+            source=CATALOG_SOURCE_UNSUPPORTED,
+            age_s=None,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+    except (BenchBackendError, sqlite3.Error, OSError, ValueError):
+        pass
+
+    if cached and age_s is not None and age_s < backend.catalog_stale_max_s:
+        _warn_cached("catalog", age_hours=age_s / 3600.0, has_data=True)
+        return CatalogView(
+            entries=tuple(cached),
+            source=CATALOG_SOURCE_CACHE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    print(
+        "warning: handoffkeep catalog unavailable; using the bundled snapshot (catalog=stale)",
+        file=sys.stderr,
+    )
+    return CatalogView(
+        entries=catalog_snapshot(),
+        source=CATALOG_SOURCE_SNAPSHOT,
+        age_s=age_s,
+        backend=backend.name,
+        reason=backend.reason,
+    )
+
+
+def catalog_snapshot() -> tuple[CatalogEntry, ...]:
+    """The bundled offline snapshot, derived from the reviewed code tables."""
+
+    from .launch import snapshot_entries
+
+    return snapshot_entries()
+
+
+def _catalog_sort_key(entry: CatalogEntry) -> tuple[int, str, int, str]:
+    grade_rank = REP_GRADES.index(entry.grade) if entry.grade in REP_GRADES else len(REP_GRADES)
+    return (grade_rank, entry.profile, CATALOG_EFFORT_RANKS.get(entry.effort, 99), entry.effort)
+
+
+def _catalog_rows_from_json(payload: object) -> list[CatalogEntry]:
+    rows = payload.get("catalog") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or not rows:
+        raise BenchError('catalog JSON must be a non-empty list (or {"catalog": [...]})')
+    return [_catalog_from_wire(row) for row in rows]
+
+
+def push_catalog(source: pathlib.Path | str, *, path: pathlib.Path | str | None = None) -> int:
+    """Write catalog rows to handoffkeep (operator token) and refresh the cache."""
+
+    backend = bench_backend()
+    if backend.name != BENCH_BACKEND_HANDOFFKEEP:
+        raise BenchError(
+            "bench push-catalog requires the handoffkeep backend "
+            "(set HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN, or [bench] backend)"
+        )
+    try:
+        raw = pathlib.Path(os.path.expanduser(str(source))).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BenchError(f"cannot read catalog JSON: {source}") from exc
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise BenchError("catalog JSON is not valid JSON") from exc
+    entries = _catalog_rows_from_json(payload)
+    for entry in entries:
+        if not entry.decided_by:
+            raise BenchError(
+                f"{entry.profile}/{entry.effort or '-'}: decided_by is required caller-supplied "
+                "provenance on the catalog route"
+            )
+    response = _handoffkeep_request(
+        backend,
+        "catalog",
+        method="PUT",
+        body={"catalog": [_catalog_to_wire(entry) for entry in entries]},
+    )
+    accepted = response.get("upserted")
+    if isinstance(accepted, bool) or not isinstance(accepted, int) or accepted != len(entries):
+        raise BenchBackendError("handoffkeep rejected the catalog write")
+    reset_catalog_memo()
+    try:
+        _commit_catalog_cache(path=path, entries=_fetch_catalog(backend), backend=backend)
+    except (BenchBackendError, sqlite3.Error, OSError, ValueError):
+        # The write landed; a cache refresh failure only costs one extra read.
+        print("warning: catalog written but the local cache was not refreshed", file=sys.stderr)
+    return len(entries)
+
+
+def catalog_report(*, path: pathlib.Path | str | None = None) -> str:
+    """Render the catalog as one row per (profile, effort)."""
+
+    view = read_catalog(path=path)
+    lines = [view.label]
+    for entry in sorted(view.entries, key=_catalog_sort_key):
+        retired = " retired" if entry.retired_at else ""
+        score = "-" if entry.score is None else f"{entry.score:g}"
+        lines.append(
+            f"{entry.grade:<3} {entry.profile}"
+            f"{'@' + entry.effort if entry.effort else ''} "
+            f"model={entry.model_id or '-'} pool={entry.pool or '-'} "
+            f"gate={entry.gate} score={score}{retired}"
+        )
+    return "\n".join(lines)
+
+
+def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
+    """One screen answering "is this host reading the canon, and if not, why?"."""
+
+    backend = bench_backend()
+    view = read_catalog(path=path)
+    # Report the credentials that exist on the host, not the ones the resolved
+    # backend kept — "token missing" on a host that has one sends the reader to
+    # the wrong problem.
+    found_url, found_token = _handoffkeep_credentials()
+    lines = [
+        f"backend={backend.name} reason={backend.reason}",
+        f"credentials url={'found' if found_url else 'none'} "
+        f"token={'found' if found_token else 'none'} "
+        f"(env or {handoffkeep_dotenv_path()})",
+        f"catalog_ttl_s={backend.catalog_ttl_s:g} catalog_stale_max_s={backend.catalog_stale_max_s:g}",
+        view.label,
+        f"rows={len(view.entries)} profiles={len(view.profiles())}",
+    ]
+    env_url = os.environ.get("HANDOFFKEEP_URL")
+    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
+    if bool(env_url) != bool(env_token):
+        missing = "HANDOFFKEEP_TOKEN" if env_url else "HANDOFFKEEP_URL"
+        lines.append(
+            f"note: only one of HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN is set ({missing} is missing); "
+            "an environment override is all-or-nothing and config.env is not used to complete it"
+        )
+    override = os.environ.get("HANDOFFKEEP_CONFIG")
+    if override and not pathlib.Path(os.path.expanduser(override)).is_file():
+        # An explicit override is honoured as written — it deliberately does not
+        # fall back to the default config.env. Say so, because a typo in that
+        # variable otherwise leaves the host in local mode with no sign of why,
+        # which is the exact silence this whole change exists to remove.
+        lines.append(
+            f"note: HANDOFFKEEP_CONFIG points at {override}, which does not exist; "
+            "the default ~/.config/handoffkeep/config.env is NOT consulted while it is set"
+        )
+    if backend.reason == "auto-local-insecure-url":
+        lines.append(
+            "blocked: handoffkeep credentials exist but the URL is plaintext http to a "
+            "non-local host; serve it over https, or set [bench] allow_plaintext_url = true "
+            "for a private WireGuard/Tailscale tunnel"
+        )
+    if view.stale:
+        lines.append(
+            "stale: running on the bundled snapshot — server placements are NOT in effect; "
+            "non-default gates require --operator-request until the canon is readable"
+        )
+    uncovered = sorted(snapshot_profiles() - view.profiles()) if not view.stale else []
+    if uncovered:
+        lines.append("uncovered (snapshot-only, catalog has no row): " + ", ".join(uncovered))
+    return "\n".join(lines)
+
+
+def snapshot_profiles() -> set[str]:
+    from .launch import snapshot_entries
+
+    return {entry.profile for entry in snapshot_entries()}
+
+
+def _profile_from_catalog(entry: CatalogEntry, template: object | None):
+    """Build the runtime Profile for one catalog row.
+
+    A row that also exists in the bundled snapshot keeps that row's display and
+    provenance metadata (estimate reasons, annotations, AA lookup keys) and takes
+    only placement, model id and gate from the canon — losing the metadata would
+    turn every ``--recommend`` line into a bare model id the moment a host went
+    server-canonical.
+    """
+
+    from .recommend import Profile
+
+    effort = entry.effort or None
+    if template is not None:
+        return replace(
+            template,
+            gate=entry.gate,
+            gate_reason=entry.gate_reason or template.gate_reason,
+            benchmark=entry.score if entry.score is not None else template.benchmark,
+            aa_agent_model_id=entry.model_id or template.aa_agent_model_id,
+            launcher_effort=effort or template.launcher_effort,
+        )
+    label = entry.model_id or entry.profile
+    return Profile(
+        entry.profile,
+        f"{label} ({entry.effort})" if entry.effort else label,
+        entry.score,
+        gate=entry.gate,
+        gate_reason=entry.gate_reason,
+        launcher_effort=effort,
+        benchmark_annotation=entry.benchmark_annotation,
+        benchmark_source=entry.benchmark_source,
+        benchmark_effort=effort,
+        aa_agent_model_id=entry.model_id or None,
+        # Carry the server's pool: this row's name is one the local routing table
+        # may never have seen, and without it the profile reaches the grade table
+        # only to render "측정 불가" — a server addition that can never be
+        # recommended is not an addition.
+        catalog_pool=entry.pool or None,
+    )
+
+
+def _catalog_grade_table(view: CatalogView) -> dict | None:
+    """Rebuild the grade table with the catalog as the canon, or None if unusable.
+
+    The rules that make the canon actually canonical:
+
+    * a ``(profile, effort)`` the catalog carries is placed where the catalog
+      says — additions and moves both land;
+    * a snapshot row whose *profile* the catalog knows but whose *rung* it does
+      not is dropped, so retiring or deleting a rung server-side takes effect;
+    * a snapshot row for a profile the catalog never mentions is kept, so a
+      half-seeded catalog cannot silently empty the table (``bench catalog
+      status`` lists these as uncovered);
+    * ``consult_only`` rows never enter the table at all — they are launchable
+      on an explicit operator request, never recommendation candidates.
+
+    The merge is all-or-nothing: if the result fails the boundary validator the
+    whole catalog is rejected.  A partially applied canon is worse than a stale
+    one, because nothing downstream could tell which half it got.
+    """
+
+    from .recommend import GRADE_TABLE, validate_grade_table
+
+    if not view.entries:
+        # Nothing seeded yet. A catalog that has said nothing cannot be the
+        # reason the table empties, so the snapshot stands.
+        return None
+    live = [entry for entry in view.entries if not entry.retired_at]
+    # Coverage counts retired rows too. A profile whose every rung the operator
+    # retired is a profile the canon has spoken about — leaving it out here put
+    # its snapshot rows back into the recommendations while ``resolve_launch``
+    # refused to start it, so a dispatcher could be handed a profile it cannot
+    # launch. A catalog where everything is retired therefore empties the table,
+    # which is what it was asked to say.
+    covered_profiles = {entry.profile for entry in view.entries}
+    templates: dict[tuple[str, str], object] = {}
+    for profiles in GRADE_TABLE.values():
+        for profile in profiles:
+            templates.setdefault((profile.name, profile.launcher_effort or ""), profile)
+
+    # A profile-default row (effort "") is the legacy /v1/bench/grades projection
+    # of the profile's default placement, not an extra launchable rung. Once the
+    # same profile carries enumerated rungs, admitting both would list it twice —
+    # once with an effort and once without — and a `bench grades set` during the
+    # rollout would silently add that phantom candidate.
+    enumerated = {entry.profile for entry in live if entry.effort}
+
+    proposed: dict[str, list] = {grade: [] for grade in GRADE_TABLE}
+    for entry in sorted(live, key=_catalog_sort_key):
+        if entry.gate == "consult_only":
+            continue
+        if not entry.effort and entry.profile in enumerated:
+            continue
+        if entry.grade not in proposed:
+            return None
+        proposed[entry.grade].append(_profile_from_catalog(entry, templates.get(entry.key)))
+
+    for grade, profiles in GRADE_TABLE.items():
+        for profile in profiles:
+            if profile.name in covered_profiles:
+                continue
+            proposed[grade].append(profile)
+
+    try:
+        validate_grade_table(proposed)
+    except ValueError:
+        print(
+            "warning: handoffkeep bench catalog failed boundary validation; using the code table",
+            file=sys.stderr,
+        )
+        return None
+    return proposed
+
+
 def runtime_grade_table(*, path: pathlib.Path | str | None = None) -> dict:
-    """Overlay server placements onto a copy of the code table when safe."""
+    """Resolve the grade table: canonical catalog first, then grades, then code.
+
+    The layering matters during the rollout — production handoffkeep predates the
+    catalog route, so a host that switches to server mode today gets a 404 on
+    ``/v1/bench/catalog`` and must keep working off the pre-existing
+    ``/v1/bench/grades`` projection rather than losing server placements.
+    """
 
     from .recommend import GRADE_TABLE, validate_grade_table
 
     if bench_backend().name != BENCH_BACKEND_HANDOFFKEEP:
         return GRADE_TABLE
+
+    # Only a view that actually came from the canon may rebuild the table. A
+    # snapshot view (local, unsupported route, or stale) must fall through to the
+    # grades projection and then to the code table — rebuilding from the snapshot
+    # would look like a canonical answer while being a copy of the code table.
+    view = read_catalog(path=path)
+    if view.source in (CATALOG_SOURCE_SERVER, CATALOG_SOURCE_CACHE):
+        table = _catalog_grade_table(view)
+        if table is not None:
+            return table
+
     assignments = read_grades(path=path)
     if not assignments:
         return GRADE_TABLE

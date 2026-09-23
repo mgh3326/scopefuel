@@ -175,6 +175,12 @@ class Profile:
     served_slug: str | None = None
     upstream_model: str | None = None
     upstream_as_of: str | None = None
+    # #593: the canonical catalog's pool for this row. Only consulted when
+    # ``profile_pool()`` cannot route the name — a profile the server introduced
+    # that this build has never heard of. Without it such a row reached the grade
+    # table and then rendered "측정 불가", so the server could add a profile that
+    # could never actually be recommended.
+    catalog_pool: str | None = None
 
 
 _HARNESS_LABELS = {
@@ -1023,6 +1029,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
 
 
 _GRADE_ORDER: tuple[Grade, ...] = ("S+", "S", "A+", "A", "B", "C")
+# Public alias: the launch catalog ranks grades with the same ladder and must
+# not keep a second copy of it.
+REP_GRADES_ORDER: tuple[Grade, ...] = _GRADE_ORDER
 _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
     {
         UNMEASURED_ANNOTATION,
@@ -1169,6 +1178,22 @@ def _benchmark_annotation(profile: Profile) -> str | None:
     if profile.benchmark_annotation == MODEL_ONLY_ANNOTATION:
         return f"{profile.model} · {profile.benchmark_annotation}"
     return profile.benchmark_annotation
+
+
+def resolved_pool(profile: Profile) -> tuple[str, str | None]:
+    """Route a Profile, falling back to the catalog's pool for unknown names.
+
+    The name-based table stays authoritative for every profile this build knows,
+    because it also carries the group scope (agy gemini/3p) that a flat catalog
+    ``pool`` string cannot express — and because silently re-pooling a known
+    profile would move its quota accounting. The catalog pool fills the gap only
+    where the local table has nothing to say.
+    """
+
+    provider_id, group_name = profile_pool(profile.name)
+    if provider_id:
+        return provider_id, group_name
+    return (profile.catalog_pool or ""), None
 
 
 def profile_pool(profile: str) -> tuple[str, str | None]:
@@ -1620,7 +1645,7 @@ def resolve_display_effort(profile: Profile) -> tuple[str | None, str]:
     """
     if profile.benchmark_effort:
         return profile.benchmark_effort, "profile"
-    provider_id, _ = profile_pool(profile.name)
+    provider_id, _ = resolved_pool(profile)
     if provider_id == "claude":
         settings_effort = _read_claude_settings_effort()
         if settings_effort:
@@ -1654,7 +1679,7 @@ def _profile_has_benchmark_score(profile: Profile, bench_scores: list[ModelScore
     model_fallback_id = profile.aa_model_id or (
         profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
     )
-    codex_profile = profile_pool(profile.name)[0] == "codex"
+    codex_profile = resolved_pool(profile)[0] == "codex"
     registered_model_metric = profile.benchmark_metric if profile.benchmark_source == "AA-model" else None
     model_scores = [
         score
@@ -1701,7 +1726,7 @@ def _build_escalation_entry(
     now: dt.datetime | None = None,
     reason_override: str | None = None,
 ) -> _EscalationEntry:
-    provider_id, group_name = profile_pool(profile.name)
+    provider_id, group_name = resolved_pool(profile)
     provider_label = _provider_label(provider_id, group_name)
     gate_reason = reason_override if reason_override is not None else (profile.gate_reason or "")
     now = now or dt.datetime.now(dt.UTC)
@@ -1762,7 +1787,7 @@ def _cross_grade_measured_alternatives(
     if grade_index == 0:
         return []
     existing_escalation_pools = {
-        profile_pool(profile.name)[0] for profile in table[grade] if profile.gate == "escalation"
+        resolved_pool(profile)[0] for profile in table[grade] if profile.gate == "escalation"
     }
     if not existing_escalation_pools:
         return []
@@ -1775,7 +1800,7 @@ def _cross_grade_measured_alternatives(
             and profile.benchmark_annotation is not None
             and profile.estimate_reason is not None
         ):
-            provider_id, _ = profile_pool(profile.name)
+            provider_id, _ = resolved_pool(profile)
             estimated_by_provider.setdefault(provider_id, profile)
 
     alternatives: list[tuple[Profile, str]] = []
@@ -1791,7 +1816,7 @@ def _cross_grade_measured_alternatives(
             # must not surface S+ Sol as a cross-grade measured alternative.
             if profile.name in _SOL_PROFILES:
                 continue
-            provider_id, _ = profile_pool(profile.name)
+            provider_id, _ = resolved_pool(profile)
             source_profile = estimated_by_provider.get(provider_id)
             if (
                 source_profile is None
@@ -2398,7 +2423,7 @@ def recommend(
             escalation.append(_build_escalation_entry(profile, by_id, today, now=now))
             continue
 
-        provider_id, group_name = profile_pool(profile.name)
+        provider_id, group_name = resolved_pool(profile)
         provider_label = _provider_label(provider_id, group_name)
 
         result = by_id.get(provider_id)
@@ -2547,7 +2572,7 @@ def recommend(
     intra_pool_rank = {id(candidate.profile): physical_order[id(candidate.profile)] for candidate in included}
     candidates_by_pool: dict[tuple[str, str | None], list[_Candidate]] = {}
     for candidate in included:
-        candidates_by_pool.setdefault(profile_pool(candidate.profile.name), []).append(candidate)
+        candidates_by_pool.setdefault(resolved_pool(candidate.profile), []).append(candidate)
 
     for pool_candidates in candidates_by_pool.values():
         benchmark_candidates = [item for item in pool_candidates if item.profile.benchmark is not None]
@@ -2693,7 +2718,7 @@ def recommend(
             model_fallback_id = profile.aa_model_id or (
                 profile.benchmark_model_id if profile.benchmark_source == "AA-model" else None
             )
-            codex_profile = profile_pool(profile.name)[0] == "codex"
+            codex_profile = resolved_pool(profile)[0] == "codex"
             registered_model_metric = (
                 profile.benchmark_metric if profile.benchmark_source == "AA-model" else None
             )
