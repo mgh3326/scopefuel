@@ -134,8 +134,12 @@ WRK_PRE_593_RESOLUTION: dict[str, tuple[str, str]] = {
     "grok-hi": ("grok-4.7", "high"),
     "grok-med": ("grok-4.7", "medium"),
     "opus": ("claude-opus-5-5", "high"),
-    "sonnet": ("", "high"),
-    "haiku": ("", "low"),
+    # bin/wrk emits the Claude CLI alias for these ("--model sonnet"), so the
+    # model id below is the catalog's identity rather than the launcher's argv —
+    # the catalog route requires a non-blank model_id on every row, and these
+    # spellings are catalog-exempt on the wrk side (see WRK_CATALOG_EXEMPT).
+    "sonnet": ("claude-sonnet-5", "high"),
+    "haiku": ("claude-haiku-4.5", "low"),
     "fable": ("claude-fable-5-1", ""),
 }
 

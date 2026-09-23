@@ -8,6 +8,8 @@ and a flag meant for quota snapshots that reaches the catalog's cache.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -531,3 +533,41 @@ def test_a_cache_stamped_in_the_future_is_refetched_not_trusted_forever(catalog_
     view = bench.read_catalog()
     assert view.source == "server"
     assert any(entry.model_id == "claude-opus-99" for entry in view.entries)
+
+
+def test_every_snapshot_row_satisfies_the_server_row_contract():
+    """handoffkeep rejects the whole batch if any row is invalid, so the seed has
+    to be acceptable row by row.
+
+    `profile`, `model_id`, `pool` and `decided_by` are required non-blank on the
+    catalog route, `grade`/`gate` come from closed sets, and `score` must be a
+    finite 0-100 (handoffkeep 6de6d6d internal/store/store.go
+    validBenchCatalogEntry). Verified against a real local server at that commit:
+    before this check, 15 of 49 seed rows carried an empty model_id and the seed
+    PUT failed with 400 invalid_context — the documented one-time seed step would
+    not have worked.
+    """
+
+    for entry in launch.snapshot_entries():
+        where = f"{entry.profile}/{entry.effort or '-'}"
+        assert entry.profile.strip(), f"{where}: profile must not be blank"
+        assert entry.model_id.strip(), f"{where}: model_id is required by the catalog route"
+        assert entry.pool.strip(), f"{where}: pool is required by the catalog route"
+        assert entry.grade in bench.REP_GRADES, f"{where}: grade {entry.grade!r} is off the ladder"
+        assert entry.gate in bench.CATALOG_GATES, f"{where}: gate {entry.gate!r} is not a catalog gate"
+        if entry.score is not None:
+            assert 0.0 <= entry.score <= 100.0, f"{where}: score {entry.score} out of range"
+
+
+def test_the_emitted_seed_carries_provenance_on_every_row():
+    """`decided_by` is caller-supplied on this route; the server rejects a blank."""
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        assert cli.main(["bench", "push-catalog", "--emit-seed", "--decided-by", "operator-desk"]) == 0
+    rows = json.loads(buffer.getvalue())["catalog"]
+    assert rows
+    for row in rows:
+        assert str(row["decided_by"]).strip()
+        assert str(row["deviation_ref"]).strip()
+        assert str(row["model_id"]).strip()

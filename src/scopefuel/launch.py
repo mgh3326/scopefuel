@@ -49,6 +49,24 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     "kiro-sonnet": "claude-sonnet-5",
     "kiro-cheap": "qwen3-coder-next",
     "kiro-haiku": "claude-haiku-4.5",
+    # Profiles whose launcher passes a CLI alias ("--model sonnet") or a fixed
+    # argv rather than a model id. They still need an identity here: the catalog
+    # route requires a non-blank model_id, so a row without one is rejected and
+    # the whole seed batch with it. The launcher keeps its alias either way —
+    # these spellings are catalog-exempt on the wrk side.
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4.5",
+    "devin-swe2": "swe-2",
+    "devin-glm52": "glm-5-2",
+    "devin-swe17": "swe-1-7",
+    "devin-ds41": "deepseek-v4-1-flash-high",
+    # Same model as kimi-k3; the differentiator is KIMI_CODE_HOME, not the model.
+    "kimi-k3-low": "kimi-k3",
+    "oc-qwen37-max": "qwen3.7-max",
+    "oc-minimax-m3": "minimax-m3",
+    "oc-solar4": "solar-pro4",
+    # A router, not a model — this is the identity the launcher actually requests.
+    "oc-omni": "omniroute/auto/coding",
 }
 
 # The rung a profile starts on when the caller pins no effort.  Only profiles

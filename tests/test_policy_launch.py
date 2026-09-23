@@ -87,7 +87,9 @@ def test_astra_is_consult_only_and_defaults_to_xhigh(capsys):
         ("kiro-opus", None, "claude-opus-5", "xhigh"),
         ("kiro-sonnet", None, "claude-sonnet-5", "high"),
         ("kiro-cheap", None, "qwen3-coder-next", "medium"),
-        ("haiku", None, "", "low"),
+        # The launcher passes the CLI alias (--model haiku); the catalog still
+        # carries the model identity, which its route requires non-blank.
+        ("haiku", None, "claude-haiku-4.5", "low"),
     ],
 )
 def test_snapshot_defaults_match_the_launcher_case_table(profile, effort, model_id, resolved_effort):
