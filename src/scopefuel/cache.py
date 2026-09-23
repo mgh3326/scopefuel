@@ -15,7 +15,7 @@ import re
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from .http import classify_error
 from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
@@ -356,9 +356,13 @@ def collect(
     """
     now = time.time() if now is None else now
     # task #578 — 측정 전에 계정 binding 을 고정한다(미등록이면 빈 dict, 동작 불변).
-    from . import quota_v2
+    # v2 는 shadow 전용이므로 어떤 실패도 이 legacy 경로로 새지 않게 여기서 끊는다.
+    try:
+        from . import quota_v2
 
-    v2_identities = quota_v2.capture_identities(names, now)
+        v2_identities = quota_v2.capture_identities(names, now)
+    except Exception:
+        v2_identities = {}
     cache = _load()
     backoff = _load_backoff()
     results: list[ProviderResult | None] = [None] * len(names)
@@ -459,7 +463,9 @@ def collect(
         _merge_results(successes, failures, now)
         # 이번 호출에서 실제로 시도한 결과만 account-scoped v2 저장소에 추가한다
         # (캐시 히트·backoff 는 여기 오지 않는다). legacy 캐시와는 별 파일이다.
-        quota_v2.record_fetch(successes, failures, measured_at=now, identities=v2_identities)
+        if v2_identities:
+            with suppress(Exception):
+                quota_v2.record_fetch(successes, failures, measured_at=now, identities=v2_identities)
     return [result for result in results if result is not None]
 
 

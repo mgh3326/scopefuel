@@ -116,7 +116,7 @@ def _obs(
 ) -> dict:
     identity = quota_v2.Identity("claude", account, "unknown", revision, machine, "slot-x", 0.0, 1e12)
     source = result if result is not None else _claude(measured)
-    if status != "success":
+    if status not in ("success", "partial"):
         source = ProviderResult(
             id="claude",
             error="x",
@@ -591,3 +591,77 @@ def test_json_output_schema_unchanged_when_enrolled(slot_env, monkeypatch, capsy
     after = json.loads(capsys.readouterr().out)
     assert set(before) == set(after)
     assert [set(p) for p in before["providers"]] == [set(p) for p in after["providers"]]
+
+
+# ---------------------------------------------------------------- round 2 (tester t578-verify findings)
+
+
+def test_own_slot_auth_failure_is_not_cleared_by_other_node_or_later_429():
+    """SF-1: the execution slot's own auth failure stands until that same slot
+    measures again."""
+    now = T0 + dt.timedelta(seconds=90)
+    own = {"machine": "node-a", "revision": 1}
+    low = _obs("obs-low", T0, result=_claude(T0, five=10.0), **own)
+    auth = _obs("obs-auth", T0 + dt.timedelta(seconds=10), status="auth_error", **own)
+    other_success = _obs("obs-other", T0 + dt.timedelta(seconds=20), machine="node-b", revision=2)
+    own_429 = _obs("obs-429", T0 + dt.timedelta(seconds=30), status="rate_limited", **own)
+    for rows in ([low, auth, other_success], [low, auth, own_429]):
+        v2 = quota_v2.evaluate(_snapshot(_identity(), rows), "opus", now=now)
+        assert v2.code == "AUTH_BLOCKED" and not v2.gate.ok
+    recovered = _obs("obs-own-again", T0 + dt.timedelta(seconds=40), **own)
+    v2 = quota_v2.evaluate(_snapshot(_identity(), [low, auth, own_429, recovered]), "opus", now=now)
+    assert v2.code == "OK" and v2.observation_ids == ("obs-own-again",)
+
+
+def test_newer_partial_is_not_bypassed_by_an_older_complete_success():
+    """SF-2: a newer partial showing 99% must not fall back to an older 10%."""
+    low = _obs("obs-low", T0, result=_claude(T0, five=10.0))
+    high = _claude(T0, five=99.0, week=99.0)
+    high.warning = "incomplete response"
+    partial = _obs("obs-partial", T0 + dt.timedelta(seconds=20), status="partial", result=high)
+    v2 = quota_v2.evaluate(_snapshot(_identity(), [low, partial]), "opus", now=T0 + dt.timedelta(seconds=30))
+    assert v2.code == "PARTIAL" and not v2.gate.ok and v2.gate.unmeasurable
+
+
+@pytest.mark.parametrize("hook", ["capture_identities", "record_fetch", "shadow_gate", "load_bindings"])
+def test_v2_hook_failure_never_reaches_the_real_gate(hook, slot_env, monkeypatch, capsys, tmp_path):
+    """SF-3: an exception raised by any v2 entry point is cut at the legacy
+    boundary — rc, stdout, stderr and --gate-output stay the same."""
+
+    def run() -> tuple[int, str, str, dict]:
+        cache.cache_path().unlink(missing_ok=True)
+        output = tmp_path / "gate.json"
+        rc, out, err = _run_gate(
+            monkeypatch,
+            capsys,
+            lambda: _claude(dt.datetime.now(dt.UTC)),
+            "--no-cache",
+            "--gate-output",
+            str(output),
+        )
+        record = json.loads(output.read_text())
+        record.pop("generated_at")
+        return rc, out, err, record
+
+    baseline = run()
+    _enroll(_binding(slot_env, ACCOUNT_A, 1, verified=dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1)))
+
+    def boom(*_args, **_kwargs):
+        raise ZeroDivisionError("injected")
+
+    monkeypatch.setattr(quota_v2, hook, boom)
+    assert run() == baseline
+    assert cli.main(["--json", "--no-cache"]) == 0
+    assert json.loads(capsys.readouterr().out)["schema"] == "scopefuel.v1"
+
+
+def test_limit_ids_do_not_depend_on_bucket_order():
+    """SF-4: two limits sharing scope/window keep their ids when reordered."""
+    first = Bucket("7d weekly", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
+    second = Bucket("7d rolling", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
+    same_label_a = Bucket("7d", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
+    same_label_b = Bucket("7d", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
+    for pair in ((first, second), (same_label_a, same_label_b)):
+        forward = {b["used_pct"]: b["limit_id"] for b in quota_v2.buckets_to_v2(list(pair))}
+        backward = {b["used_pct"]: b["limit_id"] for b in quota_v2.buckets_to_v2(list(reversed(pair)))}
+        assert forward == backward and len(set(forward.values())) == 2

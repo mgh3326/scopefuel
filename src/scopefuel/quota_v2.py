@@ -346,21 +346,46 @@ def _normalize_reset(value: str | None) -> str | None:
     return None if parsed is None else parsed.isoformat().replace("+00:00", "Z")
 
 
+def _base_limit_id(bucket: Bucket) -> str:
+    name = bucket.scope.name if bucket.scope.kind != "account" else None
+    return f"{bucket.scope.kind}:{_slug(name) if name else '-'}:{_slug(bucket.window)}"
+
+
+def _limit_ids(buckets: list[Bucket]) -> list[str]:
+    """Stable limit ids that do not depend on bucket order.
+
+    ``scope:ref:window`` identifies a limit. When two buckets share it, the
+    label is added; if labels collide too, the ids are numbered in a canonical
+    order of the bucket's own fields rather than the order it arrived in.
+    """
+    bases = [_base_limit_id(b) for b in buckets]
+    ids = [
+        base if bases.count(base) == 1 else f"{base}:{_slug(bucket.label or '')}"
+        for base, bucket in zip(bases, buckets, strict=True)
+    ]
+    for dup in {i for i in ids if ids.count(i) > 1}:
+        members = sorted(
+            (index for index, value in enumerate(ids) if value == dup),
+            key=lambda index: (
+                str(buckets[index].resets_at),
+                str(buckets[index].horizon),
+                -1.0 if buckets[index].used_pct is None else float(buckets[index].used_pct),
+            ),
+        )
+        for rank, index in enumerate(members, start=1):
+            ids[index] = f"{dup}-{rank}"
+    return ids
+
+
 def buckets_to_v2(buckets: list[Bucket]) -> list[dict]:
     out: list[dict] = []
-    seen: set[str] = set()
-    for bucket in buckets:
+    for bucket, limit_id in zip(buckets, _limit_ids(buckets), strict=True):
         name = bucket.scope.name if bucket.scope.kind != "account" else None
-        base = f"{bucket.scope.kind}:{_slug(name) if name else '-'}:{_slug(bucket.window)}"
-        limit_id, suffix = base, 2
-        while limit_id in seen:
-            limit_id, suffix = f"{base}-{suffix}", suffix + 1
-        seen.add(limit_id)
         reset = _normalize_reset(bucket.resets_at)
         window = bucket.window if WINDOW_RE.match(bucket.window or "") else "?"
         out.append(
             {
-                "limit_id": limit_id,
+                "limit_id": limit_id[:128],
                 "label": bucket.label[:128] if bucket.label else None,
                 "scope": {"kind": bucket.scope.kind, "ref": name},
                 "horizon": bucket.horizon if bucket.horizon in HORIZONS else "week",
@@ -753,10 +778,16 @@ def _select(
             continue
         candidates.setdefault(obs["observation_id"], obs)
     rows = sorted(candidates.values(), key=lambda o: _parse_time(o["measured_at"]))  # type: ignore[arg-type,return-value]
-    successes = [o for o in rows if o["status"] == "success"]
+    measuring = [o for o in rows if o["status"] in MEASURING]
     base = {"identity": identity, "excluded": excluded}
 
-    def failure_after(point: dt.datetime | None, *, own_only: bool) -> dict | None:
+    def own_slot(obs: dict) -> bool:
+        return (
+            obs["source_machine"] == identity["machine_id"]
+            and obs["source_binding_revision"] == identity["binding_revision"]
+        )
+
+    def failure_after(point: dt.datetime | None) -> dict | None:
         found = None
         for obs in rows:
             if obs["status"] in MEASURING:
@@ -764,31 +795,37 @@ def _select(
             at = _parse_time(obs["measured_at"])
             if point is not None and at is not None and at <= point:
                 continue
-            if own_only and (
-                obs["source_machine"] != identity["machine_id"]
-                or obs["source_binding_revision"] != identity["binding_revision"]
-            ):
-                continue
             found = obs
         return found
 
-    if not successes:
-        failure = failure_after(None, own_only=False)
-        own = failure_after(None, own_only=True)
-        code = "AUTH_BLOCKED" if own is not None and own["status"] == "auth_error" else "NO_SAMPLE"
-        error_kind = _FAILURE_KIND.get(failure["status"]) if failure else None
+    # The execution slot's own auth failure stands until that same slot
+    # measures again: a later value from another node, or a later 429 on this
+    # slot, does not clear it. Another node's expired credential does not
+    # block this one.
+    own_auth = None
+    for obs in rows:
+        if not own_slot(obs):
+            continue
+        if obs["status"] == "auth_error":
+            own_auth = obs
+        elif obs["status"] in MEASURING:
+            own_auth = None
+    if own_auth is not None:
         return _Selection(
-            ProviderResult(
-                id=provider, error=f"quota-v2 {code}", error_kind=error_kind, pool_class=pool_class
-            ),
-            code,
+            _unusable(provider, "AUTH_BLOCKED", "auth", pool_class),
+            "AUTH_BLOCKED",
+            observation_ids=(own_auth["observation_id"],),
             **base,
         )
-    latest = successes[-1]
+    if not measuring:
+        failure = failure_after(None)
+        error_kind = _FAILURE_KIND.get(failure["status"]) if failure else None
+        return _Selection(_unusable(provider, "NO_SAMPLE", error_kind, pool_class), "NO_SAMPLE", **base)
+    latest = measuring[-1]
     latest_at = _parse_time(latest["measured_at"])
     assert latest_at is not None
-    twins = [o for o in successes if _parse_time(o["measured_at"]) == latest_at]
-    if any(_values(o) != _values(latest) for o in twins):
+    twins = [o for o in measuring if _parse_time(o["measured_at"]) == latest_at]
+    if any(o["status"] != latest["status"] or _values(o) != _values(latest) for o in twins):
         # Same instant, different values, no way to order them: never pick
         # the friendlier one.
         return _Selection(
@@ -797,17 +834,16 @@ def _select(
             observation_ids=tuple(o["observation_id"] for o in twins),
             **base,
         )
-    # The execution slot's own auth failure is never covered by a value
-    # measured elsewhere; another node's expired credential does not block
-    # this one.
-    own_auth = failure_after(latest_at, own_only=True)
-    if own_auth is not None and own_auth["status"] == "auth_error":
+    if latest["status"] == "partial":
+        # The newest measurement is incomplete. Falling back to an older
+        # complete one could hide a higher value the partial one shows, so
+        # it is not admission evidence (the legacy gate refuses a warning
+        # result the same way).
         return _Selection(
-            ProviderResult(
-                id=provider, error="quota-v2 AUTH_BLOCKED", error_kind="auth", pool_class=pool_class
-            ),
-            "AUTH_BLOCKED",
-            observation_ids=(own_auth["observation_id"],),
+            _unusable(provider, "PARTIAL", "parse", pool_class),
+            "PARTIAL",
+            observation_ids=(latest["observation_id"],),
+            measured_at=latest["measured_at"],
             **base,
         )
     age = (now - latest_at).total_seconds()
@@ -831,7 +867,7 @@ def _select(
             freshness="fresh",
             **base,
         )
-    failure = failure_after(latest_at, own_only=False)
+    failure = failure_after(latest_at)
     if failure is None or failure["status"] not in ("rate_limited", "transport_error"):
         # Old value and no evidence the measurement itself is failing: stage 1
         # has no refresh intent, so this is not admission evidence.

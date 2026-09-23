@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import pathlib
@@ -595,6 +596,23 @@ def _manual_gate_audit(
     )
 
 
+def _shadow_gate(
+    args, fetchers, automatic_results, result, exit_code, now, bench_scores, model_prices, grade_table
+) -> None:
+    quota_v2.shadow_gate(
+        profile=args.profile,
+        legacy=result,
+        legacy_exit=exit_code,
+        now=now,
+        names=list(fetchers),
+        pool_classes={item.id: item.pool_class for item in automatic_results},
+        bench_scores=bench_scores,
+        model_prices=model_prices,
+        grade_table=grade_table,
+        gate_kwargs=_gate_args(args),
+    )
+
+
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     automatic_results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
@@ -687,18 +705,10 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
 
     # task #578 1단계 — shadow 전용: v2(account-scoped) 판정을 계산해 비교 로그에만 남긴다.
     # result·exit_code·출력은 건드리지 않으며, 미등록 노드에서는 아무것도 하지 않는다.
-    quota_v2.shadow_gate(
-        profile=args.profile,
-        legacy=result,
-        legacy_exit=exit_code,
-        now=now,
-        names=list(fetchers),
-        pool_classes={item.id: item.pool_class for item in automatic_results},
-        bench_scores=bench_scores,
-        model_prices=model_prices,
-        grade_table=grade_table,
-        gate_kwargs=_gate_args(args),
-    )
+    with contextlib.suppress(Exception):
+        _shadow_gate(
+            args, fetchers, automatic_results, result, exit_code, now, bench_scores, model_prices, grade_table
+        )
 
     if args.gate_output:
         record = _gate_record(result, exit_code, now, purpose=args.purpose)
