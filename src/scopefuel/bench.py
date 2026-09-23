@@ -920,10 +920,17 @@ def _handoffkeep_credentials() -> tuple[str | None, str | None]:
     wins, so a shell can point one command at a different endpoint.
     """
 
-    url = os.environ.get("HANDOFFKEEP_URL")
-    token = os.environ.get("HANDOFFKEEP_TOKEN")
-    if url and token:
-        return url, token
+    env_url = os.environ.get("HANDOFFKEEP_URL")
+    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
+    if env_url or env_token:
+        # An environment override is all-or-nothing. Completing a half-set pair
+        # from config.env would send the stored bearer token to whatever host the
+        # environment named — setting one variable would be enough to redirect
+        # the credential (CWE-522). An incomplete pair resolves to local instead,
+        # and ``bench catalog status`` says which half is missing.
+        return env_url, env_token
+    url: str | None = None
+    token: str | None = None
     try:
         raw = handoffkeep_dotenv_path().read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -2558,6 +2565,22 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
         view.label,
         f"rows={len(view.entries)} profiles={len(view.profiles())}",
     ]
+    env_url = os.environ.get("HANDOFFKEEP_URL")
+    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
+    if bool(env_url) != bool(env_token):
+        missing = "HANDOFFKEEP_TOKEN" if env_url else "HANDOFFKEEP_URL"
+        lines.append(
+            f"note: only one of HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN is set ({missing} is missing); "
+            "an environment override is all-or-nothing and config.env is not used to complete it"
+        )
+    if bool(found_url) != bool(found_token) and (
+        os.environ.get("HANDOFFKEEP_URL") or os.environ.get("HANDOFFKEEP_TOKEN")
+    ):
+        missing = "HANDOFFKEEP_TOKEN" if found_url else "HANDOFFKEEP_URL"
+        lines.append(
+            f"note: only one of HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN is set ({missing} is missing); "
+            "an environment override is all-or-nothing and config.env is not used to complete it"
+        )
     override = os.environ.get("HANDOFFKEEP_CONFIG")
     if override and not pathlib.Path(os.path.expanduser(override)).is_file():
         # An explicit override is honoured as written — it deliberately does not
@@ -2650,10 +2673,18 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
 
     from .recommend import GRADE_TABLE, validate_grade_table
 
-    live = [entry for entry in view.entries if not entry.retired_at]
-    if not live:
+    if not view.entries:
+        # Nothing seeded yet. A catalog that has said nothing cannot be the
+        # reason the table empties, so the snapshot stands.
         return None
-    covered_profiles = {entry.profile for entry in live}
+    live = [entry for entry in view.entries if not entry.retired_at]
+    # Coverage counts retired rows too. A profile whose every rung the operator
+    # retired is a profile the canon has spoken about — leaving it out here put
+    # its snapshot rows back into the recommendations while ``resolve_launch``
+    # refused to start it, so a dispatcher could be handed a profile it cannot
+    # launch. A catalog where everything is retired therefore empties the table,
+    # which is what it was asked to say.
+    covered_profiles = {entry.profile for entry in view.entries}
     templates: dict[tuple[str, str], object] = {}
     for profiles in GRADE_TABLE.values():
         for profile in profiles:

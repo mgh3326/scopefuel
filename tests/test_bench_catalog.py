@@ -571,3 +571,61 @@ def test_the_emitted_seed_carries_provenance_on_every_row():
         assert str(row["decided_by"]).strip()
         assert str(row["deviation_ref"]).strip()
         assert str(row["model_id"]).strip()
+
+
+def test_a_fully_retired_profile_leaves_the_recommendations(catalog_server):
+    """Coverage counts retired rows, or the canon's retirement is half-applied.
+
+    Before this, retiring every rung of a profile dropped it from the *live* set,
+    so the merge treated it as "never mentioned" and restored its snapshot rows —
+    `--recommend` kept proposing a profile `policy launch` refused to start.
+    """
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    retired = "2026-09-24T00:00:00Z"
+    fake.catalog = [
+        _row("opus", effort, "claude-opus-5-5", "claude", "S+", retired_at=retired)
+        for effort in ("high", "xhigh")
+    ] + [_row("codex-sol", "max", "gpt-6-sol", "codex", "S+")]
+    _age_catalog_cache(3601)
+
+    table = bench.runtime_grade_table()
+    assert not any(p.name == "opus" for profiles in table.values() for p in profiles)
+    with pytest.raises(launch.LaunchError):
+        launch.resolve_launch("opus")
+    # A profile the catalog never mentioned is still untouched.
+    assert any(p.name == "kimi-k3" for profiles in table.values() for p in profiles)
+
+
+def test_an_empty_catalog_still_falls_back_to_the_snapshot(catalog_server):
+    """ "Nothing seeded yet" and "everything retired" are different statements."""
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    fake.catalog = []
+    _age_catalog_cache(3601)
+
+    table = bench.runtime_grade_table()
+    assert any(p.name == "opus" for profiles in table.values() for p in profiles)
+
+
+def test_a_half_set_environment_override_is_not_completed_from_config_env(tmp_path, monkeypatch):
+    """Setting one variable must not redirect the stored bearer token.
+
+    Completing the pair from config.env meant `HANDOFFKEEP_URL=https://elsewhere`
+    alone was enough to make the client send the config.env token to that host.
+    """
+
+    env = tmp_path / "hk.env"
+    env.write_text("HANDOFFKEEP_URL=https://real.example\nHANDOFFKEEP_TOKEN=secret\n", encoding="utf-8")
+    monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(env))
+    monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
+    monkeypatch.setenv("HANDOFFKEEP_URL", "https://attacker.example")
+
+    url, token = bench._handoffkeep_credentials()
+    assert url == "https://attacker.example"
+    assert token is None, "the config.env token must not follow an environment-chosen URL"
+    backend = bench.bench_backend()
+    assert backend.name == bench.BENCH_BACKEND_LOCAL
+    assert "all-or-nothing" in bench.catalog_status_report()
