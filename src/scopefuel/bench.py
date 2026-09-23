@@ -2558,6 +2558,16 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
         view.label,
         f"rows={len(view.entries)} profiles={len(view.profiles())}",
     ]
+    override = os.environ.get("HANDOFFKEEP_CONFIG")
+    if override and not pathlib.Path(os.path.expanduser(override)).is_file():
+        # An explicit override is honoured as written — it deliberately does not
+        # fall back to the default config.env. Say so, because a typo in that
+        # variable otherwise leaves the host in local mode with no sign of why,
+        # which is the exact silence this whole change exists to remove.
+        lines.append(
+            f"note: HANDOFFKEEP_CONFIG points at {override}, which does not exist; "
+            "the default ~/.config/handoffkeep/config.env is NOT consulted while it is set"
+        )
     if backend.reason == "auto-local-insecure-url":
         lines.append(
             "blocked: handoffkeep credentials exist but the URL is plaintext http to a "

@@ -249,3 +249,19 @@ def test_a_gated_rung_still_resolves_with_an_operator_request():
     decision = launch.resolve_launch("opus", operator_request=True, view=view)
     assert decision.effort == "high"
     assert decision.gate == "consult_only"
+
+
+def test_an_unknown_effort_rung_is_refused_rather_than_echoed_back():
+    """#593 verify r2 observation 1: `--effort bogus` returned rc 0 and handed the
+    string straight back, where a caller could put it in the agent's argv."""
+
+    with pytest.raises(launch.LaunchError, match="unknown effort rung"):
+        launch.resolve_launch("opus", effort="bogus")
+    assert cli.main(["policy", "launch", "opus", "--effort", "bogus"]) == 3
+
+
+def test_a_rung_the_catalog_defines_is_accepted_even_if_this_build_predates_it():
+    """The vocabulary check must not stop the server from introducing a rung."""
+
+    view = _view(_entry("opus", "ultra2", "S+"), _entry("opus", "high", "S+"))
+    assert launch.resolve_launch("opus", effort="ultra2", view=view).effort == "ultra2"
