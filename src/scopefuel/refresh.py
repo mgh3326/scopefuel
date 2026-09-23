@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from . import cache, proctrack
+from .http import classify_error
 from .model import ProviderResult
 from .providers import BUILTIN
 
@@ -100,11 +101,21 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
         signal.signal(signal.SIGALRM, _kill_process_group_on_timeout)
         signal.setitimer(signal.ITIMER_REAL, _timeout_seconds())
         try:
+            now = time.time()
+            remaining = cache.backoff_remaining(pool, now)
+            if remaining > 0:
+                print(f"refresh: pool={pool} backoff 중 — {remaining:.0f}s 뒤 허용, 네트워크 호출 생략")
+                return 0
             fetcher = fetchers[pool]
             result = _fetch(fetcher, pool)
             if result.error or result.warning:
                 detail = result.error or result.warning
-                print(f"refresh: pool={pool} failed: {detail}", file=sys.stderr)
+                cache.record_failure(pool, result, now)
+                print(
+                    f"refresh: pool={pool} failed: status={result.http_status or '-'} "
+                    f"kind={result.error_kind or '-'} detail={detail}",
+                    file=sys.stderr,
+                )
                 return 1
             now = time.time()
             result.id = pool
@@ -124,9 +135,16 @@ def _fetch(fetcher: object, pool: str) -> ProviderResult:
     try:
         result = fetcher()  # type: ignore[operator]
     except Exception as exc:
-        return ProviderResult(id=pool, error=f"fetch failed ({type(exc).__name__})")
+        kind, status, retry_after = classify_error(exc)
+        return ProviderResult(
+            id=pool,
+            error=str(exc),
+            error_kind=kind,
+            http_status=status,
+            retry_after_s=retry_after,
+        )
     if not isinstance(result, ProviderResult):
-        return ProviderResult(id=pool, error="fetcher returned an invalid result")
+        return ProviderResult(id=pool, error="fetcher returned an invalid result", error_kind="unknown")
     return result
 
 

@@ -480,6 +480,7 @@ def _gate_record(
         "ok": result.ok,
         "exit_code": exit_code,
         "unmeasurable": result.unmeasurable,
+        "stale_accepted": result.stale_accepted,
         "used_pct": result.used_pct,
         "pool_class": result.pool_class,
         "reason": result.reason,
@@ -669,6 +670,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             f"profile={result.profile} pool={result.provider_id} "
             f"used_pct={result.used_pct} class={result.pool_class}"
         )
+        if result.stale_accepted:
+            first_line += " stale_accepted=true"
         if result.operator_request_ref is not None:
             first_line += (
                 f" escalation_override={'true' if result.escalation_override else 'false'}"

@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from . import cache, manual
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset, _window_seconds
 from .policy import (
@@ -1293,6 +1294,77 @@ def _matching_buckets(result: ProviderResult, group_name: str | None) -> list[tu
     return out
 
 
+_RATE_LIMITED_RE = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many requests", re.I)
+
+
+def _stale_failure_kind(result: ProviderResult) -> str | None:
+    """stale 수용이 가능한 실패 사유 — "rate_limited" | "transport" | None(수용 불가).
+
+    수용 사유는 429·5xx·네트워크뿐이다. auth·credentials·parse·분류 불가는
+    전부 None — 어떤 실패인지 모르는 값으로 게이트를 열지 않는다.
+    """
+    kind = result.error_kind
+    if kind == "rate_limited":
+        return "rate_limited"
+    if kind in ("server", "network", "transport"):
+        text = result.last_error or result.error or ""
+        return "rate_limited" if _RATE_LIMITED_RE.search(text) else "transport"
+    if kind is not None:
+        return None
+    kind, _ = manual.classify_automatic_failure(result)
+    if kind != "transport":
+        return None
+    text = result.last_error or result.error or ""
+    return "rate_limited" if _RATE_LIMITED_RE.search(text) else "transport"
+
+
+def _stale_accepted(result: ProviderResult | None, group_name: str | None, now: dt.datetime) -> str | None:
+    """stale_accepted 명시 수용 분기. 수용 시 실패 사유를 돌려주고 아니면 None.
+
+    조건(전부 필수 — 하나라도 어긋나면 기존처럼 거부): stale 폴백 결과이고,
+    실패 사유가 429/5xx/네트워크이며, 나이가 cache.STALE_MAX_S(6h) 이하이고,
+    계정 지문이 일치(account_fp_match is True — 지문이 없는 provider·구형식
+    엔트리는 수용하지 않는다)하고, 필수 bucket(manual.REQUIRED_WINDOWS)이 전부
+    있고, 매칭 bucket 의 reset 회차가 경과하지 않았을 때.
+    """
+    if result is None or not result.stale or result.error or result.warning:
+        return None
+    kind = _stale_failure_kind(result)
+    if kind is None:
+        return None
+    if result.account_fp_match is not True:
+        return None
+    if result.age_s is None or result.age_s > cache.STALE_MAX_S:
+        return None
+    matches = _matching_buckets(result, group_name)
+    if not matches:
+        return None
+    covered = {window for _used, window, _reset in matches}
+    if not manual.REQUIRED_WINDOWS.get(result.id, frozenset()) <= covered:
+        return None
+    now_utc = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
+    for _used, _window, reset_at in matches:
+        reset = _parse_reset(reset_at)
+        if reset is None or reset <= now_utc:
+            return None
+    return kind
+
+
+def _stale_tag(result: ProviderResult, kind: str) -> str:
+    label = "속도 제한" if kind == "rate_limited" else "조회 실패"
+    age = cache.format_age(result.age_s) or "?"
+    return f"stale_accepted — {label}, 마지막 값 {age}"
+
+
+def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str:
+    """측정 불가 사유 — 429 는 '속도 제한'으로 구분해 보고한다(#576 AC1)."""
+    if result is not None and _stale_failure_kind(result) == "rate_limited":
+        if result.stale and result.age_s is not None:
+            return f"{provider_id} 속도 제한 — 마지막 값 {cache.format_age(result.age_s)} 수용 불가"
+        return f"{provider_id} 속도 제한 — 마지막 정상 값 없음"
+    return f"{provider_id} 측정 불가 (provider error/degraded)"
+
+
 def _reset_display(iso: str | None) -> str:
     if not iso:
         return "-"
@@ -1651,8 +1723,9 @@ def _build_escalation_entry(
             reason_parts.append(override.note)
         status_notes.append(", ".join(reason_parts) + ")")
 
-    if result is None or result.error or result.warning or result.status != "ok":
-        status_notes.append("측정 불가")
+    accepted = _stale_accepted(result, group_name, now)
+    if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
+        status_notes.append(_unmeasurable_reason(provider_id, result))
     else:
         matches = _matching_buckets(result, group_name)
         if not matches:
@@ -1665,7 +1738,10 @@ def _build_escalation_entry(
             if over is not None:
                 status_notes.append(f"{over.used_pct:g}% 소진 (reset {_reset_display(over.reset_at)})")
             else:
-                status_notes.append(f"사용 {_format_windows_display(states, constraint)}")
+                note = f"사용 {_format_windows_display(states, constraint)}"
+                if accepted is not None:
+                    note += f" [{_stale_tag(result, accepted)}]"
+                status_notes.append(note)
 
     return _EscalationEntry(
         profile=profile,
@@ -1776,6 +1852,8 @@ class GateResult:
     observed_age_s: float | None = None
     remaining_effect_s: float | None = None
     last_auto_error: str | None = None
+    # task #576 — stale_accepted 명시 수용. True 면 reason 에 나이·사유가 적힌다.
+    stale_accepted: bool = False
 
 
 def _find_profile(
@@ -2000,13 +2078,14 @@ def gate_check(
         # Profile known to profile_pool but not in GRADE_TABLE: check quota only.
         by_id = {r.id: r for r in providers}
         result = by_id.get(provider_id)
-        if result is None or result.error or result.warning or result.status != "ok":
+        accepted = _stale_accepted(result, group_name, now)
+        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
             return GateResult(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=None,
-                reason=f"{provider_id} 측정 불가 (provider error/degraded)",
+                reason=_unmeasurable_reason(provider_id, result),
                 unmeasurable=True,
             )
         matches = _matching_buckets(result, group_name)
@@ -2058,14 +2137,18 @@ def gate_check(
                 used_pct=over.used_pct,
                 pool_class=effective_class,
             )
+        reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+        if accepted is not None:
+            reason += f" [{_stale_tag(result, accepted)}]"
         return GateResult(
             ok=True,
             profile=profile_name,
             provider_id=provider_id,
             grade=None,
-            reason=f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}",
+            reason=reason,
             used_pct=used_pct,
             pool_class=effective_class,
+            stale_accepted=accepted is not None,
         )
 
     grade, profile = found
@@ -2132,14 +2215,15 @@ def gate_check(
                 **audit,
             )
 
-    if result is None or result.error or result.warning or result.status != "ok":
+    accepted = _stale_accepted(result, group_name, now)
+    if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
         alts = alternatives()
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=f"{provider_id} 측정 불가 (provider error/degraded)",
+            reason=_unmeasurable_reason(provider_id, result),
             unmeasurable=True,
             alternatives=alts,
             **audit,
@@ -2208,6 +2292,8 @@ def gate_check(
             f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
             f"class={effective_class} — {profile.gate_reason or ''}"
         )
+        if accepted is not None:
+            reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
             tag = _operator_request_audit(
                 operator_request, audit_requested_by or "unknown", escalation_override
@@ -2221,17 +2307,22 @@ def gate_check(
             reason=reason,
             used_pct=used_pct,
             pool_class=effective_class,
+            stale_accepted=accepted is not None,
             **audit,
         )
 
+    reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+    if accepted is not None:
+        reason += f" [{_stale_tag(result, accepted)}]"
     return GateResult(
         ok=True,
         profile=profile_name,
         provider_id=provider_id,
         grade=grade,
-        reason=f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}",
+        reason=reason,
         used_pct=used_pct,
         pool_class=effective_class,
+        stale_accepted=accepted is not None,
     )
 
 
@@ -2311,8 +2402,16 @@ def recommend(
         provider_label = _provider_label(provider_id, group_name)
 
         result = by_id.get(provider_id)
-        if result is None or result.error or result.warning or result.status != "ok":
-            excluded.append(_Excluded(profile, "측정 불가", provider_id=provider_id, kind="unmeasurable"))
+        accepted = _stale_accepted(result, group_name, now)
+        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
+            excluded.append(
+                _Excluded(
+                    profile,
+                    _unmeasurable_reason(provider_id, result),
+                    provider_id=provider_id,
+                    kind="unmeasurable",
+                )
+            )
             continue
 
         matches = _matching_buckets(result, group_name)
@@ -2402,7 +2501,10 @@ def recommend(
                 throughput_window=throughput_window,
                 brake=brake,
                 brake_window=brake_window,
-                windows_display=_format_windows_display(states, constraint),
+                windows_display=(
+                    _format_windows_display(states, constraint)
+                    + (f" [{_stale_tag(result, accepted)}]" if accepted is not None else "")
+                ),
                 used_pct=used_pct,
                 remaining_pct=remaining_pct,
                 pool_class=effective_class,
@@ -2757,7 +2859,8 @@ def recommend(
             if kind == "exhausted":
                 label = f"{provider_id} 풀 소진"
             elif kind == "unmeasurable":
-                label = f"{provider_id} 측정 불가"
+                # 429 등 구분된 사유가 있으면 그대로 보여준다(#576) — 없으면 기존 문구.
+                label = reason if reason and reason != "측정 불가" else f"{provider_id} 측정 불가"
             else:
                 label = provider_id or group[0].profile.name
             if kind == "unmeasurable":

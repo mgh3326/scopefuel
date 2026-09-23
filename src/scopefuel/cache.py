@@ -11,11 +11,13 @@ import fcntl
 import json
 import os
 import pathlib
+import re
 import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 
+from .http import classify_error
 from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
 from .policy import get_policy
 
@@ -33,6 +35,15 @@ PROVIDER_TTL_S = {
 }
 MAX_FETCH_WORKERS = 8  # 현재 provider 수 이하: 독립 HTTP/PTY fetch를 병렬화하되 무제한 spawn은 피한다.
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
+
+# task #576 — 429 이후 host-local backoff. Retry-After 양수는 그대로 존중하고,
+# 없거나 0이면 지수(60s → … → 15m 상한)로 늘린다. 상태는 호스트 로컬이다.
+BACKOFF_SCHEMA = "scopefuel.backoff.v1"
+BACKOFF_BASE_S = 60.0
+BACKOFF_MAX_S = 15 * 60.0
+
+# 구형식 결과(error_kind 없음)에서 429 텍스트를 알아채는 보조 장치.
+_RATE_LIMITED_TEXT = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many requests", re.I)
 
 
 def cache_path() -> pathlib.Path:
@@ -88,6 +99,103 @@ def update_entry(name: str, result: ProviderResult, now: float) -> None:
         data = _load()
         data[name] = _to_entry(result, now)
         _save(data)
+        state = _load_backoff()
+        if state["pools"].pop(name, None) is not None:
+            _save_backoff(state)
+
+
+def backoff_path() -> pathlib.Path:
+    return cache_dir() / "backoff.json"
+
+
+def _load_backoff() -> dict:
+    try:
+        data = json.loads(backoff_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"schema": BACKOFF_SCHEMA, "pools": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("pools"), dict):
+        return {"schema": BACKOFF_SCHEMA, "pools": {}}
+    return data
+
+
+def _save_backoff(data: dict) -> None:
+    path = backoff_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    except OSError:
+        pass  # backoff 기록 실패가 조회를 막지는 않는다
+
+
+def backoff_remaining(name: str, now: float) -> float:
+    """name pool 의 남은 backoff 초. 기록이 없거나 창이 지났으면 0."""
+    state = _load_backoff().get("pools", {}).get(name)
+    if not isinstance(state, dict):
+        return 0.0
+    try:
+        until = float(state.get("next_allowed_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, until - now)
+
+
+def _is_rate_limited(result: ProviderResult) -> bool:
+    if result.error_kind is not None:
+        return result.error_kind == "rate_limited"
+    return bool(result.error and _RATE_LIMITED_TEXT.search(result.error))
+
+
+def _bump_backoff(pools: dict, name: str, result: ProviderResult, now: float) -> None:
+    """429 실패의 다음 허용 시각을 기록한다.
+
+    Retry-After 양수는 상한으로 깎지 않고 그대로 존중한다 — 서버 요구를 임의로
+    줄이면 정확히 그 폭주를 다시 만든다. 없거나 0이면 60s → … → 15m 지수로.
+    """
+    prev = pools.get(name)
+    consecutive = int(prev.get("consecutive") or 0) + 1 if isinstance(prev, dict) else 1
+    retry_after = result.retry_after_s
+    if retry_after is not None and retry_after > 0:
+        delay = retry_after
+    else:
+        delay = min(BACKOFF_BASE_S * (2 ** (consecutive - 1)), BACKOFF_MAX_S)
+    pools[name] = {
+        "consecutive": consecutive,
+        "next_allowed_at": now + delay,
+        "last_error": result.error,
+        "last_error_kind": result.error_kind,
+        "last_http_status": result.http_status,
+        "updated_at": now,
+    }
+
+
+def _audit_failure(entry: dict | None, result: ProviderResult, now: float) -> dict:
+    """실패 감사 — 정상 스냅샷(result/fetched_at)은 건드리지 않고 last_error* 만 갱신한다."""
+    if not isinstance(entry, dict):
+        entry = {"fetched_at": 0, "result": {}}
+    entry["last_error"] = result.error or result.warning
+    entry["last_error_at"] = now
+    # error_kind 가 없는 구형식 결과는 텍스트에서 429 를 복원한다.
+    kind = result.error_kind or ("rate_limited" if _is_rate_limited(result) else None)
+    if kind:
+        entry["last_error_kind"] = kind
+    if result.http_status is not None:
+        entry["last_http_status"] = result.http_status
+    return entry
+
+
+def record_failure(name: str, result: ProviderResult, now: float) -> None:
+    """단일-pool writer 경로(refresh worker)의 실패 감사 + 429 backoff 기록."""
+    with _exclusive_cache_lock():
+        data = _load()
+        data[name] = _audit_failure(data.get(name), result, now)
+        _save(data)
+        if _is_rate_limited(result):
+            state = _load_backoff()
+            _bump_backoff(state["pools"], name, result, now)
+            _save_backoff(state)
 
 
 def _to_entry(result: ProviderResult, now: float) -> dict:
@@ -97,6 +205,9 @@ def _to_entry(result: ProviderResult, now: float) -> dict:
     # never part of the last successful automatic snapshot.
     payload.pop("manual", None)
     payload.pop("last_error", None)
+    # 지문은 로컬 캐시 파일에만 둔다 — 계정 동일성 증명용이며 출력 계약이 아니다.
+    if result.account_fp:
+        payload["account_fp"] = result.account_fp
     return {"fetched_at": now, "result": payload}
 
 
@@ -153,7 +264,80 @@ def _from_entry(
         age_s=now - fetched_at,
         stale=True,
         pool_class=effective_class,
+        account_fp=payload.get("account_fp"),
     )
+
+
+def _failure_label(result: ProviderResult) -> str:
+    return "속도 제한" if _is_rate_limited(result) else "조회 실패"
+
+
+def _backoff_result(
+    name: str,
+    fetcher: object,
+    entry: object,
+    state: dict | None,
+    now: float,
+    until: float,
+    policy_class: PoolClass,
+) -> ProviderResult:
+    """backoff 창 안의 결과 — 네트워크 0. 스냅샷이 있으면 나이와 함께 돌려준다."""
+    remaining = until - now
+    state = state if isinstance(state, dict) else {}
+    last_error = state.get("last_error")
+    if isinstance(entry, dict):
+        age = now - float(entry.get("fetched_at") or 0)
+        if age <= STALE_MAX_S:
+            stale = _from_entry(entry, name, now, policy_class)
+            stale.note = f"backoff 중, 마지막 값 {format_age(age)}"
+            stale.last_error = last_error
+            stale.last_error_at = state.get("updated_at") or now
+            stale.error_kind = state.get("last_error_kind") or "rate_limited"
+            status = state.get("last_http_status")
+            stale.http_status = status if isinstance(status, int) else None
+            stale.backoff_until = until
+            # 네트워크 없이 읽을 수 있는 로컬 자격 지문으로 계정 동일성을 다시 확인한다.
+            # 지문을 낼 수 없는 provider/구형식 엔트리는 "증명 불가"(None)로 둔다.
+            probe = getattr(fetcher, "current_account_fp", None)
+            current_fp = probe() if callable(probe) else None
+            stored_fp = (entry.get("result") or {}).get("account_fp")
+            stale.account_fp_match = (
+                None
+                if stored_fp is None and current_fp is None
+                else stored_fp is not None and stored_fp == current_fp
+            )
+            return stale
+    return ProviderResult(
+        id=name,
+        error=f"backoff 중, {remaining:.0f}s 뒤 재시도 가능" + (f" ({last_error})" if last_error else ""),
+        error_kind="rate_limited",
+        backoff_until=until,
+    )
+
+
+def _merge_results(
+    successes: dict[str, ProviderResult],
+    failures: dict[str, ProviderResult],
+    now: float,
+) -> None:
+    """파일을 다시 읽어 이번 호출의 결과만 병합한다 — 다른 writer/provider 의
+    기존 엔트리는 남는다(#576 부분 병합). 실패는 스냅샷을 덮지 않고 감사만 남긴다."""
+    with _exclusive_cache_lock():
+        data = _load()
+        backoff = _load_backoff()
+        backoff_dirty = False
+        for name, result in successes.items():
+            data[name] = _to_entry(result, now)
+            if backoff["pools"].pop(name, None) is not None:
+                backoff_dirty = True
+        for name, result in failures.items():
+            data[name] = _audit_failure(data.get(name), result, now)
+            if _is_rate_limited(result):
+                _bump_backoff(backoff["pools"], name, result, now)
+                backoff_dirty = True
+        _save(data)
+        if backoff_dirty:
+            _save_backoff(backoff)
 
 
 def collect(
@@ -164,11 +348,16 @@ def collect(
     use_cache: bool = True,
     now: float | None = None,
 ) -> list[ProviderResult]:
-    """fetch → 실패하면 캐시 폴백. 반환 순서는 names 순서."""
+    """fetch → 실패하면 캐시 폴백. 반환 순서는 names 순서.
+
+    use_cache=False 도 파일을 읽는다 — 이번 호출에서 성공한 항목만 덮어쓰는 부분
+    병합이므로 실패하거나 이번에 조회하지 않은 provider 의 기존 스냅샷은 남는다
+    (#576: 예전에는 빈 dict 를 통째로 저장해 다른 provider 의 정상 값까지 사라졌다).
+    """
     now = time.time() if now is None else now
-    cache = _load() if use_cache else {}
+    cache = _load()
+    backoff = _load_backoff()
     results: list[ProviderResult | None] = [None] * len(names)
-    dirty = False
     misses: list[tuple[int, str, object, dict | None, PoolClass]] = []
 
     for index, name in enumerate(names):
@@ -185,15 +374,32 @@ def collect(
             results[index] = fresh
             continue
 
+        # backoff 창 안에서는 --no-cache 포함 어느 경로도 네트워크를 치지 않는다.
+        state = backoff.get("pools", {}).get(name)
+        try:
+            until = float((state or {}).get("next_allowed_at") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until > now:
+            results[index] = _backoff_result(name, fetcher, entry, state, now, until, policy_class)
+            continue
+
         misses.append((index, name, fetcher, entry if isinstance(entry, dict) else None, policy_class))
 
     def fetch_one(fetcher: object) -> ProviderResult:
         if fetcher is None:
-            return ProviderResult(id="?", error="알 수 없는 provider")
+            return ProviderResult(id="?", error="알 수 없는 provider", error_kind="unknown")
         try:
             return fetcher()  # type: ignore[operator]
         except Exception as exc:
-            return ProviderResult(id="?", error=str(exc))
+            kind, status, retry_after = classify_error(exc)
+            return ProviderResult(
+                id="?",
+                error=str(exc),
+                error_kind=kind,
+                http_status=status,
+                retry_after_s=retry_after,
+            )
 
     fetched: dict[int, Future[ProviderResult]] = {}
     if misses:
@@ -201,32 +407,52 @@ def collect(
             for index, _name, fetcher, _entry, _policy_class in misses:
                 fetched[index] = pool.submit(fetch_one, fetcher)
 
+    successes: dict[str, ProviderResult] = {}
+    failures: dict[str, ProviderResult] = {}
     for index, name, _fetcher, entry, policy_class in misses:
         result = fetched[index].result()
         result.id = name
 
         result.pool_class = _effective_class(name, _fetcher, result.pool_class)
 
-        if result.error and entry:
-            age = now - float(entry.get("fetched_at") or 0)
-            if age <= STALE_MAX_S:
-                stale = _from_entry(entry, name, now, policy_class)
-                stale.note = f"조회 실패 → 캐시 사용 ({result.error})"
-                stale.last_error = result.error
-                if result.hint:
-                    stale.last_error += f" — {result.hint}"
-                results[index] = stale
-                continue
+        if result.error:
+            failures[name] = result
+            if isinstance(entry, dict):
+                age = now - float(entry.get("fetched_at") or 0)
+                stored_fp = (entry.get("result") or {}).get("account_fp")
+                if stored_fp is not None and result.account_fp is not None and stored_fp != result.account_fp:
+                    # 계정/구독 변경 의심 — 다른 계정의 스냅샷은 쓰지 않는다(자문 2558)
+                    result.account_fp_match = False
+                elif age <= STALE_MAX_S:
+                    stale = _from_entry(entry, name, now, policy_class)
+                    stale.note = f"{_failure_label(result)} → 캐시 사용 ({result.error})"
+                    stale.last_error = result.error
+                    if result.hint:
+                        stale.last_error += f" — {result.hint}"
+                    stale.last_error_at = now
+                    stale.error_kind = result.error_kind
+                    stale.http_status = result.http_status
+                    stale.retry_after_s = result.retry_after_s
+                    stale.account_fp_match = (
+                        None
+                        if stored_fp is None and result.account_fp is None
+                        else stored_fp is not None and stored_fp == result.account_fp
+                    )
+                    results[index] = stale
+                    continue
+            results[index] = result
+            continue
 
-        if not result.error and not result.warning:
+        if result.warning:
+            failures[name] = result  # warning 도 관측 감사는 남긴다
+        else:
             result.fetched_at = now
             result.age_s = 0.0
-            cache[name] = _to_entry(result, now)
-            dirty = True
+            successes[name] = result
         results[index] = result
 
-    if dirty:
-        _save(cache)
+    if successes or failures:
+        _merge_results(successes, failures, now)
     return [result for result in results if result is not None]
 
 
