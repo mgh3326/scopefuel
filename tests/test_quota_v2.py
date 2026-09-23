@@ -656,12 +656,63 @@ def test_v2_hook_failure_never_reaches_the_real_gate(hook, slot_env, monkeypatch
 
 
 def test_limit_ids_do_not_depend_on_bucket_order():
-    """SF-4: two limits sharing scope/window keep their ids when reordered."""
+    """SF-4: two limits sharing scope/window keep their ids when reordered.
+    Buckets identical in every fixed field cannot be told apart; they only
+    need distinct ids."""
     first = Bucket("7d weekly", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
     second = Bucket("7d rolling", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
-    same_label_a = Bucket("7d", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
-    same_label_b = Bucket("7d", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
-    for pair in ((first, second), (same_label_a, same_label_b)):
-        forward = {b["used_pct"]: b["limit_id"] for b in quota_v2.buckets_to_v2(list(pair))}
-        backward = {b["used_pct"]: b["limit_id"] for b in quota_v2.buckets_to_v2(list(reversed(pair)))}
-        assert forward == backward and len(set(forward.values())) == 2
+    forward = {b["label"]: b["limit_id"] for b in quota_v2.buckets_to_v2([first, second])}
+    backward = {b["label"]: b["limit_id"] for b in quota_v2.buckets_to_v2([second, first])}
+    assert forward == backward and len(set(forward.values())) == 2
+    twin_a = Bucket("7d", "7d", 30.0, _iso(T0 + dt.timedelta(days=3)), Scope("account"), "week")
+    twin_b = Bucket("7d", "7d", 60.0, _iso(T0 + dt.timedelta(days=5)), Scope("account"), "week")
+    assert len(set(quota_v2._limit_ids([twin_a, twin_b]))) == 2
+
+
+# ---------------------------------------------------------------- round 3 (t578-verify r2 findings)
+
+
+def test_limit_ids_stay_unique_and_bounded_so_no_observation_is_dropped(slot_env):
+    """R2-SF-1: colliding slugs, suffix look-alikes and long labels must still
+    give unique ids — a duplicate would drop the whole envelope."""
+    reset = _iso(T0 + dt.timedelta(days=3))
+    long_a, long_b = "x" * 121 + "a", "x" * 121 + "b"
+    for labels in (("requests", "Requests", "requests-1"), (long_a, long_b), ("same", "same")):
+        buckets = [
+            Bucket(label, "7d", 10.0 * (i + 1), reset, Scope("model", label), "week")
+            for i, label in enumerate(labels)
+        ] + [Bucket(label, "7d", 50.0, reset, Scope("account"), "week") for label in labels]
+        ids = quota_v2._limit_ids(buckets)
+        assert len(set(ids)) == len(ids) and all(len(i) <= 128 for i in ids)
+        identity = quota_v2.Identity("claude", ACCOUNT_A, "unknown", 1, "node-a", "slot-x", 0.0, 1e12)
+        obs = quota_v2.observation_from_result(
+            ProviderResult(id="claude", buckets=buckets), identity, measured_at=T0.timestamp()
+        )
+        assert quota_v2.validate_observation(obs)
+        assert quota_v2.append_observations([obs]) == 1
+
+
+def test_limit_ids_do_not_move_when_usage_changes():
+    """R2-SF-3: ids depend on fixed identity, not on the current value."""
+    reset = _iso(T0 + dt.timedelta(days=3))
+
+    def ids(first: float, second: float) -> dict[str, str]:
+        pair = [
+            Bucket("A B", "7d", first, reset, Scope("account"), "week"),
+            Bucket("A-B", "7d", second, reset, Scope("account"), "week"),
+        ]
+        return {b.label: i for b, i in zip(pair, quota_v2._limit_ids(pair), strict=True)}
+
+    low_high, high_low = ids(10.0, 90.0), ids(90.0, 10.0)
+    assert low_high == high_low and len(set(low_high.values())) == 2
+
+
+@pytest.mark.parametrize("order", ["auth_first", "success_first"])
+def test_same_instant_own_auth_failure_is_not_cleared_by_input_order(order):
+    """R2-SF-2: an own-slot auth failure and a success at the same instant have
+    no provable order; the auth failure wins either way."""
+    auth = _obs("obs-auth", T0, status="auth_error")
+    success = _obs("obs-ok", T0, result=_claude(T0, five=10.0))
+    rows = [auth, success] if order == "auth_first" else [success, auth]
+    v2 = quota_v2.evaluate(_snapshot(_identity(), rows), "opus", now=T0 + dt.timedelta(seconds=10))
+    assert v2.code == "AUTH_BLOCKED" and not v2.gate.ok

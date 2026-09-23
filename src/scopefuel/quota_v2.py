@@ -352,28 +352,36 @@ def _base_limit_id(bucket: Bucket) -> str:
 
 
 def _limit_ids(buckets: list[Bucket]) -> list[str]:
-    """Stable limit ids that do not depend on bucket order.
+    """Stable, unique limit ids that depend only on what identifies a limit.
 
-    ``scope:ref:window`` identifies a limit. When two buckets share it, the
-    label is added; if labels collide too, the ids are numbered in a canonical
-    order of the bucket's own fields rather than the order it arrived in.
+    ``scope:ref:window`` names a limit. When several buckets share it, each
+    gets a short hash of its fixed identity (raw label, scope ref, window,
+    horizon) — never of its position or its current value, so reordering or a
+    changing usage cannot swap ids. Ids are bounded to 128 characters and a
+    final pass keeps them unique even if two buckets are identical.
     """
+
+    def bounded(prefix: str, suffix: str = "") -> str:
+        return prefix[: 128 - len(suffix)] + suffix
+
+    def fingerprint(bucket: Bucket) -> str:
+        raw = "\x00".join(
+            (bucket.label or "", bucket.scope.name or "", bucket.window or "", bucket.horizon or "")
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()[:10]
+
     bases = [_base_limit_id(b) for b in buckets]
     ids = [
-        base if bases.count(base) == 1 else f"{base}:{_slug(bucket.label or '')}"
+        bounded(base) if bases.count(base) == 1 else bounded(base, f":{fingerprint(bucket)}")
         for base, bucket in zip(bases, buckets, strict=True)
     ]
-    for dup in {i for i in ids if ids.count(i) > 1}:
-        members = sorted(
-            (index for index, value in enumerate(ids) if value == dup),
-            key=lambda index: (
-                str(buckets[index].resets_at),
-                str(buckets[index].horizon),
-                -1.0 if buckets[index].used_pct is None else float(buckets[index].used_pct),
-            ),
-        )
-        for rank, index in enumerate(members, start=1):
-            ids[index] = f"{dup}-{rank}"
+    seen: set[str] = set()
+    for index, value in enumerate(ids):
+        candidate, n = value, 2
+        while candidate in seen:  # identical buckets: nothing fixed tells them apart
+            candidate, n = bounded(value, f"-{n}"), n + 1
+        ids[index] = candidate
+        seen.add(candidate)
     return ids
 
 
@@ -385,7 +393,7 @@ def buckets_to_v2(buckets: list[Bucket]) -> list[dict]:
         window = bucket.window if WINDOW_RE.match(bucket.window or "") else "?"
         out.append(
             {
-                "limit_id": limit_id[:128],
+                "limit_id": limit_id,
                 "label": bucket.label[:128] if bucket.label else None,
                 "scope": {"kind": bucket.scope.kind, "ref": name},
                 "horizon": bucket.horizon if bucket.horizon in HORIZONS else "week",
@@ -803,7 +811,9 @@ def _select(
     # slot, does not clear it. Another node's expired credential does not
     # block this one.
     own_auth = None
-    for obs in rows:
+    # Within one instant there is no evidence which came last, so an auth
+    # failure is ordered after a measurement taken at the same time.
+    for obs in sorted(rows, key=lambda o: (_parse_time(o["measured_at"]), o["status"] == "auth_error")):
         if not own_slot(obs):
             continue
         if obs["status"] == "auth_error":
