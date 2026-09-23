@@ -652,9 +652,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         ),
                         last_auto_error=resolution.last_auto_error,
                     )
-    exit_code = (
-        0 if result.ok else (5 if result.role_denied else (4 if result.unmeasurable else 3))
-    )
+    exit_code = 0 if result.ok else (5 if result.role_denied else (4 if result.unmeasurable else 3))
 
     if args.gate_output:
         record = _gate_record(result, exit_code, now, purpose=args.purpose)

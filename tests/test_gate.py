@@ -561,9 +561,7 @@ def test_astra_role_profiles_membership_pinned():
     만든다 — 멤버십 자체를 정확히 고정한다."""
     from scopefuel.recommend import ASTRA_ROLE_PROFILES
 
-    assert frozenset(
-        {"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"}
-    ) == ASTRA_ROLE_PROFILES
+    assert frozenset({"codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"}) == ASTRA_ROLE_PROFILES
 
 
 def test_astra_allowed_purposes_pinned():
@@ -573,9 +571,7 @@ def test_astra_allowed_purposes_pinned():
     assert frozenset({"director", "architect", "operator-request"}) == ASTRA_ALLOWED_PURPOSES
 
 
-@pytest.mark.parametrize(
-    "profile_name", ["codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"]
-)
+@pytest.mark.parametrize("profile_name", ["codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"])
 def test_gate_astra_allowed_purpose_passes_quota_check(profile_name):
     """AC: 허용 용도 + 쿼타 여유 → 통과. builder-*/captain-* 는 런처 철자가 아니라
     역할 세트 멤버십으로 판별된다(wrk 측 tombstone 과 별개)."""
