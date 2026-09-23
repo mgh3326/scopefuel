@@ -2573,14 +2573,6 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
             f"note: only one of HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN is set ({missing} is missing); "
             "an environment override is all-or-nothing and config.env is not used to complete it"
         )
-    if bool(found_url) != bool(found_token) and (
-        os.environ.get("HANDOFFKEEP_URL") or os.environ.get("HANDOFFKEEP_TOKEN")
-    ):
-        missing = "HANDOFFKEEP_TOKEN" if found_url else "HANDOFFKEEP_URL"
-        lines.append(
-            f"note: only one of HANDOFFKEEP_URL/HANDOFFKEEP_TOKEN is set ({missing} is missing); "
-            "an environment override is all-or-nothing and config.env is not used to complete it"
-        )
     override = os.environ.get("HANDOFFKEEP_CONFIG")
     if override and not pathlib.Path(os.path.expanduser(override)).is_file():
         # An explicit override is honoured as written — it deliberately does not

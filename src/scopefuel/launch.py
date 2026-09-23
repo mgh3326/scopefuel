@@ -278,7 +278,7 @@ def _normalize_effort(effort: str | None) -> str | None:
     return normalized or None
 
 
-def _known_rung(effort: str, rows: list[CatalogEntry]) -> bool:
+def _known_rung(effort: str, entries: tuple[CatalogEntry, ...] | list[CatalogEntry]) -> bool:
     """Whether a rung name is one the system actually knows.
 
     Rung names are a closed vocabulary. A catalog may later add one this build
@@ -286,9 +286,12 @@ def _known_rung(effort: str, rows: list[CatalogEntry]) -> bool:
     too — but an arbitrary string does not. Without this, `policy launch opus
     --effort bogus` returned rc 0 and echoed "bogus" straight back, and a caller
     that trusted the answer would put it in the agent's argv.
+
+    Retired rows count as known so the caller is told the rung was *retired*
+    rather than that it never existed — both refuse, but only one is true.
     """
 
-    return effort in CATALOG_EFFORT_RANKS or any(row.effort == effort for row in rows)
+    return effort in CATALOG_EFFORT_RANKS or any(entry.effort == effort for entry in entries)
 
 
 def _retired_rung(view: CatalogView, profile: str, effort: str) -> bool:
@@ -323,7 +326,8 @@ def resolve_launch(
         )
 
     requested = _normalize_effort(effort)
-    if requested and not _known_rung(requested, rows):
+    profile_entries = [entry for entry in view.entries if entry.profile == canonical]
+    if requested and not _known_rung(requested, profile_entries):
         known = ", ".join(sorted(r for r in CATALOG_EFFORT_RANKS if r))
         raise LaunchError(f"profile '{profile}': unknown effort rung '{requested}' (known: {known})")
     if requested:
