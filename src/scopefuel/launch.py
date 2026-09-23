@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 from .bench import (
     CATALOG_EFFORT_RANKS,
+    CATALOG_SOURCE_SNAPSHOT,
     CatalogEntry,
     CatalogView,
     read_catalog,
@@ -319,14 +320,32 @@ def resolve_launch(
     view = read_catalog(path=path) if view is None else view
     canonical = PROFILE_ALIASES.get(profile, profile)
     rows = _live_rows(view, canonical)
+    from_snapshot = False
     if not rows:
-        raise LaunchError(
-            f"profile '{profile}' is not in the catalog"
-            + (" (catalog=stale — bundled snapshot only)" if view.stale else "")
-        )
+        mentioned = any(entry.profile == canonical for entry in view.entries)
+        if mentioned:
+            # The catalog carries this profile and every rung of it is retired.
+            # That is a statement, and the answer is no.
+            raise LaunchError(f"profile '{profile}' is retired in the catalog")
+        snapshot_rows = [e for e in snapshot_entries() if e.profile == canonical]
+        if not snapshot_rows or view.source == CATALOG_SOURCE_SNAPSHOT:
+            raise LaunchError(
+                f"profile '{profile}' is not in the catalog"
+                + (" (catalog=stale — bundled snapshot only)" if view.stale else "")
+            )
+        # A partially seeded catalog: canonical for what it covers, silent about
+        # this profile. The grade table keeps such profiles so a half-seeded
+        # catalog cannot empty it — so launching them has to work too, or
+        # ``--recommend`` proposes what nothing can start. They resolve from the
+        # bundled snapshot under the stale rules: the canon has not spoken about
+        # this profile, so nothing here may widen a gate.
+        rows = snapshot_rows
+        from_snapshot = True
 
     requested = _normalize_effort(effort)
-    profile_entries = [entry for entry in view.entries if entry.profile == canonical]
+    profile_entries = (
+        rows if from_snapshot else [entry for entry in view.entries if entry.profile == canonical]
+    )
     if requested and not _known_rung(requested, profile_entries):
         known = ", ".join(sorted(r for r in CATALOG_EFFORT_RANKS if r))
         raise LaunchError(f"profile '{profile}': unknown effort rung '{requested}' (known: {known})")
@@ -368,7 +387,7 @@ def resolve_launch(
             f"profile '{profile}' is consult_only; pass --operator-request"
             + (f" ({row.gate_reason})" if row.gate_reason else "")
         )
-    if view.stale and row.gate != GATE_DEFAULT and not operator_request:
+    if (view.stale or from_snapshot) and row.gate != GATE_DEFAULT and not operator_request:
         raise LaunchError(
             f"profile '{profile}' has gate={row.gate} and the catalog is stale; "
             "pass --operator-request (a stale catalog cannot widen a gate)"
@@ -382,8 +401,8 @@ def resolve_launch(
         gate=row.gate,
         grade=row.grade,
         gate_reason=row.gate_reason,
-        catalog_source=view.source,
-        catalog_stale=view.stale,
+        catalog_source=CATALOG_SOURCE_SNAPSHOT if from_snapshot else view.source,
+        catalog_stale=view.stale or from_snapshot,
         catalog_age_s=view.age_s,
         operator_request=operator_request,
     )

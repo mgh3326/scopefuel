@@ -17,7 +17,7 @@ import sqlite3
 import pytest
 from test_bench_backend import FakeHandoffkeep, _set_backend
 
-from scopefuel import bench, cli, launch
+from scopefuel import bench, cli, launch, recommend
 from scopefuel.http import HttpError
 
 SEED_REF = "hk:doc/task/2026-09-23/scopefuel-catalog-server-canonical"
@@ -629,3 +629,115 @@ def test_a_half_set_environment_override_is_not_completed_from_config_env(tmp_pa
     backend = bench.bench_backend()
     assert backend.name == bench.BENCH_BACKEND_LOCAL
     assert "all-or-nothing" in bench.catalog_status_report()
+
+
+# --- I2, stated properly: an addition that cannot be dispatched is not an
+#     addition, and a recommendation that cannot be launched is a trap. --------
+
+
+def _codex_provider():
+    from scopefuel.model import Bucket, ProviderResult, Scope
+
+    return ProviderResult(
+        id="codex",
+        pool_class="preserve",
+        buckets=[Bucket(label="5h", window="5h", used_pct=10.0, scope=Scope("account"), horizon="now")],
+    )
+
+
+def test_a_catalog_only_profile_is_recommendable_on_the_servers_pool_and_launchable():
+    """Table membership was never the point.
+
+    A catalog row whose profile name this build has never seen reached the grade
+    table and then rendered "측정 불가", because routing went through
+    `profile_pool(name)` and the catalog's own `pool` was dropped. The server
+    could add a profile that could never actually be recommended.
+    """
+
+    view = bench.CatalogView(
+        entries=(
+            bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),
+            bench.CatalogEntry("brand-new", "high", "brand-new-1", "codex", "S", score=63.0),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    table = bench._catalog_grade_table(view)
+
+    rendered = recommend.recommend([_codex_provider()], "S", grade_table=table)
+    assert "brand-new" in rendered, "the server's addition never reached the output"
+    brand_new_lines = [line for line in rendered.splitlines() if "brand-new" in line]
+    assert any("측정 불가" not in line for line in brand_new_lines), (
+        f"the addition is listed but undispatchable: {brand_new_lines}"
+    )
+    assert any("Codex" in line for line in brand_new_lines), (
+        f"the server's pool did not route the addition: {brand_new_lines}"
+    )
+
+    decision = launch.resolve_launch("brand-new", view=view)
+    assert decision.model_id == "brand-new-1"
+    assert decision.pool == "codex"
+
+
+def test_every_recommended_profile_in_a_partly_seeded_catalog_can_be_launched():
+    """The invariant, checked as one statement rather than two halves.
+
+    A catalog that covers some profiles and is silent about others is the normal
+    state during the rollout. The grade table keeps the uncovered ones so a
+    half-seeded catalog cannot empty it — so launching them has to work, or
+    `--recommend` hands a dispatcher a profile nothing can start.
+    """
+
+    view = bench.CatalogView(
+        entries=(
+            bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),
+            bench.CatalogEntry("codex-sol", "max", "gpt-6-sol", "codex", "S+"),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    table = bench._catalog_grade_table(view)
+
+    unlaunchable = []
+    for profiles in table.values():
+        for profile in profiles:
+            try:
+                launch.resolve_launch(profile.name, operator_request=True, view=view)
+            except launch.LaunchError as exc:
+                unlaunchable.append(f"{profile.name}: {exc}")
+    assert not unlaunchable, "recommended but unlaunchable: " + "; ".join(sorted(set(unlaunchable)))
+
+
+def test_an_uncovered_profile_resolves_from_the_snapshot_and_says_so():
+    """It launches, but it is not the canon speaking — so it is labelled, and it
+    may not widen a gate."""
+
+    view = bench.CatalogView(
+        entries=(bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),),
+        source="server",
+        backend="handoffkeep",
+    )
+    decision = launch.resolve_launch("kimi-k3", view=view)
+    assert decision.catalog_source == "snapshot"
+    assert decision.catalog_stale is True
+
+    # ...and the stale rule still applies to a non-default gate: oc-omni is an
+    # escalation row in the bundled snapshot, and nothing here may widen it.
+    with pytest.raises(launch.LaunchError, match="stale"):
+        launch.resolve_launch("oc-omni", view=view)
+    assert launch.resolve_launch("oc-omni", operator_request=True, view=view).gate == "escalation"
+
+
+def test_a_profile_the_catalog_retired_is_still_refused_not_snapshot_resolved():
+    """The snapshot fallback must not resurrect what the canon retired."""
+
+    view = bench.CatalogView(
+        entries=(
+            bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),
+            bench.CatalogEntry("grok-hi", "", "grok-4.7", "grok", "S", retired_at="2026-09-24T00:00:00Z"),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch("grok-hi", view=view)

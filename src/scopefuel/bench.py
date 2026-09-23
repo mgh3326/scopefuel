@@ -2640,6 +2640,11 @@ def _profile_from_catalog(entry: CatalogEntry, template: object | None):
         benchmark_source=entry.benchmark_source,
         benchmark_effort=effort,
         aa_agent_model_id=entry.model_id or None,
+        # Carry the server's pool: this row's name is one the local routing table
+        # may never have seen, and without it the profile reaches the grade table
+        # only to render "측정 불가" — a server addition that can never be
+        # recommended is not an addition.
+        catalog_pool=entry.pool or None,
     )
 
 
