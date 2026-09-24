@@ -17,7 +17,7 @@ from dataclasses import replace
 
 from . import bench, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
 from .cache import collect
-from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
+from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
 from .providers import default_order, registry
 from .recommend import grade_help_text
@@ -799,6 +799,12 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             f"profile={result.profile} pool={result.provider_id} "
             f"used_pct={result.used_pct} class={result.pool_class}"
         )
+        # task #659 — 이 판정이 어느 계정의 측정에 기반하는지 항상 보인다
+        # (지문 앞 8자 + 안전 라벨 — 이메일·토큰은 절대 표시하지 않는다).
+        measured = next((item for item in automatic_results if item.id == provider_id), None)
+        tag = account_tag(measured.account_fp, measured.account_label) if measured is not None else ""
+        if tag:
+            first_line += f' account="{tag}"'
         if result.stale_accepted:
             first_line += " stale_accepted=true"
         if result.operator_request_ref is not None:

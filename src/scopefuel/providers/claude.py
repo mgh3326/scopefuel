@@ -24,9 +24,10 @@ import pathlib
 import subprocess
 import sys
 import time
+import unicodedata
 
 from ..http import HttpError, classify_error, request_json
-from ..model import Bucket, ProviderResult, Scope
+from ..model import Bucket, ProviderResult, Scope, safe_label
 from ..quota_v2_contract import Attempt, claude_attempt
 
 CREDENTIALS = pathlib.Path.home() / ".claude" / ".credentials.json"
@@ -48,13 +49,42 @@ def _credentials_path() -> pathlib.Path:
     return pathlib.Path(configured) / ".credentials.json" if configured else CREDENTIALS
 
 
+def _keychain_service() -> str:
+    """Claude Code 가 자격을 두는 Keychain 아이템 이름 — cli ``AD()`` 와 동일 규칙.
+
+    config 컨텍스트마다 다른 아이템이다 (설치된 2.1.281 바이너리에서 확인):
+
+    - ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` 가 *설정돼 있으면* 그 값(NFC 정규화)의
+      sha256 앞 8자를 접미사로 쓴다 — 빈 문자열이면 접미사 없음.
+    - 그게 없으면 ``CLAUDE_CONFIG_DIR`` 가 있을 때 그 **원문**(NFC 정규화 — 절대
+      경로로 resolve 하지 않는다: 같은 문자열로 뜬 claude 프로세스와 같은
+      아이템을 가리켜야 한다)을 해시해 접미사로 쓴다.
+    - 둘 다 없으면 무접미사 ``Claude Code-credentials``.
+
+    task #659 — 이 이름을 따라야 토큰 출처와 ``.claude.json`` uuid 출처가 항상
+    같은 config 컨텍스트에 묶인다. ``CLAUDE_CONFIG_DIR`` 아래에서 무접미사
+    기본 아이템을 읽으면 다른 컨텍스트의 토큰과 이 컨텍스트의 uuid 를 섞어
+    측정을 잘못된 계정 지문으로 게시하게 된다(#654 S-A).
+    """
+    secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    source = secure if secure is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    if not source:
+        return KEYCHAIN_SERVICE
+    digest = hashlib.sha256(unicodedata.normalize("NFC", source).encode()).hexdigest()[:8]
+    return f"{KEYCHAIN_SERVICE}-{digest}"
+
+
 def _read_keychain() -> str | None:
-    """macOS Keychain 의 자격증명 blob. 실패는 전부 '없음'으로 접는다(폴백이므로)."""
+    """macOS Keychain 의 자격증명 blob. 실패는 전부 '없음'으로 접는다(폴백이므로).
+
+    읽는 아이템은 ``_keychain_service()`` 가 정한 현재 config 컨텍스트의 것뿐
+    이다 — 다른 컨텍스트의 아이템(기본 무접미사 포함)은 절대 읽지 않는다.
+    """
     if sys.platform != "darwin":
         return None
     try:
         proc = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            ["security", "find-generic-password", "-s", _keychain_service(), "-w"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -105,24 +135,64 @@ def _account_uuid() -> str | None:
     return uuid.strip() if isinstance(uuid, str) and uuid.strip() else None
 
 
-def _account_fp(oauth: dict) -> str | None:
-    """계정 지문 — 호스트를 넘어 같은 계정을 식별한다 (task #653/#654).
+def _account_identity(oauth: dict) -> tuple[str | None, str | None]:
+    """계정 지문과 그 묶임 근거 — ``(account_fp, kind)`` (task #653/#654/#659).
 
     정본은 ``oauthAccount.accountUuid`` 다 — accessToken 은 로그인 회차·호스트마다
     다르므로 토큰 해시를 정본으로 쓰면 같은 계정이 '다른 계정'으로 오판돼 원격
-    스냅샷 공유(AC2)가 깨진다. uuid 를 읽을 수 없는 호스트는 #576 의 로컬 stale
-    일치를 위해 토큰 해시로 폴백한다 — 그 지문은 다른 토큰의 원격 스냅샷과
-    어차피 불일치하므로 fail-closed 는 유지된다. 자문 2558 의 '계정/구독 변경
-    의심' 계약도 유지된다 — uuid·토큰이 바뀌면 지문도 바뀐다.
+    스냅샷 공유(AC2)가 깨진다. uuid 는 토큰과 **같은 config 컨텍스트**에서만
+    읽는다 — ``_claude_json_path()`` 와 토큰 출처(파일·컨텍스트별 Keychain
+    아이템)가 모두 ``CLAUDE_CONFIG_DIR`` 에 묶여 있으므로 둘이 어긋나는 조합은
+    만들어지지 않는다(#659 AC1).
+
+    kind:
+
+    - ``"account"`` — uuid-bound 지문. hk 게시·교차호스트 원격 읽기가 가능하다.
+    - ``"token"`` — 같은 컨텍스트에서 uuid 를 읽지 못한 호스트의 토큰 해시
+      폴백. #576 로컬 stale 일치 전용이다 — 게시하면 토큰 회전마다 아무도
+      못 읽는 orphan 문서가 생기고(N-1), 무엇보다 그 지문이 어느 계정인지
+      증명할 수 없다.
+    - ``None`` — 토큰도 없다.
+
+    자문 2558 의 '계정/구독 변경 의심' 계약: uuid 경로에서는 *계정이* 바뀌면
+    지문이 바뀐다(토큰 회전으로는 안 바뀐다 — 회전 후 stale 스냅샷이 같은
+    계정으로 수용되는 것은 의도된 semantic 이다). uuid 가 없으면 토큰 지문
+    이므로 토큰 회전이 곧 지문 변경이다.
     """
     plan = str(oauth.get("subscriptionType") or "")
     uuid = _account_uuid()
     if uuid:
-        return hashlib.sha256(f"claude-account|{plan}|{uuid}".encode()).hexdigest()[:16]
+        return hashlib.sha256(f"claude-account|{plan}|{uuid}".encode()).hexdigest()[:16], "account"
     token = (oauth.get("accessToken") or "").strip()
     if not token:
+        return None, None
+    return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16], "token"
+
+
+def _account_fp(oauth: dict) -> str | None:
+    """계정 지문 — ``_account_identity`` 의 지문 부분만."""
+    return _account_identity(oauth)[0]
+
+
+def _account_label() -> str | None:
+    """계정의 안전한 표시 라벨 — 같은 컨텍스트의 ``.claude.json`` 에서 읽는다.
+
+    ``oauthAccount`` 의 ``organizationName`` → ``displayName`` → ``fullName``
+    순으로 첫 유효값을 쓴다. 이메일·토큰·uuid 원문은 절대 쓰지 않는다 —
+    ``safe_label`` 이 '@' 포함 값과 인용부호·제어문자를 걸러낸다.
+    """
+    try:
+        payload = json.loads(_claude_json_path().read_text())
+    except (OSError, ValueError):
         return None
-    return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16]
+    account = payload.get("oauthAccount") if isinstance(payload, dict) else None
+    if not isinstance(account, dict):
+        return None
+    for key in ("organizationName", "displayName", "fullName"):
+        label = safe_label(account.get(key))
+        if label:
+            return label
+    return None
 
 
 def _session_fp(oauth: dict) -> str | None:
@@ -154,6 +224,12 @@ def current_account_fp() -> str | None:
     return None if loaded is None else _account_fp(loaded[0])
 
 
+def current_account_fp_kind() -> str | None:
+    """현재 지문의 묶임 근거 — "account" | "token" | None (원격 읽기 게이트용)."""
+    loaded = _load_oauth()
+    return None if loaded is None else _account_identity(loaded[0])[1]
+
+
 def fetch() -> ProviderResult:
     loaded = _load_oauth()
     if loaded is None:
@@ -162,13 +238,14 @@ def fetch() -> ProviderResult:
             error="자격증명 없음",
             error_kind="credentials",
             hint=(
-                f"{_credentials_path()} 없음, Keychain('{KEYCHAIN_SERVICE}')에서도 못 읽음 "
+                f"{_credentials_path()} 없음, Keychain('{_keychain_service()}')에서도 못 읽음 "
                 "— claude 로그인 후 다시 시도"
             ),
         )
     oauth, origin = loaded
     token = oauth["accessToken"].strip()
-    fp = _account_fp(oauth)
+    fp, fp_kind = _account_identity(oauth)
+    label = _account_label()
     session_fp = _session_fp(oauth)
 
     # task #653 — 만료는 호출 전에 판정한다. 이미 지난 자격으로 친 401 은
@@ -180,6 +257,8 @@ def fetch() -> ProviderResult:
             error="token expired — claude access token 만료",
             error_kind="token_expired",
             account_fp=fp,
+            account_fp_kind=fp_kind,
+            account_label=label,
             session_fp=session_fp,
             hint="expiresAt 과거 — 실행 중인 claude 세션이 갱신하거나 재로그인 필요",
             v2_attempt=Attempt("auth_error", "auth_error:token_expired"),
@@ -214,6 +293,8 @@ def fetch() -> ProviderResult:
             http_status=status,
             retry_after_s=retry_after,
             account_fp=fp,
+            account_fp_kind=fp_kind,
+            account_label=label,
             session_fp=session_fp,
             hint="usage API 속도 제한" if kind == "rate_limited" else None,
             v2_attempt=(
@@ -266,6 +347,12 @@ def fetch() -> ProviderResult:
     extra = raw.get("extra_usage") or {}
     if extra.get("is_enabled"):
         note = f"extra usage {extra.get('utilization')}%"
+    if fp_kind == "token":
+        # task #659 — 게시 거부 사유를 결과에 명시한다(AC1): 이 컨텍스트의
+        # .claude.json 에서 uuid 를 못 읽었으므로 지문이 토큰 해시 폴백이라
+        # hk 스냅샷은 게시·구독되지 않는다(N-1 orphan 방지).
+        skip = "hk 공유 건너뜀 — 이 config 컨텍스트의 .claude.json 에 account uuid 없음"
+        note = f"{note} · {skip}" if note else skip
 
     return ProviderResult(
         id="claude",
@@ -276,12 +363,15 @@ def fetch() -> ProviderResult:
         raw=raw,
         http_status=200,
         account_fp=fp,
+        account_fp_kind=fp_kind,
+        account_label=label,
         session_fp=session_fp,
         v2_attempt=claude_attempt(http_status=http_status[-1] if http_status else 200, body=raw),
     )
 
 
 fetch.current_account_fp = current_account_fp  # noqa: B010 — 로컬 전용 probe
+fetch.current_account_fp_kind = current_account_fp_kind  # noqa: B010 — 지문 묶임 근거 probe
 
 
 def _num(value: object) -> float | None:

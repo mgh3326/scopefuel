@@ -247,6 +247,13 @@ class ProviderResult:
     # 로만 쓰인다 — 계정 지문과 달리 토큰 회전을 따라 바뀌는 것이 목적이다.
     # as_dict/--json 출력에는 싣지 않는다.
     session_fp: str | None = None
+    # task #659 — account_fp 의 묶임 근거. "account" = 같은 config 컨텍스트의
+    # 계정 uuid 에서 유도(교차호스트 공유·게시 가능), "token" = 현재 토큰 해시
+    # 폴백(로컬 stale 일치 전용 — 게시·원격 조회 대상이 아니다).
+    account_fp_kind: str | None = None
+    # task #659 — 계정의 안전한 표시 라벨(org/display 이름, 정제됨).
+    # 이메일·토큰·uuid 원문은 절대 들어가지 않는다.
+    account_label: str | None = None
     last_error_at: float | None = None
     # host-local backoff 창의 끝(epoch). 창 안에서는 어느 경로도 네트워크를 치지 않는다.
     backoff_until: float | None = None
@@ -336,6 +343,10 @@ class ProviderResult:
             out["backoff_until"] = self.backoff_until
         if self.account_fp_match is not None:
             out["account_fp_match"] = self.account_fp_match
+        if self.account_fp_kind is not None:
+            out["account_fp_kind"] = self.account_fp_kind
+        if self.account_label is not None:
+            out["account_label"] = self.account_label
         if self.manual is not None:
             out["manual"] = self.manual
         if include_raw:
@@ -540,3 +551,32 @@ def epoch_to_iso(epoch: float | None) -> str | None:
         return None
     seconds = epoch / 1000 if epoch > 1e12 else epoch
     return dt.datetime.fromtimestamp(seconds, dt.UTC).isoformat()
+
+
+_LABEL_DROP = re.compile(r"[^\w .'()-]+", re.UNICODE)
+LABEL_MAX_LEN = 32
+
+
+def safe_label(raw: object) -> str | None:
+    """표시용 계정 라벨 정제 (task #659) — 이메일·자격 값은 절대 라벨이 안 된다.
+
+    ``@`` 가 들어간 값은 어떤 필드에서 왔든 버린다. 인용부호·제어문자·줄바꿈도
+    걸러낸다 — 게이트의 ``source_label="…"`` 처럼 기계 파싱되는 줄에 실리기
+    때문이다. 비어 있으면 None.
+    """
+    if not isinstance(raw, str) or "@" in raw:
+        return None
+    label = " ".join(_LABEL_DROP.sub(" ", raw).split())
+    return label[:LABEL_MAX_LEN] or None
+
+
+def account_tag(account_fp: str | None, label: str | None = None) -> str:
+    """계정 표시 태그 — 지문 앞 8자 + 안전 라벨 (task #659).
+
+    어느 계정의 측정인지 표·게이트 라인에 보이는 문자열이다.
+    예: ``c0605596`` / ``c0605596 (My Org)``.
+    """
+    if not account_fp:
+        return ""
+    tag = account_fp[:8]
+    return f"{tag} ({label})" if label else tag
