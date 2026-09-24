@@ -55,7 +55,9 @@ def _credentials_path() -> pathlib.Path:
     """
     secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
     if secure is not None:
-        return pathlib.Path(secure or pathlib.Path.home() / ".claude") / ".credentials.json"
+        # 빈 SSCD 는 기본 저장소를 뜻한다 — CREDENTIALS 상수를 써야 테스트의
+        # 경로 우회(conftest)가 계속 먹는다.
+        return pathlib.Path(secure) / ".credentials.json" if secure else CREDENTIALS
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     return pathlib.Path(configured) / ".credentials.json" if configured else CREDENTIALS
 

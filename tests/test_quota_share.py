@@ -17,13 +17,17 @@ hk 는 dict-backed fake 이다 — ``quota_share.request_json`` 을 바꿔 실 �
 - M9  (#659) measured_by.account_fp 검사 제거 → provenance mismatch 테스트가 RED
 - M10 (#659) kind=="account" 게시 게이트 제거 → token-fallback 거부 테스트가 RED
 - M11 (#659) SSCD≠CCD 컨텍스트 가드 제거(파일·keychain 자격 공통) → uuid-unbound 테스트가 RED
+- M12 (#659 R3) 64자 초과 호스트명 잘라내기 제거(→'unknown' 회귀) → long-hostname 테스트가 RED
 
 검증자(v659 R1)가 확인한 생존-그러나-정상 뮤턴트(의도된 미고정, 여기에 기록):
 - M2b: 15→15.5분 수용 — REMOTE_MAX_AGE_S 는 절대 경계가 아니라 정책이다.
 - M2f: 미래 스큐 60→3600초 — NTP 드리프트 여유분, 방향만 고정됐다.
-- F3:  토큰 폴백 지문 공식 변경 — 폴백은 로컬 전용이라 공식이 계약이 아니다.
+- F3:  토큰 폴백 지문 공식 변경 — R2 이후 RED(M11 테스트가 폴백 해시를 정확히 대조).
 - F9:  session_fp 미검증 — provenance 전용 필드라 신뢰 경계가 아니다.
-- A7/A9: NFC 정규화 제거/NFD — ASCII 경로에서 동등 변형이다.
+- A7/A9: NFC 정규화 제거/NFD — ASCII 경로에서만 동등 변형이다(NFD 한글 경로는 결과가 다름 — P2).
+
+검증자(v659 R2)가 새로 찾은 생존 뮤턴트는 전부 고정됐다: S1b(SSCD="" 경로),
+S4j(gate-output account 키), N9(fullName 라벨), N10(enabled 게이트).
 """
 
 from __future__ import annotations
@@ -31,7 +35,6 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-import socket
 import subprocess
 import urllib.parse
 from types import SimpleNamespace
@@ -51,7 +54,9 @@ TODAY = NOW.date()
 FP_A = "fp-account-aaaa1111"
 FP_B = "fp-account-bbbb2222"
 HK_URL = "https://hk.invalid"
-HOST = socket.gethostname()
+# 게시 host 를 환경과 무관하게 고정한다 — GH macOS runner 처럼 호스트명이
+# 64자를 넘는 환경에서도 결정적으로 검증한다(#659 CI).
+TEST_HOST = "hk-test-host.local"
 
 
 class FakeHk:
@@ -224,6 +229,7 @@ def _walk_keys(obj: object):
 def test_collect_publishes_sanitized_snapshot(monkeypatch):
     """M1 — 토큰 형 필드를 싣는 뮤턴트는 정확한 키 집합 검사로 RED."""
     hk = _enable(monkeypatch)
+    monkeypatch.setattr(quota_share.socket, "gethostname", lambda: TEST_HOST)
     cache.collect({"claude": lambda: _ok()}, ["claude"], now=EPOCH)
 
     assert [key for key, _ in hk.puts] == [f"quota/claude/{FP_A}/latest"]
@@ -248,7 +254,7 @@ def test_collect_publishes_sanitized_snapshot(monkeypatch):
     assert payload["measured_at_epoch"] == pytest.approx(EPOCH)
     # task #659 AC2 — measured_by 는 어느 호스트·세션·'계정'이 측정했는지 담는다.
     expected_by = {
-        "host": HOST,
+        "host": TEST_HOST,
         "session_fp": "sess-writer-1",
         "account_fp": FP_A,
         "account_label": None,
@@ -803,6 +809,7 @@ def test_real_shape_cross_host_writer_reader(monkeypatch, tmp_path):
     같은 계정(uuid 동일)·다른 토큰에서도 지문이 일치해 원격 스냅샷을 읽는다.
     """
     hk = _enable(monkeypatch)
+    monkeypatch.setattr(quota_share.socket, "gethostname", lambda: TEST_HOST)
     _claude_creds(
         monkeypatch,
         tmp_path,
@@ -837,7 +844,7 @@ def test_real_shape_cross_host_writer_reader(monkeypatch, tmp_path):
     assert remote.error is None
     assert remote.source == quota_share.REMOTE_SOURCE
     writer_fp = hk.puts[0][0].split("/")[2]
-    assert remote.note == f"remote measured ({HOST}) · account {writer_fp[:8]}"
+    assert remote.note == f"remote measured ({TEST_HOST}) · account {writer_fp[:8]}"
     assert remote.account_fp == writer_fp
     assert remote.account_fp_match is True
     assert remote.last_error is not None and "expired" in remote.last_error.lower()
@@ -1058,8 +1065,9 @@ def test_keychain_token_from_other_secure_context_is_uuid_unbound(monkeypatch, t
     """M11 — AC1: SSCD≠CCD 일 때 Keychain 토큰은 SSCD 컨텍스트 것, uuid 는 CCD 것.
 
     둘을 묶으면 다른 계정의 지문으로 게시될 수 있으므로 uuid 묶음을 거부하고
-    토큰 폴백(kind="token")으로 내린다(CodeRabbit PR#86 Major). 파일 경로의
-    자격은 항상 CCD 컨텍스트라 이 가드를 타지 않는다.
+    토큰 폴백(kind="token")으로 내린다(CodeRabbit PR#86 Major). 파일 자격도
+    같은 가드를 탄다 — ``_credentials_path`` 가 SSCD 를 따르므로(aw() 규칙)
+    파일 자격은 SSCD 컨텍스트 것이다(아래 후반부가 그것을 검증한다).
     """
     cfg = tmp_path / "ccd-ctx"
     cfg.mkdir()
@@ -1411,6 +1419,31 @@ def test_snapshot_host_sanitized_on_read_and_write(monkeypatch):
     assert payload["measured_by"]["host"] == "unknown"
 
 
+def test_long_hostname_truncates_with_hash_suffix(monkeypatch):
+    """64자 초과의 깨끗한 호스트명은 'unknown' 이 아니라 잘린 라벨+해시 꼬리다.
+
+    GH macOS runner 의 ``<uuid>-<hex>.local`` 형태(74자)가 실재하므로
+    길이 초과를 거부하면 provenance 가 통째로 사라진다 — 잘라내도 서로
+    다른 호스트명은 다른 라벨이어야 한다.
+    """
+    long_host = "sjc22-bm206-a88eeeb3-f851-4757-8247-a2657f4676fc-EA60193E686A.local"
+    assert len(long_host) > quota_share._HOST_MAX_LEN
+    digest = hashlib.sha256(long_host.encode()).hexdigest()[:8]
+    expected = f"{long_host[: quota_share._HOST_MAX_LEN - 9]}-{digest}"
+    assert len(expected) == quota_share._HOST_MAX_LEN
+    assert quota_share._safe_host(long_host) == expected
+    # 경계·접히지 않음: 64자는 그대로, 다른 긴 이름은 다른 꼬리.
+    assert quota_share._safe_host("h" * quota_share._HOST_MAX_LEN) == "h" * quota_share._HOST_MAX_LEN
+    assert quota_share._safe_host("z" + long_host[1:]) != expected
+    # 게시·읽기 라운드트립이 같은 라벨에 수렴한다.
+    hk = _enable(monkeypatch)
+    monkeypatch.setattr(quota_share.socket, "gethostname", lambda: long_host)
+    assert quota_share.publish_result("claude", _ok(), now=EPOCH) is True
+    payload = json.loads(hk.puts[-1][1]["body"])
+    assert payload["measured_by"]["host"] == expected
+    assert quota_share._safe_host(payload["measured_by"]["host"]) == expected
+
+
 def test_legacy_snapshot_refused_on_body_fp_mismatch(monkeypatch):
     """S-2/G2 — ``measured_by`` 없는 legacy(#654) 문서는 본문 account_fp 검사가 유일한 방어선.
 
@@ -1574,3 +1607,92 @@ def test_remote_check_reads_identity_once(monkeypatch):
     results = cache.collect({"claude": fetch}, ["claude"], now=EPOCH, use_cache=False)
     assert results[0].source == quota_share.REMOTE_SOURCE
     assert len(reads) == 1  # fp+kind 를 따로 읽지 않는다
+
+
+def test_empty_sscd_uses_default_credentials_path(monkeypatch):
+    """S1b — SSCD="" 는 기본 저장소다. CREDENTIALS 상수를 거쳐야 한다.
+
+    ``~/.claude`` 를 직접 조립하면 conftest 의 경로 우회를 빗겨가 개발자의
+    실제 자격 파일을 읽는다 — 상수 경유를 고정한다.
+    """
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+    assert claude._credentials_path() == claude.CREDENTIALS
+
+
+def test_gate_output_includes_account_tag(monkeypatch, capsys, tmp_path):
+    """S-4b — ``--gate-output`` JSON 에도 계정 태그가 실린다(없으면 키 자체 부재)."""
+
+    def _full(*a, **k):
+        return ProviderResult(
+            id="claude",
+            plan="claude_max",
+            buckets=[_bucket("5h", 100.0), _bucket("7d", 100.0, hours_ahead=160.0)],
+            source="oauth-usage-api",
+            http_status=200,
+            account_fp=FP_A,
+            account_fp_kind="account",
+            account_label="Acme Corp",
+        )
+
+    _full.pool_class = "spend"  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": _full})
+    out = tmp_path / "gate.json"
+    rc = cli.main(["gate", "-m", "opus", "--no-cache", "--gate-output", str(out)])
+    capsys.readouterr()
+    assert rc == 3
+    assert json.loads(out.read_text())["account"] == "fp-accou (Acme Corp)"
+
+    def _plain(*a, **k):
+        return ProviderResult(
+            id="claude",
+            plan="claude_max",
+            buckets=[_bucket("5h", 100.0), _bucket("7d", 100.0, hours_ahead=160.0)],
+            source="oauth-usage-api",
+            http_status=200,
+        )
+
+    _plain.pool_class = "spend"  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": _plain})
+    out2 = tmp_path / "gate2.json"
+    rc = cli.main(["gate", "-m", "opus", "--no-cache", "--gate-output", str(out2)])
+    capsys.readouterr()
+    assert rc == 3
+    assert "account" not in json.loads(out2.read_text())  # 골든 호환 — 키 자체가 없다
+
+
+def test_fullname_is_not_used_as_label(monkeypatch, tmp_path):
+    """N-9 — ``fullName``(사람 이름)은 라벨 후보가 아니다: org/displayName 만 쓴다."""
+    cfg = tmp_path / "ccd-ctx"
+    cfg.mkdir()
+    (cfg / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok", "subscriptionType": "max"}})
+    )
+    (cfg / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"accountUuid": "u-A", "fullName": "Jane Doe"}})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    monkeypatch.setattr(claude, "_read_keychain", lambda: None)
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+
+    result = claude.fetch()
+    assert result.account_fp_kind == "account"  # uuid 묶음은 그대로
+    assert result.account_label is None
+    assert "Jane" not in json.dumps(result.as_dict(), ensure_ascii=False)
+
+
+def test_share_disabled_suppresses_skip_note(monkeypatch, tmp_path):
+    """N-10 — 공유가 꺼진 호스트(SCOPEFUEL_QUOTA_SHARE=off)에서는 잡음 note 를 달지 않는다."""
+    monkeypatch.setenv(quota_share.ENV_DISABLE, "off")
+    cfg = tmp_path / "ccd-ctx"
+    cfg.mkdir()
+    (cfg / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok", "subscriptionType": "max"}})
+    )
+    (cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {}}))  # uuid 없음 → 토큰 폴백
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    monkeypatch.setattr(claude, "_read_keychain", lambda: None)
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+
+    result = claude.fetch()
+    assert result.account_fp_kind == "token"
+    assert "공유 건너뜀" not in (result.note or "")

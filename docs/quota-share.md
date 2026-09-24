@@ -108,8 +108,11 @@ distinct from the manual self-report (`source=operator`, `자기신고 · 미검
 and classified by the same pace-based rules as local values; they are not
 pinned to `preserve` and are never written into the local cache, backoff
 state, or v2 store. `host` on the wire is whitelisted to
-`[A-Za-z0-9._-]{1,64}` on both write and read — anything else becomes
-`unknown` (#659/N-4).
+`[A-Za-z0-9._-]` on both write and read — anything else becomes `unknown`
+(#659/N-4). Names longer than 64 chars (e.g. GitHub macOS runners'
+`<uuid>-<hex>.local`) are not dropped: they are truncated to
+`<first 55>-<sha256(host)[:8]>` so provenance survives and distinct long
+names keep distinct labels.
 
 ## Publishing rules
 

@@ -18,6 +18,7 @@ usage-API 429 를 구조적으로 없앤다.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -56,7 +57,10 @@ _DOC_PREFIX = "/v1/documents/"
 
 # task #659 — 게이트 첫 줄은 기계 파싱되므로 wire 의 host 는 이 문자 집합만 허용한다
 # (공백·인용부호·줄바꿈이 섞인 host 는 key=val 주입으로 줄을 위조할 수 있다 — N-4).
-_HOST_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# 길이 제한은 64자: 실제 호스트명이 더 길 수 있으므로(GH macOS runner 가 70+자)
+# 초과분은 거부가 아니라 잘라내기+해시 꼬리로 provenance 를 보존한다.
+_HOST_CHARSET_RE = re.compile(r"[A-Za-z0-9._-]+")
+_HOST_MAX_LEN = 64
 
 
 def enabled() -> bool:
@@ -128,8 +132,21 @@ def _request(method: str, key: str, document: dict | None = None) -> dict | None
 
 
 def _safe_host(host: object) -> str:
-    """표시·기록용 호스트 라벨 — 허용 문자 집합 밖이면 'unknown' 으로 접는다."""
-    return host if isinstance(host, str) and _HOST_RE.fullmatch(host) else "unknown"
+    """표시·기록용 호스트 라벨 — 허용 문자 밖·빈 값·비문자열은 'unknown'.
+
+    문자 집합은 깨끗하지만 64자를 넘는 호스트명(예: GH macOS runner 의
+    ``<uuid>-<hex>.local``)은 'unknown' 으로 버리지 않는다 — 어느 호스트가
+    측정했는지가 이 필드의 존재 이유다. 앞 55자 + '-' + sha256(host)[:8] 로
+    잘라 총 64자·동일 문자 집합을 유지하고, 서로 다른 긴 호스트명이 같은
+    라벨로 접히지 않게 한다. 쓰기·읽기 양쪽이 같은 함수를 쓰므로 라운드트립이
+    일치한다.
+    """
+    if not isinstance(host, str) or not _HOST_CHARSET_RE.fullmatch(host):
+        return "unknown"
+    if len(host) <= _HOST_MAX_LEN:
+        return host
+    digest = hashlib.sha256(host.encode()).hexdigest()[:8]
+    return f"{host[: _HOST_MAX_LEN - 9]}-{digest}"
 
 
 def _measured_by(host: str, session_fp: str | None, result: ProviderResult) -> dict:
