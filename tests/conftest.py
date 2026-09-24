@@ -68,11 +68,16 @@ def _block_real_operator_emit(monkeypatch):
       ``PANEWIRE_BIN`` 미지정 상태의 run 호출은 AssertionError 로 실패한다.
 
     실 발송은 pytest 바깥의 설치 후 witness 절차에서만 허용된다.
+
+    상속된 ``PANEWIRE_BIN`` 은 opt-in 이 아니다 — wrk 가 읽는 공용 노브라
+    외부 export 만으로 pytest 안의 실 발송이 열렸다(R3-1). 테스트가 opt-in
+    하려면 본문에서 ``monkeypatch.setenv("PANEWIRE_BIN", <stub>)`` 해야 한다.
     """
     import subprocess as _subprocess
 
     from scopefuel import exhaust
 
+    monkeypatch.delenv("PANEWIRE_BIN", raising=False)
     real_emit = exhaust.emit_lane_event
 
     def _blocked_emit(text: str, event_id: str = "") -> bool:

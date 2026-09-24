@@ -637,6 +637,8 @@ def test_herdr_stale_result_neither_notifies_nor_clears(tmp_path, monkeypatch):
     _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
     calls: list[str] = []
     sink = _fake_sink(calls)
+    # herdr 경로의 발송도 같은 목록으로 본다 — 안 붙이면 재발송을 관측할 수 없다(N4).
+    monkeypatch.setattr(exhaust, "emit_lane_event", sink)
 
     # 선행 에피소드를 직접 만든다.
     exhaust.observe("codex", exhausted=True, used_pct=100.0, cutoff=100.0, now=NOW, sink=sink)
@@ -824,6 +826,19 @@ def test_escalation_pass_shows_invalid_cutoff_status(tmp_path):
     table["A+"] = [Profile("codex-sol", "Sol", 65.0, gate="escalation", gate_reason="t")]
     out = recommend([_result("codex", 60.0)], "A+", today=TODAY, now=NOW, grade_table=table)
     assert "invalid cutoff" in out
+
+
+def test_gate_escalation_pass_shows_invalid_cutoff_status(tmp_path):
+    """N14: gate 의 escalation 통과 reason 도 무효 cutoff 상태를 노출한다."""
+    from scopefuel.recommend import Profile
+
+    _write_config(tmp_path, '[pools.codex]\ncutoff = "bogus"\n')
+    table = {g: [] for g in ("S+", "S", "A", "B", "C")}
+    table["A+"] = [Profile("codex-sol", "Sol", 65.0, gate="escalation", gate_reason="t")]
+    result = gate_check([_result("codex", 87.0)], "codex-sol", today=TODAY, now=NOW, grade_table=table)
+    assert result.ok is True
+    assert "escalation 자격 충족" in result.reason
+    assert "invalid cutoff" in result.reason
 
 
 def test_recommend_render_path_observes_pool(tmp_path, monkeypatch):
