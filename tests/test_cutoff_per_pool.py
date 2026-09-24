@@ -30,6 +30,8 @@ def _result(
     used: float,
     pool_class: str = "spend",
     window: str = "7d",
+    scope: Scope | None = None,
+    reset_at: str | None = None,
 ) -> ProviderResult:
     return ProviderResult(
         id=provider_id,
@@ -39,12 +41,18 @@ def _result(
                 label=window,
                 window=window,
                 used_pct=used,
-                resets_at=_reset_almost_full(window),
-                scope=Scope("account"),
+                resets_at=reset_at or _reset_almost_full(window),
+                scope=scope or Scope("account"),
                 horizon="week",  # type: ignore[arg-type]
             )
         ],
     )
+
+
+def _live_result(provider_id: str, used: float) -> ProviderResult:
+    """실제 시계 기준 미래 reset — herdr 경로는 실시간(now=now())으로 판정한다."""
+    reset_at = (dt.datetime.now(dt.UTC) + dt.timedelta(hours=3)).isoformat()
+    return _result(provider_id, used, reset_at=reset_at)
 
 
 def _write_config(tmp_path, text: str) -> None:
@@ -54,7 +62,7 @@ def _write_config(tmp_path, text: str) -> None:
 
 
 def _fake_sink(calls: list[str]):
-    def _send(text: str) -> bool:
+    def _send(text: str, event_id: str = "") -> bool:
         calls.append(text)
         return True
 
@@ -209,7 +217,7 @@ def test_notify_failure_cooldown_then_retry(tmp_path, monkeypatch):
     """
     _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
     calls: list[str] = []
-    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text: calls.append(text) or False)
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": calls.append(text) or False)
 
     first = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
     assert first.ok is False
@@ -245,7 +253,7 @@ def test_sink_exception_does_not_break_gate(tmp_path, monkeypatch):
     """싱크가 예외를 던져도 게이트 판정은 그대로."""
     _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
 
-    def boom(text: str) -> bool:
+    def boom(text: str, event_id: str = "") -> bool:
         raise RuntimeError("wedged daemon")
 
     monkeypatch.setattr(exhaust, "emit_lane_event", boom)
@@ -475,3 +483,170 @@ def test_observe_state_file_shape(tmp_path):
     assert entry["window"] == "7d"
     assert entry["reset_at"] == "2026-08-01T00:00:00+00:00"
     assert entry["notified_at"] == NOW.isoformat()
+
+
+# ------------------------------------------------------------------ emit argv 계약
+
+
+def _fake_panewire(tmp_path, monkeypatch, *, duplicate: bool = False):
+    import stat
+
+    argv_log = tmp_path / "panewire-argv.jsonl"
+    shim = tmp_path / "panewire"
+    body = (
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "with open(os.environ['PANEWIRE_TEST_LOG'], 'a') as f:\n"
+        "    f.write(json.dumps(argv) + '\\n')\n"
+    )
+    if duplicate:
+        body += "sys.stderr.write('emit: duplicate event_id\\n')\nsys.exit(2)\n"
+    else:
+        body += (
+            "if '--event-id' not in argv or not argv[argv.index('--event-id') + 1]:\n"
+            "    sys.exit(2)\n"
+            "sys.exit(0)\n"
+        )
+    shim.write_text(body)
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PANEWIRE_BIN", str(shim))
+    monkeypatch.setenv("PANEWIRE_TEST_LOG", str(argv_log))
+    return argv_log
+
+
+def test_emit_lane_event_argv_contract(tmp_path, monkeypatch):
+    """lane.event 는 --event-id 필수 — 스텁으로 argv 계약 회귀를 고정한다 (B1)."""
+    argv_log = _fake_panewire(tmp_path, monkeypatch)
+    assert exhaust.emit_lane_event("본문", "scopefuel.exhaust:codex:7d:-") is True
+    argv = json.loads(argv_log.read_text().splitlines()[0])
+    assert argv[:2] == ["emit", "--kind"]
+    assert "lane.event" in argv and "--event-id" in argv
+    assert "--sink" in argv and "--owner-lane" in argv
+    # 빈 event-id 는 rc=2 → False (silent success 가 아니다)
+    assert exhaust.emit_lane_event("본문", "") is False
+
+
+def test_emit_lane_event_duplicate_event_id_counts_as_delivered(tmp_path, monkeypatch):
+    """'duplicate event_id' rc=2 = 첫 발송이 이미 기록됨 → 전달 성공으로 친다."""
+    _fake_panewire(tmp_path, monkeypatch, duplicate=True)
+    assert exhaust.emit_lane_event("본문", "dup-id") is True
+
+
+# ------------------------------------------------------------------ 경로별 관측 커버리지
+
+
+def test_d3_gate_path_also_notifies(tmp_path, monkeypatch):
+    """GRADE_TABLE 밖 프로필(D3) 경로도 같은 알림 상태 기계를 탄다."""
+    _write_config(tmp_path, '[pools.agy]\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+    result = gate_check(
+        [_result("agy", 100.0, window="30d", scope=Scope("group", "3p"))],
+        "oc-oss",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert len(calls) == 1
+    assert "agy (3p) 계정 전환 필요" in calls[0]
+
+
+def test_recommend_render_path_notifies(tmp_path, monkeypatch):
+    """recommend 렌더 평가 경로의 소진 관측도 알림을 올린다."""
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+    out = recommend([_result("codex", 100.0)], "A+", today=TODAY, now=NOW)
+    assert len(calls) == 1
+    assert "차단선 100%" in out
+
+
+def test_recommend_respects_configured_cutoff(tmp_path):
+    """recommend 렌더도 configured cutoff 를 쓴다 — 50 설정 시 60% 에서 제외."""
+    _write_config(tmp_path, "[pools.codex]\ncutoff = 50\n")
+    out = recommend([_result("codex", 60.0)], "A+", today=TODAY, now=NOW)
+    line = next(line for line in out.splitlines() if "codex" in line and "소진" in line)
+    assert "차단선 50%" in line
+
+
+def test_escalation_entry_uses_configured_cutoff_and_notifies(tmp_path, monkeypatch):
+    """escalation 엔트리 평가 경로도 configured cutoff + 알림을 적용한다."""
+    from scopefuel.recommend import Profile
+
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 50\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+    table = {g: [] for g in ("S+", "S", "A", "B", "C")}
+    table["A+"] = [Profile("codex-sol", "Sol", 65.0, gate="escalation", gate_reason="t")]
+    out = recommend([_result("codex", 60.0)], "A+", today=TODAY, now=NOW, grade_table=table)
+    assert "차단선 50%" in out
+    assert len(calls) == 1
+
+
+def test_gate_audit_record_includes_exhaust_notice(tmp_path, monkeypatch):
+    """--gate-output 감사 레코드에 알림 상태가 들어간다."""
+    from scopefuel import cli
+
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    record = cli._gate_record(result, 3, NOW)
+    assert record["exhaust_notice"] == result.exhaust_notice
+    assert "알림 발송" in record["exhaust_notice"]
+
+
+# ------------------------------------------------------------------ herdr 경로
+
+
+def _herdr_env(tmp_path, monkeypatch, provider: str = "codex"):
+    from scopefuel import herdr
+
+    monkeypatch.setattr(herdr, "_report", lambda pane_id, label: 0)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "herdr-state"))
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_EVENT_JSON",
+        json.dumps({"data": {"pane_id": "wB:p9Z", "agent": provider}}),
+    )
+    return herdr
+
+
+def test_herdr_event_notifies_exhausted_operator_switch_pool(tmp_path, monkeypatch):
+    """실행 중 잡 경로: pane 이벤트의 소진 관측이 같은 알림 상태 기계를 탄다."""
+    herdr = _herdr_env(tmp_path, monkeypatch)
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+
+    assert herdr.handle_event({"codex": lambda: _live_result("codex", 100.0)}) == 0
+    assert len(calls) == 1
+    assert "codex 계정 전환 필요" in calls[0]
+
+    # 같은 에피소드 재관측 — 디바운스 아래라도 중복 발송 없음.
+    herdr._save_state({})  # debounce 리셋 대신 상태 파일을 비워 재관측을 강제
+    assert herdr.handle_event({"codex": lambda: _live_result("codex", 100.0)}) == 0
+    assert len(calls) == 1
+
+
+def test_herdr_stale_result_neither_notifies_nor_clears(tmp_path, monkeypatch):
+    """stale 스냅샷은 알림 근거가 아니다 — 에피소드를 만들지도 지우지도 않는다."""
+    import dataclasses
+
+    herdr = _herdr_env(tmp_path, monkeypatch)
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    sink = _fake_sink(calls)
+
+    # 선행 에피소드를 직접 만든다.
+    exhaust.observe("codex", exhausted=True, used_pct=100.0, cutoff=100.0, now=NOW, sink=sink)
+    assert len(calls) == 1
+
+    stale = dataclasses.replace(_live_result("codex", 10.0), stale=True)
+    assert herdr.handle_event({"codex": lambda: stale}) == 0
+    assert len(calls) == 1  # stale 관측은 발송도 해제도 하지 않는다
+
+    # 다음 fresh 소진 관측은 기통지 억제가 유지된다(에피소드가 안 지워졌다).
+    herdr._save_state({})
+    assert herdr.handle_event({"codex": lambda: _live_result("codex", 100.0)}) == 0
+    assert len(calls) == 1

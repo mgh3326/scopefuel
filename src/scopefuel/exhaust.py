@@ -103,8 +103,14 @@ def _clear_if_recorded(key: str) -> None:
         pass  # 상태 저장소 접근 실패 — 지우지 못해도 게이트를 막지 않는다
 
 
-def emit_lane_event(text: str) -> bool:
-    """기본 싱크 — operator-desk lane event. 실패해도 예외 없이 False."""
+def emit_lane_event(text: str, event_id: str) -> bool:
+    """기본 싱크 — operator-desk lane event. 실패해도 예외 없이 False.
+
+    ``lane.event`` 는 ``--event-id`` 를 요구한다(없으면 rc=2). 같은
+    ``(owner_lane, event_id)`` 의 재발송은 panewire 가 "duplicate event_id" 로
+    거절하는데, 그건 첫 발송이 파일에 기록됐다는 뜻이므로 전달 성공으로 친다 —
+    실패로 오분류하면 같은 이벤트를 영원히 재시도한다.
+    """
     panewire = shutil.which(os.environ.get("PANEWIRE_BIN", "panewire"))
     if panewire is None:
         return False
@@ -119,6 +125,8 @@ def emit_lane_event(text: str) -> bool:
                 NOTIFY_LANE,
                 "--owner-lane",
                 NOTIFY_OWNER,
+                "--event-id",
+                event_id,
                 "--sink",
                 "--text",
                 text,
@@ -126,11 +134,22 @@ def emit_lane_event(text: str) -> bool:
             check=False,
             timeout=EMIT_TIMEOUT_S,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return completed.returncode == 0
+    if completed.returncode == 0:
+        return True
+    return b"duplicate event_id" in (completed.stderr or b"")
+
+
+def _event_id(key: str, window: str | None, reset_at: str | None) -> str:
+    """에피소드 식별 event id — (pool, scope, window, reset) 으로 결정적.
+
+    상태 파일이 유실돼도 같은 소진 창의 재발송은 panewire 의 자체 dedupe
+    (duplicate event_id)에 걸리고, 우리는 그것을 전달 성공으로 기록한다.
+    """
+    return f"scopefuel.exhaust:{key}:{window or '-'}:{reset_at or '-'}"
 
 
 def _message(
@@ -223,7 +242,12 @@ def observe(
 
             send = sink if sink is not None else emit_lane_event
             try:
-                delivered = bool(send(_message(pool, used_pct, cutoff, window, reset_at, scope)))
+                delivered = bool(
+                    send(
+                        _message(pool, used_pct, cutoff, window, reset_at, scope),
+                        _event_id(key, window, reset_at),
+                    )
+                )
             except Exception:
                 delivered = False
             record = {"window": window, "reset_at": reset_at, "used_pct": used_pct}
