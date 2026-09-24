@@ -100,25 +100,28 @@ def fetch() -> ProviderResult:
         )
     workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
     proctrack.log_probe_call(workdir, "kiro")
-    with _single_probe_lock(workdir) as acquired:
-        if not acquired:
-            # Not an error: another probe is already measuring this pool.
-            return ProviderResult(
-                id="kiro",
-                error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
-                hint="kiro-cli 를 직접 실행해 로그인 상태를 확인하세요",
-                source="cli:/usage",
-            )
-        result = _probe_once()
-        if result.error and _EXPIRED.search((result.raw or {}).get("stdout", "")):
-            # 만료된 액세스 토큰은 CLI 호출 자체가 갱신한다(실측: 1회 실패 → 재호출 성공).
-            # 갱신은 CLI 몫이고 scopefuel 은 여전히 아무것도 쓰지 않는다.
-            retried = _probe_once()
-            if not retried.error:
+    try:
+        with _single_probe_lock(workdir) as acquired:
+            if not acquired:
+                # Not an error: another probe is already measuring this pool.
+                return ProviderResult(
+                    id="kiro",
+                    error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                    hint="kiro-cli 를 직접 실행해 로그인 상태를 확인하세요",
+                    source="cli:/usage",
+                )
+            result = _probe_once()
+            if result.error and _EXPIRED.search((result.raw or {}).get("stdout", "")):
+                # 만료된 액세스 토큰은 CLI 호출 자체가 갱신한다(실측: 1회 실패 → 재호출 성공).
+                # 갱신은 CLI 몫이고 scopefuel 은 여전히 아무것도 쓰지 않는다.
+                retried = _probe_once()
+                if not retried.error:
+                    return retried
+                retried.hint = "kiro-cli 를 직접 실행해 로그인 상태를 확인하세요 (kiro-cli login)"
                 return retried
-            retried.hint = "kiro-cli 를 직접 실행해 로그인 상태를 확인하세요 (kiro-cli login)"
-            return retried
-        return result
+            return result
+    except OSError as exc:
+        return ProviderResult(id="kiro", error=f"{BINARY} 실행 실패: {exc}")
 
 
 def _probe_once() -> ProviderResult:
