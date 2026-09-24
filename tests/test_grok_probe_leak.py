@@ -189,11 +189,12 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
     SIGKILL or the cwd sweep can end them, and nothing may be reparented to pid 1.
 
     On m1 (mac-work) four grok probe processes ran from 09-16 at 100% CPU each
-    with ppid 1 and cwd grok-probe-workdir (load 27) — the orphan shape. The fake
-    below traps SIGTERM in the probe and in a forked child, so a cleanup that
-    only SIGTERMs — or only kills the direct child while the fork lives on —
-    leaves a process in the table. The mid-flight read proves the fixture really
-    ran both processes before the timeout fired.
+    with ppid 1 and cwd grok-probe-workdir (load 27). This test is the guard for
+    the timeout kill path itself: the fake traps SIGTERM in the probe and in a
+    forked child, so a cleanup that only SIGTERMs — or only kills the direct
+    child while the fork lives on — leaves a process in the table. The
+    mid-flight read proves the fixture really ran both processes before the
+    timeout fired.
     """
 
     workdir = tmp_path / "grok-probe-workdir"
@@ -216,7 +217,10 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
 
     monkeypatch.setattr(grok, "BINARY", str(fake))
     monkeypatch.setattr(grok, "PROBE_WORKDIR", workdir)
-    monkeypatch.setattr(grok, "TIMEOUT_S", 1.0)
+    # 5s, not 1s: a cold exec of a freshly written script took up to ~1.2s on a
+    # loaded Mac, so a 1s timeout could SIGTERM the shell before it installed
+    # its trap — a fail-closed flake at the pidfile precondition.
+    monkeypatch.setattr(grok, "TIMEOUT_S", 5.0)
     monkeypatch.setattr(grok, "STARTUP_DELAY_S", 0.05)
 
     outcome: list[str] = []
