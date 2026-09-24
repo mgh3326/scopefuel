@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -167,6 +168,164 @@ def test_a_sigkilled_probe_leaves_no_orphan(tmp_path):
         for pid in proctrack.pids_with_cwd(workdir, nested=True):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
+
+
+def _live_table_entries(pids) -> dict[int, tuple[int, str]]:
+    """pid → (ppid, stat) from the real process table; zombies don't count as alive."""
+    out = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,stat="], capture_output=True, text=True, check=False
+    ).stdout
+    table: dict[int, tuple[int, str]] = {}
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) == 3 and cols[0].isdigit() and cols[1].isdigit():
+            pid = int(cols[0])
+            if pid in pids and not cols[2].startswith("Z"):
+                table[pid] = (int(cols[1]), cols[2])
+    return table
+
+
+def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypatch):
+    """#655 (m1): SIGTERM-ignoring probe + SIGTERM-ignoring fork — only the group
+    SIGKILL or the cwd sweep can end them, and nothing may be reparented to pid 1.
+
+    On m1 (mac-work) four grok probe processes ran from 09-16 at 100% CPU each
+    with ppid 1 and cwd grok-probe-workdir (load 27) — the orphan shape. The fake
+    below traps SIGTERM in the probe and in a forked child, so a cleanup that
+    only SIGTERMs — or only kills the direct child while the fork lives on —
+    leaves a process in the table. The mid-flight read proves the fixture really
+    ran both processes before the timeout fired.
+    """
+
+    workdir = tmp_path / "grok-probe-workdir"
+    self_pidfile = tmp_path / "probe-self.pid"
+    child_pidfile = tmp_path / "probe-child.pid"
+    fake = tmp_path / "fake-grok-term-ignoring-forker"
+    # HUP is trapped too: closing the pty master delivers SIGHUP, so a fake
+    # that only ignores TERM dies of the pty teardown rather than the probe's
+    # kill path — the same reason _hanging_fake traps HUP.
+    fake.write_text(
+        "#!/bin/sh\n"
+        "trap '' TERM HUP\n"
+        "( trap '' TERM HUP; exec sleep 120 ) &\n"
+        f"echo $! > {child_pidfile}\n"
+        f"echo $$ > {self_pidfile}\n"
+        "printf '\\342\\235\\257 \\r\\n'\n"
+        "exec sleep 120\n"
+    )
+    fake.chmod(fake.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(grok, "BINARY", str(fake))
+    monkeypatch.setattr(grok, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(grok, "TIMEOUT_S", 1.0)
+    monkeypatch.setattr(grok, "STARTUP_DELAY_S", 0.05)
+
+    outcome: list[str] = []
+
+    def _run() -> None:
+        try:
+            grok._probe_once()
+        except subprocess.TimeoutExpired:
+            outcome.append("timeout")
+        except BaseException as exc:  # noqa: BLE001 - reported by the assert below
+            outcome.append(f"error:{exc!r}")
+        else:
+            outcome.append("clean-exit")
+
+    probe = threading.Thread(target=_run)
+    probe.start()
+    try:
+        # Mid-flight: the fake and its fork must both be alive in the table
+        # with cwd inside the workdir — otherwise the assertions below are
+        # vacuous. The pidfiles name exactly the processes this fake spawned.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self_pidfile.exists() and child_pidfile.exists():
+                break
+            time.sleep(0.05)
+        assert self_pidfile.exists() and child_pidfile.exists(), (
+            "the fake probe never forked — fixture did not exercise the scenario"
+        )
+        fake_pids = {int(self_pidfile.read_text()), int(child_pidfile.read_text())}
+        inside = set(proctrack.pids_with_cwd(workdir, nested=True))
+        assert fake_pids <= inside, f"fake processes not under the probe workdir: {fake_pids - inside}"
+
+        probe.join(timeout=15)
+        assert outcome == ["timeout"], f"probe did not end in a timeout: {outcome}"
+
+        # After the probe timeout, poll the process table: nothing from the
+        # fake may still be alive, and nothing may have been reparented to
+        # pid 1 (launchd) — the m1 orphan signature.
+        orphans: dict[int, tuple[int, str]] = {}
+        deadline = time.monotonic() + 10
+        live = _live_table_entries(fake_pids)
+        while live and time.monotonic() < deadline:
+            orphans = {pid: row for pid, row in live.items() if row[0] == 1}
+            time.sleep(0.05)
+            live = _live_table_entries(fake_pids)
+        assert not orphans, f"probe processes orphaned to pid 1: {orphans}"
+        assert live == {}, f"timed-out probe left processes alive: {live}"
+    finally:
+        probe.join(timeout=15)
+        for pid in proctrack.pids_with_cwd(workdir, nested=True):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_per_pool_lock_is_released_when_the_probe_process_is_killed(tmp_path):
+    """#608's per-pool lock is an flock: a SIGKILLed probe cannot hold it past death.
+
+    The lock lives on a file descriptor, so only the kernel releasing it —
+    not any Python cleanup — can free it when the probing process is killed
+    mid-probe. A helper process takes the lock for real, proves contention,
+    then is SIGKILLed; the lock must be acquirable immediately after.
+    """
+
+    workdir = tmp_path / "grok-probe-workdir"
+    ready = tmp_path / "lock-held"
+    helper = tmp_path / "lock_holder.py"
+    helper.write_text(
+        textwrap.dedent(
+            f"""
+            import sys
+            import time
+            from pathlib import Path
+
+            sys.path.insert(0, {str(Path("src").resolve())!r})
+            from scopefuel import proctrack
+
+            with proctrack.single_probe_lock(Path({str(workdir)!r})) as acquired:
+                assert acquired
+                Path({str(ready)!r}).write_text("held")
+                time.sleep(120)
+            """
+        )
+    )
+
+    holder = subprocess.Popen(
+        [sys.executable, str(helper)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists(), "helper never took the probe lock"
+
+        with proctrack.single_probe_lock(workdir) as acquired:
+            assert acquired is False, "lock not contended while the holder lives"
+
+        os.kill(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=10)
+
+        with proctrack.single_probe_lock(workdir) as acquired:
+            assert acquired is True, "kernel did not release the flock on SIGKILL"
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)
 
 
 def test_a_backgrounded_grandchild_does_not_survive_a_successful_probe(tmp_path, monkeypatch):
