@@ -26,7 +26,14 @@ from typing import Literal
 
 from . import cache, exhaust, manual
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
-from .model import PoolClass, ProviderResult, _is_valid_used_pct, _parse_reset, _window_seconds
+from .model import (
+    PROBE_IN_PROGRESS,
+    PoolClass,
+    ProviderResult,
+    _is_valid_used_pct,
+    _parse_reset,
+    _window_seconds,
+)
 from .policy import (
     get_active_override,
     get_boost,
@@ -292,6 +299,9 @@ DEVIN_SWE2_ESTIMATE_REASON = (
     "Terminal-Bench 4 27.3 — AA-agent 미측정. TB4 약점으로 S/S+ 배제"
 )
 DEVIN_SWE2_PLACEMENT_NOTE = "보수 배치(A+; reps 3건 전 · AA-agent 미측정)"
+# #635: devin 은 effort 를 모델 id 안에 둔다(--model swe-2-max). 변형 rung 은 high 의
+# 급을 상속하지 않는다 — high 의 A+ 는 참조로만 적고 #594 E6 판정까지 C 무점수 미측정.
+DEVIN_EFFORT_VARIANT_ANNOTATION = "미측정(high A+ 참조 · 급 비상속 · #594 E6 판정 대기)"
 
 # task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
 # opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
@@ -1025,6 +1035,25 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             None,
             benchmark_annotation=UNMEASURED_ANNOTATION,
         ),
+        # #635: effort 변형 rung. 모델 id 는 launch.LAUNCH_MODEL_IDS.
+        Profile(
+            "devin-swe2-medium",
+            "SWE-2 (medium)",
+            None,
+            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
+        ),
+        Profile(
+            "devin-swe2-max",
+            "SWE-2 (max)",
+            None,
+            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
+        ),
+        Profile(
+            "devin-ds41-max",
+            "DeepSeek V4.1 Flash (max)",
+            None,
+            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
+        ),
     ],
 }
 
@@ -1324,12 +1353,16 @@ _RATE_LIMITED_RE = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many reques
 
 
 def _stale_failure_kind(result: ProviderResult) -> str | None:
-    """stale 수용이 가능한 실패 사유 — "rate_limited" | "transport" | None(수용 불가).
+    """stale 수용이 가능한 사유 — "rate_limited" | "transport" | "probe_in_progress" | None(수용 불가).
 
     수용 사유는 429·5xx·네트워크뿐이다. auth·credentials·parse·분류 불가는
     전부 None — 어떤 실패인지 모르는 값으로 게이트를 열지 않는다.
+    #639: 잠금으로 건너뛴 회차(probe_in_progress)는 실패가 아니라 지연이다 —
+    진행 중인 프로브가 곧 새 값을 쓰므로 수용 가능한 사유로 둔다.
     """
     kind = result.error_kind
+    if kind == PROBE_IN_PROGRESS:
+        return PROBE_IN_PROGRESS
     if kind == "rate_limited":
         return "rate_limited"
     if kind in ("server", "network", "transport"):
@@ -1358,7 +1391,13 @@ def _stale_accepted(result: ProviderResult | None, group_name: str | None, now: 
     kind = _stale_failure_kind(result)
     if kind is None:
         return None
-    if result.account_fp_match is not True:
+    if kind == PROBE_IN_PROGRESS:
+        # 건너뛴 회차는 새 자격 관측을 전혀 생산하지 않는다 — 실패 측정처럼
+        # 지문 '증명'(is True)을 요구하면 지문 장치가 없는 CLI 풀은 영원히
+        # 수용되지 못한다. 대신 '불일치 증거'(is False)가 있을 때만 거부한다.
+        if result.account_fp_match is False:
+            return None
+    elif result.account_fp_match is not True:
         return None
     if result.age_s is None or result.age_s > cache.STALE_MAX_S:
         return None
@@ -1377,7 +1416,7 @@ def _stale_accepted(result: ProviderResult | None, group_name: str | None, now: 
 
 
 def _stale_tag(result: ProviderResult, kind: str) -> str:
-    label = "속도 제한" if kind == "rate_limited" else "조회 실패"
+    label = {"rate_limited": "속도 제한", PROBE_IN_PROGRESS: "탐침 진행 중"}.get(kind, "조회 실패")
     age = cache.format_age(result.age_s) or "?"
     return f"stale_accepted — {label}, 마지막 값 {age}"
 
@@ -1395,6 +1434,10 @@ def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str
             age = cache.format_age(result.age_s)
             return f"{provider_id} 속도 제한 — 마지막 정상 값이 너무 오래됨 ({age})"
         return f"{provider_id} 속도 제한 — 마지막 정상 값 없음"
+    if result is not None and result.error_kind == PROBE_IN_PROGRESS:
+        if result.stale and result.age_s is not None:
+            return f"{provider_id} 탐침 진행 중 — 직전 값 {cache.format_age(result.age_s)} 수용 불가"
+        return f"{provider_id} 탐침 진행 중 — 직전 정상 값 없음"
     return f"{provider_id} 측정 불가 (provider error/degraded)"
 
 

@@ -20,7 +20,7 @@ import termios
 import time
 
 from .. import proctrack
-from ..model import Bucket, ProviderResult, Scope
+from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_GROK_BIN") or "grok"
 # 실측 성공 경로 2.6초 대비 충분한 여유를 두되, PTY가 무한 대기하지 않게 한다.
@@ -80,8 +80,13 @@ def fetch() -> ProviderResult:
             if not acquired:
                 # Not an error: another probe is already measuring this pool.
                 # Reporting it as degraded keeps the caller from treating a
-                # deliberate skip as a measurement.
-                return _degraded(f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀", credential)
+                # deliberate skip as a measurement; the marker kind lets the
+                # cache/gate layer keep the last good snapshot instead (#639).
+                return _degraded(
+                    f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                    credential,
+                    error_kind=PROBE_IN_PROGRESS,
+                )
             output = _probe_once()
     except subprocess.TimeoutExpired:
         return _degraded(f"{BINARY} /usage 가 {TIMEOUT_S:.0f}초 안에 끝나지 않음", credential)
@@ -92,13 +97,19 @@ def fetch() -> ProviderResult:
     return result
 
 
-def _degraded(error: str, credential: dict[str, bool], stdout: str | None = None) -> ProviderResult:
+def _degraded(
+    error: str,
+    credential: dict[str, bool],
+    stdout: str | None = None,
+    error_kind: str | None = None,
+) -> ProviderResult:
     return ProviderResult(
         id="grok",
         error=error,
         hint="grok 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
         source=SOURCE,
         raw=_safe_raw(credential=credential, stdout=_redact_output(stdout) if stdout else None),
+        error_kind=error_kind,
     )
 
 
