@@ -2101,22 +2101,24 @@ def gate_check(
             requested_by=audit_requested_by,
             ref_resolution="unverified",
         )
+    # task #625: consult_only 정체성(fable)은 운영자 명시 요청이 스폰 자격이다 —
+    # ``policy launch`` 와 같은 충족 조건을 게이트에도 둔다. 측정 여부와 무관하게
+    # 요청이 없으면 거부가 먼저다(측정불가보다 "실행 자격 없음"이 더 근본적 사실).
+    # GRADE_TABLE 소속과 무관하게 검사한다 — 런타임 catalog 가 fable 을 다른 행으로
+    # 되돌려 놓는 미래에도 요청 없는 스폰은 열리지 않는다.
+    if profile_name in CONSULT_ONLY_PROFILES and operator_request is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=found[0] if found is not None else None,
+            reason=(
+                f"consult_only: {profile_name} — 운영자 명시 요청 없이 스폰 불가 "
+                "(--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)"
+            ),
+        )
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
-        # task #625: consult_only 정체성(fable)은 운영자 명시 요청이 스폰 자격이다 —
-        # ``policy launch`` 와 같은 충족 조건을 게이트에도 둔다. 측정 여부와 무관하게
-        # 요청이 없으면 거부가 먼저다(측정불가보다 "실행 자격 없음"이 더 근본적 사실).
-        if profile_name in CONSULT_ONLY_PROFILES and operator_request is None:
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=None,
-                reason=(
-                    f"consult_only: {profile_name} — 운영자 명시 요청 없이 스폰 불가 "
-                    "(--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)"
-                ),
-            )
         audit: dict[str, object] = {}
         if operator_request is not None:
             audit = {
