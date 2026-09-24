@@ -11,6 +11,7 @@ from .model import (
     Bucket,
     ProviderResult,
     _is_valid_used_pct,
+    account_tag,
     iso_to_local,
     overall_mark,
 )
@@ -93,8 +94,11 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
     lines: list[str] = []
     for result in results:
         display_id = _display_id(result)
+        # task #659 — 어느 계정의 측정인지 표에 항상 보인다 (지문 앞 8자 + 안전 라벨).
+        acct = account_tag(result.account_fp, result.account_label, result.account_fp_kind)
+        acct_s = f"  account {acct}" if acct else ""
         if result.error:
-            lines.append(f"{display_id:<7} -- {result.error}")
+            lines.append(f"{display_id:<7}{acct_s} -- {result.error}")
             if result.hint:
                 lines.append(f"        힌트: {result.hint}")
             lines.append("")
@@ -120,7 +124,7 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
         else:
             mark_text = _mark(verdict.mark, color)
 
-        lines.append(f"{display_id}{plan}  [{mark_text}] {basis}{stamp}")
+        lines.append(f"{display_id}{plan}{acct_s}  [{mark_text}] {basis}{stamp}")
 
         for bucket in result.buckets:
             tags = [t for t in (bucket.note,) if t]
@@ -167,6 +171,10 @@ def brief(
     worst = overall_mark(results, now=now)
     for result in results:
         display_id = _display_id(result)
+        acct = account_tag(result.account_fp, result.account_label, result.account_fp_kind)
+        if acct:
+            # task #659 N-2 — 구분자 '@' 는 이메일 스캐너를 건드리므로 ' acct='.
+            display_id = f"{display_id} acct={acct}"
         if result.error:
             err_msg = result.error.splitlines()[0]
             chunks.append(f"{display_id} n/a({err_msg})")

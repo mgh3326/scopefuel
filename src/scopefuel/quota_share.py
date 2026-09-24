@@ -18,15 +18,25 @@ usage-API 429 를 구조적으로 없앤다.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import os
+import re
 import socket
 import urllib.parse
 
 from . import bench
 from .http import request_json
-from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct
+from .model import (
+    Bucket,
+    PoolClass,
+    ProviderResult,
+    Scope,
+    _is_valid_used_pct,
+    account_tag,
+    safe_label,
+)
 from .policy import load_config
 
 SCHEMA = "scopefuel.quota-share.v1"
@@ -45,6 +55,13 @@ ENV_DISABLE = "SCOPEFUEL_QUOTA_SHARE"
 
 _DOC_PREFIX = "/v1/documents/"
 
+# task #659 — 게이트 첫 줄은 기계 파싱되므로 wire 의 host 는 이 문자 집합만 허용한다
+# (공백·인용부호·줄바꿈이 섞인 host 는 key=val 주입으로 줄을 위조할 수 있다 — N-4).
+# 길이 제한은 64자: 실제 호스트명이 더 길 수 있으므로(GH macOS runner 가 70+자)
+# 초과분은 거부가 아니라 잘라내기+해시 꼬리로 provenance 를 보존한다.
+_HOST_CHARSET_RE = re.compile(r"[A-Za-z0-9._-]+")
+_HOST_MAX_LEN = 64
+
 
 def enabled() -> bool:
     """기본 켜짐 — hk 자격이 없으면 엔드포인트 해석 단계에서 조용히 꺼진다."""
@@ -56,9 +73,14 @@ def key_for(pool: str, account_fp: str) -> str:
     return f"quota/{pool}/{account_fp}/latest"
 
 
-def remote_label(host: str) -> str:
-    """원격 값의 표시 라벨 — 'remote measured (host)'."""
-    return f"remote measured ({host})"
+def remote_label(host: str, account: str = "") -> str:
+    """원격 값의 표시 라벨 — 'remote measured (host) · account <fp8 (label)>'.
+
+    account 는 ``model.account_tag`` 출력 — 어느 계정의 측정인지 읽는 호스트가
+    바로 보게 한다(task #659 AC2).
+    """
+    label = f"remote measured ({host})"
+    return f"{label} · account {account}" if account else label
 
 
 def remote_eligible(result: ProviderResult) -> bool:
@@ -109,7 +131,35 @@ def _request(method: str, key: str, document: dict | None = None) -> dict | None
     return payload if isinstance(payload, dict) else None
 
 
-def _bucket_payload(bucket: Bucket, host: str, session_fp: str | None) -> dict:
+def _safe_host(host: object) -> str:
+    """표시·기록용 호스트 라벨 — 허용 문자 밖·빈 값·비문자열은 'unknown'.
+
+    문자 집합은 깨끗하지만 64자를 넘는 호스트명(예: GH macOS runner 의
+    ``<uuid>-<hex>.local``)은 'unknown' 으로 버리지 않는다 — 어느 호스트가
+    측정했는지가 이 필드의 존재 이유다. 앞 55자 + '-' + sha256(host)[:8] 로
+    잘라 총 64자·동일 문자 집합을 유지하고, 서로 다른 긴 호스트명이 같은
+    라벨로 접히지 않게 한다. 쓰기·읽기 양쪽이 같은 함수를 쓰므로 라운드트립이
+    일치한다.
+    """
+    if not isinstance(host, str) or not _HOST_CHARSET_RE.fullmatch(host):
+        return "unknown"
+    if len(host) <= _HOST_MAX_LEN:
+        return host
+    digest = hashlib.sha256(host.encode()).hexdigest()[:8]
+    return f"{host[: _HOST_MAX_LEN - 9]}-{digest}"
+
+
+def _measured_by(host: str, session_fp: str | None, result: ProviderResult) -> dict:
+    """측정 주체 provenance — 어느 호스트·세션·계정이 관측했는지 (AC2/AC5)."""
+    return {
+        "host": host,
+        "session_fp": session_fp,
+        "account_fp": result.account_fp,
+        "account_label": safe_label(result.account_label),
+    }
+
+
+def _bucket_payload(bucket: Bucket, measured_by: dict) -> dict:
     return {
         "label": bucket.label,
         "window": bucket.window,
@@ -120,21 +170,22 @@ def _bucket_payload(bucket: Bucket, host: str, session_fp: str | None) -> dict:
         "note": bucket.note,
         # 값마다 측정 주체를 붙인다 — 한 호스트/세션의 429 가 다른 호스트의
         # 계정 판정으로 번지지 않는다는 것을 관측 가능하게 하는 provenance(AC5).
-        "measured_by": {"host": host, "session_fp": session_fp},
+        "measured_by": dict(measured_by),
     }
 
 
 def _payload(pool: str, result: ProviderResult, host: str, session_fp: str | None, epoch: float) -> dict:
+    measured_by = _measured_by(host, session_fp, result)
     return {
         "schema": SCHEMA,
         "pool": pool,
         "account_fp": result.account_fp,
         "measured_at": dt.datetime.fromtimestamp(epoch, dt.UTC).isoformat(),
         "measured_at_epoch": float(epoch),
-        "measured_by": {"host": host, "session_fp": session_fp},
+        "measured_by": measured_by,
         "source": result.source,
         "plan": result.plan,
-        "buckets": [_bucket_payload(b, host, session_fp) for b in result.buckets],
+        "buckets": [_bucket_payload(b, measured_by) for b in result.buckets],
     }
 
 
@@ -150,6 +201,14 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
         fp = result.account_fp
         if not isinstance(fp, str) or not fp:
             return False
+        # task #659 — 계정 uuid 에 묶인 지문만 게시한다. 토큰 해시 폴백 지문은
+        # 이 호스트의 현재 토큰에 묶여 있어 회전마다 아무도 못 읽는 orphan
+        # 문서를 남기고(N-1), 그 지문이 어느 계정인지 증명할 수 없다 —
+        # config 컨텍스트가 어긋난 토큰+uuid 조합의 오귀속을 막는 게이트다.
+        # 건너뛴 사유는 ProviderResult.account_fp_kind="token" 과
+        # docs/quota-share.md 에 명시된다.
+        if result.account_fp_kind != "account":
+            return False
         if not any(_is_valid_used_pct(b.used_pct) for b in result.buckets):
             return False
         epoch = result.fetched_at if isinstance(result.fetched_at, int | float) else now
@@ -163,7 +222,7 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
             "session": DOC_SESSION,
             "job": "",
             "body": json.dumps(
-                _payload(pool, result, socket.gethostname(), session_fp, float(epoch)),
+                _payload(pool, result, _safe_host(socket.gethostname()), session_fp, float(epoch)),
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -174,18 +233,24 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
         return False
 
 
-def _current_fp(fetcher: object, local: ProviderResult) -> str | None:
-    """이 호스트의 *현재* 자격 지문 — 원격 조회의 조회 키이자 일치 검증 값.
+def _current_identity(fetcher: object, local: ProviderResult) -> tuple[str | None, str | None]:
+    """이 호스트의 *현재* (계정 지문, 묶임 근거) — 원격 조회의 키이자 일치 검증 값.
 
-    probe 가 있으면 그것이 정본이다(현재 자격을 다시 읽는다). probe 가 지문을
-    낼 수 없으면 이 호스트가 어느 계정인지 증명할 수 없으므로 거부한다 —
-    저장된 옛 지문으로 다른 계정의 스냅샷을 읽는 것을 막는다.
+    ``current_account_identity`` probe 가 있으면 자격을 한 번만 읽는다
+    (Keychain 호출도 1회 — N-8). 없으면 개별 probe → 로컬 결과 필드 순으로
+    폴백한다. 지문을 낼 수 없으면 이 호스트가 어느 계정인지 증명할 수 없으므로
+    거부 — 저장된 옛 지문으로 다른 계정의 스냅샷을 읽는 것을 막는다.
     """
-    probe = getattr(fetcher, "current_account_fp", None)
+    probe = getattr(fetcher, "current_account_identity", None)
     if callable(probe):
-        fp = probe()
-        return fp if isinstance(fp, str) and fp else None
-    return local.account_fp if isinstance(local.account_fp, str) and local.account_fp else None
+        fp, kind = probe()
+    else:
+        fp_probe = getattr(fetcher, "current_account_fp", None)
+        kind_probe = getattr(fetcher, "current_account_fp_kind", None)
+        fp = fp_probe() if callable(fp_probe) else local.account_fp
+        kind = kind_probe() if callable(kind_probe) else local.account_fp_kind
+    fp = fp if isinstance(fp, str) and fp else None
+    return fp, kind if kind in ("account", "token") else None
 
 
 def _snapshot(document: dict | None) -> dict | None:
@@ -210,12 +275,18 @@ def _snapshot(document: dict | None) -> dict | None:
     by = snap.get("measured_by")
     host = by.get("host") if isinstance(by, dict) else None
     session_fp = by.get("session_fp") if isinstance(by, dict) else None
+    account_label = by.get("account_label") if isinstance(by, dict) else None
+    by_fp = by.get("account_fp") if isinstance(by, dict) else None
+    if isinstance(by_fp, str) and by_fp and by_fp != snap.get("account_fp"):
+        # provenance 가 문서의 accept-key 지문과 어긋나면 위조 의심 — 거부.
+        return None
     return {
         "pool": snap.get("pool"),
         "account_fp": snap.get("account_fp"),
         "measured_at_epoch": float(measured),
-        "host": host if isinstance(host, str) and host else "unknown",
+        "host": _safe_host(host),
         "session_fp": session_fp if isinstance(session_fp, str) and session_fp else None,
+        "account_label": safe_label(account_label),
         "plan": snap.get("plan") if isinstance(snap.get("plan"), str) else None,
         "buckets": buckets,
     }
@@ -255,8 +326,13 @@ def remote_result(
     try:
         if not enabled():
             return None
-        fp = _current_fp(fetcher, local)
+        fp, kind = _current_identity(fetcher, local)
         if fp is None:
+            return None
+        # task #659 — 토큰 해시 폴백 지문으로는 읽지 않는다: 게시되는 문서는 전부
+        # uuid-bound 키라 맞을 문서가 없고, 있더라도(구형 orphan) 계정 정체성을
+        # 증명할 수 없다.
+        if kind == "token":
             return None
         snap = _snapshot(_request("GET", key_for(pool, fp)))
         if snap is None or snap["pool"] != pool or snap["account_fp"] != fp:
@@ -272,7 +348,7 @@ def remote_result(
             id=pool,
             plan=snap["plan"],
             buckets=buckets,
-            note=remote_label(snap["host"]),
+            note=remote_label(snap["host"], account_tag(fp, snap["account_label"], "account")),
             source=REMOTE_SOURCE,
             fetched_at=measured_at,
             age_s=max(0.0, age),
@@ -280,6 +356,8 @@ def remote_result(
             pool_class=policy_class,
             account_fp=fp,
             account_fp_match=True,
+            account_fp_kind="account",
+            account_label=snap["account_label"],
             session_fp=snap["session_fp"],
             # 대체된 로컬 실패는 감사로 남긴다 — 원격 성공이 '로컬이 건강하다'
             # 는 뜻이 아니므로.

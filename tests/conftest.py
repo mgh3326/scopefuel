@@ -52,6 +52,31 @@ def isolated_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(claude, "CREDENTIALS", tmp_path / "claude-absent-credentials.json")
     monkeypatch.setattr(claude, "CLAUDE_JSON", tmp_path / "claude-absent-claude.json")
+    # task #659 (AC5/N-3): an inherited CLAUDE_CONFIG_DIR would redirect both
+    # reads at the developer's real context — and CLAUDE_SECURESTORAGE_CONFIG_DIR
+    # would pick a real suffixed Keychain item. Delete both; tests opt in.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+    # On macOS the Keychain fallback runs `security find-generic-password` —
+    # absent credential files do not stop it from reaching the developer's real
+    # Keychain. Stub the subprocess to "item not found" so no test ever reads a
+    # real credential; a test that needs a Keychain blob opts in by
+    # monkeypatching claude.subprocess (or claude._read_keychain) itself.
+    import subprocess as _subprocess
+
+    class _StubbedClaudeSubprocess:
+        calls: list = []
+
+        @staticmethod
+        def run(argv, *args, **kwargs):
+            _StubbedClaudeSubprocess.calls.append(argv)
+            return _subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr="")
+
+        def __getattr__(self, name):
+            return getattr(_subprocess, name)
+
+    _StubbedClaudeSubprocess.calls = []
+    monkeypatch.setattr(claude, "subprocess", _StubbedClaudeSubprocess())
     # #608: the CLI providers' probes write probe-calls.log and hold
     # .probe.lock under PROBE_WORKDIR — a test that reaches fetch() without
     # redirecting it would pollute the incident-audit log in the real

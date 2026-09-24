@@ -17,7 +17,7 @@ from dataclasses import replace
 
 from . import bench, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
 from .cache import collect
-from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
+from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
 from .providers import default_order, registry
 from .recommend import grade_help_text
@@ -548,7 +548,11 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
 
 
 def _gate_record(
-    result: recommend.GateResult, exit_code: int, now: dt.datetime, purpose: str | None = None
+    result: recommend.GateResult,
+    exit_code: int,
+    now: dt.datetime,
+    purpose: str | None = None,
+    account: str | None = None,
 ) -> dict:
     """gate 판정의 감사 레코드 (``--gate-output`` JSON 본체)."""
     return {
@@ -582,7 +586,7 @@ def _gate_record(
         "remaining_effect_s": result.remaining_effect_s,
         "last_auto_error": result.last_auto_error,
         "exhaust_notice": result.exhaust_notice,
-    }
+    } | ({"account": account} if account else {})
 
 
 def _gate_args(args: argparse.Namespace) -> dict:
@@ -784,8 +788,17 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             args, fetchers, automatic_results, result, exit_code, now, bench_scores, model_prices, grade_table
         )
 
+    # task #659 — 이 판정이 어느 계정의 측정에 기반하는지 통과·거부 모두 보인다
+    # (지문 앞 8자 + 안전 라벨 — 이메일·토큰은 절대 표시하지 않는다).
+    measured = next((item for item in automatic_results if item.id == provider_id), None)
+    tag = (
+        account_tag(measured.account_fp, measured.account_label, measured.account_fp_kind)
+        if measured is not None
+        else ""
+    )
+
     if args.gate_output:
-        record = _gate_record(result, exit_code, now, purpose=args.purpose)
+        record = _gate_record(result, exit_code, now, purpose=args.purpose, account=tag or None)
         try:
             pathlib.Path(args.gate_output).write_text(
                 json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
@@ -799,6 +812,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             f"profile={result.profile} pool={result.provider_id} "
             f"used_pct={result.used_pct} class={result.pool_class}"
         )
+        if tag:
+            first_line += f' account="{tag}"'
         if result.stale_accepted:
             first_line += " stale_accepted=true"
         if result.operator_request_ref is not None:
@@ -834,7 +849,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         print(result.reason)
         return 0
 
-    print(result.reason, file=sys.stderr)
+    deny_reason = result.reason if not tag else f'{result.reason} account="{tag}"'
+    print(deny_reason, file=sys.stderr)
     if result.role_denied:
         # task #527: a role denial is not a quota refusal — print no
         # "alternatives exhausted" line (the profile has no grade) and say
