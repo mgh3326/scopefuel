@@ -728,6 +728,20 @@ def test_pytest_guard_blocks_real_panewire(tmp_path, monkeypatch):
         importlib.reload(exhaust)
 
 
+def test_inherited_panewire_bin_is_not_opt_in():
+    """R3-1/Ge: 상속된 PANEWIRE_BIN 은 opt-in 이 아니다 — autouse 픽스처가 지운다.
+
+    conftest 의 ``_panewire_bin_plant`` 가 매 테스트 전에 가짜 상속값을 심는다.
+    차단 픽스처의 ``delenv`` 를 지우는 뮤턴트에서는 이 값이 남아 RED 가 되고,
+    그 상태라면 차단 스텁이 ``/nonexistent-inherited-panewire`` 로 위임한다.
+    """
+    import os
+
+    assert "PANEWIRE_BIN" not in os.environ
+    assert exhaust.emit_lane_event("probe", "t638-inherited-bin") is False
+    assert exhaust._BLOCKED_EMIT_CALLS[-1][1] == "t638-inherited-bin"
+
+
 # ------------------------------------------------------------- 에피소드 event id (R2-1)
 
 
