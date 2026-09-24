@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -172,9 +173,7 @@ def test_a_sigkilled_probe_leaves_no_orphan(tmp_path):
 
 def _live_table_entries(pids) -> dict[int, tuple[int, str]]:
     """pid → (ppid, stat) from the real process table; zombies don't count as alive."""
-    out = subprocess.run(
-        ["ps", "-eo", "pid=,ppid=,stat="], capture_output=True, text=True, check=False
-    ).stdout
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,stat="], capture_output=True, text=True, check=True).stdout
     table: dict[int, tuple[int, str]] = {}
     for line in out.splitlines():
         cols = line.split()
@@ -208,8 +207,8 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
         "#!/bin/sh\n"
         "trap '' TERM HUP\n"
         "( trap '' TERM HUP; exec sleep 120 ) &\n"
-        f"echo $! > {child_pidfile}\n"
-        f"echo $$ > {self_pidfile}\n"
+        f"echo $! > {shlex.quote(str(child_pidfile))}\n"
+        f"echo $$ > {shlex.quote(str(self_pidfile))}\n"
         "printf '\\342\\235\\257 \\r\\n'\n"
         "exec sleep 120\n"
     )
@@ -221,6 +220,7 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
     monkeypatch.setattr(grok, "STARTUP_DELAY_S", 0.05)
 
     outcome: list[str] = []
+    fake_pids: set[int] = set()
 
     def _run() -> None:
         try:
@@ -238,7 +238,7 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
         # Mid-flight: the fake and its fork must both be alive in the table
         # with cwd inside the workdir — otherwise the assertions below are
         # vacuous. The pidfiles name exactly the processes this fake spawned.
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self_pidfile.exists() and child_pidfile.exists():
                 break
@@ -246,7 +246,7 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
         assert self_pidfile.exists() and child_pidfile.exists(), (
             "the fake probe never forked — fixture did not exercise the scenario"
         )
-        fake_pids = {int(self_pidfile.read_text()), int(child_pidfile.read_text())}
+        fake_pids.update((int(self_pidfile.read_text()), int(child_pidfile.read_text())))
         inside = set(proctrack.pids_with_cwd(workdir, nested=True))
         assert fake_pids <= inside, f"fake processes not under the probe workdir: {fake_pids - inside}"
 
@@ -267,7 +267,9 @@ def test_sigterm_ignoring_probe_and_its_fork_leave_no_orphan(tmp_path, monkeypat
         assert live == {}, f"timed-out probe left processes alive: {live}"
     finally:
         probe.join(timeout=15)
-        for pid in proctrack.pids_with_cwd(workdir, nested=True):
+        # Kill the recorded pids directly — the cwd sweep alone can miss a
+        # survivor once _probe_once has removed the instance directory.
+        for pid in fake_pids | set(proctrack.pids_with_cwd(workdir, nested=True)):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
 
