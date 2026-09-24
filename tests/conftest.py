@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 
 import pytest
@@ -50,3 +51,66 @@ def isolated_cache(tmp_path, monkeypatch):
     # boundary; that memo must not survive from one test into the next.
     bench.reset_catalog_memo()
     return tmp_path
+
+
+@pytest.fixture
+def _panewire_bin_plant(monkeypatch):
+    """외부에서 상속된 ``PANEWIRE_BIN``(wrk 공용 노브)을 흉내 낸다.
+
+    아래 autouse 차단 픽스처가 이것에 의존하므로 매 테스트마다 심어진 뒤
+    지워져야 한다 — delenv 를 제거하는 뮤턴트(Ge)는 이 심은 값이 남아
+    테스트가 RED 되도록 하기 위함이다.
+    """
+    monkeypatch.setenv("PANEWIRE_BIN", "/nonexistent-inherited-panewire")
+
+
+@pytest.fixture(autouse=True)
+def _block_real_operator_emit(monkeypatch, _panewire_bin_plant):
+    """task #638 사고 방지 — 모든 테스트에서 실 operator-desk 발송을 차단한다.
+
+    2026-09-24 14:53 KST 에 뮤턴트 스윕(M26)이 싱크 미스텁 테스트를 통해 실
+    panewire 를 호출해 실 lane.event 1건이 operator-desk 에 도달했다
+    (events-lane/00067). 이 픽스처는 두 경로를 전부 막는다:
+
+    - ``exhaust.emit_lane_event`` — argv 를 만드는 호출부. 시도는
+      ``exhaust._BLOCKED_EMIT_CALLS`` 에 기록된다. ``PANEWIRE_BIN`` 을 명시한
+      테스트(스텁 바이너리 계약 검증)만 실 함수에 위임한다.
+    - ``exhaust.subprocess`` — exhaust.py 안의 subprocess 사용 전부.
+      ``PANEWIRE_BIN`` 미지정 상태의 run 호출은 AssertionError 로 실패한다.
+
+    실 발송은 pytest 바깥의 설치 후 witness 절차에서만 허용된다.
+
+    상속된 ``PANEWIRE_BIN`` 은 opt-in 이 아니다 — wrk 가 읽는 공용 노브라
+    외부 export 만으로 pytest 안의 실 발송이 열렸다(R3-1). 테스트가 opt-in
+    하려면 본문에서 ``monkeypatch.setenv("PANEWIRE_BIN", <stub>)`` 해야 한다.
+    """
+    import subprocess as _subprocess
+
+    from scopefuel import exhaust
+
+    monkeypatch.delenv("PANEWIRE_BIN", raising=False)
+    real_emit = exhaust.emit_lane_event
+
+    def _blocked_emit(text: str, event_id: str = "") -> bool:
+        exhaust._BLOCKED_EMIT_CALLS.append((text, event_id))
+        if os.environ.get("PANEWIRE_BIN"):
+            return real_emit(text, event_id)
+        return False
+
+    _blocked_emit._test_stub = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(exhaust, "emit_lane_event", _blocked_emit)
+
+    class _GuardedSubprocess:
+        DEVNULL = _subprocess.DEVNULL
+        PIPE = _subprocess.PIPE
+        TimeoutExpired = _subprocess.TimeoutExpired
+
+        @staticmethod
+        def run(argv, *args, **kwargs):
+            if not os.environ.get("PANEWIRE_BIN"):
+                raise AssertionError(f"tests: real panewire subprocess blocked: {argv}")
+            return _subprocess.run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(exhaust, "subprocess", _GuardedSubprocess)
+    yield
+    exhaust._BLOCKED_EMIT_CALLS.clear()

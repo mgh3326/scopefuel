@@ -758,14 +758,18 @@ def _required_windows(pool: str) -> frozenset[str]:
 
 def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> tuple[float, float] | None:
     """Return an automatic account-bucket breach, including warning results."""
-    from .policy import get_policy
+    from .policy import get_cutoff, get_policy
     from .recommend import PRESERVE_EXCLUDE_PCT, SPEND_EXCLUDE_PCT
 
     fallback_class = result.pool_class if result.pool_class in {"preserve", "spend"} else "preserve"
     effective_class = get_policy(result.id, fallback_class, today=_as_utc(now).date())[0]
     if effective_class == "exclude":
         return None
-    cutoff = SPEND_EXCLUDE_PCT if effective_class == "spend" else PRESERVE_EXCLUDE_PCT
+    # task #638: pool-level ``cutoff`` config applies here too — the manual
+    # fallback guard must honor the same threshold the gate enforces.
+    cutoff, _cutoff_status = get_cutoff(
+        result.id, SPEND_EXCLUDE_PCT if effective_class == "spend" else PRESERVE_EXCLUDE_PCT
+    )
     confirmed = [
         float(bucket.used_pct)
         for bucket in result.buckets
