@@ -23,6 +23,10 @@ def _origin(url: str) -> tuple[str, str, int | None] | None:
         return None
 
 
+class _RedirectRefused(urllib.error.HTTPError):
+    """_SameOriginRedirectHandler 가 거부한 redirect — HttpError 변환 시 사유 표식으로 쓴다."""
+
+
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     """같은 origin(scheme·host·port) 안의 redirect 만 따라간다.
 
@@ -30,13 +34,13 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     redirect 요청에 그대로 복사한다 — Authorization bearer 가 다른 origin 이나
     https→http 다운그레이드로 새는 CWE-319. spec.py 처럼 자격이 Authorization 이
     아닌 헤더에 실리는 호출자도 있어, 헤더를 지우는 대신 cross-origin redirect
-    자체를 거부한다. 거부하면 urlopen 은 3xx 를 HTTPError 로 올린다.
+    자체를 거부한다. 거부하면 호출자는 3xx 를 HttpError 로 받는다.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         origin = _origin(req.full_url)
         if origin is None or origin != _origin(newurl):
-            return None
+            raise _RedirectRefused(req.full_url, code, "cross-origin redirect refused", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -112,13 +116,9 @@ def request_json(
         body_text = exc.read().decode("utf-8", "replace")
         if 300 <= exc.code < 400:
             # 거부된 redirect 의 본문에는 Location 목적지(URL 쿼리 포함)가 들어갈 수 있다.
-            # 목적지 대신 사유만 남긴다 — 같은 origin 루프 상한 종료는 사유 없이 그대로.
-            loc = exc.headers.get("Location") if exc.headers is not None else None
-            prev = getattr(exc, "url", None) or url
-            prev_origin = _origin(prev)
-            body_text = ""
-            if loc and (prev_origin is None or prev_origin != _origin(urllib.parse.urljoin(prev, loc))):
-                body_text = "cross-origin redirect refused"
+            # 사유 표식은 거부 판정과 1:1 인 _RedirectRefused 에만 붙는다 — 같은
+            # origin 루프 상한 등 다른 3xx 는 사유 없이 본문만 비운다.
+            body_text = "cross-origin redirect refused" if isinstance(exc, _RedirectRefused) else ""
         raise HttpError(exc.code, body_text, _retry_after_seconds(exc)) from exc
     text = payload.decode("utf-8", "replace").strip()
     if not text:

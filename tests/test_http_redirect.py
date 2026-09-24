@@ -187,7 +187,19 @@ def test_same_origin_post_307_raises(make_server):
     )
     assert result is None
     assert _refused(err)
+    assert err.body == ""  # 거부된 게 아니라 urllib 자체 거부 — 사유 표식 없음
     assert len(a.received) == 1
+
+
+def test_same_origin_redirect_loop_has_no_marker(make_server):
+    """같은 origin 자기 루프는 상한 종료 — cross-origin 표식이 붙으면 안 된다."""
+    a = make_server()
+    a.routes["/start"] = ("redirect", "/start")
+    result, err = _run(f"{a.base_url}/start", headers={"Authorization": f"Bearer {FAKE_TOKEN}"})
+    assert result is None
+    assert _refused(err)
+    assert err.body == ""
+    assert len(a.received) > 1
 
 
 # ---------------------------------------------------------- cross origin
