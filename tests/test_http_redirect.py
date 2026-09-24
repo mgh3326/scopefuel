@@ -1,7 +1,7 @@
 """#615: request_json 은 같은 origin(scheme·host·port) 안의 redirect 만 따라간다.
 
 CPython 기본 HTTPRedirectHandler 는 redirect 시 Authorization 을 포함한 헤더를
-그대로 복사해 다른 origin·https→http 로 bearer 가 샌다(CWE-319). 여기 서 두
+그대로 복사해 다른 origin·https→http 로 bearer 가 샌다(CWE-319). 여기서 두
 서버는 모두 loopback 에 뜨지만 포트가 달라 서로 다른 origin 역할을 한다.
 토큰 값은 모두 가짜이고, handler 는 request line 을 로그에 남기지 않는다.
 """
@@ -238,6 +238,25 @@ def test_http_to_https_upgrade_refused(make_server):
     assert len(a.received) == 1
 
 
+def test_exotic_port_caller_url_refuses_redirect(make_server):
+    """`:+PORT` — http.client int() 는 받지만 urlsplit 은 거부한다. origin 해석 불가 → 거부.
+
+    독립 tester 가 찾아낸 커버리지 공백(NICE-1/M4): `_origin(req.full_url)` 이
+    None 을 돌려주는 호출자 URL 로는 가드의 `origin is None` 분기만이 막는다.
+    """
+    a, b = make_server(), make_server()
+    # Location 도 `:+PORT` — 양쪽 origin 이 모두 None 이어도 따라가면 안 된다.
+    a.routes["/start"] = ("redirect", f"http://127.0.0.1:+{b.server_address[1]}/final")
+    result, err = _run(
+        f"http://127.0.0.1:+{a.server_address[1]}/start",
+        headers={"Authorization": f"Bearer {FAKE_TOKEN}"},
+    )
+    assert result is None
+    assert _refused(err)
+    assert "cross-origin" in err.body
+    assert b.received == []
+
+
 def test_multi_hop_redirect_stops_at_boundary(make_server):
     """A→A 는 따라가고(Authorization 유지), A→B hop 에서 멈춘다."""
     a, b = make_server(), make_server()
@@ -260,6 +279,7 @@ def test_refused_redirect_does_not_leak_location_in_error(make_server):
     assert _refused(err)
     assert "secret-query" not in str(err)
     assert "secret-query" not in err.body
+    assert "cross-origin" in err.body  # 사유는 남고 목적지는 안 샌다
 
 
 # --------------------------------------------------------- origin 판정 단위
@@ -274,6 +294,7 @@ def test_refused_redirect_does_not_leak_location_in_error(make_server):
         ("http://EXAMPLE.com/x", "http://example.com/y", True),  # host 대소문자
         ("http://u:p@a.com/", "http://a.com/", True),  # userinfo 는 origin 이 아니다
         ("http://a.com", "http://a.com:8080", False),  # 포트만 다름
+        ("http://a.com:0", "http://a.com", False),  # 포트 0 은 기본 포트가 아니다
         ("https://a.com", "http://a.com", False),  # downgrade
         ("http://a.com@evil.com/", "http://a.com/", False),  # userinfo 로 host 위장
         ("http://a.com.", "http://a.com", False),  # trailing dot — fail-closed
@@ -287,3 +308,4 @@ def test_origin_comparison(left, right, same):
 
 def test_origin_unparseable_is_none():
     assert _origin("http://a.com:not-a-port/") is None
+    assert _origin("http://a.com:+8080/") is None  # http.client int() 는 받는 꼴

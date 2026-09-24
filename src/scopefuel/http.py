@@ -15,7 +15,9 @@ def _origin(url: str) -> tuple[str, str, int | None] | None:
     """redirect 판정용 (scheme, host, port). 기본 포트는 정규화하고, 해석 불가면 None."""
     try:
         parsed = urllib.parse.urlsplit(url)
-        port = parsed.port or _DEFAULT_PORTS.get(parsed.scheme.lower())
+        port = parsed.port
+        if port is None:
+            port = _DEFAULT_PORTS.get(parsed.scheme.lower())
         return parsed.scheme.lower(), parsed.hostname or "", port
     except ValueError:
         return None
@@ -110,7 +112,13 @@ def request_json(
         body_text = exc.read().decode("utf-8", "replace")
         if 300 <= exc.code < 400:
             # 거부된 redirect 의 본문에는 Location 목적지(URL 쿼리 포함)가 들어갈 수 있다.
+            # 목적지 대신 사유만 남긴다 — 같은 origin 루프 상한 종료는 사유 없이 그대로.
+            loc = exc.headers.get("Location") if exc.headers is not None else None
+            prev = getattr(exc, "url", None) or url
+            prev_origin = _origin(prev)
             body_text = ""
+            if loc and (prev_origin is None or prev_origin != _origin(urllib.parse.urljoin(prev, loc))):
+                body_text = "cross-origin redirect refused"
         raise HttpError(exc.code, body_text, _retry_after_seconds(exc)) from exc
     text = payload.decode("utf-8", "replace").strip()
     if not text:
