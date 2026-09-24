@@ -119,6 +119,18 @@ types = [
         "accept",
     ),
     ("model ref list", lambda e: e["buckets"][0].update(scope={"kind": "model", "ref": []}), "reject"),
+    # JSON \u escapes of UTF-16 surrogates: a pair is one character; a lone one is not UTF-8 (§2, no repair)
+    ("label surrogate pair", setf("b0.label", "\U0001f600"), "accept"),
+    ("label lone high surrogate", setf("b0.label", "\ud800"), "reject"),
+    ("label lone low surrogate", setf("b0.label", "x\udc00"), "reject"),
+    ("label two high surrogates", setf("b0.label", "\ud800\ud800"), "reject"),
+    ("label reversed pair", setf("b0.label", "\ude00\ud83d"), "reject"),
+    ("label backslash-u text (not an escape)", setf("b0.label", "\\ud800"), "accept"),
+    (
+        "model ref lone surrogate",
+        lambda e: e["buckets"][0].update(scope={"kind": "model", "ref": "\ud800"}),
+        "reject",
+    ),
 ]
 for i, (name, change, expect) in enumerate(types):
     add(f"P-Y{i:02d}", expect, change, note=name)
@@ -161,5 +173,6 @@ add(
 )
 
 out = pathlib.Path("tests/fixtures/quota_v2_parity_r3.json")
-out.write_text(json.dumps(rows, ensure_ascii=False, indent=1) + "\n")
+# ASCII output: lone surrogates can only be written as \u escapes.
+out.write_text(json.dumps(rows, ensure_ascii=True, indent=1) + "\n")
 print(len(rows), "rows;", sum(r["expect"] == "accept" for r in rows), "accept")

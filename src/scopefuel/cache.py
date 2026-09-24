@@ -409,15 +409,16 @@ def collect(
                 retry_after_s=retry_after,
             )
 
-    # task #578 — v2 records each attempt with its completion time (start = now).
+    # task #578 — v2 records each attempt with its completion time: `now` plus the
+    # time since collect began (so a fetch that waited for a worker is not stamped early).
     elapsed: dict[int, float] = {}
+    collect_started = time.monotonic()
 
     def timed(index: int, fetcher: object) -> ProviderResult:
-        started = time.monotonic()
         try:
             return fetch_one(fetcher)
         finally:
-            elapsed[index] = time.monotonic() - started
+            elapsed[index] = time.monotonic() - collect_started
 
     fetched: dict[int, Future[ProviderResult]] = {}
     if misses:

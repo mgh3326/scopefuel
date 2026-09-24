@@ -159,7 +159,11 @@ def _text_ok(value: object) -> bool:
     """UTF-8 1..128 bytes, no C0/DEL/C1 control characters (§2)."""
     if not isinstance(value, str) or not value:
         return False
-    if len(value.encode("utf-8")) > 128:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate (JSON "\ud800") is not UTF-8: reject, never repair
+        return False
+    if len(encoded) > 128:
         return False
     return not any(_is_control(c) for c in value)
 
@@ -182,6 +186,19 @@ def _member(value: object, allowed: frozenset[str]) -> bool:
 
 def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def identity_fields_ok(identity: Mapping) -> bool:
+    """§6 I: the execution identity's own fields have the §2 shapes of the fields they must match."""
+    return (
+        _ascii_match(_PROVIDER_RE, identity.get("provider"))
+        and _ascii_match(_ACCOUNT_RE, identity.get("account_ref"))
+        and _ascii_match(_ID_RE, identity.get("entitlement_ref"))
+        and _ascii_match(_MACHINE_RE, identity.get("machine_id"))
+        and _ascii_match(_ID_RE, identity.get("local_slot_ref"))
+        and _is_int(identity.get("binding_revision"))
+        and identity["binding_revision"] >= 1
+    )
 
 
 def bucket_errors(bucket: object) -> list[str]:

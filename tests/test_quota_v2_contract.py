@@ -181,7 +181,7 @@ def test_parity_row(row):
 SHARED_FIXTURE_SHA256 = {
     "quota_v2_contract_r3.json": "904f80ffebd941b87021c65a25e3bdfc99b45990f031b7c93decd4d4a7c35490",
     "quota_v2_wire_r3.json": "efdbf028a29fa3dc64a637fbe925aac5c3c389a79a08fe9b60fe52875f1ea02c",
-    "quota_v2_parity_r3.json": "7f8fbfc0ee3a1253599819b81a2a620340a67060a56473031943c2a1c8c09a83",
+    "quota_v2_parity_r3.json": "5c21150ce5d755456c83c93b17feaac8278bc2d59dbc04b969754a1b5d010e74",
 }
 
 
@@ -320,6 +320,23 @@ def test_collect_stamps_completion_not_start(slot_env, monkeypatch):
     assert [r["measured_at"] for r in rows] == [corpus.at(503.5)]
 
 
+def test_collect_stamps_completion_after_a_worker_queue_wait(slot_env, monkeypatch):
+    """§5.1: a fetch that waited for a free worker is stamped when it completed, not start + own duration."""
+    mirror(slot_env, -3600, 86400)
+    ticks = iter([1.0, 2.0, 3.0])  # collect begins, the first fetch ends, the claude fetch ends
+    monkeypatch.setattr(
+        cache, "time", types.SimpleNamespace(time=__import__("time").time, monotonic=lambda: next(ticks))
+    )
+    monkeypatch.setattr(cache, "MAX_FETCH_WORKERS", 1)
+    cache.collect(
+        {"other": lambda: ProviderResult(id="other"), "claude": claude_result},
+        ["other", "claude"],
+        now=epoch(500),
+    )
+    rows = quota_v2.account_observations("claude", "acct_7k2m9q4x")
+    assert [r["measured_at"] for r in rows] == [corpus.at(502)]
+
+
 def test_collect_does_not_record_when_the_binding_expires_during_the_fetch(slot_env, monkeypatch):
     """RC03 through the real collect path: start inside the window, completion after it."""
     mirror(slot_env, -60, 502)
@@ -384,3 +401,31 @@ def test_recorder_skips_a_backoff_result(slot_env):
     result.backoff_until = epoch(1400)
     quota_v2.record_attempts({"claude": (result, epoch(501))}, started_at=epoch(500), identities=identities)
     assert quota_v2.account_observations("claude", "acct_7k2m9q4x") == []
+
+
+def test_a_lone_surrogate_label_is_excluded_not_raised():
+    """§2 + X2: an unencodable label makes that one observation invalid; evaluate still answers."""
+    case = {"obs": []}
+    good = corpus.observation(case, {"id": "s1", "t": 500, "vals": "claude.std"})
+    bad = corpus.observation(case, {"id": "s2", "t": 560, "vals": "claude.std"})
+    bad["buckets"][0]["label"] = "5h\ud800"
+    result = run_evaluate(case, [good, bad])
+    assert result.excluded.get("invalid") == 1
+    assert result.selected == ("s1",)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"account": "not-an-acct"},
+        {"revision": 0},
+        {"slot": "Slot A"},
+        {"machine": "node_a!"},
+        {"entitlement": ""},
+    ],
+)
+def test_a_malformed_identity_is_identity_unknown(identity):
+    """§6 I: a malformed execution identity is IDENTITY_UNKNOWN, not a usable identity."""
+    case = {"identity": identity}
+    observations = [corpus.observation(case, {"id": "s1", "t": 500, "vals": "claude.std"})]
+    assert run_evaluate(case, observations).code == "IDENTITY_UNKNOWN"

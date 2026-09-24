@@ -22,6 +22,7 @@ from .quota_v2_contract import (
     STALE_MAX_S,
     SUPPORT_LIST,
     ProviderContract,
+    identity_fields_ok,
     parse_time,
     valid_stored,
 )
@@ -117,7 +118,7 @@ def _identity(raw: object, provider: str, now: dt.datetime) -> dict | None:
         "valid_from",
         "valid_until",
     )
-    if any(k not in raw for k in keys) or raw["provider"] != provider:
+    if any(k not in raw for k in keys) or raw["provider"] != provider or not identity_fields_ok(raw):
         return None
     start, end = parse_time(raw["valid_from"]), parse_time(raw["valid_until"])
     if start is None or end is None or not start < end or not start <= now < end:
