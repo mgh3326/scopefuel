@@ -60,8 +60,13 @@ def request_json(
     body: dict | None = None,
     timeout: float = 20.0,
     insecure: bool = False,
+    status_out: list[int] | None = None,
 ) -> dict:
-    """JSON 요청/응답. insecure=True 는 localhost 자체서명 인증서 전용."""
+    """JSON 요청/응답. insecure=True 는 localhost 자체서명 인증서 전용.
+
+    ``status_out`` (task #578): 주어지면 응답의 HTTP status 를 덧붙인다 — 200 이 아닌
+    2xx 도 구분해야 하는 호출자용이며, 반환값·예외는 그대로다.
+    """
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     ctx = None
@@ -71,8 +76,12 @@ def request_json(
         ctx.verify_mode = ssl.CERT_NONE
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            if status_out is not None:
+                status_out.append(resp.status)
             payload = resp.read()
     except urllib.error.HTTPError as exc:  # 상태코드를 보존해 401/429를 구분한다
+        if status_out is not None:
+            status_out.append(exc.code)
         raise HttpError(exc.code, exc.read().decode("utf-8", "replace"), _retry_after_seconds(exc)) from exc
     text = payload.decode("utf-8", "replace").strip()
     if not text:

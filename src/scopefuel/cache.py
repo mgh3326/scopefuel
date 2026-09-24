@@ -409,17 +409,29 @@ def collect(
                 retry_after_s=retry_after,
             )
 
+    # task #578 — v2 records each attempt with its completion time (start = now).
+    elapsed: dict[int, float] = {}
+
+    def timed(index: int, fetcher: object) -> ProviderResult:
+        started = time.monotonic()
+        try:
+            return fetch_one(fetcher)
+        finally:
+            elapsed[index] = time.monotonic() - started
+
     fetched: dict[int, Future[ProviderResult]] = {}
     if misses:
         with ThreadPoolExecutor(max_workers=min(MAX_FETCH_WORKERS, len(misses))) as pool:
             for index, _name, fetcher, _entry, _policy_class in misses:
-                fetched[index] = pool.submit(fetch_one, fetcher)
+                fetched[index] = pool.submit(timed, index, fetcher)
 
     successes: dict[str, ProviderResult] = {}
     failures: dict[str, ProviderResult] = {}
+    v2_attempts: dict[str, tuple[ProviderResult, float]] = {}
     for index, name, _fetcher, entry, policy_class in misses:
         result = fetched[index].result()
         result.id = name
+        v2_attempts[name] = (result, now + elapsed.get(index, 0.0))
 
         result.pool_class = _effective_class(name, _fetcher, result.pool_class)
 
@@ -465,7 +477,7 @@ def collect(
         # (캐시 히트·backoff 는 여기 오지 않는다). legacy 캐시와는 별 파일이다.
         if v2_identities:
             with suppress(Exception):
-                quota_v2.record_fetch(successes, failures, measured_at=now, identities=v2_identities)
+                quota_v2.record_attempts(v2_attempts, started_at=now, identities=v2_identities)
     return [result for result in results if result is not None]
 
 

@@ -599,12 +599,13 @@ def _manual_gate_audit(
 def _shadow_gate(
     args, fetchers, automatic_results, result, exit_code, now, bench_scores, model_prices, grade_table
 ) -> None:
+    # The shadow evaluates at its own moment: the attempts it reads were stamped
+    # at fetch completion, after the gate's `now` was taken (contract §5.1, §5.6).
     quota_v2.shadow_gate(
         profile=args.profile,
         legacy=result,
         legacy_exit=exit_code,
-        now=now,
-        names=list(fetchers),
+        now=dt.datetime.now(dt.UTC),
         pool_classes={item.id: item.pool_class for item in automatic_results},
         bench_scores=bench_scores,
         model_prices=model_prices,
@@ -926,16 +927,13 @@ def _quota_v2_command(args: argparse.Namespace, fetchers: dict[str, object]) -> 
             if identity is None:
                 print(f"error: 신원 불명 ({reason})", file=sys.stderr)
                 return 4
-            for obs in quota_v2.account_observations(identity.provider, identity.account_ref):
-                if obs["source_machine"] == identity.machine_id and obs.get("received_at") is None:
-                    print(json.dumps(obs, ensure_ascii=False))
+            for obs in quota_v2.export_observations(identity):
+                print(json.dumps(obs, ensure_ascii=False))
             return 0
-        identities: dict[str, quota_v2.Identity | None] = {}
-        reasons: dict[str, str] = {}
-        for name in fetchers:
-            identities[name], reasons[name] = quota_v2.resolve_identity(name, now.timestamp())
+        provider, _ = recommend.profile_pool(args.profile)
+        identity, _reason = quota_v2.resolve_identity(provider, now.timestamp())
         evaluation = quota_v2.evaluate(
-            quota_v2.snapshot_for(identities, reasons=reasons), args.profile, now=now, purpose=args.purpose
+            quota_v2.snapshot_for(provider, identity), args.profile, now=now, purpose=args.purpose
         )
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

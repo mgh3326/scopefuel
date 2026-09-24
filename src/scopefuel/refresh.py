@@ -94,11 +94,11 @@ def _v2_capture(pool: str, now: float) -> dict:
         return {}
 
 
-def _v2_record(successes: dict, failures: dict, now: float, identities: dict) -> None:
+def _v2_record(pool: str, result, started_at: float, completed_at: float, identities: dict) -> None:
     if not identities:
         return
     with contextlib.suppress(Exception):
-        quota_v2.record_fetch(successes, failures, measured_at=now, identities=identities)
+        quota_v2.record_attempts({pool: (result, completed_at)}, started_at=started_at, identities=identities)
 
 
 def run_worker(fetchers: dict[str, object], pool: str) -> int:
@@ -123,11 +123,13 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
                 return 0
             fetcher = fetchers[pool]
             v2_identities = _v2_capture(pool, now)
+            started_at = now
             result = _fetch(fetcher, pool)
+            completed_at = time.time()
             if result.error or result.warning:
                 detail = result.error or result.warning
                 cache.record_failure(pool, result, now)
-                _v2_record({}, {pool: result}, now, v2_identities)
+                _v2_record(pool, result, started_at, completed_at, v2_identities)
                 print(
                     f"refresh: pool={pool} failed: status={result.http_status or '-'} "
                     f"kind={result.error_kind or '-'} detail={detail}",
@@ -142,7 +144,7 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
             result.age_s = 0.0
             result.stale = False
             cache.update_entry(pool, result, now)
-            _v2_record({pool: result}, {}, now, v2_identities)
+            _v2_record(pool, result, started_at, completed_at, v2_identities)
             print(f"refresh: pool={pool} updated fetched_at={now:.6f}", flush=True)
             return 0
         finally:
