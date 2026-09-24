@@ -99,14 +99,19 @@ scopefuel manual clear --pool claude
 ## gate — 프로필 스폰 판정
 
 ```bash
-scopefuel gate -m fable                      # exit 0=가능 / 3=차단 / 4=측정불가
-scopefuel gate -m fable --gate-output f.json # 판정 감사 레코드(JSON)를 파일로 저장
+scopefuel gate -m fable --operator-request hk:task/625        # exit 0=가능 / 3=차단 / 4=측정불가
+scopefuel gate -m fable --operator-request hk:task/625 --gate-output f.json  # 감사 레코드(JSON)
 ```
 
 `fable`은 급표(GRADE_TABLE) 밖의 운영자 명시 자문 전용 프로필입니다(ROB-591,
-`CONSULT_ONLY_PROFILES`). `--recommend`의 후보·승급 후보에는 나오지 않고, 명시한
-`gate -m fable`은 쿼타·cutoff·provider 상태·policy `exclude`만으로 판정합니다(escalation이
-아니므로 `--operator-request`는 `operator_request_not_applicable`로 거부).
+`CONSULT_ONLY_PROFILES`). `--recommend`의 후보·승급 후보에는 나오지 않습니다. `gate -m
+fable`은 `policy launch`와 같은 consult_only 규칙을 적용합니다(#625): 유효한
+`--operator-request` 없이는 거부되고, 있으면 쿼타·cutoff·provider 상태·policy
+`exclude`를 검사한 뒤 통과 시 감사 필드를 남깁니다.
+
+```bash
+scopefuel gate -m fable --operator-request hk:task/625 --requested-by operator
+```
 
 escalation 프로필(GRADE_TABLE의 `gate="escalation"` 행, 예: `oc-omni`)은 같은 grade의 정상
 후보가 하나라도 가용하면 차단됩니다. 운영자가 그 프로필을 명시 지정한 경우에만 아래 경로로 그
@@ -118,7 +123,8 @@ scopefuel gate -m oc-omni --operator-request hk:task/461 --requested-by operator
 
 - `--operator-request REF` — durable 참조만 받습니다: `hk:doc/<key>` 또는 `hk:task/<정수>`.
   자유 텍스트·경로 탐색·허용 문자 밖·초장 입력은 `operator_request_ref_invalid`로 거부합니다.
-  escalation이 아닌 프로필에 주면 `operator_request_not_applicable`로 거부합니다(무시하지 않음).
+  escalation도 consult_only도 아닌 프로필에 주면 `operator_request_not_applicable`로
+  거부합니다(무시하지 않음).
 - 이 경로는 **감사 가능한 주장을 기록하는 경로이며 운영자 신원이나 동의를 증명하지 않습니다.**
   플래그를 넣는 주체가 에이전트일 수 있고 `--requested-by`도 자기신고(미지정 시 `unknown`)입니다.
   scopefuel은 REF를 해석하지 않으므로 기록은 항상 `ref_resolution=unverified`입니다.
