@@ -16,7 +16,14 @@ hk 는 dict-backed fake 이다 — ``quota_share.request_json`` 을 바꿔 실 �
 - M8  (#659) 다른 컨텍스트에서 uuid 읽기(기본 .claude.json) → cross-context 테스트가 RED
 - M9  (#659) measured_by.account_fp 검사 제거 → provenance mismatch 테스트가 RED
 - M10 (#659) kind=="account" 게시 게이트 제거 → token-fallback 거부 테스트가 RED
-- M11 (#659) keychain-토큰 SSCD≠CCD 가드 제거 → uuid-unbound 테스트가 RED
+- M11 (#659) SSCD≠CCD 컨텍스트 가드 제거(파일·keychain 자격 공통) → uuid-unbound 테스트가 RED
+
+검증자(v659 R1)가 확인한 생존-그러나-정상 뮤턴트(의도된 미고정, 여기에 기록):
+- M2b: 15→15.5분 수용 — REMOTE_MAX_AGE_S 는 절대 경계가 아니라 정책이다.
+- M2f: 미래 스큐 60→3600초 — NTP 드리프트 여유분, 방향만 고정됐다.
+- F3:  토큰 폴백 지문 공식 변경 — 폴백은 로컬 전용이라 공식이 계약이 아니다.
+- F9:  session_fp 미검증 — provenance 전용 필드라 신뢰 경계가 아니다.
+- A7/A9: NFC 정규화 제거/NFD — ASCII 경로에서 동등 변형이다.
 """
 
 from __future__ import annotations
@@ -1072,13 +1079,99 @@ def test_keychain_token_from_other_secure_context_is_uuid_unbound(monkeypatch, t
     assert result.error is None
     assert result.account_fp_kind == "token"  # uuid 묶음 거부 → 게시 불가
     assert result.account_fp == hashlib.sha256(b"max|kc-token-b").hexdigest()[:16]
-    assert "secure-storage" in (result.note or "")  # 거부 사유가 보인다(AC1)
+    assert "SSCD" in (result.note or "")  # 거부 사유가 보인다(AC1)
 
-    # 같은 환경에서 파일 자격(CCD/.credentials.json)은 같은 컨텍스트라 묶인다.
-    (cfg / ".credentials.json").write_text(blob)
+    # 같은 환경에서 파일 자격도 SSCD 아래에 둔다(aw() 규칙) — 여전히 SSCD≠CCD
+    # 이므로 묶이지 않고, SSCD 를 CCD 와 같게 두면 정상적으로 묶인다.
+    sscd = tmp_path / "sscd-other"
+    sscd.mkdir()
+    (sscd / ".credentials.json").write_text(blob)
+    result2 = claude.fetch()
+    assert result2.source == "oauth-usage-api"  # 파일 출처
+    assert result2.account_fp_kind == "token"
+
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(cfg))
+    result3 = claude.fetch()
+    assert result3.account_fp_kind == "account"
+    assert result3.account_fp == hashlib.sha256(b"claude-account|max|u-A").hexdigest()[:16]
+
+
+def test_credentials_file_follows_secure_storage_context(monkeypatch, tmp_path):
+    """S-1 — SSCD 가 있으면 평문 자격은 ``$SSCD/.credentials.json`` 이다.
+
+    Claude Code 의 ``ke()``/``aw()`` 규칙과 같아야 한다 — 아니면 CCD 에 남은
+    잔재 자격을 집어 다른 계정으로 오귀속된다. 파일 출처 토큰도 SSCD≠CCD
+    이면 uuid 묶음을 거부한다(컨텍스트가 다르다).
+    """
+    ccd = tmp_path / "ccd-ctx"
+    sscd = tmp_path / "sscd-ctx"
+    ccd.mkdir()
+    sscd.mkdir()
+    (ccd / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-B"}}))
+    # CCD 에는 이전 로그인의 잔재, SSCD 에는 현재 토큰이 있다.
+    (ccd / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok-stale-A", "subscriptionType": "max"}})
+    )
+    (sscd / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok-live-B", "subscriptionType": "max"}})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(ccd))
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(sscd))
+    monkeypatch.setattr(claude, "_read_keychain", lambda: None)
+    seen: list[str] = []
+
+    def _usage(*a, headers=None, **k):
+        seen.append((headers or {}).get("Authorization", ""))
+        return {"five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"}}
+
+    monkeypatch.setattr(claude, "request_json", _usage)
+    result = claude.fetch()
+
+    assert seen == ["Bearer tok-live-B"]  # CCD 잔재가 아니라 SSCD 파일을 읽었다
+    assert result.error is None
+    assert result.source == "oauth-usage-api"  # 파일 출처
+    # 자격(SSCD)과 uuid(CCD)의 컨텍스트가 다르므로 묶지 않는다 → 게시 불가.
+    assert result.account_fp_kind == "token"
+    assert result.account_fp == hashlib.sha256(b"max|tok-live-B").hexdigest()[:16]
+    assert "SSCD" in (result.note or "")
+
+    # SSCD == CCD(같은 컨텍스트)면 정상적으로 묶인다.
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(ccd))
     result2 = claude.fetch()
     assert result2.account_fp_kind == "account"
-    assert result2.account_fp == hashlib.sha256(b"claude-account|max|u-A").hexdigest()[:16]
+
+
+def test_keychain_miss_never_falls_back_to_default_item(monkeypatch, tmp_path):
+    """S-3/A4 — 접미사 아이템 miss 시 무접미사 기본 아이템으로 폴백하지 않는다.
+
+    무접미사 아이템은 기본 컨텍스트(다른 계정일 수 있는)의 것이다. 스텁이
+    무접미사 서비스에만 blob 을 돌려줘도 조회 자체가 일어나지 않아야 한다.
+    """
+    cfg = tmp_path / "ccd-ctx"
+    cfg.mkdir()
+    (cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-A"}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    blob = json.dumps({"claudeAiOauth": {"accessToken": "default-tok", "subscriptionType": "max"}})
+    services: list[str] = []
+
+    def _run(argv, **_k):
+        assert argv[:3] == ["security", "find-generic-password", "-s"]
+        services.append(argv[3])
+        hit = argv[3] == "Claude Code-credentials"  # 무접미사에만 blob
+        return SimpleNamespace(returncode=0 if hit else 1, stdout=blob if hit else "")
+
+    monkeypatch.setattr(claude.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        claude,
+        "subprocess",
+        SimpleNamespace(run=_run, SubprocessError=subprocess.SubprocessError),
+    )
+
+    result = claude.fetch()
+
+    expected = "Claude Code-credentials-" + hashlib.sha256(str(cfg).encode()).hexdigest()[:8]
+    assert services == [expected]  # miss 후 무접미사 아이템을 조회하지 않는다
+    assert result.error_kind == "credentials"
 
 
 def test_default_context_reads_unsuffixed_item(monkeypatch, tmp_path):
@@ -1316,3 +1409,168 @@ def test_snapshot_host_sanitized_on_read_and_write(monkeypatch):
     assert quota_share.publish_result("claude", _ok(), now=EPOCH + 1) is True
     payload = json.loads(hk.puts[-1][1]["body"])
     assert payload["measured_by"]["host"] == "unknown"
+
+
+def test_legacy_snapshot_refused_on_body_fp_mismatch(monkeypatch):
+    """S-2/G2 — ``measured_by`` 없는 legacy(#654) 문서는 본문 account_fp 검사가 유일한 방어선.
+
+    새 provenance 검사는 ``measured_by.account_fp`` 가 있을 때만 태우므로,
+    운영 중인 구형 게시자의 문서는 본문 지문 대조가 마지막 방어다.
+    """
+    hk = _enable(monkeypatch)
+    key = _seed_remote(hk, measured_at=EPOCH - 60.0)
+    legacy = json.loads(hk.docs[key]["body"])
+    legacy.pop("measured_by", None)  # #654 형태 — provenance 필드 없음
+    for bucket in legacy["buckets"]:
+        bucket.pop("measured_by", None)
+    legacy["account_fp"] = FP_B  # 본문 지문 변조
+    hk.docs[key]["body"] = json.dumps(legacy)
+    results = cache.collect(
+        {"claude": _failing("HTTP 401", kind="auth", status=401)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert results[0].source != quota_share.REMOTE_SOURCE
+
+    # 대조: 본문 지문이 맞는 legacy 문서는 여전히 수용한다(#654 호환).
+    legacy["account_fp"] = FP_A
+    hk.docs[key]["body"] = json.dumps(legacy)
+    results = cache.collect(
+        {"claude": _failing("HTTP 401", kind="auth", status=401)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert results[0].source == quota_share.REMOTE_SOURCE
+
+
+def test_account_label_sanitized_on_fetch(monkeypatch, tmp_path):
+    """S-6/B7 — ``_account_label`` 의 safe_label 제거 뮤턴트를 잡는다.
+
+    개인 계정의 실제 기본 형태 ``person@example.com's Organization`` 처럼
+    '@' 가 든 org 이름은 fetch 결과의 라벨로 새면 안 된다.
+    """
+    cfg = tmp_path / "ccd-ctx"
+    cfg.mkdir()
+    (cfg / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok", "subscriptionType": "max"}})
+    )
+    (cfg / ".claude.json").write_text(
+        json.dumps(
+            {
+                "oauthAccount": {
+                    "accountUuid": "u-A",
+                    "organizationName": "person@example.com's Organization",
+                    "emailAddress": "person@example.com",
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    monkeypatch.setattr(claude, "_read_keychain", lambda: None)
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+
+    result = claude.fetch()
+    assert result.account_label is None  # '@' 라벨은 통째로 버린다
+    assert "example.com" not in json.dumps(result.as_dict(), ensure_ascii=False)
+
+
+def test_snapshot_host_sanitized_without_newline(monkeypatch):
+    """N-3 — 줄바꿈 없는 따옴표·공백 host 도 'unknown' 으로 접힌다."""
+    hk = _enable(monkeypatch)
+    _seed_remote(hk, measured_at=EPOCH - 60.0, host='evil" ok=1 class=spend x="')
+    results = cache.collect(
+        {"claude": _failing("HTTP 429", kind="rate_limited", status=429)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    remote = results[0]
+    assert remote.source == quota_share.REMOTE_SOURCE
+    assert remote.note == "remote measured (unknown) · account fp-accou"
+    assert "ok=1" not in remote.note
+
+
+def test_brief_shows_account_tag_without_at_sign():
+    """N-2 — brief 한 줄에 계정 태그가 보인다(구분자는 '@' 가 아니다)."""
+    from scopefuel import render
+
+    out = render.brief([_ok(label="Acme Corp")], color=False, now=NOW)
+    assert "claude acct=fp-accou (Acme Corp)" in out
+    assert "claude@" not in out
+
+
+def test_cache_hit_restores_account_tag_fields():
+    """N-1 — 캐시 히트도 account_fp_kind·account_label 을 복원한다."""
+    entry = cache._to_entry(_ok(label="Acme Corp"), now=EPOCH)
+    restored = cache._from_entry(entry, "claude", now=EPOCH + 5)
+    assert restored.account_fp == FP_A
+    assert restored.account_fp_kind == "account"
+    assert restored.account_label == "Acme Corp"
+
+
+def test_token_fp_tag_does_not_claim_account():
+    """N-4 — 토큰 폴백 지문은 계정 정체가 아니므로 ``token:`` 접두로 구분한다."""
+    from scopefuel import render
+    from scopefuel.model import account_tag
+
+    assert account_tag("deadbeefcafe", "Org", kind="token") == "token:deadbeef (Org)"
+    assert account_tag("deadbeefcafe", "Org", kind="account") == "deadbeef (Org)"
+    assert account_tag("deadbeefcafe", "Org") == "deadbeef (Org)"
+
+    out = render.table([_ok(fp="deadbeefcafe", fp_kind="token", label="Org")], color=False, now=NOW)
+    assert "account token:deadbeef (Org)" in out.splitlines()[0]
+
+
+def test_gate_deny_line_shows_account_tag(monkeypatch, capsys):
+    """S-4 — 거부 게이트 줄에도 어느 계정이 소진됐는지 보인다."""
+    fetch = lambda: _ok(label="Acme Corp")  # noqa: E731
+    fetch.pool_class = "spend"
+
+    def _full(*a, **k):
+        return ProviderResult(
+            id="claude",
+            plan="claude_max",
+            buckets=[_bucket("5h", 100.0), _bucket("7d", 100.0, hours_ahead=160.0)],
+            source="oauth-usage-api",
+            http_status=200,
+            account_fp=FP_A,
+            account_fp_kind="account",
+            account_label="Acme Corp",
+        )
+
+    fetch = _full
+    fetch.pool_class = "spend"  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": fetch})
+    rc = cli.main(["gate", "-m", "opus", "--no-cache"])
+    err = capsys.readouterr().err
+    assert rc == 3
+    assert 'account="fp-accou (Acme Corp)"' in err.splitlines()[0]
+
+
+def test_remote_check_reads_identity_once(monkeypatch):
+    """N-8 — 원격 조회 게이트는 자격을 한 번만 읽는다 (Keychain 호출 1회)."""
+    hk = _enable(monkeypatch)
+    _seed_remote(hk, measured_at=EPOCH - 60.0)
+    reads: list[int] = []
+
+    def fetch() -> ProviderResult:
+        return ProviderResult(
+            id="claude",
+            error="HTTP 429",
+            error_kind="rate_limited",
+            http_status=429,
+            account_fp=FP_A,
+            account_fp_kind="account",
+        )
+
+    def _identity():
+        reads.append(1)
+        return FP_A, "account"
+
+    fetch.current_account_identity = _identity  # noqa: B023
+    fetch.pool_class = "spend"  # type: ignore[attr-defined]
+    results = cache.collect({"claude": fetch}, ["claude"], now=EPOCH, use_cache=False)
+    assert results[0].source == quota_share.REMOTE_SOURCE
+    assert len(reads) == 1  # fp+kind 를 따로 읽지 않는다

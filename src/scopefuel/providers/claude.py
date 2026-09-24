@@ -26,6 +26,7 @@ import sys
 import time
 import unicodedata
 
+from .. import quota_share
 from ..http import HttpError, classify_error, request_json
 from ..model import Bucket, ProviderResult, Scope, safe_label
 from ..quota_v2_contract import Attempt, claude_attempt
@@ -45,6 +46,16 @@ def _read_file() -> str | None:
 
 
 def _credentials_path() -> pathlib.Path:
+    """평문 자격 파일 — Claude Code ``ke()``/``aw()`` 와 같은 규칙.
+
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` 가 *설정돼 있으면* 평문 저장소는 그쪽이다
+    (빈 문자열이면 ``~/.claude``). 없으면 ``CLAUDE_CONFIG_DIR``, 그것도 없으면
+    기본 ``~/.claude``. SSCD 아래에서 ``$CCD/.credentials.json`` 을 읽으면
+    Claude Code 가 실제 쓰는 자격이 아닌 잔재를 집을 수 있다(#659 S-1).
+    """
+    secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    if secure is not None:
+        return pathlib.Path(secure or pathlib.Path.home() / ".claude") / ".credentials.json"
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     return pathlib.Path(configured) / ".credentials.json" if configured else CREDENTIALS
 
@@ -74,17 +85,25 @@ def _keychain_service() -> str:
     return f"{KEYCHAIN_SERVICE}-{digest}"
 
 
-def _keychain_context() -> str | None:
-    """Keychain 아이템이 묶인 컨텍스트 디렉터리 — ``_keychain_service`` 의 해시 입력.
+def _default_context() -> str:
+    return unicodedata.normalize("NFC", str(pathlib.Path.home() / ".claude"))
 
-    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` 가 설정돼 있으면 그 값, 아니면
-    ``CLAUDE_CONFIG_DIR``, 둘 다 없으면 ``None``(무접미사 기본 아이템).
+
+def _cred_context() -> str:
+    """자격 저장소(파일·Keychain 아이템)의 컨텍스트 디렉터리 — SSCD ?? CCD ?? 기본.
+
+    ``_keychain_service`` 의 해시 입력 및 ``_credentials_path`` 의 부모와 같은
+    기준이다 — 빈 문자열과 미설정은 모두 기본 컨텍스트로 접는다.
     """
     secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
-    if secure is not None:
-        return unicodedata.normalize("NFC", secure)
+    raw = secure if secure is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    return unicodedata.normalize("NFC", raw) if raw else _default_context()
+
+
+def _config_context() -> str:
+    """``.claude.json`` 이 사는 컨텍스트 디렉터리 — CCD ?? 기본."""
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    return unicodedata.normalize("NFC", configured) if configured is not None else None
+    return unicodedata.normalize("NFC", configured) if configured else _default_context()
 
 
 def _read_keychain() -> str | None:
@@ -148,17 +167,18 @@ def _account_uuid() -> str | None:
     return uuid.strip() if isinstance(uuid, str) and uuid.strip() else None
 
 
-def _account_identity(oauth: dict, origin: str | None = None) -> tuple[str | None, str | None]:
+def _account_identity(oauth: dict) -> tuple[str | None, str | None]:
     """계정 지문과 그 묶임 근거 — ``(account_fp, kind)`` (task #653/#654/#659).
 
     정본은 ``oauthAccount.accountUuid`` 다 — accessToken 은 로그인 회차·호스트마다
     다르므로 토큰 해시를 정본으로 쓰면 같은 계정이 '다른 계정'으로 오판돼 원격
     스냅샷 공유(AC2)가 깨진다. uuid 는 토큰과 **같은 config 컨텍스트**에서만
     읽는다 — ``_claude_json_path()`` 와 토큰 출처(파일·컨텍스트별 Keychain
-    아이템)가 모두 ``CLAUDE_CONFIG_DIR`` 에 묶여 있으므로 둘이 어긋나는 조합은
-    만들어지지 않는다(#659 AC1). 단 한 가지 예외: Keychain 폴백으로 읽은
-    토큰은 ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` 컨텍스트의 아이템일 수 있고,
-    그 값이 ``CLAUDE_CONFIG_DIR`` 와 다르면 uuid 묶음을 거부한다(아래 가드).
+    아이템·파일)가 ``CLAUDE_SECURESTORAGE_CONFIG_DIR ?? CLAUDE_CONFIG_DIR`` 에
+    묶여 있으므로 둘이 어긋나는 조합은 만들어지지 않는다(#659 AC1). 단 한 가지
+    예외: SSCD 가 CCD 와 다른 값으로 설정되면 자격은 secure-storage 컨텍스트
+    것인데 uuid 는 config 컨텍스트 것이다 — 묶으면 다른 계정의 지문으로
+    게시될 수 있으므로 거부하고 토큰 폴백으로 내린다(아래 가드, fail-closed).
 
     kind:
 
@@ -176,15 +196,11 @@ def _account_identity(oauth: dict, origin: str | None = None) -> tuple[str | Non
     """
     plan = str(oauth.get("subscriptionType") or "")
     uuid = _account_uuid()
-    if uuid and origin == "keychain":
-        # Keychain 토큰의 컨텍스트(SSCD ?? CCD)가 .claude.json 의 컨텍스트(CCD)와
-        # 다르면 다른 계정의 uuid 를 빌려오는 셈이다 — 묶지 않고 토큰 폴백으로
-        # 내려 게시를 막는다(CodeRabbit PR#86 Major).
-        keychain_ctx = _keychain_context()
-        config_ctx = os.environ.get("CLAUDE_CONFIG_DIR")
-        config_ctx = unicodedata.normalize("NFC", config_ctx) if config_ctx is not None else None
-        if keychain_ctx != config_ctx:
-            uuid = None
+    if uuid and _cred_context() != _config_context():
+        # 자격의 컨텍스트(SSCD ?? CCD)가 .claude.json 의 컨텍스트(CCD)와 다르면
+        # 다른 계정의 uuid 를 빌려오는 것과 구분할 수 없다 — 묶지 않고 토큰
+        # 폴백으로 내려 게시를 막는다(CodeRabbit PR#86 Major).
+        uuid = None
     if uuid:
         return hashlib.sha256(f"claude-account|{plan}|{uuid}".encode()).hexdigest()[:16], "account"
     token = (oauth.get("accessToken") or "").strip()
@@ -193,17 +209,18 @@ def _account_identity(oauth: dict, origin: str | None = None) -> tuple[str | Non
     return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16], "token"
 
 
-def _account_fp(oauth: dict, origin: str | None = None) -> str | None:
+def _account_fp(oauth: dict) -> str | None:
     """계정 지문 — ``_account_identity`` 의 지문 부분만."""
-    return _account_identity(oauth, origin)[0]
+    return _account_identity(oauth)[0]
 
 
 def _account_label() -> str | None:
     """계정의 안전한 표시 라벨 — 같은 컨텍스트의 ``.claude.json`` 에서 읽는다.
 
-    ``oauthAccount`` 의 ``organizationName`` → ``displayName`` → ``fullName``
-    순으로 첫 유효값을 쓴다. 이메일·토큰·uuid 원문은 절대 쓰지 않는다 —
-    ``safe_label`` 이 '@' 포함 값과 인용부호·제어문자를 걸러낸다.
+    ``oauthAccount`` 의 ``organizationName`` → ``displayName`` 순으로 첫
+    유효값을 쓴다 — ``fullName``(사람 이름)은 hk ``measured_by`` 에 실릴 수
+    있어 라벨 후보에서 뺐다(#659 N-9). 이메일·토큰·uuid 원문은 절대 쓰지
+    않는다 — ``safe_label`` 이 '@' 포함 값과 인용부호·제어문자를 걸러낸다.
     """
     try:
         payload = json.loads(_claude_json_path().read_text())
@@ -212,7 +229,7 @@ def _account_label() -> str | None:
     account = payload.get("oauthAccount") if isinstance(payload, dict) else None
     if not isinstance(account, dict):
         return None
-    for key in ("organizationName", "displayName", "fullName"):
+    for key in ("organizationName", "displayName"):
         label = safe_label(account.get(key))
         if label:
             return label
@@ -245,13 +262,19 @@ def _expiry_epoch(oauth: dict) -> float | None:
 def current_account_fp() -> str | None:
     """네트워크 없이 로컬 자격 파일만으로 지문을 계산한다 (backoff·원격 조회의 계정 검증용)."""
     loaded = _load_oauth()
-    return None if loaded is None else _account_fp(*loaded)
+    return None if loaded is None else _account_fp(loaded[0])
 
 
 def current_account_fp_kind() -> str | None:
     """현재 지문의 묶임 근거 — "account" | "token" | None (원격 읽기 게이트용)."""
     loaded = _load_oauth()
-    return None if loaded is None else _account_identity(*loaded)[1]
+    return None if loaded is None else _account_identity(loaded[0])[1]
+
+
+def current_account_identity() -> tuple[str | None, str | None]:
+    """(account_fp, kind) 를 자격 읽기 1회로 계산한다 — 원격 조회 게이트용(N-8)."""
+    loaded = _load_oauth()
+    return (None, None) if loaded is None else _account_identity(loaded[0])
 
 
 def fetch() -> ProviderResult:
@@ -268,7 +291,7 @@ def fetch() -> ProviderResult:
         )
     oauth, origin = loaded
     token = oauth["accessToken"].strip()
-    fp, fp_kind = _account_identity(oauth, origin)
+    fp, fp_kind = _account_identity(oauth)
     label = _account_label()
     session_fp = _session_fp(oauth)
 
@@ -371,13 +394,14 @@ def fetch() -> ProviderResult:
     extra = raw.get("extra_usage") or {}
     if extra.get("is_enabled"):
         note = f"extra usage {extra.get('utilization')}%"
-    if fp_kind == "token":
+    if fp_kind == "token" and quota_share.enabled():
         # task #659 — 게시 거부 사유를 결과에 명시한다(AC1): 지문이 토큰 해시
         # 폴백이라 hk 스냅샷은 게시·구독되지 않는다(N-1 orphan 방지). uuid 는
-        # 있는데 Keychain 자격의 secure-storage 컨텍스트가 달라 묶음을 거부한
-        # 경우와, 이 컨텍스트의 .claude.json 에 uuid 가 아예 없는 경우를 구분한다.
-        if origin == "keychain" and _account_uuid():
-            skip = "hk 공유 건너뜀 — keychain 자격의 secure-storage 컨텍스트가 이 config 컨텍스트와 다름"
+        # 있는데 자격 저장소 컨텍스트(SSCD ?? CCD)가 달라 묶음을 거부한 경우와,
+        # 이 컨텍스트의 .claude.json 에 uuid 가 아예 없는 경우를 구분한다.
+        # 공유가 꺼진 호스트에서는 잡음이므로 note 를 붙이지 않는다(N-10).
+        if _account_uuid() is not None:
+            skip = "hk 공유 건너뜀 — 자격 저장소 컨텍스트(SSCD)가 .claude.json 컨텍스트와 다름"
         else:
             skip = "hk 공유 건너뜀 — 이 config 컨텍스트의 .claude.json 에 account uuid 없음"
         note = f"{note} · {skip}" if note else skip
@@ -400,6 +424,7 @@ def fetch() -> ProviderResult:
 
 fetch.current_account_fp = current_account_fp  # noqa: B010 — 로컬 전용 probe
 fetch.current_account_fp_kind = current_account_fp_kind  # noqa: B010 — 지문 묶임 근거 probe
+fetch.current_account_identity = current_account_identity  # noqa: B010 — 1회 읽기 probe(N-8)
 
 
 def _num(value: object) -> float | None:

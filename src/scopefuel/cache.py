@@ -274,6 +274,10 @@ def _from_entry(
         stale=True,
         pool_class=effective_class,
         account_fp=payload.get("account_fp"),
+        # task #659 N-1 — 캐시 히트에서도 계정 표시가 살아야 한다(새 측정과
+        # stale 표시가 오락가락하지 않게 kind·label 도 복원한다).
+        account_fp_kind=payload.get("account_fp_kind"),
+        account_label=payload.get("account_label"),
     )
 
 

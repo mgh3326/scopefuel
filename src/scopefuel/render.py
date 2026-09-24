@@ -95,7 +95,7 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
     for result in results:
         display_id = _display_id(result)
         # task #659 — 어느 계정의 측정인지 표에 항상 보인다 (지문 앞 8자 + 안전 라벨).
-        acct = account_tag(result.account_fp, result.account_label)
+        acct = account_tag(result.account_fp, result.account_label, result.account_fp_kind)
         acct_s = f"  account {acct}" if acct else ""
         if result.error:
             lines.append(f"{display_id:<7}{acct_s} -- {result.error}")
@@ -171,9 +171,10 @@ def brief(
     worst = overall_mark(results, now=now)
     for result in results:
         display_id = _display_id(result)
-        acct = account_tag(result.account_fp, result.account_label)
+        acct = account_tag(result.account_fp, result.account_label, result.account_fp_kind)
         if acct:
-            display_id = f"{display_id}@{acct}"
+            # task #659 N-2 — 구분자 '@' 는 이메일 스캐너를 건드리므로 ' acct='.
+            display_id = f"{display_id} acct={acct}"
         if result.error:
             err_msg = result.error.splitlines()[0]
             chunks.append(f"{display_id} n/a({err_msg})")

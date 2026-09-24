@@ -57,10 +57,13 @@ containing `@` and strips quotes/control characters before it can be rendered.
   the context's `.claude.json` has no UUID the measurement degrades to the
   token fallback below instead of borrowing another context's identity. The
   same rule applies when `CLAUDE_SECURESTORAGE_CONFIG_DIR` differs from
-  `CLAUDE_CONFIG_DIR` and credentials arrive via the Keychain fallback: the
-  token then belongs to the secure-storage context while the UUID belongs to
-  the config context, so the UUID binding is refused and the fingerprint
-  degrades to the token fallback (fail-closed — nothing is published).
+  `CLAUDE_CONFIG_DIR`: the credentials file (`$SSCD/.credentials.json` per
+  Claude's `aw()`) and the Keychain item then both belong to the
+  secure-storage context while the UUID still comes from `$CCD/.claude.json`,
+  so the UUID binding is refused and the fingerprint degrades to the token
+  fallback (fail-closed — nothing is published or read remotely). Setting
+  SSCD to a different directory therefore disables remote sharing on that
+  host.
 - Hosts where `accountUuid` is unreadable in *that* context fall back to the
   legacy `sha256("<subscriptionType>|<accessToken>")[:16]` fingerprint
   (`account_fp_kind = "token"`). That keeps host-local stale acceptance (#576)
@@ -134,7 +137,14 @@ Prerequisites per host (#659 AC7):
 - Re-login (not refresh — #616) is the remedy for expired tokens.
 - Known limitation: staging/custom-OAuth Claude contexts store the account file
   as `.claude-staging-oauth.json` / `.claude-custom-oauth.json`; only the
-  production `.claude.json` name is read.
+  production `.claude.json` name is read. Claude's legacy
+  `~/.claude/.config.json` precedence (`ct()`) is likewise not honoured —
+  both cases fail closed (token-fallback fingerprint, no sharing).
+- Residual: within one context, a stale `.credentials.json` residue and
+  `.claude.json` can disagree about the account (#654 K2) — the file is read
+  first, so a leftover token pairs with that context's UUID. Claude Code
+  deletes the plaintext file after a successful Keychain write, so residue is
+  rare; the guard above covers the cross-context case only.
 
 - **Measuring host:** this Mac (and/or `mbp-server` once it runs a build that
   includes this change). Whichever host has healthy, non-expired credentials

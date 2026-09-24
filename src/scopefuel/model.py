@@ -570,13 +570,16 @@ def safe_label(raw: object) -> str | None:
     return label[:LABEL_MAX_LEN] or None
 
 
-def account_tag(account_fp: str | None, label: str | None = None) -> str:
+def account_tag(account_fp: str | None, label: str | None = None, kind: str | None = None) -> str:
     """계정 표시 태그 — 지문 앞 8자 + 안전 라벨 (task #659).
 
     어느 계정의 측정인지 표·게이트 라인에 보이는 문자열이다.
-    예: ``c0605596`` / ``c0605596 (My Org)``.
+    예: ``c0605596`` / ``c0605596 (My Org)``. ``kind == "token"`` 이면 그
+    지문은 계정이 아니라 토큰 해시이므로 ``token:`` 접두로 구분한다(N-4).
     """
     if not account_fp:
         return ""
     tag = account_fp[:8]
+    if kind == "token":
+        tag = f"token:{tag}"
     return f"{tag} ({label})" if label else tag

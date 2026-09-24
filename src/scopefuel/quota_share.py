@@ -216,33 +216,24 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
         return False
 
 
-def _current_fp(fetcher: object, local: ProviderResult) -> str | None:
-    """이 호스트의 *현재* 자격 지문 — 원격 조회의 조회 키이자 일치 검증 값.
+def _current_identity(fetcher: object, local: ProviderResult) -> tuple[str | None, str | None]:
+    """이 호스트의 *현재* (계정 지문, 묶임 근거) — 원격 조회의 키이자 일치 검증 값.
 
-    probe 가 있으면 그것이 정본이다(현재 자격을 다시 읽는다). probe 가 지문을
-    낼 수 없으면 이 호스트가 어느 계정인지 증명할 수 없으므로 거부한다 —
-    저장된 옛 지문으로 다른 계정의 스냅샷을 읽는 것을 막는다.
+    ``current_account_identity`` probe 가 있으면 자격을 한 번만 읽는다
+    (Keychain 호출도 1회 — N-8). 없으면 개별 probe → 로컬 결과 필드 순으로
+    폴백한다. 지문을 낼 수 없으면 이 호스트가 어느 계정인지 증명할 수 없으므로
+    거부 — 저장된 옛 지문으로 다른 계정의 스냅샷을 읽는 것을 막는다.
     """
-    probe = getattr(fetcher, "current_account_fp", None)
+    probe = getattr(fetcher, "current_account_identity", None)
     if callable(probe):
-        fp = probe()
-        return fp if isinstance(fp, str) and fp else None
-    return local.account_fp if isinstance(local.account_fp, str) and local.account_fp else None
-
-
-def _current_fp_kind(fetcher: object, local: ProviderResult) -> str | None:
-    """이 호스트의 *현재* 지문 묶임 근거 — "account" | "token" | None.
-
-    probe 가 없는 구형/스텁 fetcher 는 로컬 결과의 kind 로 폴백한다. 둘 다
-    없으면 None — 모르는 경우 읽기 자체는 시도하되(문서가 없어 거부된다),
-    "token" 이면 uuid-bound 키에만 게시되므로 어차피 맞을 문서가 없다.
-    """
-    probe = getattr(fetcher, "current_account_fp_kind", None)
-    if callable(probe):
-        kind = probe()
-        return kind if kind in ("account", "token") else None
-    kind = local.account_fp_kind
-    return kind if kind in ("account", "token") else None
+        fp, kind = probe()
+    else:
+        fp_probe = getattr(fetcher, "current_account_fp", None)
+        kind_probe = getattr(fetcher, "current_account_fp_kind", None)
+        fp = fp_probe() if callable(fp_probe) else local.account_fp
+        kind = kind_probe() if callable(kind_probe) else local.account_fp_kind
+    fp = fp if isinstance(fp, str) and fp else None
+    return fp, kind if kind in ("account", "token") else None
 
 
 def _snapshot(document: dict | None) -> dict | None:
@@ -318,13 +309,13 @@ def remote_result(
     try:
         if not enabled():
             return None
-        fp = _current_fp(fetcher, local)
+        fp, kind = _current_identity(fetcher, local)
         if fp is None:
             return None
         # task #659 — 토큰 해시 폴백 지문으로는 읽지 않는다: 게시되는 문서는 전부
         # uuid-bound 키라 맞을 문서가 없고, 있더라도(구형 orphan) 계정 정체성을
         # 증명할 수 없다.
-        if _current_fp_kind(fetcher, local) == "token":
+        if kind == "token":
             return None
         snap = _snapshot(_request("GET", key_for(pool, fp)))
         if snap is None or snap["pool"] != pool or snap["account_fp"] != fp:
@@ -340,7 +331,7 @@ def remote_result(
             id=pool,
             plan=snap["plan"],
             buckets=buckets,
-            note=remote_label(snap["host"], account_tag(fp, snap["account_label"])),
+            note=remote_label(snap["host"], account_tag(fp, snap["account_label"], "account")),
             source=REMOTE_SOURCE,
             fetched_at=measured_at,
             age_s=max(0.0, age),
