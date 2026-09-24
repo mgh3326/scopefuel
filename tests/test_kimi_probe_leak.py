@@ -81,7 +81,6 @@ def test_fetch_reports_timeout_without_leaking(tmp_path, monkeypatch):
     monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(kimi, "TIMEOUT_S", 1.0)
     monkeypatch.setattr(kimi, "STARTUP_DELAY_S", 0.05)
-    monkeypatch.setattr(kimi.shutil, "which", lambda _binary: kimi.BINARY)
 
     result = kimi.fetch()
     assert result.error and "끝나지 않음" in result.error
@@ -118,7 +117,6 @@ def test_a_second_probe_is_skipped_while_one_is_running(tmp_path, monkeypatch):
     workdir = tmp_path / "kimi-probe-workdir"
     monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(kimi, "BINARY", str(_hanging_fake(tmp_path)))
-    monkeypatch.setattr(kimi.shutil, "which", lambda _binary: kimi.BINARY)
 
     entered = []
 
@@ -234,7 +232,6 @@ def test_fetch_writes_one_caller_log_line_per_probe(tmp_path, monkeypatch):
     monkeypatch.setattr(kimi, "BINARY", str(binary))
     monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(kimi, "STARTUP_DELAY_S", 0.05)
-    monkeypatch.setattr(kimi.shutil, "which", lambda _binary: kimi.BINARY)
 
     result = kimi.fetch()
     assert result.error is None

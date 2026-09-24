@@ -78,7 +78,6 @@ def test_fetch_reports_timeout_without_leaking(tmp_path, monkeypatch):
     monkeypatch.setattr(kiro, "BINARY", str(_hanging_fake(tmp_path)))
     monkeypatch.setattr(kiro, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(kiro, "TIMEOUT_S", 1.0)
-    monkeypatch.setattr(kiro.shutil, "which", lambda _binary: kiro.BINARY)
 
     result = kiro.fetch()
     assert result.error and "끝나지 않음" in result.error
@@ -112,7 +111,6 @@ def test_a_second_probe_is_skipped_while_one_is_running(tmp_path, monkeypatch):
     workdir = tmp_path / "kiro-probe-workdir"
     monkeypatch.setattr(kiro, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(kiro, "BINARY", str(_hanging_fake(tmp_path)))
-    monkeypatch.setattr(kiro.shutil, "which", lambda _binary: kiro.BINARY)
 
     entered = []
 
@@ -217,7 +215,6 @@ def test_fetch_writes_one_caller_log_line_per_probe(tmp_path, monkeypatch):
     binary.chmod(binary.stat().st_mode | 0o111)
     monkeypatch.setattr(kiro, "BINARY", str(binary))
     monkeypatch.setattr(kiro, "PROBE_WORKDIR", workdir)
-    monkeypatch.setattr(kiro.shutil, "which", lambda _binary: kiro.BINARY)
 
     result = kiro.fetch()
     assert result.error is None
