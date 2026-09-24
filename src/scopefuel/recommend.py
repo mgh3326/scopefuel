@@ -2243,6 +2243,14 @@ def gate_check(
 
     escalation_override = False
     audit: dict[str, object] = {}
+    if operator_request is not None:
+        # 여기 도달하는 비-escalation 요청은 consult_only 정체성뿐이다 — catalog 가
+        # fable 을 default-gate 행으로 되돌린 경우에도 감사 필드는 기록한다.
+        audit = {
+            "operator_request_ref": operator_request,
+            "requested_by": audit_requested_by or "unknown",
+            "ref_resolution": "unverified",
+        }
     if profile.gate == "escalation":
         # 1) escalation 자격: 같은 grade 의 다른 정상 후보가 전부 소진·측정불가일 때만 진행.
         #    유효한 operator-request 가 있으면 이 "대안 가용 거부" 갈래 하나만 건너뛴다
@@ -2387,6 +2395,8 @@ def gate_check(
     reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
+    if operator_request is not None:
+        reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     return GateResult(
         ok=True,
         profile=profile_name,
@@ -2396,6 +2406,7 @@ def gate_check(
         used_pct=used_pct,
         pool_class=effective_class,
         stale_accepted=accepted is not None,
+        **audit,
     )
 
 
