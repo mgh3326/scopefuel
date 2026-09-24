@@ -1422,10 +1422,17 @@ def _stale_tag(result: ProviderResult, kind: str) -> str:
 
 
 def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str:
-    """측정 불가 사유 — 429 는 '속도 제한'으로 구분해 보고한다(#576 AC1)."""
+    """측정 불가 사유 — 429 는 '속도 제한'으로 구분해 보고한다(#576 AC1).
+
+    task #614: 6h 를 넘은 정상 스냅샷이 있으면 cache 가 error 결과의 age_s 에
+    그 나이를 남긴다 — "마지막 정상 값 없음"은 스냅샷이 진짜 없을 때만 쓴다.
+    """
     if result is not None and _stale_failure_kind(result) == "rate_limited":
         if result.stale and result.age_s is not None:
             return f"{provider_id} 속도 제한 — 마지막 값 {cache.format_age(result.age_s)} 수용 불가"
+        if result.age_s is not None:
+            age = cache.format_age(result.age_s)
+            return f"{provider_id} 속도 제한 — 마지막 정상 값이 너무 오래됨 ({age})"
         return f"{provider_id} 속도 제한 — 마지막 정상 값 없음"
     if result is not None and result.error_kind == PROBE_IN_PROGRESS:
         if result.stale and result.age_s is not None:
