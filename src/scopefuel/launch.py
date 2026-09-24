@@ -68,6 +68,10 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     "devin-glm52": "glm-5-2",
     "devin-swe17": "swe-1-7",
     "devin-ds41": "deepseek-v4-1-flash-high",
+    # #635: devin effort lives in the model id, one profile per rung.
+    "devin-swe2-medium": "swe-2-medium",
+    "devin-swe2-max": "swe-2-max",
+    "devin-ds41-max": "deepseek-v4-1-flash-max",
     # Same model as kimi-k3; the differentiator is KIMI_CODE_HOME, not the model.
     "kimi-k3-low": "kimi-k3",
     "oc-qwen37-max": "qwen3.7-max",

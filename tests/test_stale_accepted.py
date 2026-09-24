@@ -8,11 +8,18 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import pathlib
+import subprocess
+import sys
 import time
+import urllib.error
 
 import pytest
 
+import scopefuel
 from scopefuel import cache, cli, refresh
+from scopefuel.http import HttpError, classify_error
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import gate_check, recommend
 
@@ -602,3 +609,164 @@ def test_gate_stale_accepted_over_cutoff_still_denied():
     assert res.ok is False
     assert res.unmeasurable is False  # 측정값은 있다 — 소진 거부
     assert "소진" in res.reason
+
+
+# ---------------------------------------------------------------- task #614: 테스트 보강
+
+
+@pytest.mark.parametrize("retry_after", [900.0, 901.0, 3600.0])
+def test_backoff_retry_after_boundary_values(retry_after):
+    """뮤턴트 h1: Retry-After 를 BACKOFF_MAX_S(900)로 깎으면 실패한다.
+
+    기존 테스트는 900 == BACKOFF_MAX_S 라서 클램프 뮤턴트가 생존했다 —
+    경계(900)와 바로 위(901), 큰 값(3600)으로 죽인다.
+    """
+    _seed()
+    _rate_limited_collect(retry_after=retry_after)
+    assert cache.backoff_remaining("claude", EPOCH) == pytest.approx(retry_after)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_kind"),
+    [
+        (401, "auth"),
+        (403, "auth"),
+        (429, "rate_limited"),
+        (503, "server"),
+        (400, "http"),
+    ],
+)
+def test_classify_error_with_real_http_error(status, expected_kind):
+    """뮤턴트 c2: 손으로 만든 dict 가 아니라 실 HttpError 객체로 분류한다.
+
+    401/403 → auth 매핑이 rate_limited 로 회귀하면 게이트가 401 에서도
+    stale 을 열고 backoff 를 기록한다 — 이 테스트가 그 회귀를 잡는다.
+    """
+    kind, http_status, retry_after = classify_error(HttpError(status, "denied", retry_after=7.0))
+    assert kind == expected_kind
+    assert http_status == status
+    assert retry_after == 7.0
+
+
+def test_classify_error_network_and_unknown():
+    kind, status, retry_after = classify_error(urllib.error.URLError("connection refused"))
+    assert (kind, status, retry_after) == ("network", None, None)
+    kind, status, retry_after = classify_error(ValueError("?"))
+    assert (kind, status, retry_after) == ("unknown", None, None)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_gate_rejects_auth_error_raised_as_http_error(status):
+    """fetcher 가 실 HttpError 를 raise — auth 로 분류돼 게이트가 거부하고 backoff 는 없다."""
+    _seed()
+
+    def fetch() -> ProviderResult:
+        raise HttpError(status, "auth denied")
+
+    fetch.current_account_fp = lambda: FP_A
+
+    results = cache.collect({"claude": fetch}, ["claude"], now=EPOCH, use_cache=False)
+    assert results[0].error_kind == "auth"
+    assert results[0].http_status == status
+    assert results[0].stale is True  # 표시 폴백은 된다
+    res = gate_check(results, "opus", today=TODAY, now=NOW)
+    assert res.ok is False
+    assert res.unmeasurable is True
+    assert res.stale_accepted is False
+    # 429 로 오분류됐다면 여기서 backoff 가 기록된다 — auth 는 기록하지 않는다.
+    assert cache.backoff_remaining("claude", EPOCH) == 0.0
+
+
+def test_gate_429_reason_says_too_old_when_last_good_expired():
+    """AC3: 6h 넘은 정상 스냅샷이 있는데 '마지막 정상 값 없음'이면 문구가 거짓이다."""
+    _seed(now=EPOCH - cache.STALE_MAX_S - 10.0)
+    results = _rate_limited_collect()
+    assert results[0].error is not None  # 6h 초과는 표시 폴백도 없다
+    res = gate_check(results, "opus", today=TODAY, now=NOW)
+    assert res.ok is False
+    assert res.unmeasurable is True
+    assert "속도 제한" in res.reason
+    assert "너무 오래됨" in res.reason
+    assert "6.0시간 전" in res.reason
+    assert "정상 값 없음" not in res.reason
+
+
+def test_gate_429_reason_says_too_old_during_backoff_window():
+    """AC3: backoff 창 안에서도 같은 문구 계약 — 낡은 스냅샷은 '없음'이 아니다."""
+    _seed(now=EPOCH - cache.STALE_MAX_S - 10.0)
+    _rate_limited_collect()  # 60s backoff 창이 연다
+    calls: list[str] = []
+
+    def counting() -> ProviderResult:
+        calls.append("fetch")
+        return ProviderResult(id="claude", error="HTTP 429", error_kind="rate_limited", http_status=429)
+
+    second = cache.collect({"claude": counting}, ["claude"], now=EPOCH + 30, use_cache=False)
+    assert calls == []  # 창 안이라 네트워크 0
+    assert second[0].error is not None
+    res = gate_check(second, "opus", today=TODAY, now=NOW + dt.timedelta(seconds=30))
+    assert res.ok is False
+    assert res.unmeasurable is True
+    assert "너무 오래됨" in res.reason
+    assert "정상 값 없음" not in res.reason
+
+
+def test_gate_429_reason_says_absent_when_no_last_good():
+    """AC3: 정상 스냅샷이 진짜 없으면 '마지막 정상 값 없음'이 정확한 문구다."""
+    results = _rate_limited_collect()  # 시드 없음
+    res = gate_check(results, "opus", today=TODAY, now=NOW)
+    assert res.ok is False
+    assert res.unmeasurable is True
+    assert "속도 제한" in res.reason
+    assert "마지막 정상 값 없음" in res.reason
+    assert "오래됨" not in res.reason
+
+
+def test_gate_429_reason_says_age_when_stale_unacceptable():
+    """AC3: 6h 내 stale 이지만 수용 불가(필수 bucket 결손) — 나이를 적는다."""
+    _seed(result=ProviderResult(id="claude", buckets=[_bucket("5h", 10.0)], account_fp=FP_A))
+    results = _rate_limited_collect()
+    res = gate_check(results, "opus", today=TODAY, now=NOW)
+    assert res.ok is False
+    assert res.unmeasurable is True
+    assert "속도 제한" in res.reason
+    assert "10분 전" in res.reason
+    assert "수용 불가" in res.reason
+
+
+def test_backoff_json_concurrent_processes_no_lost_updates(tmp_path):
+    """AC4 회귀 가드: 다중 프로세스의 동시 backoff 기록이 유실되지 않는다.
+
+    모든 backoff 쓰기(update_entry·record_failure·_merge_results)는
+    snapshots.lock 의 flock 안에서 load→bump→save 하므로 직렬화된다.
+    직렬화가 깨지면 두 프로세스가 같은 consecutive 를 읽어 덮어써
+    최종값이 N*M 보다 작아진다(lost update). 파일 손상은 tmp+replace 가 막는다.
+    """
+    procs, bumps = 4, 10
+    script = (
+        "from scopefuel import cache\n"
+        "from scopefuel.model import ProviderResult\n"
+        f"for i in range({bumps}):\n"
+        "    cache.record_failure('claude', ProviderResult(id='claude', "
+        "error='HTTP 429', error_kind='rate_limited', http_status=429), "
+        f"{EPOCH!r} + i)\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(pathlib.Path(scopefuel.__file__).resolve().parent.parent),
+    }
+    children = [subprocess.Popen([sys.executable, "-c", script], env=env, cwd=tmp_path) for _ in range(procs)]
+    for child in children:
+        assert child.wait(timeout=120) == 0
+
+    # 손상 없이 파싱되고, 모든 bump 가 카운터에 반영됐다.
+    state = json.loads(cache.backoff_path().read_text(encoding="utf-8"))
+    assert state["schema"] == cache.BACKOFF_SCHEMA
+    entry = state["pools"]["claude"]
+    assert entry["consecutive"] == procs * bumps
+    assert entry["next_allowed_at"] > EPOCH
+
+    # 같은 lock 안에서 쓰는 snapshots.json 감사 필드도 손상되지 않는다.
+    data = json.loads(cache.cache_path().read_text(encoding="utf-8"))
+    assert data["claude"]["last_error_kind"] == "rate_limited"
+    assert data["claude"]["last_http_status"] == 429
