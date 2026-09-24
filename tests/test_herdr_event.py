@@ -6,6 +6,8 @@ import json
 import pathlib
 import stat
 
+import pytest
+
 from scopefuel import cli
 from scopefuel.model import Bucket, ProviderResult, Scope
 
@@ -54,9 +56,11 @@ def test_herdr_event_reports_display_only_token_and_debounces(tmp_path, monkeypa
     monkeypatch.setenv("HERDR_BIN_PATH", str(shim))
     monkeypatch.setenv("HERDR_TEST_LOG", str(log))
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    # Synthetic pane id: keeps the w<win>:p<pane> shape, but index 0 and the
+    # placeholder X cannot address a live pane (real ids are 1-based numerics).
     monkeypatch.setenv(
         "HERDR_PLUGIN_EVENT_JSON",
-        json.dumps({"type": "pane.agent_detected", "data": {"pane_id": "wB:p2R", "agent": "claude"}}),
+        json.dumps({"type": "pane.agent_detected", "data": {"pane_id": "wX:p0X", "agent": "claude"}}),
     )
 
     assert cli.main(["herdr-event"]) == 0
@@ -69,7 +73,7 @@ def test_herdr_event_reports_display_only_token_and_debounces(tmp_path, monkeypa
         "report-metadata",
         "--source",
         "scopefuel.gauge",
-        "wB:p2R",
+        "wX:p0X",
         "--token",
         "scopefuel_quota=claude·max · now 6% · wk 97% · [Fable 100%] · credential=default",
         "--ttl-ms",
@@ -82,7 +86,22 @@ def test_herdr_event_ignores_unknown_agent_without_fetch_or_report(tmp_path, mon
     monkeypatch.setattr(cli, "registry", lambda: {"claude": lambda: (_ for _ in ()).throw(AssertionError())})
     monkeypatch.setenv("HERDR_BIN_PATH", str(shim))
     monkeypatch.setenv("HERDR_TEST_LOG", str(log))
-    monkeypatch.setenv("HERDR_PLUGIN_EVENT_JSON", json.dumps({"data": {"pane_id": "w1:p1", "agent": "bash"}}))
+    monkeypatch.setenv("HERDR_PLUGIN_EVENT_JSON", json.dumps({"data": {"pane_id": "w0:p0", "agent": "bash"}}))
+
+    assert cli.main(["herdr-event"]) == 0
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("pane_id", ["", 123, None])
+def test_herdr_event_ignores_malformed_pane_id(tmp_path, monkeypatch, pane_id):
+    shim, log = _fake_herdr(tmp_path)
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": _claude})
+    monkeypatch.setenv("HERDR_BIN_PATH", str(shim))
+    monkeypatch.setenv("HERDR_TEST_LOG", str(log))
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_EVENT_JSON", json.dumps({"data": {"pane_id": pane_id, "agent": "claude"}})
+    )
 
     assert cli.main(["herdr-event"]) == 0
     assert not log.exists()
