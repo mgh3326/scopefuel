@@ -747,6 +747,38 @@ def test_sigkilled_models_list_parent_leaves_no_orphan(tmp_path):
                 os.kill(pid, signal.SIGKILL)
 
 
+def test_banner_probe_backgrounded_grandchild_does_not_survive(tmp_path, monkeypatch):
+    """_probe_banner's finally sweeps the instance dir too — a helper the CLI
+    backgrounds before printing its quota line must not outlive the probe
+    (#608 S7: the sweep mutant survived the suite without this test)."""
+
+    workdir = tmp_path / "probe-workdir"
+    pidfile = tmp_path / "grandchild.pid"
+    fake = tmp_path / "fake-devin-banner-backgrounder"
+    fake.write_text(
+        f"#!/bin/sh\nsleep 120 &\necho $! > {pidfile}\n"
+        "printf '%s\\r\\n' 'v3000.10.31'\nsleep 0.05\n"
+        f"printf '%s\\r\\n' '{_REDRAW_LINE}'\nexit 0\n"
+    )
+    fake.chmod(fake.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(devin, "BINARY", str(fake))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(devin, "TIMEOUT_S", 3.0)
+    monkeypatch.setattr(devin, "BANNER_SETTLE_S", 0.05)
+
+    devin._probe_banner()
+
+    pid = int(pidfile.read_text())
+    try:
+        assert _wait_gone([pid], timeout=10) == [], (
+            "a backgrounded grandchild outlived a successful banner probe"
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
 def test_models_list_backgrounded_grandchild_does_not_survive(tmp_path, monkeypatch):
     """A CLI that backgrounds a helper and exits 0 leaks it without the cwd sweep."""
 
