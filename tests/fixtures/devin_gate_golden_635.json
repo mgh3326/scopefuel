@@ -7,7 +7,7 @@
       "exhaust_notice": null,
       "exit_code": 0,
       "expires_at": null,
-      "grade": "C",
+      "grade": "A+",
       "last_auto_error": null,
       "manual_observation_ids": [],
       "manual_observations": [],
@@ -43,7 +43,7 @@
       "exhaust_notice": null,
       "exit_code": 4,
       "expires_at": null,
-      "grade": "C",
+      "grade": "A+",
       "last_auto_error": null,
       "manual_observation_ids": [],
       "manual_observations": [],
@@ -68,7 +68,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [manual fallback 불가: manual observation 없음]\n대안(C) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   },
   "devin-swe2/free": {

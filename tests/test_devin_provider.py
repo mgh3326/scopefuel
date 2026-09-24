@@ -884,6 +884,10 @@ def test_task295_recommend_c_lists_remaining_devin_profiles_as_unmeasured(fixtur
         assert "미측정" in row, (name, row)
 
 
+def _ranked_names(out: str) -> list[str]:
+    return [line.split()[1] for line in out.splitlines() if line[:1].isdigit()]
+
+
 def test_task631_ds41_measured_grade_is_in_both_snapshot_consumers(capsys, fixture_text):
     placements = [
         grade for grade, profiles in GRADE_TABLE.items() if any(p.name == "devin-ds41" for p in profiles)
@@ -914,13 +918,16 @@ def test_task631_ds41_measured_grade_is_in_both_snapshot_consumers(capsys, fixtu
     providers = [devin.parse(_fixture(fixture_text))]
     aplus = recommend(providers, "A+")
     c_grade = recommend(providers, "C")
-    assert "devin-ds41" in aplus
     assert "hk:doc 2227" in aplus
-    assert "devin-ds41" not in c_grade
+    # Match the row token, not a substring: #635's devin-ds41-max stays in C.
+    assert "devin-ds41" in _ranked_names(aplus)
+    assert "devin-ds41" not in _ranked_names(c_grade)
 
 
 def test_task631_other_unscored_c_rows_keep_their_placements():
     expected = {"codex-luna", "kiro-cheap", "oc-omni", "devin-glm52", "devin-swe17"}
+    # #635 effort variants are unmeasured C rows of their own (high rung is only a reference).
+    expected |= {"devin-swe2-medium", "devin-swe2-max", "devin-ds41-max"}
     actual = {p.name for p in GRADE_TABLE["C"] if p.benchmark is None}
     assert actual == expected
     snapshot = {
