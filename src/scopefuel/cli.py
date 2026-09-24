@@ -314,7 +314,8 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--operator-request",
         metavar="REF",
         help=(
-            "escalation 프로필 전용 운영자 명시 요청 참조 (hk:doc/<key> 또는 hk:task/<정수>만 허용). "
+            "escalation/consult_only 프로필 전용 운영자 명시 요청 참조 (hk:doc/<key> 또는 "
+            "hk:task/<정수>만 허용). fable 같은 consult_only 프로필은 이 REF 없이는 거부된다. "
             "감사 가능한 주장을 기록하는 경로이며 운영자 신원·동의를 증명하지 않는다"
         ),
     )
