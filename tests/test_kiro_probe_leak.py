@@ -170,9 +170,7 @@ def test_a_sigkilled_probe_leaves_no_orphan(tmp_path):
         os.kill(probe.pid, signal.SIGKILL)
         probe.wait(timeout=10)
 
-        assert _wait_gone(children, timeout=30) == [], (
-            "a SIGKILLed probe orphaned its kiro-cli child"
-        )
+        assert _wait_gone(children, timeout=30) == [], "a SIGKILLed probe orphaned its kiro-cli child"
     finally:
         if probe.poll() is None:
             probe.kill()
