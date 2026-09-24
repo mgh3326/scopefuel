@@ -3,6 +3,12 @@
 No config → BUILTIN behavior exactly. Overrides can expire; expired entries are
 ignored and surfaced in `policy list` so a temporary tweak does not silently
 become permanent policy.
+
+``[pools.<p>] cutoff`` / ``on_exhaust`` (task #638) are operator-set config
+values, not a bypass path — task #461's invariant stands: a request-time
+``--operator-request`` can never skip quota/exclude/cutoff checks. The gate
+applies the configured cutoff to every profile path exactly as it applied the
+builtin one.
 """
 
 from __future__ import annotations
@@ -112,6 +118,16 @@ def _write_config(config: dict) -> None:
                 lines.append(f"price_usd = {entry['price_usd']!r}")
             if "capacity_weight" in entry and entry["capacity_weight"] is not None:
                 lines.append(f"capacity_weight = {entry['capacity_weight']!r}")
+            if "cutoff" in entry and entry["cutoff"] is not None:
+                raw_cutoff = entry["cutoff"]
+                # 숫자만 TOML 수치로 쓴다 — bool/문자열은 repr(`True`)이 TOML 을
+                # 깨뜨리므로 문자열로 보존한다. 재독 시 get_cutoff 가 여전히 거부한다.
+                if isinstance(raw_cutoff, bool) or not isinstance(raw_cutoff, (int, float)):
+                    lines.append(f"cutoff = {_toml_string(str(raw_cutoff))}")
+                else:
+                    lines.append(f"cutoff = {raw_cutoff!r}")
+            if "on_exhaust" in entry and entry["on_exhaust"] is not None:
+                lines.append(f"on_exhaust = {_toml_string(str(entry['on_exhaust']))}")
             lines.append("")
     text = "\n".join(lines).rstrip() + "\n" if lines else ""
     path.write_text(text, encoding="utf-8")
@@ -427,6 +443,53 @@ def get_pool_plan(pool: str) -> str | None:
         return None
     plan = entry.get("plan")
     return str(plan) if isinstance(plan, str) else None
+
+
+ON_EXHAUST_MODES = frozenset({"block", "operator-switch"})
+DEFAULT_ON_EXHAUST = "block"
+
+
+def get_cutoff(pool: str, default: float) -> tuple[float, str | None]:
+    """``[pools.<p>] cutoff`` — 풀별 사용량 차단선(0~100). 미설정 시 ``default``.
+
+    잘못된 값(비수치·bool·범위 밖·NaN/inf)은 거부하고 default 로 폴백한다 —
+    오타가 차단선을 조용히 0 이나 100 으로 바꾸지 않게 하기 위한 fail-closed
+    관례(``get_capacity_weight`` 와 동일: 폴백 + status 문자열 노출).
+    """
+    config = load_config()
+    pools = config.get("pools") or {}
+    entry = pools.get(pool)
+    if not isinstance(entry, dict):
+        return default, None
+    raw = entry.get("cutoff")
+    if raw is None:
+        return default, None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return default, f"invalid cutoff {raw!r} (기본값 {default:g}%로 폴백)"
+    value = float(raw)
+    if not _finite(value) or not 0.0 <= value <= 100.0:
+        return default, f"invalid cutoff {raw!r} (기본값 {default:g}%로 폴백)"
+    return value, None
+
+
+def get_on_exhaust(pool: str) -> tuple[str, str | None]:
+    """``[pools.<p>] on_exhaust`` — ``"block"``(기본) 또는 ``"operator-switch"``.
+
+    ``operator-switch`` 면 차단선 도달 시 "계정 전환 필요" 알림을 운영자 경로로
+    올린다(exhaust.observe). 그 외 값은 ``block`` 으로 폴백하고 status 로
+    노출한다 — 오타가 알림을 켜거나 끄는 일이 없게 한다.
+    """
+    config = load_config()
+    pools = config.get("pools") or {}
+    entry = pools.get(pool)
+    if not isinstance(entry, dict):
+        return DEFAULT_ON_EXHAUST, None
+    raw = entry.get("on_exhaust")
+    if raw is None:
+        return DEFAULT_ON_EXHAUST, None
+    if not isinstance(raw, str) or raw not in ON_EXHAUST_MODES:
+        return DEFAULT_ON_EXHAUST, f"invalid on_exhaust {raw!r} (block 으로 폴백)"
+    return raw, None
 
 
 def list_policies(

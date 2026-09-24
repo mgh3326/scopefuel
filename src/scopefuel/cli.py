@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import pathlib
@@ -14,7 +15,7 @@ import sys
 import time
 from dataclasses import replace
 
-from . import bench, herdr, launch, manual, recommend, render, served
+from . import bench, herdr, launch, manual, quota_v2, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -343,6 +344,36 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help="Herdr pane 이벤트를 표시 전용 쿼타 메타데이터로 갱신 (plugin 내부용)",
     )
 
+    v2_parser = subparsers.add_parser(
+        "quota-v2",
+        help="계정 단위 쿼타 v2 (#578 1단계, shadow 전용 — 실제 gate 판정은 바꾸지 않음)",
+    )
+    v2_sub = v2_parser.add_subparsers(dest="v2_command", required=True)
+    v2_slot = v2_sub.add_parser(
+        "slot", help="이 실행 환경의 login slot 위치자 (운영자 등록 입력용, 신원 아님)"
+    )
+    v2_slot.add_argument("--provider", required=True)
+    v2_bindings = v2_sub.add_parser("bindings", help="hub binding 미러")
+    v2_bindings_sub = v2_bindings.add_subparsers(dest="v2_bindings_command", required=True)
+    v2_bindings_import = v2_bindings_sub.add_parser(
+        "import", help="node 토큰으로 받은 hub GET /v2/quota/bindings 응답을 미러로 저장"
+    )
+    v2_bindings_import.add_argument("file", help="JSON 파일 경로 (- 는 stdin)")
+    v2_bindings_sub.add_parser("show", help="미러와 provider별 현재 신원 해석 결과")
+    v2_obs = v2_sub.add_parser("observations", help="account-scoped 관측 저장소")
+    v2_obs_sub = v2_obs.add_subparsers(dest="v2_obs_command", required=True)
+    v2_obs_import = v2_obs_sub.add_parser(
+        "import", help="hub GET /v2/quota/observations 응답을 저장 (binding 있는 계정만)"
+    )
+    v2_obs_import.add_argument("file", help="JSON 파일 경로 (- 는 stdin)")
+    v2_obs_export = v2_obs_sub.add_parser(
+        "export", help="이 node 가 측정하고 아직 hub 수신 전인 관측을 JSONL 로 (POST 본문용)"
+    )
+    v2_obs_export.add_argument("--provider", required=True)
+    v2_eval = v2_sub.add_parser("evaluate", help="로컬 v2 스냅샷만으로 판정 (네트워크 0, 진단 전용)")
+    v2_eval.add_argument("-m", "--profile", required=True, choices=all_profiles)
+    v2_eval.add_argument("--purpose", metavar="PURPOSE")
+
     models_parser = subparsers.add_parser("models", help="업스트림 서빙 모델 기록/drift 검증")
     models_sub = models_parser.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser(
@@ -550,6 +581,7 @@ def _gate_record(
         "observed_age_s": result.observed_age_s,
         "remaining_effect_s": result.remaining_effect_s,
         "last_auto_error": result.last_auto_error,
+        "exhaust_notice": result.exhaust_notice,
     }
 
 
@@ -611,6 +643,24 @@ def _manual_gate_audit(
         observed_age_s=round(observed_age_s, 1),
         remaining_effect_s=round(remaining_effect_s, 1),
         last_auto_error=resolution.last_auto_error,
+    )
+
+
+def _shadow_gate(
+    args, fetchers, automatic_results, result, exit_code, now, bench_scores, model_prices, grade_table
+) -> None:
+    # The shadow evaluates at its own moment: the attempts it reads were stamped
+    # at fetch completion, after the gate's `now` was taken (contract §5.1, §5.6).
+    quota_v2.shadow_gate(
+        profile=args.profile,
+        legacy=result,
+        legacy_exit=exit_code,
+        now=dt.datetime.now(dt.UTC),
+        pool_classes={item.id: item.pool_class for item in automatic_results},
+        bench_scores=bench_scores,
+        model_prices=model_prices,
+        grade_table=grade_table,
+        gate_kwargs=_gate_args(args),
     )
 
 
@@ -703,6 +753,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         last_auto_error=resolution.last_auto_error,
                     )
     exit_code = 0 if result.ok else (5 if result.role_denied else (4 if result.unmeasurable else 3))
+
+    # task #578 1단계 — shadow 전용: v2(account-scoped) 판정을 계산해 비교 로그에만 남긴다.
+    # result·exit_code·출력은 건드리지 않으며, 미등록 노드에서는 아무것도 하지 않는다.
+    with contextlib.suppress(Exception):
+        _shadow_gate(
+            args, fetchers, automatic_results, result, exit_code, now, bench_scores, model_prices, grade_table
+        )
 
     if args.gate_output:
         record = _gate_record(result, exit_code, now, purpose=args.purpose)
@@ -958,6 +1015,57 @@ def _reps_command(args: argparse.Namespace) -> int:
     return 2
 
 
+def _read_json_arg(path: str) -> object:
+    text = sys.stdin.read() if path == "-" else pathlib.Path(path).read_text()
+    return json.loads(text)
+
+
+def _quota_v2_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
+    now = dt.datetime.now(dt.UTC)
+    try:
+        if args.v2_command == "slot":
+            slot = quota_v2.slot_locator(args.provider)
+            if slot is None:
+                print("error: slot 위치자를 만들 환경 변수가 없다", file=sys.stderr)
+                return 2
+            print(slot)
+            return 0
+        if args.v2_command == "bindings" and args.v2_bindings_command == "import":
+            mirror = quota_v2.import_bindings(_read_json_arg(args.file))
+            print(f"bindings={len(mirror['bindings'])} machine_id={mirror['machine_id']}")
+            return 0
+        if args.v2_command == "bindings":
+            mirror = quota_v2.load_bindings()
+            rows = []
+            for name in fetchers:
+                identity, reason = quota_v2.resolve_identity(name, now.timestamp(), mirror=mirror)
+                rows.append({"provider": name, "reason": reason, "identity": identity and identity.as_dict()})
+            print(json.dumps({"mirror": mirror, "resolved": rows}, indent=2, ensure_ascii=False))
+            return 0
+        if args.v2_command == "observations" and args.v2_obs_command == "import":
+            added = quota_v2.import_observations(_read_json_arg(args.file))
+            print(f"added={added}")
+            return 0
+        if args.v2_command == "observations":
+            identity, reason = quota_v2.resolve_identity(args.provider, now.timestamp())
+            if identity is None:
+                print(f"error: 신원 불명 ({reason})", file=sys.stderr)
+                return 4
+            for obs in quota_v2.export_observations(identity):
+                print(json.dumps(obs, ensure_ascii=False))
+            return 0
+        provider, _ = recommend.profile_pool(args.profile)
+        identity, _reason = quota_v2.resolve_identity(provider, now.timestamp())
+        evaluation = quota_v2.evaluate(
+            quota_v2.snapshot_for(provider, identity), args.profile, now=now, purpose=args.purpose
+        )
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(evaluation.as_dict(), indent=2, ensure_ascii=False))
+    return 0
+
+
 def _models_command(args: argparse.Namespace) -> int:
     if args.models_command != "verify":
         return 2
@@ -997,6 +1105,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "models":
         return _models_command(args)
+
+    if args.command == "quota-v2":
+        return _quota_v2_command(args, fetchers)
 
     if args.list_providers:
         for name in default_order(list(fetchers)):

@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from . import cache, proctrack
+from . import cache, proctrack, quota_v2
 from .http import classify_error
 from .model import ProviderResult
 from .providers import BUILTIN
@@ -86,6 +86,21 @@ def _kill_process_group_on_timeout(_signum: int, _frame: object) -> None:
     os._exit(124)
 
 
+def _v2_capture(pool: str, now: float) -> dict:
+    """task #578 shadow 기록 — 실패해도 refresh 결과·rc 에 영향 0."""
+    try:
+        return quota_v2.capture_identities([pool], now)
+    except Exception:
+        return {}
+
+
+def _v2_record(pool: str, result, started_at: float, completed_at: float, identities: dict) -> None:
+    if not identities:
+        return
+    with contextlib.suppress(Exception):
+        quota_v2.record_attempts({pool: (result, completed_at)}, started_at=started_at, identities=identities)
+
+
 def run_worker(fetchers: dict[str, object], pool: str) -> int:
     """Fetch one pool and merge only that pool into the cache."""
 
@@ -107,10 +122,14 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
                 print(f"refresh: pool={pool} backoff 중 — {remaining:.0f}s 뒤 허용, 네트워크 호출 생략")
                 return 0
             fetcher = fetchers[pool]
+            v2_identities = _v2_capture(pool, now)
+            started_at = now
             result = _fetch(fetcher, pool)
+            completed_at = time.time()
             if result.error or result.warning:
                 detail = result.error or result.warning
                 cache.record_failure(pool, result, now)
+                _v2_record(pool, result, started_at, completed_at, v2_identities)
                 print(
                     f"refresh: pool={pool} failed: status={result.http_status or '-'} "
                     f"kind={result.error_kind or '-'} detail={detail}",
@@ -125,6 +144,7 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
             result.age_s = 0.0
             result.stale = False
             cache.update_entry(pool, result, now)
+            _v2_record(pool, result, started_at, completed_at, v2_identities)
             print(f"refresh: pool={pool} updated fetched_at={now:.6f}", flush=True)
             return 0
         finally:

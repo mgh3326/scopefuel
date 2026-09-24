@@ -275,7 +275,7 @@ def test_fresh_automatic_cutoff_cannot_be_hidden_by_manual_low_value(
     rc = cli.main(["gate", "-m", "opus", "--no-cache"])
     captured = capsys.readouterr()
     assert rc == 3
-    assert "95% 소진" in captured.err
+    assert "95% 사용 · 5% 남음 · 차단선 90%" in captured.err
     assert "source=operator" not in captured.err
 
 
@@ -324,7 +324,7 @@ def test_stale_automatic_cutoff_confirmation_cannot_be_hidden(claude_error_regis
     rc = cli.main(["gate", "-m", "opus", "--no-cache"])
     captured = capsys.readouterr()
     assert rc == 3
-    assert "95% 소진" in captured.err
+    assert "95% 사용 · 5% 남음 · 차단선 90%" in captured.err
     assert "source=operator" not in captured.err
 
     assert cli.main(["--json", "--no-cache", "--only", "claude"]) == 0
@@ -382,7 +382,9 @@ def test_warning_bucket_cutoff_cannot_be_hidden_by_manual(capsys, monkeypatch, w
 
     captured = capsys.readouterr()
     assert rc == 3
-    assert f"{used_pct:g}% 소진" in captured.err
+    assert f"{used_pct:g}% 사용" in captured.err
+    assert "차단선 90%" in captured.err
+    assert "소진" in captured.err
     assert "source=operator" not in captured.err
     resolution = manual.resolve_result(automatic, now=dt.datetime.now(dt.UTC))
     assert resolution.applied is False
@@ -476,7 +478,7 @@ def test_manual_used_zero_still_runs_normal_cutoff_check(claude_error_registry, 
     rc = cli.main(["gate", "-m", "opus", "--no-cache"])
     captured = capsys.readouterr()
     assert rc == 3
-    assert "0% 소진 (cutoff 0%" in captured.err
+    assert "0% 사용 · 100% 남음 · 차단선 0%" in captured.err
     assert "source=operator" in captured.err
 
 
