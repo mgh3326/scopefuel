@@ -126,6 +126,87 @@ def test_parse_dollar_amounts_do_not_trip_the_403_marker():
     ]
 
 
+# The panel the real CLI actually draws (from buildManagedUsageSection in the
+# installed bundle): no parens around "resets in", and the hint always carries
+# an hour component — "resets in 20d 15h 2m" contains the substring "15h".
+REAL_EXHAUSTED_MONTHLY = (
+    "Plan usage\n"
+    "  5h limit       ░░░░    0% used   resets in 3h 12m\n"
+    "  Weekly limit   ░░░░    0% used   resets in 4d 2h 1m\n"
+    "  Monthly limit  ████  100% used   resets in 20d 15h 2m\n"
+)
+
+
+def test_parse_real_render_monthly_row_with_15h_reset_is_monthly():
+    """#573 tester blocker B1: a monthly reset hint containing "5h"/"15h" must
+    not classify the row as session — an exhausted monthly cap was dropped."""
+    result = kimi.parse(REAL_EXHAUSTED_MONTHLY)
+
+    assert result.error is None
+    assert [(b.label, b.window, b.used_pct) for b in result.buckets] == [
+        ("5h", "5h", 0.0),
+        ("weekly", "7d", 0.0),
+        ("monthly", "30d", 100.0),
+    ]
+    # Bare (paren-less) reset hints are parsed too.
+    assert all(bucket.resets_at for bucket in result.buckets)
+
+
+def test_parse_real_render_monthly_row_with_5h_reset_is_monthly():
+    result = kimi.parse(
+        "  5h limit       ░░░░    0% used   resets in 3h 12m\n"
+        "  Weekly limit   ░░░░    0% used   resets in 4d 2h 1m\n"
+        "  Monthly limit  ████  100% used   resets in 20d 5h 2m\n"
+    )
+
+    assert result.error is None
+    assert [(b.label, b.used_pct) for b in result.buckets] == [
+        ("5h", 0.0),
+        ("weekly", 0.0),
+        ("monthly", 100.0),
+    ]
+
+
+def test_parse_monthly_only_with_5h_in_reset_is_unmeasurable():
+    # Monthly row at month-end can reset within hours ("resets in 5h 10m") —
+    # it must not turn into a session bucket.
+    result = kimi.parse("  Monthly limit  ████  100% used   resets in 5h 10m\n")
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_dollar_429_does_not_trip_the_rate_limit_marker():
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "Extra Usage\n"
+        "  Used this month  $429.10\n"
+        "  Balance          $70.90\n"
+    )
+
+    assert result.error is None
+    assert len(result.buckets) == 2
+
+
+def test_parse_context_token_counts_do_not_trip_the_403_marker():
+    result = kimi.parse(
+        "5h limit: 0% used\nWeekly limit: 0% used\nContext  (403 / 256k)\nSession tokens  403k\n"
+    )
+
+    assert result.error is None
+    assert len(result.buckets) == 2
+
+
+def test_parse_unknown_limit_row_is_unmeasurable():
+    # A new quota dimension we cannot classify must not be silently dropped —
+    # it may be the binding constraint.
+    result = kimi.parse("5h limit: 0% used\nWeekly limit: 0% used\nDaily limit 100% used\n")
+
+    assert result.error is not None
+    assert "알 수 없는 quota 행" in result.error
+
+
 def test_fetch_uses_a_pty_and_sends_usage_once(tmp_path, monkeypatch):
     binary = tmp_path / "fake-kimi"
     binary.write_text(
