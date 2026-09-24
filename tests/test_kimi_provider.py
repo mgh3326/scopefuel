@@ -38,6 +38,96 @@ def test_parse_rate_limit_is_an_immediate_error_without_retry():
     assert result.raw == {"stdout": "HTTP 429 Too Many Requests\n"}
 
 
+# ------------------------------------------------------------------ #573
+# The /usage panel renders one row per managed /usages entry — 5h, weekly,
+# AND monthly (the membership quota that freezes all usage on its own). The
+# parser used to drop the monthly row and ignore quota-403 text printed next
+# to otherwise-healthy rows, so an exhausted pool surfaced as "5h 0% · 주 0%".
+
+
+def test_parse_monthly_limit_row_is_a_third_account_bucket():
+    result = kimi.parse(
+        "5h limit: 0% used (resets in 3h)\n"
+        "Weekly limit: 12% used (resets in 4d)\n"
+        "Monthly limit: 47% used\n"
+    )
+
+    assert result.error is None
+    assert [(b.label, b.window, b.horizon, b.used_pct) for b in result.buckets] == [
+        ("5h", "5h", "now", 0.0),
+        ("weekly", "7d", "week", 12.0),
+        ("monthly", "30d", "month", 47.0),
+    ]
+    assert all(bucket.scope.kind == "account" for bucket in result.buckets)
+
+
+def test_parse_quota_403_text_is_an_error_even_with_healthy_rows():
+    # The incident rendering: rows read 0% used while the account was blocked.
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "403 You've reached your 5-hour usage limit. Your quota will reset "
+        "when the current 5-hour window ends.\n"
+    )
+
+    assert result.error is not None
+    assert "사용 한도" in result.error
+    assert "5-hour usage limit" in result.error
+    assert result.buckets == []
+
+
+def test_parse_weekly_usage_limit_text_is_an_error():
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "403 You've reached your weekly usage limit for this billing cycle.\n"
+    )
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_failed_to_fetch_usage_is_an_error():
+    result = kimi.parse("Failed to fetch usage: HTTP 403\n")
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_monthly_only_output_is_unmeasurable():
+    # Shape change: only the membership row rendered — the 5h/weekly windows
+    # are invisible, so the reading must not become a usable measurement.
+    result = kimi.parse("Monthly limit: 100% used\n")
+
+    assert result.error is not None
+    assert "quota 줄을 찾지 못함" in result.error
+    assert result.buckets == []
+
+
+def test_parse_changed_panel_shape_is_unmeasurable_not_zero():
+    result = kimi.parse("Plan usage\n  No usage data available.\n")
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_dollar_amounts_do_not_trip_the_403_marker():
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "Extra Usage\n"
+        "  Used this month  $403.20\n"
+        "  Monthly limit    Unlimited\n"
+        "  Balance          $96.80\n"
+    )
+
+    assert result.error is None
+    assert [(b.label, b.used_pct) for b in result.buckets] == [
+        ("5h", 0.0),
+        ("weekly", 0.0),
+    ]
+
+
 def test_fetch_uses_a_pty_and_sends_usage_once(tmp_path, monkeypatch):
     binary = tmp_path / "fake-kimi"
     binary.write_text(

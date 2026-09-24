@@ -49,6 +49,14 @@ _PERCENT_USED = re.compile(r"(?P<used>\d+(?:\.\d+)?)\s*%\s+used", re.IGNORECASE)
 _RESET_IN = re.compile(r"\(\s*resets\s+in\s+(?P<duration>[^)]*)\)", re.IGNORECASE)
 _DURATION_PART = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[dhms])", re.IGNORECASE)
 _RATE_LIMIT = re.compile(r"\b(?:429|too\s+many\s+requests|rate[- ]?limited)\b", re.IGNORECASE)
+# Quota-exhaustion / fetch-failure markers in the rendered panel.  The CLI's
+# quota 403s say "You've reached your ... usage limit"; the /usage card itself
+# renders "Failed to fetch usage: HTTP <code>" when the usages endpoint fails.
+# Bare ``403`` is excluded when it reads as a money amount (``$403.20``).
+_QUOTA_LIMIT = re.compile(
+    r"(?<![\d$.])403(?!\.\d)|usage\s+limit|reached\s+your|failed\s+to\s+fetch\s+usage",
+    re.IGNORECASE,
+)
 _PLAN = re.compile(r"\b(?:plan|tier)\s*[:|]\s*(?P<plan>[A-Za-z][A-Za-z0-9+ -]*)", re.IGNORECASE)
 
 
@@ -180,7 +188,7 @@ def _probe_once() -> str:
                     continue
                 if not ready and _normal_prompt_ready(clean):
                     ready = True
-                if _RATE_LIMIT.search(clean):
+                if _RATE_LIMIT.search(clean) or _QUOTA_LIMIT.search(clean):
                     break
                 if ready and usage_seen_at is None and _usage_panel_seen(clean):
                     usage_seen_at = time.monotonic()
@@ -294,9 +302,39 @@ def _usage_percent_present(line: str) -> bool:
 
 
 def parse(text: str) -> ProviderResult:
-    """Parse Kimi CLI remaining percentages into scopefuel used percentages."""
+    """Parse Kimi CLI remaining percentages into scopefuel used percentages.
+
+    The panel renders one row per entry of the managed ``GET /usages``
+    payload: ``5h limit``, ``Weekly limit`` and ``Monthly limit`` (the
+    membership quota that freezes all usage on its own).  A quota 403 or a
+    fetch failure can appear next to otherwise healthy-looking rows, so any
+    such marker makes the whole reading unmeasurable — a partially rendered
+    panel is never evidence of a healthy pool.
+    """
 
     clean = _clean(text)
+    if _RATE_LIMIT.search(clean):
+        return ProviderResult(
+            id="kimi",
+            error="Kimi CLI usage rate limited (HTTP 429/rate limit; retry 금지)",
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw={"stdout": clean},
+            pool_class="spend",
+        )
+    limit_line = next(
+        (line.strip() for line in clean.splitlines() if _QUOTA_LIMIT.search(line)), ""
+    )
+    if limit_line:
+        return ProviderResult(
+            id="kimi",
+            error=f"Kimi CLI /usage 출력에 사용 한도 도달·조회 오류 표시가 있음: {limit_line[:160]}",
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw={"stdout": clean},
+            pool_class="spend",
+        )
+
     buckets_by_kind: dict[str, Bucket] = {}
     for line in clean.splitlines():
         lower = line.lower()
@@ -307,6 +345,8 @@ def parse(text: str) -> ProviderResult:
             kind, label, window, horizon = "weekly", "weekly", "7d", "week"
         elif "5h" in lower or "hour" in lower:
             kind, label, window, horizon = "session", "5h", "5h", "now"
+        elif "month" in lower:
+            kind, label, window, horizon = "monthly", "monthly", "30d", "month"
         else:
             continue
 
@@ -335,12 +375,13 @@ def parse(text: str) -> ProviderResult:
             ),
         )
 
-    buckets = [buckets_by_kind[k] for k in ("session", "weekly") if k in buckets_by_kind]
-    if not buckets:
-        if _RATE_LIMIT.search(clean):
-            error = "Kimi CLI usage rate limited (HTTP 429/rate limit; retry 금지)"
-        else:
-            error = "/usage 출력에서 Weekly/5h quota 줄을 찾지 못함"
+    buckets = [
+        buckets_by_kind[k] for k in ("session", "weekly", "monthly") if k in buckets_by_kind
+    ]
+    if "session" not in buckets_by_kind and "weekly" not in buckets_by_kind:
+        error = "/usage 출력에서 Weekly/5h quota 줄을 찾지 못함"
+        if "monthly" in buckets_by_kind:
+            error += " (monthly 행만으로는 5h/weekly 소진 여부를 판정할 수 없음)"
         return ProviderResult(
             id="kimi",
             error=error,
