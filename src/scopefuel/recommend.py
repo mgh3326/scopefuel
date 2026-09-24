@@ -1995,11 +1995,14 @@ def gate_check(
     (``oc-omni`` 같은 명시적 무료 레인을 제외하고) 해당 프로필 자체의 provider 측정·
     유효 class·exclude·raw cutoff 를 정상 프로필과 동일하게 검사한다.
 
-    ``operator_request``(task #461)는 escalation 프로필에서만 유효한 운영자 명시 요청의
-    durable 참조다. 유효하면 "같은 grade 정상 대안이 가용하므로 거부" 갈래 **하나만**
-    건너뛰고, 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로 적용된다. 이것은
-    감사 가능한 주장의 기록이지 신원·동의의 증명이 아니며, REF 는 항상
-    ``ref_resolution=unverified`` 로만 기록된다.
+    ``operator_request``(task #461)는 escalation 프로필과 CONSULT_ONLY_PROFILES
+    (fable)에서만 유효한 운영자 명시 요청의 durable 참조다. escalation 에서는 유효한
+    REF 가 "같은 grade 정상 대안이 가용하므로 거부" 갈래 **하나만** 건너뛰고,
+    consult_only 에서는 요청 그 자체가 자격이다(policy launch 와 같은 충족 조건 —
+    task #625). 어느 쪽이든 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로
+    적용된다. astra 철자에는 적용되지 않는다 — 그 역할 게이트는 purpose 만 본다
+    (#527 고정 동작). 이것은 감사 가능한 주장의 기록이지 신원·동의의 증명이
+    아니며, REF 는 항상 ``ref_resolution=unverified`` 로만 기록된다.
 
     ``purpose``(task #527)는 astra 역할 게이트의 용도 입력이다. ASTRA_ROLE_PROFILES
     멤버(모델 식별 — 이름 substring 이 아니다)는 ``purpose`` 가
@@ -2075,21 +2078,54 @@ def gate_check(
     found = _find_profile(profile_name, grade_table=table)
 
     # escalation 이 아닌 프로필에 operator-request 를 주면 조용히 무시하지 않고 거부한다 —
-    # 범용 우회 플래그로 오인되는 것을 막기 위한 fail-closed.
-    if operator_request is not None and (found is None or found[1].gate != "escalation"):
+    # 범용 우회 플래그로 오인되는 것을 막기 위한 fail-closed. task #625: 단
+    # CONSULT_ONLY_PROFILES(fable)은 예외다 — ``policy launch`` 가 요구하는 바로 그
+    # 요청을 게이트가 거부하면 정상 경로가 성립하지 않는다(fable 은 #591 이후
+    # GRADE_TABLE 밖이라 found=None 으로 여기 도달한다). astra 철자는 계속
+    # not_applicable — 그 자격은 purpose 축이고 요청이 대신하지 않는다(#527).
+    if (
+        operator_request is not None
+        and (found is None or found[1].gate != "escalation")
+        and profile_name not in CONSULT_ONLY_PROFILES
+    ):
         grade_of_found = found[0] if found is not None else None
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
             grade=grade_of_found,
-            reason=(f"operator_request_not_applicable: {profile_name} 은 escalation 프로필이 아니다"),
+            reason=(
+                f"operator_request_not_applicable: {profile_name} 은 escalation/consult_only 프로필이 아니다"
+            ),
             operator_request_ref=operator_request,
             requested_by=audit_requested_by,
             ref_resolution="unverified",
         )
+    # task #625: consult_only 정체성(fable)은 운영자 명시 요청이 스폰 자격이다 —
+    # ``policy launch`` 와 같은 충족 조건을 게이트에도 둔다. 측정 여부와 무관하게
+    # 요청이 없으면 거부가 먼저다(측정불가보다 "실행 자격 없음"이 더 근본적 사실).
+    # GRADE_TABLE 소속과 무관하게 검사한다 — 런타임 catalog 가 fable 을 다른 행으로
+    # 되돌려 놓는 미래에도 요청 없는 스폰은 열리지 않는다.
+    if profile_name in CONSULT_ONLY_PROFILES and operator_request is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=found[0] if found is not None else None,
+            reason=(
+                f"consult_only: {profile_name} — 운영자 명시 요청 없이 스폰 불가 "
+                "(--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)"
+            ),
+        )
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
+        audit: dict[str, object] = {}
+        if operator_request is not None:
+            audit = {
+                "operator_request_ref": operator_request,
+                "requested_by": audit_requested_by or "unknown",
+                "ref_resolution": "unverified",
+            }
         # If provider_id is unknown too, return unmeasurable.
         if not provider_id:
             return GateResult(
@@ -2099,6 +2135,7 @@ def gate_check(
                 grade=None,
                 reason=f"unknown profile: {profile_name}",
                 unmeasurable=True,
+                **audit,
             )
         # Profile known to profile_pool but not in GRADE_TABLE: check quota only.
         by_id = {r.id: r for r in providers}
@@ -2112,6 +2149,7 @@ def gate_check(
                 grade=None,
                 reason=_unmeasurable_reason(provider_id, result),
                 unmeasurable=True,
+                **audit,
             )
         matches = _matching_buckets(result, group_name)
         if not matches:
@@ -2122,6 +2160,7 @@ def gate_check(
                 grade=None,
                 reason=f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)",
                 unmeasurable=True,
+                **audit,
             )
         states = _window_states(matches, now)
         constraint = _select_constraint(states)
@@ -2149,6 +2188,7 @@ def gate_check(
                 reason=", ".join(reason_parts) + ")",
                 used_pct=used_pct,
                 pool_class=effective_class,
+                **audit,
             )
         cutoff = _usage_cutoff(effective_class)
         over = _any_window_over_cutoff(states, cutoff)
@@ -2161,10 +2201,17 @@ def gate_check(
                 reason=f"{over.used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
                 used_pct=over.used_pct,
                 pool_class=effective_class,
+                **audit,
             )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
+        if operator_request is not None:
+            # consult_only 충족은 escalation_override 가 아니다 — 대안 거부를 건너뛴
+            # 것이 아니라 요청 자체가 자격이므로 override=False 로 기록한다.
+            reason += (
+                f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
+            )
         return GateResult(
             ok=True,
             profile=profile_name,
@@ -2174,6 +2221,7 @@ def gate_check(
             used_pct=used_pct,
             pool_class=effective_class,
             stale_accepted=accepted is not None,
+            **audit,
         )
 
     grade, profile = found
@@ -2195,6 +2243,14 @@ def gate_check(
 
     escalation_override = False
     audit: dict[str, object] = {}
+    if operator_request is not None:
+        # 여기 도달하는 비-escalation 요청은 consult_only 정체성뿐이다 — catalog 가
+        # fable 을 default-gate 행으로 되돌린 경우에도 감사 필드는 기록한다.
+        audit = {
+            "operator_request_ref": operator_request,
+            "requested_by": audit_requested_by or "unknown",
+            "ref_resolution": "unverified",
+        }
     if profile.gate == "escalation":
         # 1) escalation 자격: 같은 grade 의 다른 정상 후보가 전부 소진·측정불가일 때만 진행.
         #    유효한 operator-request 가 있으면 이 "대안 가용 거부" 갈래 하나만 건너뛴다
@@ -2339,6 +2395,8 @@ def gate_check(
     reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
+    if operator_request is not None:
+        reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     return GateResult(
         ok=True,
         profile=profile_name,
@@ -2348,6 +2406,7 @@ def gate_check(
         used_pct=used_pct,
         pool_class=effective_class,
         stale_accepted=accepted is not None,
+        **audit,
     )
 
 

@@ -155,9 +155,12 @@ def test_gate_fable_consult_only_blocked_by_pool_policy_exclude():
     active policy exclude on its own pool must still fail-closed — scoped narrowly
     to CONSULT_ONLY_PROFILES, not every D3 ("not in GRADE_TABLE") profile (a retired
     oc-* spelling, for instance, keeps its ordinary D3 behavior unchanged — see
-    test_gate_oc_oss_not_in_grade_table_* below)."""
+    test_gate_oc_oss_not_in_grade_table_* below). #625: reaching the exclude check
+    now needs the operator request that consult_only requires."""
     policy.set_policy("claude", "exclude", until=dt.date(2026, 8, 31), note="Pro 요금제")
-    result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
+    result = gate_check(
+        _healthy_s_plus_providers(), "fable", today=TODAY, now=NOW, operator_request="hk:task/625"
+    )
     assert result.ok is False
     assert result.grade is None
     assert result.unmeasurable is False
@@ -165,29 +168,67 @@ def test_gate_fable_consult_only_blocked_by_pool_policy_exclude():
     assert "until 2026-08-31" in result.reason
     assert "Pro 요금제" in result.reason
     assert result.pool_class == "exclude"
+    # 요청은 consult_only 충족일 뿐 quota 검사 면제가 아니다 — 감사 필드는 남는다.
+    assert result.operator_request_ref == "hk:task/625"
+    assert result.ref_resolution == "unverified"
+    assert result.escalation_override is False
 
 
 def test_gate_fable_consult_only_still_blocked_by_own_pool_unmeasurable():
-    """ROB-591: the D3 path still checks the profile's own pool measurability."""
+    """ROB-591: the D3 path still checks the profile's own pool measurability.
+    #625: the request satisfies consult_only; measurability still fails."""
     providers = [
         ProviderResult(id="claude", error="HTTP 503"),
         _result("codex", 95.0, pool_class="preserve"),  # codex-max 소진
         _result("kiro", 99.5, pool_class="spend", window="30d"),  # kiro-opus/kiro-sol 도 소진
     ]
-    result = gate_check(providers, "fable", today=TODAY, now=NOW)
+    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/625")
     assert result.ok is False
     assert result.unmeasurable is True
     assert "측정 불가" in result.reason
 
 
-def test_gate_fable_consult_only_accepted_when_healthy():
-    """AC1: explicit `scopefuel gate -m fable` remains accepted under healthy provider
-    input (own pool ok) — it is never a GRADE_TABLE recommendation (grade is None),
-    but an explicit launch is still evaluated normally."""
+def test_gate_fable_consult_only_denied_without_operator_request():
+    """#625/#527 AC⑤: fable's consult gate is an explicit operator request — a bare
+    `scopefuel gate -m fable` must be refused even under a healthy pool. The #591-era
+    quota-only pass let the two surfaces disagree: policy launch refused while the
+    gate said spawnable."""
     result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert result.role_denied is False
+    assert "consult_only" in result.reason
+    assert "--operator-request" in result.reason
+
+
+def test_gate_fable_consult_only_purpose_alone_never_satisfies():
+    """purpose 는 fable 의 consult_only 를 열지 않는다 — launch 와 같은 규칙."""
+    for purpose in ("architect", "director", "operator-request", "builder", "worker", "tester"):
+        result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW, purpose=purpose)
+        assert result.ok is False, (purpose, result.reason)
+        assert "consult_only" in result.reason
+
+
+def test_gate_fable_consult_only_accepted_with_operator_request():
+    """#625 AC2: a valid operator request satisfies consult_only, then the D3 quota
+    checks run normally — healthy pool → ok, with the audit fields recorded."""
+    result = gate_check(
+        _healthy_s_plus_providers(),
+        "fable",
+        today=TODAY,
+        now=NOW,
+        operator_request="hk:doc/note/2026-09-23/model-refresh-opus55-gpt6-grok47",
+        requested_by="operator",
+    )
     assert result.ok is True
     assert result.grade is None
     assert result.provider_id == "claude"
+    assert result.escalation_override is False  # 대안 거부를 건너뛴 것이 아니다
+    assert result.operator_request_ref == "hk:doc/note/2026-09-23/model-refresh-opus55-gpt6-grok47"
+    assert result.requested_by == "operator"
+    assert result.ref_resolution == "unverified"
+    assert "operator_request=hk:doc/note/2026-09-23/model-refresh-opus55-gpt6-grok47" in result.reason
+    assert "escalation_override=false" in result.reason
 
 
 def test_gate_fable_consult_only_blocked_by_own_pool_cutoff():
@@ -196,7 +237,7 @@ def test_gate_fable_consult_only_blocked_by_own_pool_cutoff():
         _result("codex", 10.0, pool_class="preserve"),
         _result("kiro", 10.0, pool_class="spend", window="30d"),
     ]
-    result = gate_check(providers, "fable", today=TODAY, now=NOW)
+    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/625")
     assert result.ok is False
     assert result.unmeasurable is False
     assert "소진" in result.reason
@@ -486,6 +527,65 @@ def test_gate_operator_request_on_non_escalation_profile_rejected():
     )
     assert result.ok is False
     assert "operator_request_not_applicable" in result.reason
+
+
+def test_gate_operator_request_on_plain_d3_profile_rejected():
+    """#625: consult_only 가 아닌 D3(GRADE_TABLE 밖) 철자에는 여전히 not_applicable —
+    요청 경로가 열린 것은 consult_only 정체성뿐이다."""
+    providers = [
+        _result("agy", 10.0, pool_class="spend", scope=Scope("group", "3p"), window="30d"),
+    ]
+    result = gate_check(providers, "oc-oss", today=TODAY, now=NOW, operator_request="hk:task/625")
+    assert result.ok is False
+    assert "operator_request_not_applicable" in result.reason
+
+
+def test_gate_fable_cli_operator_request_exit_0_with_audit_fields(monkeypatch, capsys, tmp_path):
+    """#625 AC2: `scopefuel gate -m fable --operator-request <ref>` 가 rc 0 이고
+    감사 필드가 stdout 첫 줄과 --gate-output 레코드에 남는다."""
+    providers = {
+        "claude": lambda: _result("claude", 10.0, pool_class="preserve"),
+    }
+    monkeypatch.setattr(cli, "registry", lambda: providers)
+    gate_file = tmp_path / "gate.json"
+    rc = cli.main(
+        [
+            "gate",
+            "-m",
+            "fable",
+            "--operator-request",
+            "hk:task/625",
+            "--requested-by",
+            "operator",
+            "--gate-output",
+            str(gate_file),
+            "--no-cache",
+        ]
+    )
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "operator_request_ref=hk:task/625" in out.out
+    assert "requested_by=operator" in out.out
+    assert "ref_resolution=unverified" in out.out
+    assert "escalation_override=false" in out.out
+
+    record = json.loads(gate_file.read_text())
+    assert record["operator_request_ref"] == "hk:task/625"
+    assert record["requested_by"] == "operator"
+    assert record["ref_resolution"] == "unverified"
+    assert record["escalation_override"] is False
+    assert record["exit_code"] == 0
+
+
+def test_gate_fable_cli_no_request_exit_3(monkeypatch, capsys):
+    """#625 AC3: `scopefuel gate -m fable` (요청 없음) 은 consult_only 거부."""
+    monkeypatch.setattr(
+        cli, "registry", lambda: {"claude": lambda: _result("claude", 10.0, pool_class="preserve")}
+    )
+    rc = cli.main(["gate", "-m", "fable", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 3
+    assert "consult_only" in out.err
 
 
 def test_gate_operator_request_cli_oc_omni_exit_0_with_audit_fields(monkeypatch, capsys, tmp_path):
