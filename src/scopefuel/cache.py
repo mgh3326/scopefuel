@@ -285,6 +285,7 @@ def _backoff_result(
     remaining = until - now
     state = state if isinstance(state, dict) else {}
     last_error = state.get("last_error")
+    last_good_age: float | None = None
     if isinstance(entry, dict):
         age = now - float(entry.get("fetched_at") or 0)
         if age <= STALE_MAX_S:
@@ -307,11 +308,15 @@ def _backoff_result(
                 else stored_fp is not None and stored_fp == current_fp
             )
             return stale
+        if entry.get("result"):
+            # task #614 — collect 의 6h 초과 경로와 같은 주석: 스냅샷은 있다, 너무 오래됐다.
+            last_good_age = age
     return ProviderResult(
         id=name,
         error=f"backoff 중, {remaining:.0f}s 뒤 재시도 가능" + (f" ({last_error})" if last_error else ""),
         error_kind="rate_limited",
         backoff_until=until,
+        age_s=last_good_age,
     )
 
 
@@ -461,6 +466,11 @@ def collect(
                     )
                     results[index] = stale
                     continue
+                elif entry.get("result"):
+                    # task #614 — 정상 스냅샷이 존재하지만 6h 한도를 넘었다.
+                    # 거부 사유가 "마지막 정상 값 없음"이 아니라 "너무 오래됨"이려면
+                    # 나이를 결과에 남겨야 한다.
+                    result.age_s = age
             results[index] = result
             continue
 
