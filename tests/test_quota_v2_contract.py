@@ -429,3 +429,30 @@ def test_a_malformed_identity_is_identity_unknown(identity):
     case = {"identity": identity}
     observations = [corpus.observation(case, {"id": "s1", "t": 500, "vals": "claude.std"})]
     assert run_evaluate(case, observations).code == "IDENTITY_UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2026-09-24T24:00:00Z",
+        "2026-09-24T24:00:00.000000+09:00",
+        "2026-01-00T24:00:00Z",  # day 00: Python 3.14's fromisoformat rolls it into 2026-01-01
+        "2026-09-24T23:59:60Z",
+        "2026-02-29T00:00:00Z",
+        "9999-12-31T23:59:59-01:00",
+    ],
+)
+def test_parse_time_rejects_what_some_interpreters_accept(text):
+    """§2 times: the accepted set is fixed by the contract text, not by the Python version."""
+    from scopefuel.quota_v2_contract import parse_time
+
+    assert parse_time(text) is None
+
+
+def test_parse_time_keeps_offsets_and_fractions():
+    from scopefuel.quota_v2_contract import parse_time
+
+    assert parse_time("2026-09-24T10:08:20.1234567+09:00") == dt.datetime(
+        2026, 9, 24, 1, 8, 20, 123456, tzinfo=dt.UTC
+    )
+    assert parse_time("0001-01-01T00:00:00Z") == dt.datetime(1, 1, 1, tzinfo=dt.UTC)

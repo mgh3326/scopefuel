@@ -51,7 +51,9 @@ _MACHINE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}")
 _VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/:-]{0,127}")
 _WINDOW_RE = re.compile(r"(?:[a-z0-9][a-z0-9._-]{0,31}|\?)")
 _INSTANCE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
-_RFC3339_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)")
+_RFC3339_RE = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(?:Z|([+-])([01]\d|2[0-3]):([0-5]\d))"
+)
 
 ENVELOPE_FIELDS = (
     "schema",
@@ -133,13 +135,31 @@ SUPPORT_LIST: tuple[str, ...] = ("claude",)  # §1.1 production value
 
 
 def parse_time(value: object) -> dt.datetime | None:
-    """RFC3339 with an explicit offset → aware UTC datetime; anything else → None."""
-    if not isinstance(value, str) or not value.isascii() or not _RFC3339_RE.fullmatch(value):
+    """RFC3339 with an explicit offset → aware UTC datetime; anything else → None.
+
+    The fields are range-checked here and the datetime is built from them, so the
+    accepted set does not follow the interpreter: `datetime.fromisoformat` in
+    Python 3.14 accepts hour 24 (``T24:00:00`` → next day), which 3.11–3.13 and
+    the Go hub reject. Hour 0–23, minute 0–59, second 0–59 (no leap second),
+    a real calendar date, and year 1–9999 both as written and in UTC.
+    """
+    if not isinstance(value, str) or not value.isascii():
         return None
+    match = _RFC3339_RE.fullmatch(value)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    fraction, sign, offset_h, offset_m = match.group(7, 8, 9, 10)
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    offset = dt.timedelta(0)
+    if sign is not None:
+        offset = dt.timedelta(hours=int(offset_h), minutes=int(offset_m)) * (1 if sign == "+" else -1)
+    microsecond = int((fraction or "")[:6].ljust(6, "0"))
     try:
-        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.astimezone(dt.UTC) if parsed.tzinfo is not None else None
-    except (ValueError, OverflowError):  # out of range, or year 1/9999 pushed out by the offset
+        local = dt.datetime(year, month, day, hour, minute, second, microsecond, dt.timezone(offset))
+        return local.astimezone(dt.UTC)
+    except (ValueError, OverflowError):  # no such date, or year 1/9999 pushed out by the offset
         return None
 
 
