@@ -89,7 +89,6 @@ def fetch() -> ProviderResult:
                 return ProviderResult(
                     id="kimi",
                     error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
-                    hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
                     source="cli:/usage",
                     pool_class="spend",
                     error_kind=PROBE_IN_PROGRESS,

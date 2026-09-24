@@ -296,6 +296,65 @@ def test_gate_cli_passes_while_probe_in_progress(monkeypatch, capsys):
     assert "탐침 진행 중" in out.out
 
 
+@pytest.mark.parametrize("pool", ["devin", "kimi", "grok", "kiro"])
+@pytest.mark.parametrize("kind", ["auth", "credentials", "unknown", "rate_limited", None])
+def test_lock_skip_does_not_hide_failure_recorded_after_snapshot(pool, kind):
+    """스냅샷 이후에 기록된 실제 실패는 건너뜀으로 덮이지 않는다(fail-open 방지).
+
+    잠금 보유 프로브가 실패를 기록한 직후 다른 호출자가 건너뜀을 받으면,
+    마지막 실제 관측은 그 실패다 — 기록된 사유 그대로 #576 규칙이 판정한다.
+    """
+    _seed(pool, at=_stale_seed_at(pool))
+    failure = ProviderResult(
+        id=pool,
+        error="HTTP 401 인증 실패" if kind == "auth" else f"{pool} 배너 파싱 실패",
+        error_kind=kind,
+        http_status=401 if kind == "auth" else None,
+    )
+    cache.record_failure(pool, failure, EPOCH - 5.0)
+
+    result = _collect_skip(pool, use_cache=True)
+
+    assert result.stale is True
+    assert result.error_kind != PROBE_IN_PROGRESS
+    res = gate_check([result], POOL_PROFILE[pool], today=TODAY, now=NOW)
+    assert res.ok is False
+    assert "탐침 진행 중" not in res.reason
+
+
+def test_lock_skip_stale_rejected_on_account_fp_mismatch():
+    """지문 불일치 증거(match=False)가 있으면 건너뜀 수용을 하지 않는다."""
+    pool = "devin"
+    seeded = _good_result(pool)
+    seeded.account_fp = "acct-A"
+    cache.update_entry(pool, seeded, _stale_seed_at(pool))
+    fetcher = _skip_fetcher(pool)
+    fetcher.current_account_fp = lambda: "acct-B"
+
+    result = cache.collect({pool: fetcher}, [pool], now=EPOCH, use_cache=True)[0]
+
+    assert result.account_fp_match is False
+    res = gate_check([result], POOL_PROFILE[pool], today=TODAY, now=NOW)
+    assert res.ok is False
+
+
+def test_lock_skip_stale_accepted_when_fp_matches():
+    """지문 일치(match=True)면 건너뜀 수용은 유지된다 — 완화가 과하지 않음을 핀."""
+    pool = "devin"
+    seeded = _good_result(pool)
+    seeded.account_fp = "acct-A"
+    cache.update_entry(pool, seeded, _stale_seed_at(pool))
+    fetcher = _skip_fetcher(pool)
+    fetcher.current_account_fp = lambda: "acct-A"
+
+    result = cache.collect({pool: fetcher}, [pool], now=EPOCH, use_cache=True)[0]
+
+    assert result.account_fp_match is True
+    res = gate_check([result], POOL_PROFILE[pool], today=TODAY, now=NOW)
+    assert res.ok is True
+    assert res.stale_accepted is True
+
+
 # ---------------------------------------------------------------- AC4: 4개 CLI 풀
 
 

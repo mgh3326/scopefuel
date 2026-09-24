@@ -339,7 +339,8 @@ def _in_progress_result(
     건너뜀 결과를 그대로 돌려준다 — 마지막 정상 값 없음(측정 불가)은 유지.
     """
     if isinstance(entry, dict):
-        age = now - float(entry.get("fetched_at") or 0)
+        snap_at = float(entry.get("fetched_at") or 0)
+        age = now - snap_at
         if age <= ttl_s:
             kept = _from_entry(entry, name, now, policy_class)
             kept.stale = False
@@ -347,6 +348,15 @@ def _in_progress_result(
             return kept
         if age <= STALE_MAX_S:
             stale = _from_entry(entry, name, now, policy_class)
+            # 스냅샷 이후에 기록된 실패 감사가 있으면 마지막 실제 관측은 그
+            # 실패다 — 건너뜀은 관측이 아니므로 기록된 실패 사유를 그대로
+            # 노출해 #576 규칙에 맡긴다(auth·parse 등은 그대로 차단).
+            audited_at = entry.get("last_error_at")
+            if isinstance(audited_at, int | float) and audited_at > snap_at:
+                stale.last_error = entry.get("last_error")
+                stale.last_error_at = float(audited_at)
+                stale.error_kind = entry.get("last_error_kind")
+                return stale
             stale.note = f"탐침 진행 중 — 직전 값 {format_age(age)}"
             stale.last_error = skipped.error
             stale.last_error_at = now
