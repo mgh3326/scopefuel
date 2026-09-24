@@ -724,3 +724,77 @@ def test_gate_purpose_ignored_for_non_astra_profile():
     with_purpose = gate_check(providers, "codex-max", today=TODAY, now=NOW, purpose="builder")
     assert with_purpose.ok == plain.ok is True
     assert with_purpose.role_denied is False
+
+
+# ------------------------------------------------------------------ #573 kimi
+# 소진된 kimi 풀이 "5h 0% · 주 0%" 로 측정돼 게이트를 통과한 사고.
+# /usage 패널의 monthly 행(멤버십 쿼타)도 측정 대상이며, 한도/조회 오류
+# 텍스트가 찍힌 출력은 측정 불가다.
+
+
+def _kimi_result(
+    h5: float,
+    weekly: float,
+    monthly: float | None = None,
+) -> ProviderResult:
+    buckets = [
+        Bucket(
+            label="5h",
+            window="5h",
+            used_pct=h5,
+            scope=Scope("account"),
+            horizon="now",  # type: ignore[arg-type]
+        ),
+        Bucket(
+            label="weekly",
+            window="7d",
+            used_pct=weekly,
+            scope=Scope("account"),
+            horizon="week",  # type: ignore[arg-type]
+        ),
+    ]
+    if monthly is not None:
+        buckets.append(
+            Bucket(
+                label="monthly",
+                window="30d",
+                used_pct=monthly,
+                scope=Scope("account"),
+                horizon="month",  # type: ignore[arg-type]
+            )
+        )
+    return ProviderResult(id="kimi", pool_class="spend", buckets=buckets)
+
+
+def test_gate_kimi_monthly_exhausted_blocks_despite_zero_windows():
+    # 사고 형태: 5h/주간은 0% 인데 monthly 캡이 소진 → 소진이 아니라 통과하면 안 됨.
+    result = gate_check([_kimi_result(0.0, 0.0, monthly=100.0)], "kimi-k3", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert "100%" in result.reason
+
+
+def test_gate_kimi_quota_error_is_unmeasurable():
+    providers = [
+        ProviderResult(
+            id="kimi",
+            pool_class="spend",
+            error="Kimi CLI /usage 출력에 사용 한도 도달·조회 오류 표시가 있음: "
+            "403 You've reached your 5-hour usage limit.",
+        )
+    ]
+    result = gate_check(providers, "kimi-k3", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is True
+
+
+def test_gate_kimi_healthy_values_still_pass():
+    result = gate_check([_kimi_result(30.0, 20.0, monthly=45.0)], "kimi-k3", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.provider_id == "kimi"
+
+
+def test_gate_kimi_zero_windows_without_monthly_is_the_known_shape():
+    # 정상 회귀: 패널이 5h/주간만 렌더하고 0% 면 계측된 건강 상태로 통과한다.
+    result = gate_check([_kimi_result(0.0, 0.0)], "kimi-k3", today=TODAY, now=NOW)
+    assert result.ok is True
