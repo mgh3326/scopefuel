@@ -44,6 +44,14 @@ def isolated_cache(tmp_path, monkeypatch):
     # test write to production hk — delete it; tests opt in with their own fake.
     monkeypatch.delenv("HANDOFFKEEP_URL", raising=False)
     monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
+    # task #654: claude reads ~/.claude/.credentials.json and ~/.claude.json —
+    # point both at absent paths so no test observes the developer's real
+    # account fingerprint or tokens. Tests opt in via CLAUDE_CONFIG_DIR or by
+    # monkeypatching claude.CREDENTIALS/CLAUDE_JSON themselves.
+    from scopefuel.providers import claude
+
+    monkeypatch.setattr(claude, "CREDENTIALS", tmp_path / "claude-absent-credentials.json")
+    monkeypatch.setattr(claude, "CLAUDE_JSON", tmp_path / "claude-absent-claude.json")
     # #608: the CLI providers' probes write probe-calls.log and hold
     # .probe.lock under PROBE_WORKDIR — a test that reaches fetch() without
     # redirecting it would pollute the incident-audit log in the real

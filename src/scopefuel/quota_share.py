@@ -10,9 +10,9 @@ usage-API 429 를 구조적으로 없앤다.
   계정 지문 일치·``REMOTE_MAX_AGE_S`` 이내만 받아들인다. 원격 값은 로컬
   측정이 아니므로 로컬 캐시·backoff·v2 저장소에 쓰지 않는다.
 - 페이로드는 비밀이 아닌 값뿐이다 — used_pct·reset·측정 시각·측정 호스트·
-  계정/세션 지문(비가역 해시). 토큰·자격 원문은 절대 싣지 않는다. hk 서버의
-  ``guard.Reject`` 도 credential-shaped body 를 거부한다 — 이 모듈이 첫째
-  방어선이고 서버 가드가 둘째다.
+  계정/세션 지문(비가역 해시). 토큰·자격 원문은 절대 싣지 않는다 — 이 모듈의
+  고정 키 집합이 유일한 방어선이다(hk ``guard.Reject`` 는 ``sk-ant-api03`` 형
+  키만 잡고 OAuth 토큰 형태는 통과시킨다).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ _DOC_PREFIX = "/v1/documents/"
 
 def enabled() -> bool:
     """기본 켜짐 — hk 자격이 없으면 엔드포인트 해석 단계에서 조용히 꺼진다."""
-    return os.environ.get(ENV_DISABLE, "").strip().lower() not in {"off", "0", "disabled", "false"}
+    return os.environ.get(ENV_DISABLE, "").strip().lower() not in {"off", "0", "disabled", "false", "no"}
 
 
 def key_for(pool: str, account_fp: str) -> str:
@@ -209,12 +209,13 @@ def _snapshot(document: dict | None) -> dict | None:
         return None
     by = snap.get("measured_by")
     host = by.get("host") if isinstance(by, dict) else None
+    session_fp = by.get("session_fp") if isinstance(by, dict) else None
     return {
         "pool": snap.get("pool"),
         "account_fp": snap.get("account_fp"),
         "measured_at_epoch": float(measured),
         "host": host if isinstance(host, str) and host else "unknown",
-        "session_fp": by.get("session_fp") if isinstance(by, dict) else None,
+        "session_fp": session_fp if isinstance(session_fp, str) and session_fp else None,
         "plan": snap.get("plan") if isinstance(snap.get("plan"), str) else None,
         "buckets": buckets,
     }

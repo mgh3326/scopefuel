@@ -30,6 +30,7 @@ from ..model import Bucket, ProviderResult, Scope
 from ..quota_v2_contract import Attempt, claude_attempt
 
 CREDENTIALS = pathlib.Path.home() / ".claude" / ".credentials.json"
+CLAUDE_JSON = pathlib.Path.home() / ".claude.json"
 KEYCHAIN_SERVICE = os.environ.get("SCOPEFUEL_CLAUDE_KEYCHAIN_SERVICE", "Claude Code-credentials")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 BETA_HEADER = "oauth-2025-04-20"
@@ -84,22 +85,44 @@ def _load_oauth() -> tuple[dict, str] | None:
     return None
 
 
+def _claude_json_path() -> pathlib.Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return pathlib.Path(configured) / ".claude.json" if configured else CLAUDE_JSON
+
+
+def _account_uuid() -> str | None:
+    """계정 uuid — ``~/.claude.json`` 최상위의 ``oauthAccount.accountUuid``.
+
+    자격 파일/Keychain 의 ``claudeAiOauth`` 에는 토큰·만료·플랜만 있고 계정
+    식별자는 없다 — uuid 는 Claude Code 주 설정 파일에만 있다(읽기 전용).
+    """
+    try:
+        payload = json.loads(_claude_json_path().read_text())
+    except (OSError, ValueError):
+        return None
+    account = payload.get("oauthAccount") if isinstance(payload, dict) else None
+    uuid = account.get("accountUuid") if isinstance(account, dict) else None
+    return uuid.strip() if isinstance(uuid, str) and uuid.strip() else None
+
+
 def _account_fp(oauth: dict) -> str | None:
     """계정 지문 — 호스트를 넘어 같은 계정을 식별한다 (task #653/#654).
 
-    정본은 ``oauthAccount.accountUuid`` 다. accessToken 은 로그인 회차·호스트마다
-    다르므로 토큰 해시는 같은 계정을 '다른 계정'으로 오판한다 — 원격 스냅샷
-    공유(AC2)와 stale 수용의 계정 일치 증명을 둘 다 깬다. uuid 가 없는 자격은
-    지문을 내지 않는다 — 토큰 해시로 조용히 폴백하면 다시 호스트마다 다른 지문이
-    되므로 허용하지 않는다(fail closed). 자문 2558 의 '계정/구독 변경 의심'
-    계약은 유지된다 — uuid 가 바뀌면 지문도 바뀐다.
+    정본은 ``oauthAccount.accountUuid`` 다 — accessToken 은 로그인 회차·호스트마다
+    다르므로 토큰 해시를 정본으로 쓰면 같은 계정이 '다른 계정'으로 오판돼 원격
+    스냅샷 공유(AC2)가 깨진다. uuid 를 읽을 수 없는 호스트는 #576 의 로컬 stale
+    일치를 위해 토큰 해시로 폴백한다 — 그 지문은 다른 토큰의 원격 스냅샷과
+    어차피 불일치하므로 fail-closed 는 유지된다. 자문 2558 의 '계정/구독 변경
+    의심' 계약도 유지된다 — uuid·토큰이 바뀌면 지문도 바뀐다.
     """
-    account = oauth.get("oauthAccount")
-    uuid = account.get("accountUuid") if isinstance(account, dict) else None
-    if not isinstance(uuid, str) or not uuid.strip():
-        return None
     plan = str(oauth.get("subscriptionType") or "")
-    return hashlib.sha256(f"claude-account|{plan}|{uuid.strip()}".encode()).hexdigest()[:16]
+    uuid = _account_uuid()
+    if uuid:
+        return hashlib.sha256(f"claude-account|{plan}|{uuid}".encode()).hexdigest()[:16]
+    token = (oauth.get("accessToken") or "").strip()
+    if not token:
+        return None
+    return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16]
 
 
 def _session_fp(oauth: dict) -> str | None:

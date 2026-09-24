@@ -25,7 +25,7 @@ import pytest
 from scopefuel import cache, cli, quota_share, refresh
 from scopefuel.http import HttpError
 from scopefuel.model import Bucket, ProviderResult, Scope
-from scopefuel.providers import claude
+from scopefuel.providers import FetcherWrapper, claude
 from scopefuel.quota_v2_contract import Attempt
 from scopefuel.recommend import gate_check
 
@@ -482,25 +482,46 @@ def test_usage_call_count_unchanged_by_sharing(monkeypatch):
 # ------------------------------------------------------------------ AC3: 지문
 
 
-def test_claude_account_fp_matches_across_tokens():
+def test_claude_account_fp_matches_across_tokens(monkeypatch):
     """AC3 — 다른 호스트의 다른 토큰, 같은 계정 uuid → 같은 지문."""
-    a = {"accessToken": "token-host-a", "subscriptionType": "max", "oauthAccount": {"accountUuid": "u-1"}}
-    b = {"accessToken": "token-host-b", "subscriptionType": "max", "oauthAccount": {"accountUuid": "u-1"}}
+    monkeypatch.setattr(claude, "_account_uuid", lambda: "u-1")
+    a = {"accessToken": "token-host-a", "subscriptionType": "max"}
+    b = {"accessToken": "token-host-b", "subscriptionType": "max"}
     assert claude._account_fp(a) == claude._account_fp(b)
     # 세션 지문은 다르다 — 토큰을 따라 바뀌는 게 목적이다.
     assert claude._session_fp(a) != claude._session_fp(b)
 
 
-def test_claude_account_fp_differs_across_accounts():
-    a = {"accessToken": "t", "subscriptionType": "max", "oauthAccount": {"accountUuid": "u-1"}}
-    b = {"accessToken": "t", "subscriptionType": "max", "oauthAccount": {"accountUuid": "u-2"}}
-    assert claude._account_fp(a) != claude._account_fp(b)
+def test_claude_account_fp_differs_across_accounts(monkeypatch):
+    uuid = {"v": "u-1"}
+    monkeypatch.setattr(claude, "_account_uuid", lambda: uuid["v"])
+    creds = {"accessToken": "t", "subscriptionType": "max"}
+    first = claude._account_fp(creds)
+    uuid["v"] = "u-2"
+    assert claude._account_fp(creds) != first
 
 
-def test_claude_account_fp_is_none_without_account_uuid():
-    """uuid 가 없으면 토큰 해시로 폴백하지 않고 None — 호스트마다 다른 지문 방지."""
-    assert claude._account_fp({"accessToken": "t"}) is None
-    assert claude._account_fp({"accessToken": "t", "oauthAccount": {"accountUuid": "  "}}) is None
+def test_claude_account_fp_falls_back_to_token_hash(monkeypatch):
+    """uuid 를 읽을 수 없는 호스트는 토큰 해시로 폴백한다 — #576 의 로컬 stale
+    일치가 깨지지 않게. 다른 토큰의 원격 스냅샷과는 어차피 불일치해 fail-closed."""
+    monkeypatch.setattr(claude, "_account_uuid", lambda: None)
+    a = {"accessToken": "same-token", "subscriptionType": "max"}
+    b = {"accessToken": "same-token", "subscriptionType": "max"}
+    assert claude._account_fp(a) == claude._account_fp(b) is not None
+    # 다른 토큰 → 다른 지문 — uuid 없는 호스트끼리 원격 스냅샷을 공유하지 않는다.
+    assert claude._account_fp(a) != claude._account_fp({"accessToken": "other-token"})
+    # 토큰마저 없으면 지문을 낼 수 없다.
+    assert claude._account_fp({"subscriptionType": "max"}) is None
+
+
+def test_claude_account_uuid_read_from_claude_json(monkeypatch, tmp_path):
+    """uuid 는 자격 파일이 아니라 .claude.json 최상위에 있다 — 실 레이아웃."""
+    cfg = _claude_creds(monkeypatch, tmp_path, {"accessToken": "t"}, account_uuid="u-real")
+    assert claude._account_uuid() == "u-real"
+    (cfg / ".claude.json").write_text("{}")
+    assert claude._account_uuid() is None
+    (cfg / ".claude.json").write_text("{broken")
+    assert claude._account_uuid() is None
 
 
 def test_session_fp_not_serialized():
@@ -513,11 +534,29 @@ def test_session_fp_not_serialized():
 # ------------------------------------------------------------------ AC4: 만료
 
 
-def _claude_creds(monkeypatch, tmp_path, oauth: dict) -> None:
-    creds = tmp_path / ".credentials.json"
-    creds.write_text(json.dumps({"claudeAiOauth": oauth}))
-    monkeypatch.setattr(claude, "CREDENTIALS", creds)
+def _claude_creds(
+    monkeypatch,
+    tmp_path,
+    oauth: dict,
+    *,
+    account_uuid: str | None = None,
+    dirname: str = "claude-cfg",
+) -> object:
+    """실제 파일 레이아웃으로 자격을 심는다.
+
+    토큰·만료·플랜은 ``$CLAUDE_CONFIG_DIR/.credentials.json`` 의
+    ``claudeAiOauth`` 에, 계정 uuid 는 같은 디렉터리의 ``.claude.json`` 최상위
+    ``oauthAccount`` 에 있다 — 자격 안에 ``oauthAccount`` 를 넣는 형태는
+    Claude Code 가 쓰지 않는다(v654 검증 B1).
+    """
+    cfg = tmp_path / dirname
+    cfg.mkdir(exist_ok=True)
+    (cfg / ".credentials.json").write_text(json.dumps({"claudeAiOauth": oauth}))
+    claude_json: dict = {"oauthAccount": {"accountUuid": account_uuid}} if account_uuid else {}
+    (cfg / ".claude.json").write_text(json.dumps(claude_json))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
     monkeypatch.setattr(claude, "_read_keychain", lambda: None)
+    return cfg
 
 
 def test_claude_expired_token_fails_before_any_call(monkeypatch, tmp_path):
@@ -528,8 +567,8 @@ def test_claude_expired_token_fails_before_any_call(monkeypatch, tmp_path):
         {
             "accessToken": "expired-token",
             "expiresAt": 1000,  # 1970 — 밀리초가 아니라 초 단위도 과거면 만료
-            "oauthAccount": {"accountUuid": "u-1"},
         },
+        account_uuid="u-1",
     )
     calls: list = []
     monkeypatch.setattr(claude, "request_json", lambda *a, **k: calls.append(1) or {})
@@ -538,9 +577,7 @@ def test_claude_expired_token_fails_before_any_call(monkeypatch, tmp_path):
     assert calls == []  # 호출 전 판정 — 401/429 가 될 기회 자체가 없다
     assert result.error_kind == "token_expired"
     assert "expired" in (result.error or "").lower()
-    assert result.account_fp == claude._account_fp(
-        {"accessToken": "expired-token", "oauthAccount": {"accountUuid": "u-1"}}
-    )
+    assert result.account_fp == claude._account_fp({"accessToken": "expired-token"})
     assert isinstance(result.v2_attempt, Attempt)
     assert result.v2_attempt.error_ref == "auth_error:token_expired"
 
@@ -553,9 +590,9 @@ def test_claude_valid_expiry_proceeds_to_usage_call(monkeypatch, tmp_path):
         {
             "accessToken": "live-token",
             "expiresAt": 4_000_000_000_000,  # ms — 먼 미래
-            "oauthAccount": {"accountUuid": "u-1"},
             "subscriptionType": "max",
         },
+        account_uuid="u-1",
     )
     calls: list = []
 
@@ -584,7 +621,9 @@ def test_claude_missing_expiry_proceeds(monkeypatch, tmp_path):
     result = claude.fetch()
     assert calls == [1]
     assert result.error is None
-    assert result.account_fp is None  # uuid 없음 → 지문 없음(fail closed)
+    # uuid 없음 → 토큰 해시 폴백 — 이 호스트의 #576 stale 일치는 유지되고,
+    # 다른 토큰의 원격 스냅샷과는 불일치해 공유는 자연히 닫힌다.
+    assert result.account_fp == claude._account_fp({"accessToken": "live-token"})
 
 
 def test_claude_401_expired_body_reports_token_expired(monkeypatch, tmp_path):
@@ -637,3 +676,254 @@ def test_claude_401_without_expired_stays_auth(monkeypatch, tmp_path):
     assert result.error_kind == "auth"
     assert isinstance(result.v2_attempt, Attempt)
     assert result.v2_attempt.error_ref == "auth_error:http_401"
+
+
+# ------------------------------------------------- B1 회귀: 실제 자격 파일 형태
+#
+# v654 검증 B1 — 실제 ``claudeAiOauth`` 에는 ``oauthAccount`` 가 없고 계정
+# uuid 는 ``.claude.json`` 최상위에 있다. 아래 테스트는 실 레이아웃의
+# synthetic 토큰으로 end-to-end 를 고정한다.
+
+
+def _real_oauth(token: str, *, expires_ms: float = 4_000_000_000_000) -> dict:
+    """실제 ``claudeAiOauth`` 의 키 집합 그대로 — ``oauthAccount`` 없음."""
+    return {
+        "accessToken": token,
+        "refreshToken": "synthetic-refresh",
+        "expiresAt": expires_ms,
+        "refreshTokenExpiresAt": 4_000_000_000_000,
+        "scopes": ["user:inference", "user:profile"],
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+    }
+
+
+def _usage_ok(*_a, **_k):
+    return {
+        "five_hour": {"utilization": 10.0, "resets_at": "2099-01-01T00:00:00Z"},
+        "seven_day": {"utilization": 30.0, "resets_at": "2099-01-08T00:00:00Z"},
+    }
+
+
+def _usage_429(*_a, **_k):
+    raise HttpError(429, "rate_limit_error")
+
+
+def test_real_shape_stale_accepted_after_429(monkeypatch, tmp_path):
+    """R1 — uuid 없는 실 자격에서도 #576 stale 수용은 살아 있다.
+
+    라운드1 은 지문이 None 이라 account_fp_match=None → 게이트 fail-closed
+    였다. 토큰 해시 폴백으로 같은 토큰의 지문은 저장값과 일치해야 한다.
+    """
+    _claude_creds(monkeypatch, tmp_path, _real_oauth("synthetic-token-a"))
+    fetcher = FetcherWrapper(claude.fetch, "spend")
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+    cache.collect({"claude": fetcher}, ["claude"], now=EPOCH)
+    monkeypatch.setattr(claude, "request_json", _usage_429)
+    results = cache.collect({"claude": fetcher}, ["claude"], now=EPOCH + 600)
+
+    assert results[0].account_fp_match is True
+    res = gate_check(results, "opus", today=TODAY, now=NOW + dt.timedelta(seconds=600))
+    assert res.ok is True
+    assert res.stale_accepted is True
+
+
+def test_real_shape_measurement_publishes(monkeypatch, tmp_path):
+    """R2 — 실 자격 형태의 성공 측정도 hk 에 게시된다(라운드1 은 puts=0)."""
+    hk = _enable(monkeypatch)
+    _claude_creds(
+        monkeypatch,
+        tmp_path,
+        _real_oauth("synthetic-token-a"),
+        account_uuid="u-real",
+    )
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+    cache.collect({"claude": FetcherWrapper(claude.fetch, "spend")}, ["claude"], now=EPOCH)
+
+    expected_fp = claude.current_account_fp()
+    assert expected_fp is not None
+    assert [key for key, _ in hk.puts] == [f"quota/claude/{expected_fp}/latest"]
+
+
+def test_real_shape_cross_host_writer_reader(monkeypatch, tmp_path):
+    """R3 — 스펙의 m1b/Pi 시나리오: 발행 호스트 토큰A → 읽는 호스트 만료 토큰B.
+
+    같은 계정(uuid 동일)·다른 토큰에서도 지문이 일치해 원격 스냅샷을 읽는다.
+    """
+    hk = _enable(monkeypatch)
+    _claude_creds(
+        monkeypatch,
+        tmp_path,
+        _real_oauth("synthetic-token-a"),
+        account_uuid="u-1",
+        dirname="writer-cfg",
+    )
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+    cache.collect({"claude": FetcherWrapper(claude.fetch, "spend")}, ["claude"], now=EPOCH)
+    assert len(hk.puts) == 1
+
+    # 읽는 호스트: 만료 토큰 B + 같은 uuid + 별도 캐시 — usage API 는 안 친다.
+    _claude_creds(
+        monkeypatch,
+        tmp_path,
+        _real_oauth("synthetic-token-b", expires_ms=1_000_000),
+        account_uuid="u-1",
+        dirname="reader-cfg",
+    )
+    monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "reader-cache.json"))
+    calls: list = []
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: calls.append(1) or {})
+    results = cache.collect(
+        {"claude": FetcherWrapper(claude.fetch, "spend")},
+        ["claude"],
+        now=EPOCH + 120,
+        use_cache=False,
+    )
+
+    remote = results[0]
+    assert calls == []  # 만료 토큰은 호출 전에 'token expired'
+    assert remote.error is None
+    assert remote.source == quota_share.REMOTE_SOURCE
+    assert remote.note == f"remote measured ({HOST})"
+    assert remote.account_fp_match is True
+    assert remote.last_error is not None and "expired" in remote.last_error.lower()
+
+
+# ------------------------------------------------- M7 / 생존 뮤턴트 핀
+
+
+def test_backoff_result_keeps_policy_class(monkeypatch):
+    """M7 — 스냅샷 없는 backoff 결과도 policy_class 를 보존한다(#653).
+
+    이 줄을 지우는 뮤턴트가 라운드1 full suite 를 통과했다 — manual fallback
+    class 로 preserve 가 새는 것을 여기서 고정한다.
+    """
+    fetcher = _failing("HTTP 429", kind="rate_limited", status=429)
+    cache.collect({"claude": fetcher}, ["claude"], now=EPOCH, use_cache=False)
+    results = cache.collect({"claude": fetcher}, ["claude"], now=EPOCH + 30, use_cache=False)
+    assert results[0].backoff_until is not None
+    assert results[0].pool_class == "spend"
+
+
+def test_remote_snapshot_boundary_15_minutes(monkeypatch):
+    """정확히 15분(=REMOTE_MAX_AGE_S)은 수용, 15분+1s 는 거부."""
+    hk = _enable(monkeypatch)
+    _seed_remote(hk, measured_at=EPOCH - quota_share.REMOTE_MAX_AGE_S)
+    results = cache.collect(
+        {"claude": _failing("HTTP 429", kind="rate_limited", status=429)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert results[0].source == quota_share.REMOTE_SOURCE
+
+
+def test_remote_refused_beyond_future_skew(monkeypatch):
+    """원격 시계가 로컬보다 60s 이상 미래면 거부 — NTP 드리프트 허용치 밖."""
+    hk = _enable(monkeypatch)
+    _seed_remote(hk, measured_at=EPOCH + quota_share.MAX_FUTURE_SKEW_S + 1)
+    results = cache.collect(
+        {"claude": _failing("HTTP 429", kind="rate_limited", status=429)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert results[0].source != quota_share.REMOTE_SOURCE
+    _seed_remote(hk, measured_at=EPOCH + quota_share.MAX_FUTURE_SKEW_S)
+    results = cache.collect(
+        {"claude": _failing("HTTP 429", kind="rate_limited", status=429)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert results[0].source == quota_share.REMOTE_SOURCE
+
+
+def test_remote_refused_on_body_pool_mismatch(monkeypatch):
+    """조회 키는 맞아도 본문 pool 이 다르면 거부한다 — 방어 심화."""
+    hk = _enable(monkeypatch)
+    key = _seed_remote(hk, measured_at=EPOCH - 60.0)
+    tampered = json.loads(hk.docs[key]["body"])
+    tampered["pool"] = "codex"
+    hk.docs[key]["body"] = json.dumps(tampered)
+    results = cache.collect(
+        {"claude": _failing("HTTP 401", kind="auth", status=401)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert results[0].source != quota_share.REMOTE_SOURCE
+
+
+def test_plaintext_hk_url_refused(monkeypatch):
+    """평문 http hk URL 은 opt-in 없이 쓰지 않는다 — bearer 를 평문으로 보내지 않는다."""
+    calls: list = []
+    monkeypatch.setenv("HANDOFFKEEP_URL", "http://hk.example.com")
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", "hk-test-token")
+    monkeypatch.setattr(quota_share, "request_json", lambda *a, **k: calls.append(1) or {})
+    cache.collect({"claude": lambda: _ok()}, ["claude"], now=EPOCH)
+    results = cache.collect(
+        {"claude": _failing("HTTP 429", kind="rate_limited", status=429)},
+        ["claude"],
+        now=EPOCH + 400,
+        use_cache=False,
+    )
+    assert calls == []
+    assert results[0].source != quota_share.REMOTE_SOURCE
+
+
+def test_refresh_worker_does_not_add_usage_calls(monkeypatch, capsys):
+    """refresh writer 경로의 게시도 usage API 호출 수를 늘리지 않는다(M6b)."""
+    hk = _enable(monkeypatch)
+    calls = {"n": 0}
+
+    def fetch() -> ProviderResult:
+        calls["n"] += 1
+        return _ok()
+
+    fetch.pool_class = "spend"  # type: ignore[attr-defined]
+    assert refresh.run_worker({"claude": fetch}, "claude") == 0
+    assert calls["n"] == 1
+    assert len(hk.puts) == 1
+    capsys.readouterr()
+
+
+def test_failed_measurement_does_not_publish(monkeypatch):
+    """실패 결과는 게시하지 않는다 — 스냅샷은 성공 측정의 부산물이다."""
+    hk = _enable(monkeypatch)
+    cache.collect(
+        {"claude": _failing("HTTP 429", kind="rate_limited", status=429)},
+        ["claude"],
+        now=EPOCH,
+        use_cache=False,
+    )
+    assert hk.puts == []
+
+
+def test_quota_share_disabled_env_values(monkeypatch):
+    """off·0·disabled·false·no 모두 끔 — 대소문자·공백 무관."""
+    for value in ("off", "0", "disabled", "false", "no", " OFF "):
+        monkeypatch.setenv("SCOPEFUEL_QUOTA_SHARE", value)
+        assert quota_share.enabled() is False, value
+    monkeypatch.setenv("SCOPEFUEL_QUOTA_SHARE", "on")
+    assert quota_share.enabled() is True
+
+
+def test_claude_expiry_edge_values_proceed(monkeypatch, tmp_path):
+    """expiresAt 의 bool·문자열·초 단위 미래는 '모름/미래' — 호출은 진행한다."""
+    for index, expires_at in enumerate((True, "soon", 4_000_000_000)):
+        _claude_creds(
+            monkeypatch,
+            tmp_path,
+            {"accessToken": "live-token", "expiresAt": expires_at},
+            dirname=f"c-{index}",
+        )
+        calls: list = []
+        monkeypatch.setattr(
+            claude,
+            "request_json",
+            lambda *a, _c=calls, **k: _c.append(1) or {"five_hour": {}},
+        )
+        result = claude.fetch()
+        assert calls == [1], expires_at
+        assert result.error is None

@@ -1,11 +1,12 @@
 # Cross-host quota snapshots via handoffkeep (#653/#654)
 
 Each Claude account is measured in **one place**. The measuring host publishes a
-sanitized snapshot to the existing handoffkeep document store, and every other
-host reads it instead of polling the usage API itself. The trigger was ClaudeBar
-on m1b multiplying usage-API polls until the account's token/IP drew HTTP 429s
-while the same account answered 200 elsewhere — the limit is per token, session
-or IP, not per account, so the fix is to stop multiplying calls.
+sanitized snapshot to the existing handoffkeep document store. Other hosts still
+run their own measurement first; they consult the remote snapshot only when the
+local measurement is unavailable, expired, or in backoff. The trigger was
+ClaudeBar on m1b multiplying usage-API polls until the account's token/IP drew
+HTTP 429s while the same account answered 200 elsewhere — the limit is per
+token, session or IP, not per account, so the fix is to stop multiplying calls.
 
 ```
 measuring host (this Mac / mbp-server)
@@ -25,17 +26,24 @@ reader hosts (m1b, Pi, …)
 - `account_fp` — the reader's accept key
 
 **No token-like field is ever written.** The body carries only measurements and
-irreversible fingerprints; handoffkeep's `guard.Reject` additionally refuses
-credential-shaped bodies, so a regression that serialised a token would fail at
-the server too.
+irreversible fingerprints, and the payload key set is fixed in
+`quota_share._payload` — that client-side key set is the only defence. Do not
+rely on handoffkeep's `guard.Reject` as a second line: it matches
+`sk-ant-(api03-)?…` API keys but **not** Claude OAuth tokens
+(`sk-ant-oat01-…`/`sk-ant-ort01-…`), which would pass the server guard.
 
 ## Fingerprints
 
 - `account_fp` = `sha256("claude-account|<subscriptionType>|<accountUuid>")[:16]`.
-  The account UUID (`claudeAiOauth.oauthAccount.accountUuid`) is stable across
-  hosts and OAuth sessions; a token hash is *not*, because each host holds a
-  different access token (AC3). Credentials without an `accountUuid` produce no
-  fingerprint — fail closed, never a silent token-hash fallback.
+  The account UUID is read from `oauthAccount.accountUuid` at the **top level of
+  `~/.claude.json`** (`$CLAUDE_CONFIG_DIR/.claude.json` when that env is set) —
+  it is *not* inside `claudeAiOauth` in the credentials file. It is stable
+  across hosts and OAuth sessions; a token hash is *not*, because each host
+  holds a different access token (AC3).
+- Hosts where `accountUuid` is unreadable fall back to the legacy
+  `sha256("<subscriptionType>|<accessToken>")[:16]` fingerprint. That keeps
+  host-local stale acceptance (#576) working — with a different token the
+  fingerprint differs anyway, so remote sharing stays fail-closed.
 - `session_fp` = `sha256("claude-session|<accessToken>")[:16]`. Provenance only:
   it records *which* token-session measured a value, so one session's 429 is
   visibly that session's event — it never establishes account identity.
@@ -66,16 +74,23 @@ as before. Results without an account fingerprint are not published.
   should keep running `scopefuel`/`refresh` as usual — every success
   republishes `latest`.
 - **hk key and ACL:** `quota/claude/<account_fp>/latest` under the existing
-  handoffkeep document API (`PUT`/`GET /v1/documents/{key}`, bearer auth). The
-  body is non-secret by construction; readers and writers share the same
-  service token already used by `bench`.
+  handoffkeep document API (`PUT`/`GET /v1/documents/{key}`, bearer auth).
+  There is **no per-key ACL** — any holder of the shared `bench` service token
+  can PUT or GET `quota/…` documents. That is accepted for now: the body is
+  non-secret by construction and the fingerprint is an irreversible hash, but
+  it means a leaked bench token could also *write* forged snapshots. If that
+  matters, revoke/rotate the token rather than relying on document ACLs.
 - **m1b and Pi start reading** simply by running this build: `collect` already
   falls back to the remote snapshot when local measurement is unavailable,
   expired, or in backoff. Nothing to schedule — reading is a side effect of
-  their normal `scopefuel` runs. Expired `~/.claude/.credentials.json` files on
-  those hosts no longer produce misleading 401/429 noise: `expiresAt` is
-  checked before any call and reported as `token expired` (#653). Automatic
-  token refresh remains prohibited (#616) — re-login is manual.
+  their normal `scopefuel` runs. Each host needs its own
+  `~/.claude.json` (`oauthAccount.accountUuid`) for the fingerprint to match
+  across different OAuth tokens; without it the host falls back to a token-hash
+  fingerprint and remote reads simply won't match. Expired
+  `~/.claude/.credentials.json` files on those hosts no longer produce
+  misleading 401/429 noise: `expiresAt` is checked before any call and reported
+  as `token expired` (#653). Automatic token refresh remains prohibited (#616)
+  — re-login is manual.
 - **Witness:** on m1b/Pi, `scopefuel gate -m opus` prints
   `class=spend source=remote source_label="remote measured (<host>)"` while the
   local token is expired/429-ing; a snapshot older than 15 minutes is refused
