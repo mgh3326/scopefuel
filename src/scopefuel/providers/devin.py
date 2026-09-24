@@ -85,9 +85,17 @@ def fetch() -> ProviderResult:
             hint="Devin CLI 설치 후 다시 시도 (SCOPEFUEL_DEVIN_BIN 으로 경로 지정 가능)",
         )
 
-    proctrack.log_probe_call(Path(PROBE_WORKDIR).expanduser(), PROVIDER_ID)
-    banner = _banner_result()
-    models = _fetch_models_list()
+    workdir = Path(PROBE_WORKDIR).expanduser()
+    proctrack.log_probe_call(workdir, PROVIDER_ID)
+    try:
+        with proctrack.single_probe_lock(workdir) as acquired:
+            if not acquired:
+                # Not an error: another probe is already measuring this pool.
+                return _failed(f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀")
+            banner = _banner_result()
+            models = _fetch_models_list()
+    except OSError as exc:
+        return _failed(f"{BINARY} 실행 실패: {exc}")
 
     if banner.error is None:
         buckets = list(banner.buckets)
@@ -121,29 +129,90 @@ def fetch() -> ProviderResult:
 
 
 def _fetch_models_list() -> ProviderResult:
+    """`devin models list` — subprocess.run 의 timeout 은 직접 자식만 죽인다.
+
+    자식이 백그라운드로 남긴 손자나, 부모가 SIGKILL 당했을 때의 자식 본인은
+    살아남는다 — 2026-09-23 사고와 같은 모양으로, 실제로 재현됐다(#608
+    검증 B2). 그래서 배너 프로브와 같은 proctrack 장치를 쓴다: 인스턴스
+    디렉터리 cwd, 전용 세션, pgid 등록, 분리 리퍼.
+    """
+
+    workdir = Path(PROBE_WORKDIR).expanduser()
+    workdir.mkdir(parents=True, exist_ok=True)
+    proctrack.kill_stale_probe_leftovers(workdir)
+    instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
+    process: subprocess.Popen[str] | None = None
+    reaper: subprocess.Popen[bytes] | None = None
+    child_pgid: int | None = None
     try:
-        proc = subprocess.run(  # noqa: S603 - 사용자 PATH 의 devin, 인자는 고정
+        process = subprocess.Popen(  # noqa: S603 - 사용자 PATH 의 devin, 인자는 고정
             [BINARY, "models", "list"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=TIMEOUT_S,
+            cwd=instance_dir,
+            close_fds=True,
+            start_new_session=True,
             env=_child_env(),
         )
-    except subprocess.TimeoutExpired:
-        return _failed(
-            f"{BINARY} models list 가 {TIMEOUT_S:.0f}초 안에 끝나지 않음",
-            hint="devin 을 직접 실행해 models list 가 나오는지 확인하세요",
-        )
+        with contextlib.suppress(OSError):
+            child_pgid = os.getpgid(process.pid)
+        if child_pgid is not None:
+            proctrack.register(child_pgid, instance_dir)
+        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
+        try:
+            stdout, stderr = process.communicate(timeout=TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return _failed(
+                f"{BINARY} models list 가 {TIMEOUT_S:.0f}초 안에 끝나지 않음",
+                hint="devin 을 직접 실행해 models list 가 나오는지 확인하세요",
+            )
+        if process.returncode != 0:
+            return _failed(
+                f"{BINARY} models list 종료코드 {process.returncode}",
+                hint="devin 을 직접 실행해 로그인/네트워크 상태를 확인하세요",
+                stdout=_clean(stdout + stderr),
+            )
+        return parse(stdout + stderr)
     except OSError as exc:
         return _failed(f"{BINARY} 실행 실패: {exc}")
-
-    if proc.returncode != 0:
-        return _failed(
-            f"{BINARY} models list 종료코드 {proc.returncode}",
-            hint="devin 을 직접 실행해 로그인/네트워크 상태를 확인하세요",
-            stdout=_clean(proc.stdout + proc.stderr),
-        )
-    return parse(proc.stdout + proc.stderr)
+    finally:
+        if process is not None and process.poll() is None:
+            process_group = None
+            with contextlib.suppress(OSError):
+                process_group = os.getpgid(process.pid)
+            try:
+                if process_group is not None:
+                    os.killpg(process_group, signal.SIGTERM)
+                process.wait(timeout=2.0)
+            except (subprocess.TimeoutExpired, OSError):
+                if process_group is not None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(process_group, signal.SIGKILL)
+                else:
+                    process.kill()
+                # A wait() that times out here must not escape the finally
+                # block — every cleanup line below it still has to run.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+        # The direct child exiting is not the end of the probe's descendants:
+        # a CLI that backgrounds a helper and returns 0 leaves that helper
+        # running. Sweep the instance directory unconditionally, by cwd,
+        # before it is removed — once it is gone proctrack has no cwd left
+        # to recognise them by.
+        with contextlib.suppress(OSError):
+            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
+        if child_pgid is not None:
+            proctrack.unregister(child_pgid)
+        if reaper is not None:
+            if reaper.poll() is None:
+                with contextlib.suppress(OSError):
+                    reaper.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                reaper.wait(timeout=2.0)
+        with contextlib.suppress(OSError):
+            os.close(owner_fd)
+        shutil.rmtree(instance_dir, ignore_errors=True)
 
 
 def _banner_result() -> ProviderResult:
@@ -263,7 +332,17 @@ def _probe_banner() -> str:
                         os.killpg(process_group, signal.SIGKILL)
                 else:
                     process.kill()
-                process.wait(timeout=2.0)
+                # A wait() that times out here must not escape the finally
+                # block — every cleanup line below it still has to run.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+        # The direct child exiting is not the end of the probe's descendants:
+        # a CLI that backgrounds a helper and returns 0 leaves that helper
+        # running. Sweep the instance directory unconditionally, by cwd,
+        # before it is removed — once it is gone proctrack has no cwd left
+        # to recognise them by.
+        with contextlib.suppress(OSError):
+            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
         if child_pgid is not None:
             proctrack.unregister(child_pgid)
         if reaper is not None:

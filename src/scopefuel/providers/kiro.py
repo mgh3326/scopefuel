@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
-import fcntl
 import os
 import pathlib
 import re
@@ -61,36 +60,6 @@ _PLAN_NAME = re.compile(r"\|\s*KIRO ([A-Z+ ]+?)\s*$", re.MULTILINE)
 _EXPIRED = re.compile(r"Token expired|AccessDenied", re.IGNORECASE)
 
 
-@contextlib.contextmanager
-def _single_probe_lock(workdir: pathlib.Path):
-    """Admit one kiro probe at a time, per pool.
-
-    2026-09-23: a caller polling every ~15s outran a 30s grok probe, so each
-    round started another CLI while the previous one was still running — 22
-    of them on desktop. kiro's CLI probe has the same shape, so it gets the
-    same bound: a second caller is told the pool is busy instead of adding
-    to the pile. The lock is an flock on a file descriptor, so the kernel
-    releases it if the holder is SIGKILLed.
-    """
-
-    workdir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(workdir / ".probe.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        with contextlib.suppress(OSError):
-            os.close(fd)
-
-
 def fetch() -> ProviderResult:
     if shutil.which(BINARY) is None:
         return ProviderResult(
@@ -101,7 +70,7 @@ def fetch() -> ProviderResult:
     workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
     proctrack.log_probe_call(workdir, "kiro")
     try:
-        with _single_probe_lock(workdir) as acquired:
+        with proctrack.single_probe_lock(workdir) as acquired:
             if not acquired:
                 # Not an error: another probe is already measuring this pool.
                 return ProviderResult(

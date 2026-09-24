@@ -106,7 +106,7 @@ def test_a_second_probe_is_skipped_while_one_is_running(tmp_path, monkeypatch):
         entered.append(True)
         raise AssertionError("the second probe must not start a grok")
 
-    with grok._single_probe_lock(workdir) as acquired:
+    with proctrack.single_probe_lock(workdir) as acquired:
         assert acquired is True
         monkeypatch.setattr(grok, "_probe_once", _never_called)
         result = grok.fetch()
