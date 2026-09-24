@@ -5,7 +5,15 @@ from __future__ import annotations
 import datetime as dt
 
 from .cache import format_age
-from .model import WARN_PCT, Bucket, ProviderResult, _is_valid_used_pct, iso_to_local, overall_mark
+from .model import (
+    PROBE_IN_PROGRESS,
+    WARN_PCT,
+    Bucket,
+    ProviderResult,
+    _is_valid_used_pct,
+    iso_to_local,
+    overall_mark,
+)
 
 MARK_TEXT = {"ok": "ok", "warn": "WARN", "crit": "CRIT", "degraded": "DEGRADED"}
 MARK_COLOR = {"ok": "\033[32m", "warn": "\033[33m", "crit": "\033[31m", "degraded": "\033[33m"}
@@ -201,6 +209,9 @@ def brief(
             elif result.pool_class == "spend" and verdict.basis != "none":
                 parts.append("(소진 진행)")
         if result.stale:
-            parts.append(f"[{format_age(result.age_s)}]")
+            age_tag = f"[{format_age(result.age_s)}]"
+            if result.error_kind == PROBE_IN_PROGRESS:
+                age_tag += "(탐침 진행 중)"
+            parts.append(age_tag)
         chunks.append(f"{display_id} " + " ".join(parts))
     return f"[{_mark(worst, color)}] " + " | ".join(chunks)
