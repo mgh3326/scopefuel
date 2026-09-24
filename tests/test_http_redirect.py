@@ -26,6 +26,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     """routes 규칙대로 redirect 또는 JSON 을 돌려주고 받은 헤더를 기록한다."""
 
     def _respond(self):
+        length = self.headers.get("Content-Length")
+        if length:
+            self.rfile.read(int(length))  # 안 읽은 본문이 있으면 close 가 RST 를 내 응답이 끊긴다
         self.server.received.append(
             (self.command, self.path, {k.lower(): v for k, v in self.headers.items()})
         )
