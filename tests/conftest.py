@@ -53,8 +53,19 @@ def isolated_cache(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def _panewire_bin_plant(monkeypatch):
+    """외부에서 상속된 ``PANEWIRE_BIN``(wrk 공용 노브)을 흉내 낸다.
+
+    아래 autouse 차단 픽스처가 이것에 의존하므로 매 테스트마다 심어진 뒤
+    지워져야 한다 — delenv 를 제거하는 뮤턴트(Ge)는 이 심은 값이 남아
+    테스트가 RED 되도록 하기 위함이다.
+    """
+    monkeypatch.setenv("PANEWIRE_BIN", "/nonexistent-inherited-panewire")
+
+
 @pytest.fixture(autouse=True)
-def _block_real_operator_emit(monkeypatch):
+def _block_real_operator_emit(monkeypatch, _panewire_bin_plant):
     """task #638 사고 방지 — 모든 테스트에서 실 operator-desk 발송을 차단한다.
 
     2026-09-24 14:53 KST 에 뮤턴트 스윕(M26)이 싱크 미스텁 테스트를 통해 실
