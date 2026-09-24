@@ -45,6 +45,9 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "codex-max": ("codex-sol", None),
     "builder-sol": ("codex-sol", None),
     "captain-sol": ("codex-sol", None),
+    # #633: builder-luna is codex-luna under --role builder, pinned to the
+    # #594 E3 rung (xhigh) — same catalog profile as the worker spellings.
+    "builder-luna": ("codex-luna", "xhigh"),
     "codex-terra": ("codex-terra", "medium"),
     "codex-med": ("codex-terra", "medium"),
     "codex-terra-max": ("codex-terra-max", None),
