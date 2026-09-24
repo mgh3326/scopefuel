@@ -5,7 +5,43 @@ from __future__ import annotations
 import json
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """redirect 판정용 (scheme, host, port). 기본 포트는 정규화하고, 해석 불가면 None."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        if port is None:
+            port = _DEFAULT_PORTS.get(parsed.scheme.lower())
+        return parsed.scheme.lower(), parsed.hostname or "", port
+    except ValueError:
+        return None
+
+
+class _RedirectRefused(urllib.error.HTTPError):
+    """_SameOriginRedirectHandler 가 거부한 redirect — HttpError 변환 시 사유 표식으로 쓴다."""
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """같은 origin(scheme·host·port) 안의 redirect 만 따라간다.
+
+    CPython 기본 HTTPRedirectHandler 는 Content-Length/Content-Type 외의 헤더를
+    redirect 요청에 그대로 복사한다 — Authorization bearer 가 다른 origin 이나
+    https→http 다운그레이드로 새는 CWE-319. spec.py 처럼 자격이 Authorization 이
+    아닌 헤더에 실리는 호출자도 있어, 헤더를 지우는 대신 cross-origin redirect
+    자체를 거부한다. 거부하면 호출자는 3xx 를 HttpError 로 받는다.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        origin = _origin(req.full_url)
+        if origin is None or origin != _origin(newurl):
+            raise _RedirectRefused(req.full_url, code, "cross-origin redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class HttpError(RuntimeError):
@@ -69,11 +105,21 @@ def request_json(
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+    handlers: list[urllib.request.BaseHandler] = [_SameOriginRedirectHandler()]
+    if ctx is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             payload = resp.read()
     except urllib.error.HTTPError as exc:  # 상태코드를 보존해 401/429를 구분한다
-        raise HttpError(exc.code, exc.read().decode("utf-8", "replace"), _retry_after_seconds(exc)) from exc
+        body_text = exc.read().decode("utf-8", "replace")
+        if 300 <= exc.code < 400:
+            # 거부된 redirect 의 본문에는 Location 목적지(URL 쿼리 포함)가 들어갈 수 있다.
+            # 사유 표식은 거부 판정과 1:1 인 _RedirectRefused 에만 붙는다 — 같은
+            # origin 루프 상한 등 다른 3xx 는 사유 없이 본문만 비운다.
+            body_text = "cross-origin redirect refused" if isinstance(exc, _RedirectRefused) else ""
+        raise HttpError(exc.code, body_text, _retry_after_seconds(exc)) from exc
     text = payload.decode("utf-8", "replace").strip()
     if not text:
         return {}
