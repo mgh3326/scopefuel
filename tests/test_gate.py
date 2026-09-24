@@ -182,9 +182,7 @@ def test_gate_fable_consult_only_still_blocked_by_own_pool_unmeasurable():
         _result("codex", 95.0, pool_class="preserve"),  # codex-max 소진
         _result("kiro", 99.5, pool_class="spend", window="30d"),  # kiro-opus/kiro-sol 도 소진
     ]
-    result = gate_check(
-        providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/625"
-    )
+    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/625")
     assert result.ok is False
     assert result.unmeasurable is True
     assert "측정 불가" in result.reason
@@ -206,9 +204,7 @@ def test_gate_fable_consult_only_denied_without_operator_request():
 def test_gate_fable_consult_only_purpose_alone_never_satisfies():
     """purpose 는 fable 의 consult_only 를 열지 않는다 — launch 와 같은 규칙."""
     for purpose in ("architect", "director", "operator-request", "builder", "worker", "tester"):
-        result = gate_check(
-            _healthy_s_plus_providers(), "fable", today=TODAY, now=NOW, purpose=purpose
-        )
+        result = gate_check(_healthy_s_plus_providers(), "fable", today=TODAY, now=NOW, purpose=purpose)
         assert result.ok is False, (purpose, result.reason)
         assert "consult_only" in result.reason
 
@@ -241,9 +237,7 @@ def test_gate_fable_consult_only_blocked_by_own_pool_cutoff():
         _result("codex", 10.0, pool_class="preserve"),
         _result("kiro", 10.0, pool_class="spend", window="30d"),
     ]
-    result = gate_check(
-        providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/625"
-    )
+    result = gate_check(providers, "fable", today=TODAY, now=NOW, operator_request="hk:task/625")
     assert result.ok is False
     assert result.unmeasurable is False
     assert "소진" in result.reason
