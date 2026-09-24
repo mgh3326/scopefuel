@@ -83,7 +83,6 @@ def test_fetch_reports_timeout_without_leaking(tmp_path, monkeypatch):
     monkeypatch.setattr(grok, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(grok, "TIMEOUT_S", 1.0)
     monkeypatch.setattr(grok, "STARTUP_DELAY_S", 0.05)
-    monkeypatch.setattr(grok.shutil, "which", lambda _binary: grok.BINARY)
 
     result = grok.fetch()
     assert result.error and "끝나지 않음" in result.error
@@ -100,7 +99,6 @@ def test_a_second_probe_is_skipped_while_one_is_running(tmp_path, monkeypatch):
     workdir = tmp_path / "grok-probe-workdir"
     monkeypatch.setattr(grok, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(grok, "BINARY", str(_hanging_fake(tmp_path)))
-    monkeypatch.setattr(grok.shutil, "which", lambda _binary: grok.BINARY)
 
     entered = []
 
@@ -108,7 +106,7 @@ def test_a_second_probe_is_skipped_while_one_is_running(tmp_path, monkeypatch):
         entered.append(True)
         raise AssertionError("the second probe must not start a grok")
 
-    with grok._single_probe_lock(workdir) as acquired:
+    with proctrack.single_probe_lock(workdir) as acquired:
         assert acquired is True
         monkeypatch.setattr(grok, "_probe_once", _never_called)
         result = grok.fetch()
