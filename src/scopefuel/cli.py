@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import replace
 
-from . import bench, herdr, launch, manual, quota_v2, recommend, render, served
+from . import bench, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -752,6 +752,29 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         ),
                         last_auto_error=resolution.last_auto_error,
                     )
+    # task #654 — 원격 스냅샷(hk 문서)으로 판정했으면 provenance 를 남긴다.
+    # 자기신고(source=operator)와 구분되는 "remote measured (host)" 라벨이다.
+    provider_id = recommend.profile_pool(args.profile)[0]
+    remote_used = next(
+        (
+            item
+            for item in automatic_results
+            if item.id == provider_id and item.source == quota_share.REMOTE_SOURCE
+        ),
+        None,
+    )
+    if remote_used is not None and result.source != manual.SOURCE:
+        result = replace(
+            result,
+            source=quota_share.REMOTE_SOURCE,
+            source_label=remote_used.note,
+            measured_at=(
+                dt.datetime.fromtimestamp(remote_used.fetched_at, dt.UTC).isoformat()
+                if remote_used.fetched_at is not None
+                else None
+            ),
+            observed_age_s=remote_used.age_s,
+        )
     exit_code = 0 if result.ok else (5 if result.role_denied else (4 if result.unmeasurable else 3))
 
     # task #578 1단계 — shadow 전용: v2(account-scoped) 판정을 계산해 비교 로그에만 남긴다.
@@ -784,6 +807,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 f" operator_request_ref={result.operator_request_ref}"
                 f" requested_by={result.requested_by or 'unknown'}"
                 f" ref_resolution={result.ref_resolution or 'unverified'}"
+            )
+        if result.source == quota_share.REMOTE_SOURCE:
+            first_line += (
+                f" source={quota_share.REMOTE_SOURCE}"
+                f' source_label="{result.source_label}"'
+                f" measured_at={result.measured_at}"
+                f" observed_age_s={result.observed_age_s}"
             )
         if result.source == manual.SOURCE:
             windows = ",".join(str(observation["window"]) for observation in result.manual_observations)

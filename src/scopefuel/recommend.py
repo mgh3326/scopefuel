@@ -1438,6 +1438,9 @@ def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str
         if result.stale and result.age_s is not None:
             return f"{provider_id} 탐침 진행 중 — 직전 값 {cache.format_age(result.age_s)} 수용 불가"
         return f"{provider_id} 탐침 진행 중 — 직전 정상 값 없음"
+    # task #653 — 만료는 만료로 보고한다. 속도 제한도 아니고 '측정 불가' 도 아니다.
+    if result is not None and result.error_kind == "token_expired":
+        return f"{provider_id} {result.error or 'token expired — 자격 만료, 재로그인 필요'}"
     return f"{provider_id} 측정 불가 (provider error/degraded)"
 
 

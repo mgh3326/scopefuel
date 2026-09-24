@@ -39,6 +39,11 @@ def isolated_cache(tmp_path, monkeypatch):
     # that does not exist, so a test's backend never depends on whether the
     # developer's machine happens to be provisioned.
     monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(tmp_path / "handoffkeep-absent.env"))
+    # task #654: quota_share publishes sanitized snapshots through the same
+    # credential resolution. An inherited HANDOFFKEEP_URL/TOKEN pair would let a
+    # test write to production hk — delete it; tests opt in with their own fake.
+    monkeypatch.delenv("HANDOFFKEEP_URL", raising=False)
+    monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
     # #608: the CLI providers' probes write probe-calls.log and hold
     # .probe.lock under PROBE_WORKDIR — a test that reaches fetch() without
     # redirecting it would pollute the incident-audit log in the real

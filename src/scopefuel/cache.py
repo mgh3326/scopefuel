@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 
+from . import quota_share
 from .http import classify_error
 from .model import (
     PROBE_IN_PROGRESS,
@@ -325,6 +326,9 @@ def _backoff_result(
         error_kind="rate_limited",
         backoff_until=until,
         age_s=last_good_age,
+        # task #653 — policy_class 를 싣지 않으면 기본값 preserve 가 manual
+        # fallback 의 class 로 새어 spend 풀이 'preserve' 로 고정된다.
+        pool_class=policy_class,
     )
 
 
@@ -440,6 +444,7 @@ def collect(
     backoff = _load_backoff()
     results: list[ProviderResult | None] = [None] * len(names)
     misses: list[tuple[int, str, object, dict | None, PoolClass, float]] = []
+    policy_classes: dict[str, PoolClass] = {}
 
     for index, name in enumerate(names):
         entry = cache.get(name)
@@ -448,6 +453,7 @@ def collect(
         if isinstance(entry, dict):
             cached_class = (entry.get("result") or {}).get("pool_class")
         policy_class = _effective_class(name, fetcher, cached_class)
+        policy_classes[name] = policy_class
         effective_ttl_s = ttl_s if ttl_s is not None else PROVIDER_TTL_S.get(name, DEFAULT_TTL_S)
         if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= effective_ttl_s:
             fresh = _from_entry(entry, name, now, policy_class)
@@ -558,6 +564,9 @@ def collect(
             result.fetched_at = now
             result.age_s = 0.0
             successes[name] = result
+            # task #654 — 정상 측정의 정제 스냅샷을 hk 문서로 게시한다.
+            # 스케줄러가 아니라 정상 실행의 부산물이며 실패는 fail-open 이다.
+            quota_share.publish_result(name, result, now=now)
         results[index] = result
 
     if successes or failures:
@@ -567,6 +576,17 @@ def collect(
         if v2_identities:
             with suppress(Exception):
                 quota_v2.record_attempts(v2_attempts, started_at=now, identities=v2_identities)
+
+    # task #654 — 측정 불가·만료·backoff 인 항목만, 계정 지문이 일치하는 신선한
+    # hk 원격 스냅샷으로 대신 채운다. 원격은 로컬 측정이 아니므로 캐시·backoff·
+    # v2 저장소에는 쓰지 않는다.
+    for index, name in enumerate(names):
+        current = results[index]
+        if current is None or not quota_share.remote_eligible(current):
+            continue
+        remote = quota_share.remote_result(name, fetchers.get(name), current, policy_classes[name], now=now)
+        if remote is not None:
+            results[index] = remote
     return [result for result in results if result is not None]
 
 

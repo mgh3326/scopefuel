@@ -30,6 +30,9 @@ ERROR_REFS = frozenset(
         "rate_limited:http_429",
         "auth_error:http_401",
         "auth_error:http_403",
+        # task #653 — expiresAt 가 지난 자격의 만료는 401 과 구분해 기록한다.
+        # 호출 전 만료 판정은 HTTP status 가 아예 없으므로 http_401 을 쓰면 거짓말이다.
+        "auth_error:token_expired",
         "transport_error:http_5xx",
         "transport_error:network",
         "transport_error:timeout",
