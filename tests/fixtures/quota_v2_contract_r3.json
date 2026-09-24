@@ -1,0 +1,5325 @@
+{
+ "contract_rev": "quota-v2.r3",
+ "note": "Hand-written. Every expect.* value was set from contract.md (r3.1) sentences cited in 'basis', never by calling an implementation. A harness may only expand specs mechanically: fill defaults, turn offsets into RFC3339, copy definition fields from the contract §3 tables.",
+ "conventions": {
+  "T0": "2026-09-24T01:00:00Z",
+  "times": "t/now/reset/valid_*/observed are seconds relative to T0 (fractional allowed)",
+  "now": 600,
+  "clock": {
+   "skew_bound_s": 0,
+   "source": "fixture"
+  },
+  "support_list": [
+   "claude",
+   "ctest"
+  ],
+  "profile": {
+   "claude": "opus"
+  },
+  "identity": {
+   "provider": "claude",
+   "machine": "node-a",
+   "slot": "slot-a",
+   "revision": 2,
+   "account": "acct_7k2m9q4x",
+   "entitlement": "unknown",
+   "valid_from": -3600,
+   "valid_until": 86400
+  },
+  "src": {
+   "own": {
+    "machine": "node-a",
+    "slot": "slot-a",
+    "revision": 2
+   },
+   "own_old_rev": {
+    "machine": "node-a",
+    "slot": "slot-a",
+    "revision": 1
+   },
+   "own_other_slot": {
+    "machine": "node-a",
+    "slot": "slot-b",
+    "revision": 4
+   },
+   "other": {
+    "machine": "node-b",
+    "slot": "slot-b1",
+    "revision": 5
+   },
+   "other2": {
+    "machine": "node-c",
+    "slot": "slot-c1",
+    "revision": 7
+   }
+  },
+  "received_at": "own-machine observations: null (not uploaded); other-machine observations: t + 1 (hub-stored), unless the row sets received_at",
+  "value_sets": {
+   "claude.std": {
+    "claude.five_hour": [
+     10,
+     10800
+    ],
+    "claude.seven_day": [
+     20,
+     345600
+    ]
+   },
+   "claude.high": {
+    "claude.five_hour": [
+     95,
+     10800
+    ],
+    "claude.seven_day": [
+     96,
+     345600
+    ]
+   },
+   "ctest.std": {
+    "ctest.fixed_5h": [
+     10,
+     10800,
+     "2026-09-24T04:00:00Z"
+    ],
+    "ctest.fixed_7d": [
+     20,
+     345600,
+     "2026-09-28T01:00:00Z"
+    ]
+   }
+  },
+  "vals": "string = named set; object = {limit_id: [used_pct, reset_offset, window_instance?] | {used, reset, reset_str, instance, observed}}; key 'extend' merges onto a named set. claude window_instance defaults to \"unknown\"; ctest fixed defaults to the reset instant string; ctest.rolling_1d defaults to \"unknown\".",
+  "defaults": {
+   "status": "success",
+   "src": "own",
+   "contract_rev": "quota-v2.r3",
+   "unshared_limit_count": 0,
+   "labels": "none"
+  },
+  "selected": "list of observation ids with multiplicity (an id appears once per selected observation object)",
+  "codes": "claude rows: final code after §6G; ctest rows: FRESH/STALE for the fresh/stale outcome (§6G note)"
+ },
+ "evaluate": [
+  {
+   "id": "EV01",
+   "desc": "fresh own success",
+   "basis": "§6 F, §6G",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV02",
+   "desc": "age exactly TTL 180s",
+   "basis": "§6 F (≤ TTL)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 420,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV03",
+   "desc": "age TTL+1, no failure after it",
+   "basis": "§6 E",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 419,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "STALE_EXPIRED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV04",
+   "desc": "fresh 95/96%",
+   "basis": "§6G fresh ≥ 90",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.high"
+    }
+   ],
+   "expect": {
+    "code": "QUOTA_DENIED",
+    "ok": false,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV05",
+   "desc": "one account two nodes: newer other-node value",
+   "basis": "§5.5 δ=Δ=0, §6 F",
+   "origin": "AC1",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 550,
+     "vals": {
+      "claude.five_hour": [
+       12,
+       10800
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV06",
+   "desc": "two nodes, same instant, same values",
+   "basis": "§6 V, F",
+   "origin": "AC1",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV07",
+   "desc": "same instant, used_pct differs",
+   "basis": "§6 V, C",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       11,
+       10800
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV08",
+   "desc": "same instant, reset_at differs by 1µs",
+   "basis": "§6 V",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800.000001
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV09",
+   "desc": "20 and 20.0",
+   "basis": "§6 V numeric",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ],
+      "claude.seven_day": [
+       20.0,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV10",
+   "desc": "same reset instant as +00:00 and Z",
+   "basis": "§6 V instant",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": {
+       "used": 10,
+       "reset_str": "2026-09-24T04:00:00+00:00"
+      },
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV11",
+   "desc": "only labels differ (multilingual)",
+   "basis": "§3.4",
+   "origin": "R5-SF-1",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std",
+     "labels": {
+      "claude.five_hour": "5h"
+     }
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": "claude.std",
+     "labels": {
+      "claude.five_hour": "다섯 시간 한도"
+     }
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV12",
+   "desc": "newer higher value wins over older lower",
+   "basis": "§6 F, §6G",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 450,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 550,
+     "vals": {
+      "claude.five_hour": [
+       95,
+       10800
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "QUOTA_DENIED",
+    "ok": false,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV13",
+   "desc": "ctest union: optional limit on one node only",
+   "basis": "§6 V (one-sided ids not compared), F",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": {
+      "extend": "ctest.std",
+      "ctest.rolling_1d": [
+       5,
+       86400
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 560,
+     "vals": "ctest.std"
+    }
+   ],
+   "expect": {
+    "code": "FRESH",
+    "ok": true,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV14",
+   "desc": "fresh blocking value exactly 90",
+   "basis": "§6G (≥ 90)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       90,
+       10800
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "QUOTA_DENIED",
+    "ok": false,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV15",
+   "desc": "fresh blocking value 89.9",
+   "basis": "§6G (< 90)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ],
+      "claude.seven_day": [
+       89.9,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV20",
+   "desc": "old experimental observation without contract_rev",
+   "basis": "§2.3, §6 X1",
+   "origin": "R4-SF-2 (changed)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "contract_rev": null,
+     "vals": {
+      "account:-:5h": [
+       10,
+       10800
+      ],
+      "account:-:7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "contract_unsupported": 1
+    }
+   }
+  },
+  {
+   "id": "EV20b",
+   "desc": "r1 envelope (contract_rev quota-v2.r1)",
+   "basis": "§6 X1",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "contract_rev": "quota-v2.r1",
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "contract_unsupported": 1
+    }
+   }
+  },
+  {
+   "id": "EV21",
+   "desc": "label-hash style limit_id",
+   "basis": "§3.6(a), §6 D",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ],
+      "account:-:7d:7c130114fe8dd17b5786f61965074640": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV22",
+   "desc": "unknown claude limit_id",
+   "basis": "§3.6(a)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "extend": "claude.std",
+      "claude.seven_day_opus": [
+       5,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV22b",
+   "desc": "model limit outside the r2 claude set",
+   "basis": "§3.2 (outside), §3.6(a)",
+   "origin": "operator decision (b)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "extend": "claude.std",
+      "claude.weekly_scoped.model.opus": [
+       30,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV23",
+   "desc": "known id with wrong window",
+   "basis": "§3.6(b)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std",
+     "defs": {
+      "claude.seven_day": {
+       "window": "5h"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV24",
+   "desc": "horizon change not overridden by newer correct observation",
+   "basis": "§6 D (≤ 21600)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 300,
+     "vals": "claude.std",
+     "defs": {
+      "claude.seven_day": {
+       "horizon": "now"
+      }
+     }
+    },
+    {
+     "id": "s2",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV25",
+   "desc": "definition violation older than 6h no longer blocks",
+   "basis": "§6 D",
+   "identity": {
+    "valid_from": -30000
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": -21700,
+     "vals": "claude.std",
+     "defs": {
+      "claude.seven_day": {
+       "horizon": "now"
+      }
+     }
+    },
+    {
+     "id": "s2",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV26",
+   "desc": "claude bucket with a known window_instance",
+   "basis": "§3.2 none, §3.6(c)",
+   "origin": "R5-SF-2 on claude",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800,
+       "2026-09-24T04:00:00Z"
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV27",
+   "desc": "same instant, same id, one observation with a different horizon",
+   "basis": "§3.6(b), §6 D",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": "claude.std",
+     "defs": {
+      "claude.five_hour": {
+       "horizon": "week"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV30",
+   "desc": "own auth failure then other node success",
+   "basis": "§6 A",
+   "origin": "r1 SF-1",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    },
+    {
+     "id": "s1",
+     "src": "other",
+     "t": 550,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1"
+    ]
+   }
+  },
+  {
+   "id": "EV31",
+   "desc": "own auth cleared by strictly later own success",
+   "basis": "§6 A, A′",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    },
+    {
+     "id": "s1",
+     "t": 550,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ],
+    "excluded": {
+     "cleared_own_auth": 1
+    }
+   }
+  },
+  {
+   "id": "EV32",
+   "desc": "own partial does not clear own auth",
+   "basis": "§6 A",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_403"
+    },
+    {
+     "id": "p1",
+     "t": 550,
+     "status": "partial",
+     "error_ref": "partial:required_missing",
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1"
+    ]
+   }
+  },
+  {
+   "id": "EV33",
+   "desc": "own success and own auth at the same instant",
+   "basis": "§6 A (strictly later)",
+   "origin": "R2-SF-2",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1"
+    ]
+   }
+  },
+  {
+   "id": "EV34",
+   "desc": "other machine auth ignored",
+   "basis": "§6 O",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "a1",
+     "src": "other",
+     "t": 550,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ],
+    "excluded": {
+     "other_slot_auth": 1
+    }
+   }
+  },
+  {
+   "id": "EV35",
+   "desc": "own auth then own 429",
+   "basis": "§6 A",
+   "origin": "r1 SF-1",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    },
+    {
+     "id": "r1",
+     "t": 550,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1"
+    ]
+   }
+  },
+  {
+   "id": "EV36",
+   "desc": "same machine and slot, older revision: another slot",
+   "basis": "§6 O (slot = machine, slot, revision)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "a1",
+     "src": "own_old_rev",
+     "t": 550,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ],
+    "excluded": {
+     "other_slot_auth": 1
+    }
+   }
+  },
+  {
+   "id": "EV37",
+   "desc": "same machine, different slot: its auth is ignored",
+   "basis": "§6 O",
+   "origin": "contract r1 gap (slot identity)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "a1",
+     "src": "own_other_slot",
+     "t": 550,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ],
+    "excluded": {
+     "other_slot_auth": 1
+    }
+   }
+  },
+  {
+   "id": "EV38",
+   "desc": "own slot auth, then a success from another slot on the same machine",
+   "basis": "§6 A (own slot success only)",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    },
+    {
+     "id": "s1",
+     "src": "own_other_slot",
+     "t": 550,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1"
+    ]
+   }
+  },
+  {
+   "id": "EV39",
+   "desc": "two own auth failures at the same latest instant",
+   "basis": "§6 A (Amax all)",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    },
+    {
+     "id": "a2",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_403"
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1",
+     "a2"
+    ]
+   }
+  },
+  {
+   "id": "EV40",
+   "desc": "newest conflicting twins after older low success",
+   "basis": "§4.2, §6 C, OLD-1",
+   "origin": "R4-SF-1",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 300,
+     "vals": "claude.std"
+    },
+    {
+     "id": "d1",
+     "t": 500,
+     "status": "parse_error",
+     "error_ref": "parse_error:duplicate_limit"
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "DUPLICATE_LIMIT",
+    "ok": false,
+    "selected": [
+     "d1"
+    ]
+   }
+  },
+  {
+   "id": "EV41",
+   "desc": "same instant parse and success",
+   "basis": "§6 P",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 500,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x1"
+    ]
+   }
+  },
+  {
+   "id": "EV42",
+   "desc": "same instant duplicate conflict and parse",
+   "basis": "§6 C",
+   "obs": [
+    {
+     "id": "d1",
+     "t": 500,
+     "status": "parse_error",
+     "error_ref": "parse_error:duplicate_limit"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 500,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "DUPLICATE_LIMIT",
+    "ok": false,
+    "selected": [
+     "d1"
+    ]
+   }
+  },
+  {
+   "id": "EV43",
+   "desc": "same instant partial and 429",
+   "basis": "§6 Q",
+   "obs": [
+    {
+     "id": "p1",
+     "t": 500,
+     "status": "partial",
+     "error_ref": "partial:required_missing",
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ]
+     }
+    },
+    {
+     "id": "r1",
+     "src": "other",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "PARTIAL",
+    "ok": false,
+    "selected": [
+     "p1"
+    ]
+   }
+  },
+  {
+   "id": "EV44",
+   "desc": "same instant success and 429",
+   "basis": "§6 S, §6G stale",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "r1",
+     "src": "other",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "STALE_ACCEPTED",
+    "ok": true,
+    "selected": [
+     "s1",
+     "r1"
+    ]
+   }
+  },
+  {
+   "id": "EV50",
+   "desc": "no observations",
+   "basis": "§6 N0",
+   "obs": [],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV51",
+   "desc": "only a 429",
+   "basis": "§6 N",
+   "obs": [
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV52",
+   "desc": "parse then 429, never a success",
+   "basis": "§6 N before S′",
+   "origin": "R5-SF-5",
+   "obs": [
+    {
+     "id": "x1",
+     "t": 300,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV53",
+   "desc": "success then 429",
+   "basis": "§6 S, §6G",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 100,
+     "vals": "claude.std"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "STALE_ACCEPTED",
+    "ok": true,
+    "selected": [
+     "s1",
+     "r1"
+    ]
+   }
+  },
+  {
+   "id": "EV53b",
+   "desc": "high success then 429",
+   "basis": "§6 S, §6G stale ≥ 90",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 100,
+     "vals": "claude.high"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "QUOTA_DENIED",
+    "ok": false,
+    "selected": [
+     "s1",
+     "r1"
+    ]
+   }
+  },
+  {
+   "id": "EV54",
+   "desc": "success, other node parse, then 429 (all permutations)",
+   "basis": "§6 S′, OLD-1, PERM",
+   "all_permutations": true,
+   "obs": [
+    {
+     "id": "s1",
+     "t": 100,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 300,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x1"
+    ]
+   }
+  },
+  {
+   "id": "EV55",
+   "desc": "success, partial, transport",
+   "basis": "§6 S′",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 100,
+     "vals": "claude.std"
+    },
+    {
+     "id": "p1",
+     "t": 300,
+     "status": "partial",
+     "error_ref": "partial:required_missing",
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ]
+     }
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "transport_error",
+     "error_ref": "transport_error:network"
+    }
+   ],
+   "expect": {
+    "code": "PARTIAL",
+    "ok": false,
+    "selected": [
+     "p1"
+    ]
+   }
+  },
+  {
+   "id": "EV56",
+   "desc": "success, duplicate conflict, 429",
+   "basis": "§6 S′",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 100,
+     "vals": "claude.std"
+    },
+    {
+     "id": "d1",
+     "t": 300,
+     "status": "parse_error",
+     "error_ref": "parse_error:duplicate_limit"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "DUPLICATE_LIMIT",
+    "ok": false,
+    "selected": [
+     "d1"
+    ]
+   }
+  },
+  {
+   "id": "EV57",
+   "desc": "stale success older than 6h",
+   "basis": "§6G stale > 21600",
+   "identity": {
+    "valid_from": -30000
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": -21700,
+     "vals": "claude.std"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "STALE_REJECTED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV58",
+   "desc": "newest parse after fresh success",
+   "basis": "§6 P, OLD-1",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "t": 550,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x1"
+    ]
+   }
+  },
+  {
+   "id": "EV59",
+   "desc": "newest partial 99% after older 10%",
+   "basis": "§6 Q, OLD-1",
+   "origin": "r1 SF-2",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 450,
+     "vals": "claude.std"
+    },
+    {
+     "id": "p1",
+     "t": 550,
+     "status": "partial",
+     "error_ref": "partial:required_missing",
+     "vals": {
+      "claude.five_hour": [
+       99,
+       10800
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "PARTIAL",
+    "ok": false,
+    "selected": [
+     "p1"
+    ]
+   }
+  },
+  {
+   "id": "EV60",
+   "desc": "old success, nothing after",
+   "basis": "§6 E",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 300,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "STALE_EXPIRED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV61",
+   "desc": "success whose status claims success but lacks a required limit",
+   "basis": "§6 class (success without required = partial), Q",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "PARTIAL",
+    "ok": false,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV65",
+   "desc": "fresh value whose reset already passed",
+   "basis": "§6 K3",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       550
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_PASSED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV66",
+   "desc": "stale candidate whose reset already passed",
+   "basis": "§6 S → K3",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 100,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       550
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_PASSED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV67",
+   "desc": "reset exactly now counts as passed",
+   "basis": "§6 K3 (reset_at ≤ now)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       600
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_PASSED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV70",
+   "desc": "ctest fixed known instances, fresh",
+   "basis": "§3.3, §3.5, §6 F",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": "ctest.std"
+    }
+   ],
+   "expect": {
+    "code": "FRESH",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV70b",
+   "desc": "ctest with the production support list",
+   "basis": "§1.1, §6 U",
+   "provider": "ctest",
+   "support_list": [
+    "claude"
+   ],
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": "ctest.std"
+    }
+   ],
+   "expect": {
+    "code": "CONTRACT_UNSUPPORTED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV71",
+   "desc": "ctest fixed instance unknown (allowed, unproven)",
+   "basis": "§3.5, §6 K2",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "unknown"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV72",
+   "desc": "only window_instance differs (reset equal): instance ≠ reset is a definition violation",
+   "basis": "§3.5, §3.6(d), §6 D",
+   "origin": "R5-SF-2",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": "ctest.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "2026-09-24T05:00:00Z"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV72b",
+   "desc": "same instant, both valid, different window (instance and reset differ)",
+   "basis": "§6 V, C",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": "ctest.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       14400
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV73",
+   "desc": "same instant, known vs unknown",
+   "basis": "§6 V (unknown ≠ known), C",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": "ctest.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "unknown"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV74",
+   "desc": "same instant, both unknown, otherwise equal",
+   "basis": "§6 V then K2",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "unknown"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "unknown"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV75",
+   "desc": "newer observation back to an earlier window",
+   "basis": "§6 K1 (E_new < E_old)",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       14400
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "t": 560,
+     "vals": "ctest.std"
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "INSTANCE",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV75b",
+   "desc": "window regression hidden behind a 429 (stale path)",
+   "basis": "§6 S → K1",
+   "origin": "contract r1 gap",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       14400
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "t": 560,
+     "vals": "ctest.std"
+    },
+    {
+     "id": "r1",
+     "t": 570,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "INSTANCE",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV76",
+   "desc": "window advances after the old window ended",
+   "basis": "§3.5, §6 K1 (S_new ≥ E_old)",
+   "provider": "ctest",
+   "now": 10850,
+   "obs": [
+    {
+     "id": "s1",
+     "t": 10700,
+     "vals": {
+      "ctest.fixed_5h": [
+       80,
+       10800
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "t": 10820,
+     "vals": {
+      "ctest.fixed_5h": [
+       5,
+       28800
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "FRESH",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV76b",
+   "desc": "advanced window then 429: stale on the new window",
+   "basis": "§6 S, K1",
+   "provider": "ctest",
+   "now": 10900,
+   "obs": [
+    {
+     "id": "s1",
+     "t": 10700,
+     "vals": {
+      "ctest.fixed_5h": [
+       80,
+       10800
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "t": 10820,
+     "vals": {
+      "ctest.fixed_5h": [
+       5,
+       28800
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "r1",
+     "t": 10840,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "STALE",
+    "ok": true,
+    "selected": [
+     "s2",
+     "r1"
+    ]
+   }
+  },
+  {
+   "id": "EV76c",
+   "desc": "window claims to have advanced before the old one ended",
+   "basis": "§3.5 (t_b < S), §3.6(d), §6 D",
+   "origin": "contract r1 gap (EV76)",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "ctest.std"
+    },
+    {
+     "id": "s2",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       5,
+       28800
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV77",
+   "desc": "ctest rolling (none) with a known instance",
+   "basis": "§3.6(c)",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": {
+      "extend": "ctest.std",
+      "ctest.rolling_1d": [
+       5,
+       86400,
+       "2026-09-25T01:00:00Z"
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV78",
+   "desc": "known then newer unknown",
+   "basis": "§6 F (K = newest), K2",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 540,
+     "vals": "ctest.std"
+    },
+    {
+     "id": "s2",
+     "t": 580,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "unknown"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV79",
+   "desc": "unknown then newer known",
+   "basis": "§6 F, K",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 540,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800,
+       "unknown"
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "t": 580,
+     "vals": "ctest.std"
+    }
+   ],
+   "expect": {
+    "code": "FRESH",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV80",
+   "desc": "execution binding not started",
+   "basis": "§5.4, §6 I",
+   "origin": "R5-SF-4",
+   "identity": {
+    "valid_from": 630
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "src": "other",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "IDENTITY_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV81",
+   "desc": "now exactly valid_from",
+   "basis": "§5.4",
+   "identity": {
+    "valid_from": 600
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 600,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV82",
+   "desc": "now exactly valid_until",
+   "basis": "§5.4",
+   "identity": {
+    "valid_until": 600
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "IDENTITY_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV83",
+   "desc": "now 1µs before valid_until",
+   "basis": "§5.4",
+   "identity": {
+    "valid_until": 600.000001
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV84",
+   "desc": "own observation before own binding started",
+   "basis": "§5.6 out_of_binding",
+   "identity": {
+    "valid_from": 520
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "out_of_binding": 1
+    }
+   }
+  },
+  {
+   "id": "EV85",
+   "desc": "own observation exactly at valid_from",
+   "basis": "§5.6",
+   "identity": {
+    "valid_from": 500
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV86",
+   "desc": "own observation in the future",
+   "basis": "§5.6",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 601,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "future": 1
+    }
+   }
+  },
+  {
+   "id": "EV87",
+   "desc": "bucket observed_at earlier than measured_at ages the value",
+   "basis": "§5.2",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 550,
+     "vals": {
+      "claude.five_hour": {
+       "used": 10,
+       "reset": 10800,
+       "observed": 400
+      },
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "STALE_EXPIRED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV88",
+   "desc": "future measured_at hidden behind an early observed_at",
+   "basis": "§5.3 TS, §5.6",
+   "origin": "contract r1 gap (τ=min)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 601,
+     "vals": {
+      "claude.five_hour": {
+       "used": 10,
+       "reset": 10800,
+       "observed": 500
+      },
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "future": 1
+    }
+   }
+  },
+  {
+   "id": "EV89",
+   "desc": "own bucket observed before own binding started, measured after",
+   "basis": "§5.3, §5.6",
+   "identity": {
+    "valid_from": 450
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": {
+       "used": 10,
+       "reset": 10800,
+       "observed": 440
+      },
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "out_of_binding": 1
+    }
+   }
+  },
+  {
+   "id": "EV90",
+   "desc": "unknown clock bound with another machine's observation",
+   "basis": "§5.5 null, §6 T",
+   "clock": {
+    "skew_bound_s": null,
+    "source": "unknown"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 550,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "TIME_UNCERTAIN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV91",
+   "desc": "unknown clock bound, own observations only",
+   "basis": "§5.5",
+   "clock": {
+    "skew_bound_s": null,
+    "source": "unknown"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV92",
+   "desc": "unknown clock bound, other machine only an ignored auth",
+   "basis": "§6 O before T",
+   "clock": {
+    "skew_bound_s": null,
+    "source": "unknown"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "a1",
+     "src": "other",
+     "t": 550,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ],
+    "excluded": {
+     "other_slot_auth": 1
+    }
+   }
+  },
+  {
+   "id": "EV93",
+   "desc": "Δ=10 own vs other 5s apart: unordered",
+   "basis": "§5.5 δ=Δ",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 495,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x1"
+    ]
+   }
+  },
+  {
+   "id": "EV93b",
+   "desc": "Δ=10 own vs other exactly 10s apart: unordered",
+   "basis": "§5.5 (> δ, strict)",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 490,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x1"
+    ]
+   }
+  },
+  {
+   "id": "EV93c",
+   "desc": "Δ=10 own vs other 11s apart: ordered",
+   "basis": "§5.5",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 489,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV94",
+   "desc": "Δ=10 own vs other 30s apart",
+   "basis": "§5.5",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 470,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV95",
+   "desc": "Δ=10 other success, max age exactly TTL",
+   "basis": "§5.5 max age",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 430,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV96",
+   "desc": "Δ=10 other success, max age TTL+1",
+   "basis": "§5.5, §6 E",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 429,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "STALE_EXPIRED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV97",
+   "desc": "Δ=10 overlapping own/other successes, different values",
+   "basis": "§5.5, §6 V, C",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 510,
+     "vals": {
+      "claude.five_hour": [
+       12,
+       10800
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV98",
+   "desc": "Δ=10 other timestamp 5s ahead of now",
+   "basis": "§5.6 (t − Δ ≤ now)",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 605,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV99",
+   "desc": "Δ=10 other timestamp 11s ahead",
+   "basis": "§5.6",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 611,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "future": 1
+    }
+   }
+  },
+  {
+   "id": "EV99b",
+   "desc": "Δ=10 two other machines 20s apart: unordered (2Δ)",
+   "basis": "§5.5 δ=2Δ",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 480,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    },
+    {
+     "id": "s2",
+     "src": "other2",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x1"
+    ]
+   }
+  },
+  {
+   "id": "EV99c",
+   "desc": "Δ=10 two other machines 21s apart: ordered",
+   "basis": "§5.5 δ=2Δ",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "x1",
+     "src": "other",
+     "t": 479,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    },
+    {
+     "id": "s2",
+     "src": "other2",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV99d",
+   "desc": "Δ=10 other success timestamp 10s ahead of now: max age 0",
+   "basis": "§5.5, §5.6",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 610,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "OK",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV100",
+   "desc": "another account only",
+   "basis": "§6 X3",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "account": "acct_p3n8w5r1",
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "other_account": 1
+    }
+   }
+  },
+  {
+   "id": "EV101",
+   "desc": "same slot rebound A→B",
+   "basis": "§6 X3",
+   "origin": "r1 mutant (c)",
+   "identity": {
+    "account": "acct_p3n8w5r1",
+    "revision": 3
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "src": {
+      "machine": "node-a",
+      "slot": "slot-a",
+      "revision": 2
+     },
+     "account": "acct_7k2m9q4x",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "other_account": 1
+    }
+   }
+  },
+  {
+   "id": "EV102",
+   "desc": "provider outside support list",
+   "basis": "§6 U",
+   "identity": {
+    "provider": "codex"
+   },
+   "profile": "codex-max",
+   "obs": [],
+   "expect": {
+    "code": "CONTRACT_UNSUPPORTED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV103",
+   "desc": "no execution identity",
+   "basis": "§6 I",
+   "identity": null,
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "IDENTITY_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV104",
+   "desc": "same observation_id, different content",
+   "basis": "§6 (two observations), V, C",
+   "obs": [
+    {
+     "id": "dup",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "dup",
+     "src": "other",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       11,
+       10800
+      ],
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "dup",
+     "dup"
+    ]
+   }
+  },
+  {
+   "id": "EV105",
+   "desc": "20 vs 20.0000001 same instant",
+   "basis": "§6 V (no epsilon)",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    },
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": [
+       10,
+       10800
+      ],
+      "claude.seven_day": [
+       20.0000001,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "VALUE",
+    "ok": false,
+    "selected": [
+     "s1",
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV107",
+   "desc": "same account, different provider",
+   "basis": "§6 X3",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "provider": "codex",
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "other_account": 1
+    }
+   }
+  },
+  {
+   "id": "EV108",
+   "desc": "same provider/account, different entitlement",
+   "basis": "§6 X3",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "entitlement": "team-x",
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "other_account": 1
+    }
+   }
+  },
+  {
+   "id": "EV109",
+   "desc": "other machine observation that never went through the hub",
+   "basis": "§5.6 (received_at null) → invalid",
+   "obs": [
+    {
+     "id": "s2",
+     "src": "other",
+     "t": 500,
+     "received_at": null,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "NO_SAMPLE",
+    "ok": false,
+    "excluded": {
+     "invalid": 1
+    }
+   }
+  },
+  {
+   "id": "EV112",
+   "desc": "same measured_at, one bucket observed earlier: that observation is older",
+   "basis": "§5.2, §5.5 δ=0",
+   "provider": "ctest",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": {
+       "used": 10,
+       "reset": 10800,
+       "observed": 400
+      },
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "s2",
+     "t": 560,
+     "vals": {
+      "ctest.fixed_5h": [
+       20,
+       10800
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "FRESH",
+    "ok": true,
+    "selected": [
+     "s2"
+    ]
+   }
+  },
+  {
+   "id": "EV113",
+   "desc": "received_at later than measured_at does not refresh the age",
+   "basis": "§5.2, §5.3, §6 E",
+   "origin": "contract r2 review",
+   "obs": [
+    {
+     "id": "s1",
+     "src": "other",
+     "t": 300,
+     "received_at": 599,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "STALE_EXPIRED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV114",
+   "desc": "fixed bucket observed exactly at its window start S",
+   "basis": "§3.5 (S ≤ t_b)",
+   "origin": "contract r2 review",
+   "provider": "ctest",
+   "now": 10850,
+   "obs": [
+    {
+     "id": "s1",
+     "t": 10820,
+     "vals": {
+      "ctest.fixed_5h": {
+       "used": 5,
+       "reset": 28800,
+       "observed": 10800
+      },
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "FRESH",
+    "ok": true,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV115",
+   "desc": "fixed bucket observed exactly at its window end E",
+   "basis": "§3.5 (t_b < E), §3.6(d), §6 D",
+   "origin": "contract r2 review",
+   "provider": "ctest",
+   "now": 10850,
+   "obs": [
+    {
+     "id": "s1",
+     "t": 10820,
+     "vals": {
+      "ctest.fixed_5h": {
+       "used": 10,
+       "reset": 10800,
+       "observed": 10800
+      },
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV116",
+   "desc": "definition violation exactly 21600s old still blocks",
+   "basis": "§6 D (≤ 21600)",
+   "origin": "contract r2 review",
+   "identity": {
+    "valid_from": -30000
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": -21000,
+     "vals": "claude.std",
+     "defs": {
+      "claude.seven_day": {
+       "horizon": "now"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "code": "CONFLICT",
+    "reason": "CONTRACT",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV117",
+   "desc": "stale candidate exactly 21600s old",
+   "basis": "§6 S, §6G (≤ 21600)",
+   "origin": "contract r2 review",
+   "identity": {
+    "valid_from": -30000
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": -21000,
+     "vals": "claude.std"
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "STALE_ACCEPTED",
+    "ok": true,
+    "selected": [
+     "s1",
+     "r1"
+    ]
+   }
+  },
+  {
+   "id": "EV118",
+   "desc": "degenerate binding valid_from == valid_until",
+   "basis": "§5.4 (format error), §6 I",
+   "origin": "contract r2 review",
+   "identity": {
+    "valid_from": 700,
+    "valid_until": 700
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": "claude.std"
+    }
+   ],
+   "expect": {
+    "code": "IDENTITY_UNKNOWN",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV119",
+   "desc": "status success with a null required value",
+   "basis": "§6 class (M1)",
+   "origin": "contract r2 review",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": {
+       "used": null,
+       "reset": 10800
+      },
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "PARTIAL",
+    "ok": false,
+    "selected": [
+     "s1"
+    ]
+   }
+  },
+  {
+   "id": "EV120",
+   "desc": "ctest candidate older than 6h behind a 429",
+   "basis": "§6 S → K3 (§6G ctest note)",
+   "origin": "contract r2 review",
+   "provider": "ctest",
+   "identity": {
+    "valid_from": -30000
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": -21700,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       -3700
+      ],
+      "ctest.fixed_7d": [
+       20,
+       345600
+      ]
+     }
+    },
+    {
+     "id": "r1",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "WINDOW_PASSED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV121",
+   "desc": "a success that violates the definitions does not clear own auth",
+   "basis": "§6 A (M3)",
+   "origin": "contract r2 review",
+   "obs": [
+    {
+     "id": "a1",
+     "t": 500,
+     "status": "auth_error",
+     "error_ref": "auth_error:http_401"
+    },
+    {
+     "id": "s1",
+     "t": 550,
+     "vals": "claude.std",
+     "defs": {
+      "claude.seven_day": {
+       "horizon": "now"
+      }
+     }
+    }
+   ],
+   "expect": {
+    "code": "AUTH_BLOCKED",
+    "ok": false,
+    "selected": [
+     "a1"
+    ]
+   }
+  },
+  {
+   "id": "EV122",
+   "desc": "S′: an error provably older than one frontier success but not the other stays in B",
+   "basis": "§6 S′ (M4)",
+   "origin": "contract r2 review",
+   "clock": {
+    "skew_bound_s": 10,
+    "source": "fixture"
+   },
+   "obs": [
+    {
+     "id": "sa",
+     "t": 100,
+     "vals": "claude.std"
+    },
+    {
+     "id": "sb",
+     "src": "other",
+     "t": 105,
+     "vals": "claude.std"
+    },
+    {
+     "id": "x",
+     "src": "other",
+     "t": 93,
+     "status": "parse_error",
+     "error_ref": "parse_error:schema"
+    },
+    {
+     "id": "r",
+     "t": 500,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "PARSE_FAILED",
+    "ok": false,
+    "selected": [
+     "x"
+    ]
+   }
+  },
+  {
+   "id": "EV123",
+   "desc": "ctest stale candidate older than 6h with future resets (one bucket observed early)",
+   "basis": "§5.2, §6 S, §6G ctest (> 21600)",
+   "origin": "contract r3 review",
+   "provider": "ctest",
+   "identity": {
+    "valid_from": -30000
+   },
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "ctest.fixed_5h": [
+       10,
+       10800
+      ],
+      "ctest.fixed_7d": {
+       "used": 20,
+       "reset": 345600,
+       "observed": -21700
+      }
+     }
+    },
+    {
+     "id": "r1",
+     "t": 550,
+     "status": "rate_limited",
+     "error_ref": "rate_limited:http_429"
+    }
+   ],
+   "expect": {
+    "code": "STALE_REJECTED",
+    "ok": false
+   }
+  },
+  {
+   "id": "EV124",
+   "desc": "status success with a null reset_at on a required limit",
+   "basis": "§6 class (M1 variant)",
+   "origin": "contract r3 review",
+   "obs": [
+    {
+     "id": "s1",
+     "t": 500,
+     "vals": {
+      "claude.five_hour": {
+       "used": 10,
+       "reset": null
+      },
+      "claude.seven_day": [
+       20,
+       345600
+      ]
+     }
+    }
+   ],
+   "expect": {
+    "code": "PARTIAL",
+    "ok": false,
+    "selected": [
+     "s1"
+    ]
+   }
+  }
+ ],
+ "adapter": [
+  {
+   "id": "AD01",
+   "desc": "200 full fixture body",
+   "basis": "§3.2, §4.1",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json"
+   },
+   "expect": {
+    "status": "success",
+    "error_ref": null,
+    "limit_ids": [
+     "claude.five_hour",
+     "claude.seven_day"
+    ],
+    "labels": [
+     "5h",
+     "7d all"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD02",
+   "desc": "200, weekly_scoped model id filled in",
+   "basis": "§3.2 (model limits outside r2)",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "limits[2].scope.model.id": "opus"
+    }
+   },
+   "expect": {
+    "status": "success",
+    "error_ref": null,
+    "limit_ids": [
+     "claude.five_hour",
+     "claude.seven_day"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD03",
+   "desc": "200, two weekly_scoped entries",
+   "basis": "§3.2 count",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "append_limits_copy_of": 2
+    }
+   },
+   "expect": {
+    "status": "success",
+    "error_ref": null,
+    "limit_ids": [
+     "claude.five_hour",
+     "claude.seven_day"
+    ],
+    "unshared_limit_count": 2
+   }
+  },
+  {
+   "id": "AD04",
+   "desc": "seven_day null",
+   "basis": "§4.1 partial",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "seven_day": null
+    }
+   },
+   "expect": {
+    "status": "partial",
+    "error_ref": "partial:required_missing",
+    "limit_ids": [
+     "claude.five_hour"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD05",
+   "desc": "seven_day.utilization null",
+   "basis": "§4.1",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "seven_day.utilization": null
+    }
+   },
+   "expect": {
+    "status": "partial",
+    "error_ref": "partial:required_missing",
+    "limit_ids": [
+     "claude.five_hour"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD06",
+   "desc": "no required limit valid",
+   "basis": "§4.1",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "five_hour": null,
+     "seven_day": null
+    }
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:required_missing",
+    "limit_ids": [],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD07",
+   "desc": "200 non-JSON body",
+   "basis": "§4.1",
+   "input": {
+    "http": 200,
+    "body_text": "<html>maintenance</html>"
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:schema",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD08",
+   "desc": "401",
+   "basis": "§4.1",
+   "input": {
+    "http": 401
+   },
+   "expect": {
+    "status": "auth_error",
+    "error_ref": "auth_error:http_401",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD09",
+   "desc": "403",
+   "basis": "§4.1",
+   "input": {
+    "http": 403
+   },
+   "expect": {
+    "status": "auth_error",
+    "error_ref": "auth_error:http_403",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD10",
+   "desc": "429",
+   "basis": "§4.1",
+   "input": {
+    "http": 429
+   },
+   "expect": {
+    "status": "rate_limited",
+    "error_ref": "rate_limited:http_429",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD11",
+   "desc": "503",
+   "basis": "§4.1",
+   "input": {
+    "http": 503
+   },
+   "expect": {
+    "status": "transport_error",
+    "error_ref": "transport_error:http_5xx",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD12",
+   "desc": "connection refused",
+   "basis": "§4.1",
+   "input": {
+    "exception": "network"
+   },
+   "expect": {
+    "status": "transport_error",
+    "error_ref": "transport_error:network",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD13",
+   "desc": "timeout",
+   "basis": "§4.1",
+   "input": {
+    "exception": "timeout"
+   },
+   "expect": {
+    "status": "transport_error",
+    "error_ref": "transport_error:timeout",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD14",
+   "desc": "404",
+   "basis": "§4.1",
+   "input": {
+    "http": 404
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:http_4xx",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD15",
+   "desc": "typed 401 with unrelated warning and last_error",
+   "basis": "§4.1 typed",
+   "origin": "R5-SF-3",
+   "input": {
+    "http": 401,
+    "warning": "some field missing",
+    "last_error": "some field missing"
+   },
+   "expect": {
+    "status": "auth_error",
+    "error_ref": "auth_error:http_401",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD16",
+   "desc": "typed 200 success with auth-looking text",
+   "basis": "§4.1 typed",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "warning": "HTTP 401 unauthorized: token expired",
+    "last_error": "login required"
+   },
+   "expect": {
+    "status": "success",
+    "error_ref": null,
+    "limit_ids": [
+     "claude.five_hour",
+     "claude.seven_day"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD17",
+   "desc": "no typed outcome, auth-looking warning",
+   "basis": "§4.1 outcome_missing",
+   "origin": "CodeRabbit minor",
+   "input": {
+    "typed_outcome": null,
+    "warning": "HTTP 401 unauthorized: token expired"
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:outcome_missing",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD18",
+   "desc": "no typed outcome, both warning and last_error",
+   "basis": "§4.1 outcome_missing",
+   "input": {
+    "typed_outcome": null,
+    "warning": "rate limit",
+    "last_error": "HTTP 403 forbidden"
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:outcome_missing",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD19",
+   "desc": "typed 403 with an unrelated warning and an auth-looking last_error",
+   "basis": "§4.1 typed",
+   "input": {
+    "http": 403,
+    "warning": "some field missing",
+    "last_error": "token expired"
+   },
+   "expect": {
+    "status": "auth_error",
+    "error_ref": "auth_error:http_403",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD20",
+   "desc": "cache hit",
+   "basis": "§4.4",
+   "input": {
+    "cache_hit": true
+   },
+   "expect": {
+    "observations": 0
+   }
+  },
+  {
+   "id": "AD21",
+   "desc": "backoff window",
+   "basis": "§4.4",
+   "input": {
+    "backoff": true
+   },
+   "expect": {
+    "observations": 0
+   }
+  },
+  {
+   "id": "AD22",
+   "desc": "long multilingual model display name changes nothing shared",
+   "basis": "§3.2 labels constant, model outside",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "limits[2].scope.model.display_name": "오퍼스 모델 이름이 아주 길어서 백이십팔 바이트를 넘기는 표시 문자열입니다 오퍼스 모델 이름이 아주 길어서"
+    }
+   },
+   "expect": {
+    "status": "success",
+    "error_ref": null,
+    "limit_ids": [
+     "claude.five_hour",
+     "claude.seven_day"
+    ],
+    "labels": [
+     "5h",
+     "7d all"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD23",
+   "desc": "200, seven_day.utilization 100.5",
+   "basis": "§4.1 valid = 0..100",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "seven_day.utilization": 100.5
+    }
+   },
+   "expect": {
+    "status": "partial",
+    "error_ref": "partial:required_missing",
+    "limit_ids": [
+     "claude.five_hour"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD24",
+   "desc": "200, five_hour.resets_at missing",
+   "basis": "§4.1 valid needs reset_at",
+   "input": {
+    "http": 200,
+    "body": "fixture:claude_usage.json",
+    "patch": {
+     "five_hour.resets_at": null
+    }
+   },
+   "expect": {
+    "status": "partial",
+    "error_ref": "partial:required_missing",
+    "limit_ids": [
+     "claude.seven_day"
+    ],
+    "unshared_limit_count": 1
+   }
+  },
+  {
+   "id": "AD25",
+   "desc": "typed 429 with auth-looking warning and last_error",
+   "basis": "§4.1 typed",
+   "origin": "contract r2 review",
+   "input": {
+    "http": 429,
+    "warning": "token expired",
+    "last_error": "HTTP 401"
+   },
+   "expect": {
+    "status": "rate_limited",
+    "error_ref": "rate_limited:http_429",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD26",
+   "desc": "HTTP 204",
+   "basis": "§4.1 (unmapped HTTP)",
+   "origin": "contract r3 review",
+   "input": {
+    "http": 204
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:http_unexpected",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  },
+  {
+   "id": "AD27",
+   "desc": "HTTP 302",
+   "basis": "§4.1 (unmapped HTTP)",
+   "origin": "contract r3 review",
+   "input": {
+    "http": 302
+   },
+   "expect": {
+    "status": "parse_error",
+    "error_ref": "parse_error:http_unexpected",
+    "limit_ids": [],
+    "unshared_limit_count": 0
+   }
+  }
+ ],
+ "wire": [
+  {
+   "id": "W01",
+   "form": "post",
+   "desc": "valid r2 POST",
+   "basis": "§2",
+   "patch": {},
+   "expect": "accept"
+  },
+  {
+   "id": "W02",
+   "form": "post",
+   "desc": "contract_rev missing",
+   "basis": "§2",
+   "patch": {
+    "-contract_rev": true
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W03",
+   "form": "post",
+   "desc": "contract_rev quota-v2.r1",
+   "basis": "§2",
+   "patch": {
+    "contract_rev": "quota-v2.r1"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W04",
+   "form": "post",
+   "desc": "limit_id 128 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "a*128"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W05",
+   "form": "post",
+   "desc": "limit_id 129 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "a*129"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W06",
+   "form": "post",
+   "desc": "limit_id uppercase",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "Claude.five_hour"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W07",
+   "form": "post",
+   "desc": "limit_id non-ASCII",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "claude.five_houré"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W08",
+   "form": "post",
+   "desc": "limit_id empty",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": ""
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W09",
+   "form": "post",
+   "desc": "limit_id control char",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "claude.five\u0007hour"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W10",
+   "form": "post",
+   "desc": "label 127 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "a*127"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W11",
+   "form": "post",
+   "desc": "label 128 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "a*128"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W12",
+   "form": "post",
+   "desc": "label 129 bytes",
+   "basis": "§2 (no truncation)",
+   "origin": "R5-SF-1",
+   "patch": {
+    "buckets[0].label": "a*129"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W13",
+   "form": "post",
+   "desc": "label 256 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "a*256"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W14",
+   "form": "post",
+   "desc": "label 42 Hangul = 126 bytes",
+   "basis": "§2.2",
+   "patch": {
+    "buckets[0].label": "가*42"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W15",
+   "form": "post",
+   "desc": "label 43 Hangul = 129 bytes",
+   "basis": "§2.2",
+   "patch": {
+    "buckets[0].label": "가*43"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W16",
+   "form": "post",
+   "desc": "label BEL",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "a\u0007b"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W17",
+   "form": "post",
+   "desc": "label NEL (U+0085)",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "ab"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W18",
+   "form": "post",
+   "desc": "label DEL",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "ab"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W19",
+   "form": "post",
+   "desc": "label empty",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": ""
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W20",
+   "form": "post",
+   "desc": "label null",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": null
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W21",
+   "form": "post",
+   "desc": "duplicate limit_id",
+   "basis": "§2.1",
+   "patch": {
+    "buckets[1].limit_id": "claude.five_hour"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W22",
+   "form": "post",
+   "desc": "success without buckets",
+   "basis": "§2",
+   "patch": {
+    "buckets": []
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W23",
+   "form": "post",
+   "desc": "rate_limited with buckets",
+   "basis": "§2",
+   "patch": {
+    "status": "rate_limited",
+    "error_ref": "rate_limited:http_429"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W24",
+   "form": "post",
+   "desc": "free-text error_ref",
+   "basis": "§4.3",
+   "patch": {
+    "status": "rate_limited",
+    "error_ref": "HTTP 429 Too Many Requests",
+    "buckets": []
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W25",
+   "form": "post",
+   "desc": "enumerated error_ref",
+   "basis": "§4.3",
+   "patch": {
+    "status": "rate_limited",
+    "error_ref": "rate_limited:http_429",
+    "buckets": []
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W26",
+   "form": "post",
+   "desc": "error_ref on success",
+   "basis": "§2",
+   "patch": {
+    "error_ref": "rate_limited:http_429"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W27",
+   "form": "post",
+   "desc": "error_ref prefix ≠ status",
+   "basis": "§2, §4.3",
+   "patch": {
+    "status": "rate_limited",
+    "error_ref": "auth_error:http_401",
+    "buckets": []
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W28",
+   "form": "post",
+   "desc": "used_pct 100",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].used_pct": 100
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W29",
+   "form": "post",
+   "desc": "used_pct 100.0000001",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].used_pct": 100.0000001
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W30",
+   "form": "post",
+   "desc": "observed_at after measured_at",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].observed_at": "+1s"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W31",
+   "form": "post",
+   "desc": "observed_at equal to measured_at",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].observed_at": "+0s"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W32",
+   "form": "post",
+   "desc": "model scope ref 129 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].scope": {
+     "kind": "model",
+     "ref": "a*129"
+    }
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W33",
+   "form": "post",
+   "desc": "model scope ref null",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].scope": {
+     "kind": "model",
+     "ref": null
+    }
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W34",
+   "form": "post",
+   "desc": "account scope with ref",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].scope": {
+     "kind": "account",
+     "ref": "x"
+    }
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W35",
+   "form": "post",
+   "desc": "unknown top-level field",
+   "basis": "§2",
+   "patch": {
+    "label": "회사"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W36",
+   "form": "post",
+   "desc": "measured_at without offset",
+   "basis": "§2",
+   "patch": {
+    "measured_at": "2026-09-24T01:08:20"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W37",
+   "form": "post",
+   "desc": "window_instance unknown",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].window_instance": "unknown"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W38",
+   "form": "post",
+   "desc": "limit_id 127 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "a*127"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W39",
+   "form": "post",
+   "desc": "limit_id 256 bytes",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "a*256"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W40",
+   "form": "post",
+   "desc": "two distinct 128-byte ids sharing a 127-byte prefix",
+   "basis": "§2 (no truncation)",
+   "patch": {
+    "buckets[0].limit_id": "a*127+b",
+    "buckets[1].limit_id": "a*127+c"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W41",
+   "form": "post",
+   "desc": "two 129-byte ids",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].limit_id": "a*128+b",
+    "buckets[1].limit_id": "a*128+c"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W42",
+   "form": "post",
+   "desc": "label with NUL",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "a\u0000b"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W43",
+   "form": "post",
+   "desc": "model scope ref with U+009F",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].scope": {
+     "kind": "model",
+     "ref": "ab"
+    }
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W44",
+   "form": "post",
+   "desc": "label with U+001F",
+   "basis": "§2 (C0 end)",
+   "patch": {
+    "buckets[0].label": "a\u001fb"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W45",
+   "form": "post",
+   "desc": "label with U+00A0 (not a control char)",
+   "basis": "§2",
+   "patch": {
+    "buckets[0].label": "a b"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W46",
+   "form": "post",
+   "desc": "source_slot_ref missing",
+   "basis": "§2",
+   "patch": {
+    "-source_slot_ref": true
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W47",
+   "form": "post",
+   "desc": "unshared_limit_count missing",
+   "basis": "§2",
+   "patch": {
+    "-unshared_limit_count": true
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W48",
+   "form": "post",
+   "desc": "unshared_limit_count negative",
+   "basis": "§2",
+   "patch": {
+    "unshared_limit_count": -1
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W49",
+   "form": "post",
+   "desc": "received_at set in a POST",
+   "basis": "§2 POST",
+   "patch": {
+    "received_at": "+1s"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W50",
+   "form": "stored",
+   "desc": "stored with received_at",
+   "basis": "§2 stored",
+   "patch": {
+    "received_at": "+1s"
+   },
+   "expect": "accept"
+  },
+  {
+   "id": "W51",
+   "form": "stored",
+   "desc": "stored, local, received_at null",
+   "basis": "§2 stored",
+   "patch": {},
+   "expect": "accept"
+  },
+  {
+   "id": "W52",
+   "form": "post",
+   "desc": "window_instance with +00:00 offset",
+   "basis": "§2 (Z seconds only)",
+   "patch": {
+    "buckets[0].window_instance": "2026-09-24T04:00:00+00:00"
+   },
+   "expect": "reject"
+  },
+  {
+   "id": "W53",
+   "form": "post",
+   "desc": "lease_epoch set",
+   "basis": "§2 (null in r2)",
+   "patch": {
+    "lease_epoch": 1
+   },
+   "expect": "reject"
+  }
+ ],
+ "hub": [
+  {
+   "id": "H01",
+   "desc": "own current binding, measured inside window",
+   "basis": "§7.1, §7.5 ⑨",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590
+   },
+   "expect": 201
+  },
+  {
+   "id": "H02",
+   "desc": "measured_at 20s in the future (Δ_hub=0)",
+   "basis": "§7.3, §7.5 ④",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 620
+   },
+   "expect": 400
+  },
+  {
+   "id": "H03",
+   "desc": "bucket observed_at before valid_from",
+   "basis": "§7.2, §7.5 ⑦",
+   "binding": {
+    "valid_from": 500,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "observed_at": 480
+   },
+   "expect": 403
+  },
+  {
+   "id": "H04",
+   "desc": "measured_at before valid_from",
+   "basis": "§7.2, ⑦",
+   "binding": {
+    "valid_from": 500,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 490
+   },
+   "expect": 403
+  },
+  {
+   "id": "H05",
+   "desc": "source_machine is another machine",
+   "basis": "§7.5 ⑤",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "source_machine": "node-b"
+   },
+   "expect": 403
+  },
+  {
+   "id": "H06",
+   "desc": "operator bearer on the node route",
+   "basis": "§7.5 ②",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "bearer": "operator"
+   },
+   "expect": 401
+  },
+  {
+   "id": "H07",
+   "desc": "old revision after rebind",
+   "basis": "§7.1, ⑥",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600,
+    "rebind_before_post": true
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "revision": "old"
+   },
+   "expect": 403
+  },
+  {
+   "id": "H08",
+   "desc": "contract_rev missing",
+   "basis": "§2.3, ③",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "contract_rev": null
+   },
+   "expect": 400
+  },
+  {
+   "id": "H09",
+   "desc": "node shares the operator bearer value",
+   "basis": "§7.5 ①",
+   "config": {
+    "shared_bearer": true
+   },
+   "request": "GET /v2/quota/bindings (operator)",
+   "expect": 503
+  },
+  {
+   "id": "H10",
+   "desc": "no durable store",
+   "basis": "§7.5 ①",
+   "config": {
+    "store": null
+   },
+   "request": "GET /v2/quota/bindings (operator)",
+   "expect": 503
+  },
+  {
+   "id": "H11",
+   "desc": "observed_at exactly valid_from",
+   "basis": "§7.2 (closed start)",
+   "binding": {
+    "valid_from": 500,
+    "valid_until": 700
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "observed_at": 500
+   },
+   "expect": 201
+  },
+  {
+   "id": "H12",
+   "desc": "Δ_hub=10: interval of measured_at crosses valid_until",
+   "basis": "§7.2",
+   "config": {
+    "delta_hub_s": 10
+   },
+   "binding": {
+    "valid_from": 500,
+    "valid_until": 610
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 605
+   },
+   "expect": 403
+  },
+  {
+   "id": "H13",
+   "desc": "source_slot_ref differs from the binding's slot",
+   "basis": "§7.1, ⑥",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "source_slot_ref": "slot-other"
+   },
+   "expect": 403
+  },
+  {
+   "id": "H14",
+   "desc": "same observation_id, different content",
+   "basis": "⑧",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "repeat_with_changed_value": true
+   },
+   "expect": 409
+  },
+  {
+   "id": "H15",
+   "desc": "identical resend",
+   "basis": "⑨",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "repeat_identical": true
+   },
+   "expect": 200
+  },
+  {
+   "id": "H16",
+   "desc": "node GETs observations of an account it is not bound to",
+   "basis": "§7.6",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "request": "GET /v2/quota/observations?provider=claude&account_ref=acct_p3n8w5r1 (node-a)",
+   "expect": 403
+  },
+  {
+   "id": "H17",
+   "desc": "stored observation carries received_at",
+   "basis": "§7.7",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590
+   },
+   "then_get": true,
+   "expect": "received_at non-null"
+  },
+  {
+   "id": "H18",
+   "desc": "POST without a bearer",
+   "basis": "§7.5 ②",
+   "origin": "contract r2 review",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 590,
+    "bearer": "none"
+   },
+   "expect": 401
+  },
+  {
+   "id": "H19",
+   "desc": "node GETs observations of its own bound account",
+   "basis": "§7.6",
+   "origin": "contract r2 review",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "request": "GET /v2/quota/observations?provider=claude&account_ref=acct_7k2m9q4x (node-a)",
+   "expect": 200
+  },
+  {
+   "id": "H20",
+   "desc": "operator GETs observations",
+   "basis": "§7.6",
+   "origin": "contract r2 review",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "request": "GET /v2/quota/observations?provider=claude&account_ref=acct_7k2m9q4x (operator)",
+   "expect": 200
+  },
+  {
+   "id": "H21",
+   "desc": "node-a lists bindings while node-b also has one: only node-a's are returned",
+   "basis": "§7.6 (filtered 200)",
+   "origin": "contract r2 review",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600,
+    "also_bind_node_b": true
+   },
+   "now": 600,
+   "request": "GET /v2/quota/bindings (node-a)",
+   "expect": "200 with node-a bindings only"
+  },
+  {
+   "id": "H22",
+   "desc": "measured_at exactly now (Δ_hub = 0)",
+   "basis": "§7.3 (t = now accepted)",
+   "origin": "contract r2 review",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "now": 600,
+   "post": {
+    "measured_at": 600
+   },
+   "expect": 201
+  }
+ ],
+ "recorder": [
+  {
+   "id": "RC01",
+   "desc": "valid at start and completion",
+   "basis": "§5.1, §5.7",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 503
+   },
+   "expect": {
+    "recorded": 1,
+    "measured_at": 503
+   }
+  },
+  {
+   "id": "RC02",
+   "desc": "rebind between start and completion",
+   "basis": "§5.7",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600,
+    "rebind_at": 501
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 503
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC03",
+   "desc": "binding expires during fetch",
+   "basis": "§5.7",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 502
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 503
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC04",
+   "desc": "binding starts during fetch",
+   "basis": "§5.7",
+   "binding": {
+    "valid_from": 501,
+    "valid_until": 3600
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 503
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC05",
+   "desc": "TTL cache hit",
+   "basis": "§4.4",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "fetch": {
+    "cache_hit": true
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC06",
+   "desc": "backoff window",
+   "basis": "§4.4",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "fetch": {
+    "backoff": true
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC07",
+   "desc": "completion exactly at valid_until",
+   "basis": "§5.7 (≥ valid_until)",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 502
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 502
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC08",
+   "desc": "completion 1µs before valid_until",
+   "basis": "§5.7",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 502
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 501.999999
+   },
+   "expect": {
+    "recorded": 1,
+    "measured_at": 501.999999
+   }
+  },
+  {
+   "id": "RC09",
+   "desc": "start 1µs before valid_from",
+   "basis": "§5.7",
+   "binding": {
+    "valid_from": 500,
+    "valid_until": 3600
+   },
+   "fetch": {
+    "start": 499.999999,
+    "complete": 503
+   },
+   "expect": {
+    "recorded": 0
+   }
+  },
+  {
+   "id": "RC10",
+   "desc": "a 429 attempt inside the binding is recorded as an observation",
+   "basis": "§4.1, §5.7",
+   "origin": "contract r2 review",
+   "binding": {
+    "valid_from": -60,
+    "valid_until": 3600
+   },
+   "fetch": {
+    "start": 500,
+    "complete": 503,
+    "outcome": "rate_limited"
+   },
+   "expect": {
+    "recorded": 1,
+    "status": "rate_limited",
+    "measured_at": 503
+   }
+  }
+ ],
+ "system": [
+  {
+   "id": "S01",
+   "desc": "not enrolled",
+   "basis": "§1.2, §9",
+   "condition": "no binding mirror",
+   "expect": "rc/stdout/stderr/gate-output/json identical to 1871bbc; no quota-v2 directory created"
+  },
+  {
+   "id": "S02",
+   "desc": "enrolled",
+   "basis": "§9",
+   "condition": "valid binding mirror",
+   "expect": "identical to 1871bbc"
+  },
+  {
+   "id": "S03",
+   "desc": "v2 store corrupt",
+   "basis": "§9",
+   "condition": "observations.json is not JSON",
+   "expect": "identical to 1871bbc"
+  },
+  {
+   "id": "S04",
+   "desc": "exception in identity capture",
+   "basis": "§9",
+   "condition": "capture raises",
+   "expect": "identical to 1871bbc"
+  },
+  {
+   "id": "S05",
+   "desc": "exception in recording",
+   "basis": "§9",
+   "condition": "record raises",
+   "expect": "identical to 1871bbc"
+  },
+  {
+   "id": "S06",
+   "desc": "exception in evaluate/shadow",
+   "basis": "§9",
+   "condition": "evaluate raises",
+   "expect": "identical to 1871bbc"
+  },
+  {
+   "id": "S07",
+   "desc": "binding mirror corrupt",
+   "basis": "§9",
+   "condition": "bindings.json is not JSON",
+   "expect": "identical to 1871bbc"
+  }
+ ],
+ "categories": {
+  "note": "advice §9 generation categories → rows (count asserted). Stage 2 property generators must produce at least these counts per category.",
+  "label_id_length_127_128_129_256": {
+   "rows": [
+    "W04",
+    "W05",
+    "W10",
+    "W11",
+    "W12",
+    "W13",
+    "W38",
+    "W39",
+    "W40",
+    "W41"
+   ],
+   "count": 10
+  },
+  "common_prefix_multilingual_control_notation": {
+   "rows": [
+    "W07",
+    "W09",
+    "W14",
+    "W15",
+    "W16",
+    "W17",
+    "W18",
+    "W42",
+    "W43",
+    "W44",
+    "W45",
+    "EV10",
+    "EV11",
+    "AD22"
+   ],
+   "count": 14
+  },
+  "id_reuse_definition_change": {
+   "rows": [
+    "EV21",
+    "EV22",
+    "EV22b",
+    "EV23",
+    "EV24",
+    "EV25",
+    "EV26",
+    "EV27",
+    "W21"
+   ],
+   "count": 9
+  },
+  "independent_value_changes": {
+   "rows": [
+    "EV07",
+    "EV08",
+    "EV09",
+    "EV72",
+    "EV72b",
+    "EV87",
+    "EV105",
+    "EV112",
+    "EV119",
+    "EV124"
+   ],
+   "count": 10
+  },
+  "known_unknown_instance": {
+   "rows": [
+    "EV71",
+    "EV73",
+    "EV74",
+    "EV78",
+    "EV79"
+   ],
+   "count": 5
+  },
+  "instance_transition": {
+   "rows": [
+    "EV75",
+    "EV75b",
+    "EV76",
+    "EV76b",
+    "EV76c",
+    "EV114",
+    "EV115"
+   ],
+   "count": 7
+  },
+  "typed_auth_with_text": {
+   "rows": [
+    "AD15",
+    "AD16",
+    "AD17",
+    "AD18",
+    "AD19",
+    "AD25"
+   ],
+   "count": 6
+  },
+  "same_instant_permutation_duplicate": {
+   "rows": [
+    "EV06",
+    "EV33",
+    "EV39",
+    "EV41",
+    "EV42",
+    "EV43",
+    "EV44",
+    "EV54",
+    "EV104"
+   ],
+   "count": 9
+  },
+  "binding_edges": {
+   "rows": [
+    "EV80",
+    "EV81",
+    "EV82",
+    "EV83",
+    "EV84",
+    "EV85",
+    "EV89",
+    "RC03",
+    "RC04",
+    "RC07",
+    "RC08",
+    "RC09",
+    "H03",
+    "H04",
+    "H11",
+    "H12",
+    "EV118"
+   ],
+   "count": 17
+  },
+  "clock_interval_overlap": {
+   "rows": [
+    "EV90",
+    "EV93",
+    "EV93b",
+    "EV93c",
+    "EV94",
+    "EV95",
+    "EV96",
+    "EV97",
+    "EV98",
+    "EV99",
+    "EV99b",
+    "EV99c",
+    "EV99d"
+   ],
+   "count": 13
+  },
+  "slot_identity": {
+   "rows": [
+    "EV36",
+    "EV37",
+    "EV38",
+    "H13"
+   ],
+   "count": 4
+  },
+  "account_mixing": {
+   "rows": [
+    "EV100",
+    "EV101",
+    "EV107",
+    "EV108",
+    "EV109"
+   ],
+   "count": 5
+  },
+  "old_success_vs_newer_error": {
+   "rows": [
+    "EV40",
+    "EV52",
+    "EV54",
+    "EV55",
+    "EV56",
+    "EV58",
+    "EV59",
+    "EV121",
+    "EV122"
+   ],
+   "count": 9
+  },
+  "shadow_invariance": {
+   "rows": [
+    "S01",
+    "S02",
+    "S03",
+    "S04",
+    "S05",
+    "S06",
+    "S07"
+   ],
+   "count": 7
+  },
+  "six_hour_edges": {
+   "rows": [
+    "EV25",
+    "EV57",
+    "EV116",
+    "EV117",
+    "EV120",
+    "EV123"
+   ],
+   "count": 6
+  },
+  "hub_acl": {
+   "rows": [
+    "H05",
+    "H06",
+    "H16",
+    "H18",
+    "H19",
+    "H20",
+    "H21"
+   ],
+   "count": 7
+  },
+  "time_future_edges": {
+   "rows": [
+    "EV86",
+    "EV88",
+    "EV98",
+    "EV99",
+    "EV99d",
+    "H02",
+    "H22"
+   ],
+   "count": 7
+  },
+  "time_fields": {
+   "rows": [
+    "EV87",
+    "EV112",
+    "EV113"
+   ],
+   "count": 3
+  }
+ },
+ "provenance": {
+  "r1 SF-1": [
+   "EV30",
+   "EV35",
+   "EV38"
+  ],
+  "r1 SF-2": [
+   "EV59"
+  ],
+  "r1 SF-3": [
+   "S04",
+   "S05",
+   "S06"
+  ],
+  "r1 SF-4": [
+   "explicit ids AD01"
+  ],
+  "r1 PW-1/PW-2": [
+   "H09",
+   "H10"
+  ],
+  "r1 mutant (c)": [
+   "EV101"
+  ],
+  "R2-SF-1": [
+   "W04",
+   "W05",
+   "W38–W41"
+  ],
+  "R2-SF-2": [
+   "EV33"
+  ],
+  "R2-SF-3": [
+   "explicit ids"
+  ],
+  "R3-SF-1": [
+   "W40",
+   "W41",
+   "EV11"
+  ],
+  "R4-SF-1": [
+   "EV40",
+   "EV56",
+   "W21"
+  ],
+  "R4-SF-2": [
+   "EV20 (changed: old ids are contract_unsupported)"
+  ],
+  "R5-SF-1": [
+   "W12",
+   "W13",
+   "W15",
+   "AD22"
+  ],
+  "R5-SF-2": [
+   "EV72 (changed: instance ≠ reset is a definition violation under §3.5)",
+   "EV72b",
+   "EV73"
+  ],
+  "R5-SF-3": [
+   "AD15",
+   "AD17",
+   "AD18",
+   "AD19"
+  ],
+  "R5-SF-4": [
+   "EV80",
+   "RC04",
+   "RC09"
+  ],
+  "R5-SF-5": [
+   "EV52"
+  ],
+  "contract r1 gaps": [
+   "EV37",
+   "EV38",
+   "EV39",
+   "EV70b",
+   "EV72",
+   "EV75b",
+   "EV76",
+   "EV76b",
+   "EV76c",
+   "EV78",
+   "EV88",
+   "EV89",
+   "EV93b",
+   "EV93c",
+   "EV99b",
+   "EV99c",
+   "EV99d",
+   "EV105",
+   "EV107",
+   "EV108",
+   "H11",
+   "H12",
+   "RC07",
+   "RC08",
+   "RC09",
+   "W38–W44",
+   "AD19",
+   "S01–S07"
+  ],
+  "contract r2 review": [
+   "EV113",
+   "EV114",
+   "EV115",
+   "EV116",
+   "EV117",
+   "EV118",
+   "EV119",
+   "EV120",
+   "EV121",
+   "EV122",
+   "AD25",
+   "H18",
+   "H19",
+   "H20",
+   "H21",
+   "H22",
+   "RC10"
+  ],
+  "contract r3 review": [
+   "EV123",
+   "EV124",
+   "AD26",
+   "AD27"
+  ]
+ }
+}

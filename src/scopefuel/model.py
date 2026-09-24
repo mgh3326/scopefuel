@@ -246,6 +246,10 @@ class ProviderResult:
     last_error_at: float | None = None
     # host-local backoff 창의 끝(epoch). 창 안에서는 어느 경로도 네트워크를 치지 않는다.
     backoff_until: float | None = None
+    # task #578 — quota v2 typed attempt outcome (quota_v2_contract.Attempt). Set
+    # only by adapters that implement the v2 contract; never serialised, so the
+    # legacy --json/gate outputs are unchanged.
+    v2_attempt: object | None = None
 
     def __post_init__(self) -> None:
         self.pool_class = _normalize_pool_class(self.pool_class)

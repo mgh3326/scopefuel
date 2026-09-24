@@ -23,8 +23,9 @@ import subprocess
 import sys
 import time
 
-from ..http import classify_error, request_json
+from ..http import HttpError, classify_error, request_json
 from ..model import Bucket, ProviderResult, Scope
+from ..quota_v2_contract import claude_attempt
 
 CREDENTIALS = pathlib.Path.home() / ".claude" / ".credentials.json"
 KEYCHAIN_SERVICE = os.environ.get("SCOPEFUEL_CLAUDE_KEYCHAIN_SERVICE", "Claude Code-credentials")
@@ -116,6 +117,7 @@ def fetch() -> ProviderResult:
     token = oauth["accessToken"].strip()
     fp = _account_fp(oauth)
 
+    http_status: list[int] = []
     try:
         raw = request_json(
             USAGE_URL,
@@ -126,11 +128,13 @@ def fetch() -> ProviderResult:
                 "anthropic-beta": BETA_HEADER,
                 "User-Agent": "scopefuel",
             },
+            status_out=http_status,
         )
     except Exception as exc:
         # 429·5xx·네트워크·인증 실패를 분류해 게이트가 "속도 제한"과
         # "측정 불가"를 구분한다(실패 결과에도 지문을 실어 stale 수용 판정에 쓴다).
         kind, status, retry_after = classify_error(exc)
+        seen = exc.status if isinstance(exc, HttpError) else (http_status[-1] if http_status else None)
         return ProviderResult(
             id="claude",
             error=str(exc),
@@ -139,6 +143,7 @@ def fetch() -> ProviderResult:
             retry_after_s=retry_after,
             account_fp=fp,
             hint="usage API 속도 제한" if kind == "rate_limited" else None,
+            v2_attempt=claude_attempt(http_status=seen, exc=exc),
         )
 
     buckets: list[Bucket] = []
@@ -197,6 +202,7 @@ def fetch() -> ProviderResult:
         raw=raw,
         http_status=200,
         account_fp=fp,
+        v2_attempt=claude_attempt(http_status=http_status[-1] if http_status else 200, body=raw),
     )
 
 

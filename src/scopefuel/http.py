@@ -96,8 +96,13 @@ def request_json(
     body: dict | None = None,
     timeout: float = 20.0,
     insecure: bool = False,
+    status_out: list[int] | None = None,
 ) -> dict:
-    """JSON 요청/응답. insecure=True 는 localhost 자체서명 인증서 전용."""
+    """JSON 요청/응답. insecure=True 는 localhost 자체서명 인증서 전용.
+
+    ``status_out`` (task #578): 주어지면 응답의 HTTP status 를 덧붙인다 — 200 이 아닌
+    2xx 도 구분해야 하는 호출자용이며, 반환값·예외는 그대로다.
+    """
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     ctx = None
@@ -111,8 +116,12 @@ def request_json(
     opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(req, timeout=timeout) as resp:
+            if status_out is not None:
+                status_out.append(resp.status)
             payload = resp.read()
     except urllib.error.HTTPError as exc:  # 상태코드를 보존해 401/429를 구분한다
+        if status_out is not None:
+            status_out.append(exc.code)
         body_text = exc.read().decode("utf-8", "replace")
         if 300 <= exc.code < 400:
             # 거부된 redirect 의 본문에는 Location 목적지(URL 쿼리 포함)가 들어갈 수 있다.

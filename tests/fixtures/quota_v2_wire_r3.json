@@ -1,0 +1,2693 @@
+[
+ {
+  "id": "W01",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W02",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W03",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r1",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W04",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W05",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W06",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "Claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W07",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_houré",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W08",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W09",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five\u0007hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W10",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W11",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W12",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W13",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W14",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W15",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W16",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "a\u0007b",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W17",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "ab",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W18",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "ab",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W19",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W20",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W21",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W22",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W23",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "rate_limited",
+   "error_ref": "rate_limited:http_429",
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W24",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "rate_limited",
+   "error_ref": "HTTP 429 Too Many Requests",
+   "unshared_limit_count": 0,
+   "buckets": [],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W25",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "rate_limited",
+   "error_ref": "rate_limited:http_429",
+   "unshared_limit_count": 0,
+   "buckets": [],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W26",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": "rate_limited:http_429",
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W27",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "rate_limited",
+   "error_ref": "auth_error:http_401",
+   "unshared_limit_count": 0,
+   "buckets": [],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W28",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 100,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W29",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 100.0000001,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W30",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": "2026-09-24T01:08:21Z"
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W31",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": "2026-09-24T01:08:20Z"
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W32",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "model",
+      "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W33",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "model",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W34",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": "x"
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W35",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null,
+   "label": "회사"
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W36",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W37",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W38",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W39",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W40",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W41",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W42",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "a\u0000b",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W43",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "model",
+      "ref": "ab"
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W44",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "a\u001fb",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W45",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": "a b",
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W46",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W47",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W48",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": -1,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W49",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": "2026-09-24T01:08:21Z",
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W50",
+  "form": "stored",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": "2026-09-24T01:08:21Z",
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W51",
+  "form": "stored",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "accept"
+ },
+ {
+  "id": "W52",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "2026-09-24T04:00:00+00:00",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": null
+  },
+  "expect": "reject"
+ },
+ {
+  "id": "W53",
+  "form": "post",
+  "envelope": {
+   "schema": "quota-observation/v2",
+   "contract_rev": "quota-v2.r3",
+   "observation_id": "obs-wire",
+   "provider": "claude",
+   "account_ref": "acct_7k2m9q4x",
+   "entitlement_ref": "unknown",
+   "source_machine": "node-a",
+   "source_slot_ref": "slot-a",
+   "source_binding_revision": 2,
+   "collector_version": "scopefuel/0.1.0+quota-v2.r3",
+   "measured_at": "2026-09-24T01:08:20Z",
+   "received_at": null,
+   "status": "success",
+   "error_ref": null,
+   "unshared_limit_count": 0,
+   "buckets": [
+    {
+     "limit_id": "claude.five_hour",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "now",
+     "window": "5h",
+     "window_instance": "unknown",
+     "used_pct": 10,
+     "reset_at": "2026-09-24T04:00:00Z",
+     "observed_at": null
+    },
+    {
+     "limit_id": "claude.seven_day",
+     "label": null,
+     "scope": {
+      "kind": "account",
+      "ref": null
+     },
+     "horizon": "week",
+     "window": "7d",
+     "window_instance": "unknown",
+     "used_pct": 20,
+     "reset_at": "2026-09-28T01:00:00Z",
+     "observed_at": null
+    }
+   ],
+   "lease_epoch": 1
+  },
+  "expect": "reject"
+ }
+]
