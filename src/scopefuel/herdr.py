@@ -142,6 +142,25 @@ def _label(result: ProviderResult, credential: str) -> str:
     return " · ".join(parts)[:80]
 
 
+def _observe_exhaustion(provider: str, result: ProviderResult) -> None:
+    """task #638 — 실행 중 잡의 풀 소진도 gate 와 같은 operator-switch 알림을 올린다.
+
+    pane 이벤트로 갱신된 스냅샷이 확인된 account 소진을 보이면 ``exhaust.observe``
+    에 넘긴다. 미설정 풀은 observe 가 조기 반환해 파일도 건드리지 않는다.
+    """
+    import datetime as dt
+
+    from . import exhaust, manual
+
+    breach = manual.confirmed_automatic_cutoff(result, now=dt.datetime.now(dt.UTC))
+    exhaust.observe(
+        provider,
+        exhausted=breach is not None,
+        used_pct=breach[0] if breach is not None else None,
+        cutoff=breach[1] if breach is not None else None,
+    )
+
+
 def _report(pane_id: str, label: str) -> int:
     herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
     try:
@@ -203,6 +222,7 @@ def handle_event(fetchers: dict[str, Callable[[], ProviderResult]]) -> int:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+        _observe_exhaustion(provider, result)
         label = _label(result, credential)
         state[key] = {"at": now, "label": label}
         _save_state(state)

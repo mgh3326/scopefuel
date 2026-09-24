@@ -270,7 +270,7 @@ def test_gate_oc_oss_not_in_grade_table_blocked_by_quota_cutoff():
     assert result.grade is None  # GRADE_TABLE에 없으므로 grade=None
     assert result.unmeasurable is False
     assert "소진" in result.reason
-    assert "cutoff" in result.reason
+    assert "차단선 99%" in result.reason  # task #638 문구: 사용·남음·차단선
 
 
 # ------------------------------------------------------------------ exit 4 (unmeasurable)
