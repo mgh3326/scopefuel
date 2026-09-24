@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from . import cache, manual
+from . import cache, exhaust, manual
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
@@ -38,6 +38,7 @@ from .policy import (
     get_active_override,
     get_boost,
     get_capacity_weight,
+    get_cutoff,
     get_imminent_remaining_pct,
     get_imminent_reset_hours,
     get_policy,
@@ -1492,6 +1493,41 @@ def _usage_cutoff(pool_class: PoolClass) -> float:
     return PRESERVE_EXCLUDE_PCT
 
 
+def _pool_cutoff(provider_id: str, pool_class: PoolClass) -> tuple[float, str | None]:
+    """task #638 — ``[pools.<p>] cutoff`` 오버라이드. 무효값은 기본값 폴백 + status."""
+    return get_cutoff(provider_id, _usage_cutoff(pool_class))
+
+
+def _exhaust_display(over: _WindowState, cutoff: float) -> str:
+    """task #638 범위3 — 남은 양이 오해 없이 보이는 'N% 사용 · M% 남음 · 차단선 K%' 문구."""
+    return f"{over.used_pct:g}% 사용 · {over.remaining_pct:g}% 남음 · 차단선 {cutoff:g}% — 소진"
+
+
+def _exhaust_suffix(cutoff_status: str | None, notify_status: str | None) -> str:
+    parts = [part for part in (cutoff_status, notify_status) if part]
+    return f" ({' · '.join(parts)})" if parts else ""
+
+
+def _observe_exhaustion(
+    provider_id: str,
+    over: _WindowState | None,
+    cutoff: float,
+    now: dt.datetime,
+    scope: str | None = None,
+) -> str | None:
+    """task #638 — 소진/회복 관측을 exhaust.observe 로 넘겨 알림 상태 조각을 받는다."""
+    return exhaust.observe(
+        provider_id,
+        exhausted=over is not None,
+        used_pct=over.used_pct if over is not None else None,
+        cutoff=cutoff,
+        window=over.window if over is not None else None,
+        reset_at=over.reset_at if over is not None else None,
+        scope=scope,
+        now=now,
+    )
+
+
 def _provider_label(provider_id: str, group_name: str | None) -> str:
     label = _POOL_LABEL.get(provider_id, provider_id)
     if provider_id == "agy" and group_name:
@@ -1779,14 +1815,19 @@ def _build_escalation_entry(
         else:
             states = _window_states(matches, now)
             constraint = _select_constraint(states)
-            cutoff = _usage_cutoff(effective_class)
+            cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
             over = _any_window_over_cutoff(states, cutoff)
+            notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
             if over is not None:
-                status_notes.append(f"{over.used_pct:g}% 소진 (reset {_reset_display(over.reset_at)})")
+                status_notes.append(
+                    f"{_exhaust_display(over, cutoff)} (reset {_reset_display(over.reset_at)})"
+                    f"{_exhaust_suffix(cutoff_status, notify_status)}"
+                )
             else:
                 note = f"사용 {_format_windows_display(states, constraint)}"
                 if accepted is not None:
                     note += f" [{_stale_tag(result, accepted)}]"
+                note += _exhaust_suffix(cutoff_status, notify_status)
                 status_notes.append(note)
 
     return _EscalationEntry(
@@ -1900,6 +1941,8 @@ class GateResult:
     last_auto_error: str | None = None
     # task #576 — stale_accepted 명시 수용. True 면 reason 에 나이·사유가 적힌다.
     stale_accepted: bool = False
+    # task #638 — on_exhaust="operator-switch" 소진 알림 상태(발송/기통지/실패).
+    exhaust_notice: str | None = None
 
 
 def _find_profile(
@@ -2211,20 +2254,26 @@ def gate_check(
                 pool_class=effective_class,
                 **audit,
             )
-        cutoff = _usage_cutoff(effective_class)
+        cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
+        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
         if over is not None:
             return GateResult(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=None,
-                reason=f"{over.used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
+                reason=(
+                    f"{_exhaust_display(over, cutoff)} (class={effective_class})"
+                    f"{_exhaust_suffix(cutoff_status, notify_status)}"
+                ),
                 used_pct=over.used_pct,
                 pool_class=effective_class,
+                exhaust_notice=notify_status,
                 **audit,
             )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+        reason += _exhaust_suffix(cutoff_status, notify_status)
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -2373,8 +2422,9 @@ def gate_check(
             **audit,
         )
 
-    cutoff = _usage_cutoff(effective_class)
+    cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
+    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
     if over is not None:
         alts = alternatives()
         return GateResult(
@@ -2382,10 +2432,14 @@ def gate_check(
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=f"{over.used_pct:g}% 소진 (cutoff {cutoff:g}%, class={effective_class})",
+            reason=(
+                f"{_exhaust_display(over, cutoff)} (class={effective_class})"
+                f"{_exhaust_suffix(cutoff_status, notify_status)}"
+            ),
             used_pct=over.used_pct,
             pool_class=effective_class,
             alternatives=alts,
+            exhaust_notice=notify_status,
             **audit,
         )
 
@@ -2394,6 +2448,7 @@ def gate_check(
             f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
             f"class={effective_class} — {profile.gate_reason or ''}"
         )
+        reason += _exhaust_suffix(cutoff_status, notify_status)
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -2414,6 +2469,7 @@ def gate_check(
         )
 
     reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+    reason += _exhaust_suffix(cutoff_status, notify_status)
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
     if operator_request is not None:
@@ -2547,13 +2603,15 @@ def recommend(
             )
             continue
 
-        cutoff = _usage_cutoff(effective_class)
+        cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
+        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
         if over is not None:
             excluded.append(
                 _Excluded(
                     profile,
-                    f"{over.used_pct:g}% 소진 (reset {_reset_display(over.reset_at)})",
+                    f"{_exhaust_display(over, cutoff)} (reset {_reset_display(over.reset_at)})"
+                    f"{_exhaust_suffix(cutoff_status, notify_status)}",
                     provider_id=provider_id,
                     kind="exhausted",
                 )
