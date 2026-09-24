@@ -322,6 +322,47 @@ def test_lock_skip_does_not_hide_failure_recorded_after_snapshot(pool, kind):
     assert "탐침 진행 중" not in res.reason
 
 
+@pytest.mark.parametrize("pool", ["devin", "kimi", "grok", "kiro"])
+def test_lock_skip_fresh_snapshot_does_not_hide_newer_failure(pool):
+    """CR M1: fresh TTL 안의 스냅샷도, 그 이후에 기록된 실패는 덮지 않는다."""
+    _seed(pool, at=EPOCH - 10.0)  # 어떤 풀의 TTL 보다도 안쪽(최소 TTL=60s)
+    failure = ProviderResult(id=pool, error="HTTP 401 인증 실패", error_kind="auth", http_status=401)
+    cache.record_failure(pool, failure, EPOCH - 5.0)
+
+    result = _collect_skip(pool, use_cache=False)
+
+    assert result.error_kind == "auth"
+    res = gate_check([result], POOL_PROFILE[pool], today=TODAY, now=NOW)
+    assert res.ok is False
+
+
+def test_lock_skip_rereads_entry_after_concurrent_failure_audit():
+    """CR M2: collect 가 캐시를 읽은 뒤 기록된 실패 감사도 skip 처리 시점에 본다.
+
+    fetcher 안에서 record_failure 를 호출한다 — collect() 의 초기 _load() 이후,
+    skip 결과가 처리되기 전에 잠금 보유 프로브의 실패 감사가 쓰인 인터리빙을
+    결정적으로 재현한다.
+    """
+    pool = "devin"
+    _seed(pool, at=_stale_seed_at(pool))
+
+    def fetch() -> ProviderResult:
+        cache.record_failure(
+            pool,
+            ProviderResult(id=pool, error="HTTP 401 인증 실패", error_kind="auth", http_status=401),
+            EPOCH - 5.0,
+        )
+        return _skipped(pool)
+
+    fetch.pool_class = "spend"
+    result = cache.collect({pool: fetch}, [pool], now=EPOCH, use_cache=True)[0]
+
+    assert result.error_kind == "auth"
+    res = gate_check([result], POOL_PROFILE[pool], today=TODAY, now=NOW)
+    assert res.ok is False
+    assert "탐침 진행 중" not in res.reason
+
+
 def test_lock_skip_stale_rejected_on_account_fp_mismatch():
     """지문 불일치 증거(match=False)가 있으면 건너뜀 수용을 하지 않는다."""
     pool = "devin"

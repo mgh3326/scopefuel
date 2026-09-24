@@ -338,9 +338,27 @@ def _in_progress_result(
     stale_accepted 판정에 맡긴다. 스냅샷이 없거나 STALE_MAX_S 를 넘었으면
     건너뜀 결과를 그대로 돌려준다 — 마지막 정상 값 없음(측정 불가)은 유지.
     """
+    # collect() 는 fetch 전에 엔트리를 읽는다 — 잠금 보유 프로브가 그 사이
+    # 성공 스냅샷이나 실패 감사를 썼을 수 있으므로 캐시 잠금 아래에서 최신
+    # 엔트리를 다시 읽는다(CR M2).
+    with _exclusive_cache_lock():
+        latest = _load().get(name)
+    if isinstance(latest, dict):
+        entry = latest
     if isinstance(entry, dict):
         snap_at = float(entry.get("fetched_at") or 0)
         age = now - snap_at
+        audited_at = entry.get("last_error_at")
+        if isinstance(audited_at, int | float) and audited_at > snap_at:
+            # 스냅샷 이후에 기록된 실패 감사가 있으면 마지막 실제 관측은 그
+            # 실패다 — 건너뜀은 관측이 아니므로 fresh/stale 무관하게 기록된
+            # 실패 사유를 그대로 노출해 #576 규칙에 맡긴다(CR M1: auth·parse
+            # 등은 그대로 차단).
+            stale = _from_entry(entry, name, now, policy_class)
+            stale.last_error = entry.get("last_error")
+            stale.last_error_at = float(audited_at)
+            stale.error_kind = entry.get("last_error_kind")
+            return stale
         if age <= ttl_s:
             kept = _from_entry(entry, name, now, policy_class)
             kept.stale = False
@@ -348,15 +366,6 @@ def _in_progress_result(
             return kept
         if age <= STALE_MAX_S:
             stale = _from_entry(entry, name, now, policy_class)
-            # 스냅샷 이후에 기록된 실패 감사가 있으면 마지막 실제 관측은 그
-            # 실패다 — 건너뜀은 관측이 아니므로 기록된 실패 사유를 그대로
-            # 노출해 #576 규칙에 맡긴다(auth·parse 등은 그대로 차단).
-            audited_at = entry.get("last_error_at")
-            if isinstance(audited_at, int | float) and audited_at > snap_at:
-                stale.last_error = entry.get("last_error")
-                stale.last_error_at = float(audited_at)
-                stale.error_kind = entry.get("last_error_kind")
-                return stale
             stale.note = f"탐침 진행 중 — 직전 값 {format_age(age)}"
             stale.last_error = skipped.error
             stale.last_error_at = now
