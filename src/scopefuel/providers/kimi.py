@@ -25,6 +25,7 @@ import termios
 import time
 from pathlib import Path
 
+from .. import proctrack
 from ..model import Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_KIMI_BIN") or "kimi"
@@ -45,9 +46,25 @@ PTY_COLS = 200
 _ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\([0-2])")
 _PERCENT_LEFT = re.compile(r"(?P<remaining>\d+(?:\.\d+)?)\s*%\s+left", re.IGNORECASE)
 _PERCENT_USED = re.compile(r"(?P<used>\d+(?:\.\d+)?)\s*%\s+used", re.IGNORECASE)
-_RESET_IN = re.compile(r"\(\s*resets\s+in\s+(?P<duration>[^)]*)\)", re.IGNORECASE)
+_RESET_IN = re.compile(r"resets\s+in\s+(?P<duration>(?:\d+(?:\.\d+)?\s*[dhms]\s*)+)", re.IGNORECASE)
 _DURATION_PART = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[dhms])", re.IGNORECASE)
-_RATE_LIMIT = re.compile(r"\b(?:429|too\s+many\s+requests|rate[- ]?limited)\b", re.IGNORECASE)
+_RATE_LIMIT = re.compile(
+    r"(?<![\w$.])429(?!\.\d)(?!\w)|\btoo\s+many\s+requests\b|\brate[- ]?limited\b",
+    re.IGNORECASE,
+)
+# Quota-exhaustion / fetch-failure markers in the rendered panel.  The CLI's
+# quota 403s say "You've reached your ... usage limit"; the /usage card itself
+# renders "Failed to fetch usage: HTTP <code>" when the usages endpoint fails.
+# Bare ``403`` is excluded when it reads as a money amount (``$403.20``), a
+# token count (``403k``, ``(403 / 256k)``) or part of a longer word/hex string.
+_QUOTA_LIMIT = re.compile(
+    r"(?<![\w$.])403(?!\.\d)(?!\s*/)(?!\w)"
+    r"|usage\s+limit|reached\s+your|failed\s+to\s+fetch\s+usage",
+    re.IGNORECASE,
+)
+# ``5h`` needs a digit lookbehind: the monthly row's ``resets in 20d 15h 2m``
+# hint would otherwise match ``"5h" in line`` and misclassify the row.
+_SESSION_ROW = re.compile(r"(?<!\d)5h\b|hour", re.IGNORECASE)
 _PLAN = re.compile(r"\b(?:plan|tier)\s*[:|]\s*(?P<plan>[A-Za-z][A-Za-z0-9+ -]*)", re.IGNORECASE)
 
 
@@ -63,8 +80,20 @@ def fetch() -> ProviderResult:
             pool_class="spend",
         )
 
+    workdir = Path(PROBE_WORKDIR).expanduser()
+    proctrack.log_probe_call(workdir, "kimi")
     try:
-        output = _probe_once()
+        with proctrack.single_probe_lock(workdir) as acquired:
+            if not acquired:
+                # Not an error: another probe is already measuring this pool.
+                return ProviderResult(
+                    id="kimi",
+                    error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                    hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+                    source="cli:/usage",
+                    pool_class="spend",
+                )
+            output = _probe_once()
     except subprocess.TimeoutExpired:
         return ProviderResult(
             id="kimi",
@@ -85,17 +114,41 @@ def fetch() -> ProviderResult:
 
 
 def _probe_once() -> str:
-    """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice."""
+    """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice.
 
-    probe_workdir = Path(PROBE_WORKDIR).expanduser()
-    probe_workdir.mkdir(parents=True, exist_ok=True)
-    master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
+    The child runs in its own session, so nothing the parent's own process
+    group receives reaches it: if scopefuel is SIGKILLed mid-probe — which is
+    how a polling caller's own timeout ends a slow round — the Python cleanup
+    below never runs and the kimi child is reparented to init and keeps
+    burning CPU. That is the 2026-09-23 desktop incident's shape (22 grok
+    orphans, load 28); kimi's PTY probe shares it.
+
+    The four devices that bound it are proctrack's, already proven on the
+    devin probe (be0c0a9) and the grok probe (#593):
+
+    * a per-probe instance directory, flocked, used as the child's cwd — cwd
+      is the only identifier that cannot kill an unrelated long-lived worker;
+    * a pre-probe sweep of leftovers from probes whose owner has died;
+    * pgid + expected-cwd registration, so refresh's timeout handler can
+      reclaim the child before ``os._exit``;
+    * a detached reaper that watches for the parent's death — the last line
+      of defence, and the only one that survives SIGKILL of this process.
+    """
+
+    workdir = Path(PROBE_WORKDIR).expanduser()
+    workdir.mkdir(parents=True, exist_ok=True)
+    proctrack.kill_stale_probe_leftovers(workdir)
+    instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
+    master_fd = slave_fd = -1
     process: subprocess.Popen[bytes] | None = None
+    reaper: subprocess.Popen[bytes] | None = None
+    child_pgid: int | None = None
     try:
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command/input; binary is explicit/env-configured
             [BINARY],
-            cwd=probe_workdir,
+            cwd=instance_dir,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -103,6 +156,11 @@ def _probe_once() -> str:
             start_new_session=True,
             env=_child_env(),
         )
+        with contextlib.suppress(OSError):
+            child_pgid = os.getpgid(process.pid)
+        if child_pgid is not None:
+            proctrack.register(child_pgid, instance_dir)
+        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
         os.close(slave_fd)
         slave_fd = -1
 
@@ -138,7 +196,7 @@ def _probe_once() -> str:
                     continue
                 if not ready and _normal_prompt_ready(clean):
                     ready = True
-                if _RATE_LIMIT.search(clean):
+                if _RATE_LIMIT.search(clean) or _QUOTA_LIMIT.search(clean):
                     break
                 if ready and usage_seen_at is None and _usage_panel_seen(clean):
                     usage_seen_at = time.monotonic()
@@ -187,9 +245,33 @@ def _probe_once() -> str:
                         os.killpg(process_group, signal.SIGKILL)
                 else:
                     process.kill()
-                process.wait(timeout=2.0)
+                # A wait() that times out here used to escape the finally block,
+                # skipping every cleanup line below it — including closing the
+                # pty — and replacing the real TimeoutExpired with its own.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+        # The direct child exiting is not the end of the probe's descendants. A
+        # CLI that backgrounds a helper and returns 0 leaves that helper running,
+        # and the block above skips entirely because ``process.poll()`` is not
+        # None — the success path leaked where the timeout path did not. Sweep
+        # the instance directory unconditionally, by cwd, before it is removed:
+        # once it is gone proctrack has no cwd left to recognise them by.
+        with contextlib.suppress(OSError):
+            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
+        if child_pgid is not None:
+            proctrack.unregister(child_pgid)
+        if reaper is not None:
+            if reaper.poll() is None:
+                with contextlib.suppress(OSError):
+                    reaper.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                reaper.wait(timeout=2.0)
+        with contextlib.suppress(OSError):
+            os.close(owner_fd)
+        shutil.rmtree(instance_dir, ignore_errors=True)
         if slave_fd >= 0:
-            os.close(slave_fd)
+            with contextlib.suppress(OSError):
+                os.close(slave_fd)
         with contextlib.suppress(OSError):
             os.close(master_fd)
 
@@ -228,19 +310,56 @@ def _usage_percent_present(line: str) -> bool:
 
 
 def parse(text: str) -> ProviderResult:
-    """Parse Kimi CLI remaining percentages into scopefuel used percentages."""
+    """Parse Kimi CLI remaining percentages into scopefuel used percentages.
+
+    The panel renders one row per entry of the managed ``GET /usages``
+    payload: ``5h limit``, ``Weekly limit`` and ``Monthly limit`` (the
+    membership quota that freezes all usage on its own).  A quota 403 or a
+    fetch failure can appear next to otherwise healthy-looking rows, so any
+    such marker makes the whole reading unmeasurable — a partially rendered
+    panel is never evidence of a healthy pool.
+    """
 
     clean = _clean(text)
+    if _RATE_LIMIT.search(clean):
+        return ProviderResult(
+            id="kimi",
+            error="Kimi CLI usage rate limited (HTTP 429/rate limit; retry 금지)",
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw={"stdout": clean},
+            pool_class="spend",
+        )
+    limit_line = next((line.strip() for line in clean.splitlines() if _QUOTA_LIMIT.search(line)), "")
+    if limit_line:
+        return ProviderResult(
+            id="kimi",
+            error=f"Kimi CLI /usage 출력에 사용 한도 도달·조회 오류 표시가 있음: {limit_line[:160]}",
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw={"stdout": clean},
+            pool_class="spend",
+        )
+
     buckets_by_kind: dict[str, Bucket] = {}
+    unknown_rows: list[str] = []
     for line in clean.splitlines():
         lower = line.lower()
         if not _usage_percent_present(lower):
             continue
 
-        if "weekly" in lower:
+        # Order matters: classify by the row's own label, and check ``month``
+        # before the session marker — a monthly reset hint such as
+        # ``resets in 20d 15h 2m`` contains the substring ``5h``/``15h``.
+        if "month" in lower:
+            kind, label, window, horizon = "monthly", "monthly", "30d", "month"
+        elif "weekly" in lower:
             kind, label, window, horizon = "weekly", "weekly", "7d", "week"
-        elif "5h" in lower or "hour" in lower:
+        elif _SESSION_ROW.search(lower):
             kind, label, window, horizon = "session", "5h", "5h", "now"
+        elif "limit" in lower:
+            unknown_rows.append(line.strip())
+            continue
         else:
             continue
 
@@ -269,12 +388,20 @@ def parse(text: str) -> ProviderResult:
             ),
         )
 
-    buckets = [buckets_by_kind[k] for k in ("session", "weekly") if k in buckets_by_kind]
-    if not buckets:
-        if _RATE_LIMIT.search(clean):
-            error = "Kimi CLI usage rate limited (HTTP 429/rate limit; retry 금지)"
-        else:
-            error = "/usage 출력에서 Weekly/5h quota 줄을 찾지 못함"
+    buckets = [buckets_by_kind[k] for k in ("session", "weekly", "monthly") if k in buckets_by_kind]
+    if unknown_rows:
+        return ProviderResult(
+            id="kimi",
+            error=f"/usage 출력에 알 수 없는 quota 행이 있음: {unknown_rows[0][:120]}",
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw={"stdout": clean},
+            pool_class="spend",
+        )
+    if "session" not in buckets_by_kind and "weekly" not in buckets_by_kind:
+        error = "/usage 출력에서 Weekly/5h quota 줄을 찾지 못함"
+        if "monthly" in buckets_by_kind:
+            error += " (monthly 행만으로는 5h/weekly 소진 여부를 판정할 수 없음)"
         return ProviderResult(
             id="kimi",
             error=error,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import signal
@@ -252,13 +253,17 @@ def test_fetch_invokes_models_list(tmp_path, monkeypatch, fixture_text):
     assert result.error is None
 
 
-def test_oserror_from_probe_is_unknown(monkeypatch):
-    monkeypatch.setattr(devin.shutil, "which", lambda _name: "/tmp/fake-devin")
+def test_oserror_from_probe_is_unknown(tmp_path, monkeypatch):
+    """An executable whose interpreter is missing fails execve → OSError.
 
-    def _boom(*_a, **_k):
-        raise OSError("boom")
+    Patching devin.shutil.which/devin.subprocess.* would patch the shared
+    modules globally and also neuter proctrack's own lsof lookup.
+    """
+    binary = tmp_path / "fake-devin-badexec"
+    binary.write_text("#!/nonexistent/interpreter\n")
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
 
-    monkeypatch.setattr(devin.subprocess, "run", _boom)
     result = devin.fetch()
     assert result.error and "실행 실패" in result.error
     assert result.buckets == []
@@ -649,6 +654,199 @@ def test_concurrent_probes_never_kill_each_others_child(tmp_path):
         while time.monotonic() < deadline and proctrack.pids_with_cwd(workdir, nested=True):
             time.sleep(0.2)
         proctrack.kill_leftovers_at_cwd(workdir, nested=True)
+
+
+# -- models list 프로브 자식 수명·잠금 (#608 — B2: subprocess.run 시대의 누수) --
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_gone(pids, timeout: float = 10.0) -> list[int]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = [pid for pid in pids if _alive(pid)]
+        if not remaining:
+            return []
+        time.sleep(0.05)
+    return [pid for pid in pids if _alive(pid)]
+
+
+def _models_hanging_fake(tmp_path: Path) -> Path:
+    """A devin that never returns from `models list`."""
+
+    fake = tmp_path / "fake-devin-models-hang"
+    fake.write_text("#!/bin/sh\nexec sleep 120\n")
+    fake.chmod(fake.stat().st_mode | 0o111)
+    return fake
+
+
+def test_models_list_timeout_kills_the_child_and_its_group(tmp_path, monkeypatch):
+    """subprocess.run(timeout=) killed only the direct child; the tracked
+    Popen takes the whole group down with it."""
+
+    workdir = tmp_path / "probe-workdir"
+    monkeypatch.setattr(devin, "BINARY", str(_models_hanging_fake(tmp_path)))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+
+    result = devin._fetch_models_list()
+
+    assert result.error and "끝나지 않음" in result.error
+    assert _wait_gone(proctrack.pids_with_cwd(workdir, nested=True)) == [], (
+        "a timed-out models list left a devin child running"
+    )
+
+
+def test_sigkilled_models_list_parent_leaves_no_orphan(tmp_path):
+    """B2's exact reproduction: SIGKILL the parent mid-`models list` — only the
+    detached reaper can end the child."""
+
+    workdir = tmp_path / "probe-workdir"
+    workdir.mkdir(parents=True)
+    fake = _models_hanging_fake(tmp_path)
+
+    helper = tmp_path / "models_probe_helper.py"
+    helper.write_text(
+        "from scopefuel.providers import devin\n"
+        f"devin.BINARY = {str(fake)!r}\n"
+        f"devin.PROBE_WORKDIR = {str(workdir)!r}\n"
+        "devin.TIMEOUT_S = 120.0\n"
+        "devin._fetch_models_list()\n"
+    )
+    probe = subprocess.Popen([sys.executable, str(helper)])
+    try:
+        deadline = time.monotonic() + 20
+        children: list[int] = []
+        while time.monotonic() < deadline:
+            children = proctrack.pids_with_cwd(workdir, nested=True)
+            if children:
+                break
+            time.sleep(0.1)
+        assert children, "the fake devin models child never started"
+
+        os.kill(probe.pid, signal.SIGKILL)
+        probe.wait(timeout=10)
+
+        assert _wait_gone(children, timeout=30) == [], (
+            "a SIGKILLed fetch orphaned its devin models list child"
+        )
+    finally:
+        if probe.poll() is None:
+            probe.kill()
+            probe.wait(timeout=5)
+        for pid in proctrack.pids_with_cwd(workdir, nested=True):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_banner_probe_backgrounded_grandchild_does_not_survive(tmp_path, monkeypatch):
+    """_probe_banner's finally sweeps the instance dir too — a helper the CLI
+    backgrounds before printing its quota line must not outlive the probe
+    (#608 S7: the sweep mutant survived the suite without this test)."""
+
+    workdir = tmp_path / "probe-workdir"
+    pidfile = tmp_path / "grandchild.pid"
+    fake = tmp_path / "fake-devin-banner-backgrounder"
+    fake.write_text(
+        f"#!/bin/sh\nsleep 120 &\necho $! > {pidfile}\n"
+        "printf '%s\\r\\n' 'v3000.10.31'\nsleep 0.05\n"
+        f"printf '%s\\r\\n' '{_REDRAW_LINE}'\nexit 0\n"
+    )
+    fake.chmod(fake.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(devin, "BINARY", str(fake))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(devin, "TIMEOUT_S", 3.0)
+    monkeypatch.setattr(devin, "BANNER_SETTLE_S", 0.05)
+
+    devin._probe_banner()
+
+    pid = int(pidfile.read_text())
+    try:
+        assert _wait_gone([pid], timeout=10) == [], (
+            "a backgrounded grandchild outlived a successful banner probe"
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_models_list_backgrounded_grandchild_does_not_survive(tmp_path, monkeypatch):
+    """A CLI that backgrounds a helper and exits 0 leaks it without the cwd sweep."""
+
+    workdir = tmp_path / "probe-workdir"
+    pidfile = tmp_path / "grandchild.pid"
+    fake = tmp_path / "fake-devin-backgrounder"
+    fake.write_text(f"#!/bin/sh\nsleep 120 &\necho $! > {pidfile}\nexit 0\n")
+    fake.chmod(fake.stat().st_mode | 0o111)
+
+    monkeypatch.setattr(devin, "BINARY", str(fake))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(devin, "TIMEOUT_S", 2.0)
+
+    devin._fetch_models_list()
+
+    pid = int(pidfile.read_text())
+    try:
+        assert _wait_gone([pid], timeout=10) == [], (
+            "a backgrounded grandchild outlived a successful models list"
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def test_a_second_fetch_is_skipped_while_one_is_running(tmp_path, monkeypatch):
+    """devin had no probe lock at all — overlapping fetch() spawned one CLI
+    pair per caller."""
+
+    workdir = tmp_path / "probe-workdir"
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(devin, "BINARY", str(_models_hanging_fake(tmp_path)))
+
+    entered = []
+
+    def _never_called(*_args):
+        entered.append(True)
+        raise AssertionError("the second fetch must not start a devin")
+
+    with proctrack.single_probe_lock(workdir) as acquired:
+        assert acquired is True
+        monkeypatch.setattr(devin, "_banner_result", _never_called)
+        monkeypatch.setattr(devin, "_fetch_models_list", _never_called)
+        result = devin.fetch()
+
+    assert entered == []
+    assert result.error and "이미 실행 중" in result.error
+
+
+def test_fetch_writes_one_caller_log_line(tmp_path, monkeypatch, fixture_text):
+    """devin's two sub-probes are one probe attempt — one audit line."""
+
+    workdir = tmp_path / "probe-workdir"
+    payload = _fixture(fixture_text)
+    binary = tmp_path / "fake-devin-banner-and-models"
+    binary.write_text(_banner_probe_script(payload, banner_line=_REDRAW_LINE))
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(devin, "BINARY", str(binary))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+
+    result = devin.fetch()
+    assert result.error is None
+
+    lines = (workdir / "probe-calls.log").read_text().splitlines()
+    assert len(lines) == 1
+    assert "probe=devin" in lines[0]
+    assert f"pid={os.getpid()}" in lines[0]
+    assert "via=" in lines[0] and "fetch" in lines[0]
 
 
 # -- task295: devin 계정 풀 공유 3종 등재 ------------------------------------

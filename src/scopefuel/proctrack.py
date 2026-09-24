@@ -64,6 +64,37 @@ _REAPER_SWEEP_PASSES = 4
 _REAPER_SWEEP_GAP_S = 0.4
 
 
+@contextlib.contextmanager
+def single_probe_lock(workdir: Path):
+    """Admit one probe at a time per ``workdir``.
+
+    2026-09-23: a caller polling every ~15s outran a 30s probe, so each
+    round started another CLI while the previous one was still running —
+    22 of them on desktop. Serialising here is what bounds that: a second
+    caller is told the pool is busy instead of adding to the pile. The
+    lock is an flock on a file descriptor, so the kernel releases it if
+    the holder is SIGKILLed.
+    """
+
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(workdir / ".probe.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def register(pgid: int, cwd: Path) -> None:
     """Register a probe child's process group and the cwd it is expected to keep."""
 
@@ -379,6 +410,79 @@ def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) ->
     finally:
         os.close(sweep_fd)
     return killed
+
+
+_CALL_LOG_NAME = "probe-calls.log"
+
+
+def log_probe_call(workdir: Path, provider: str) -> None:
+    """Append one caller-identification line per probe attempt.
+
+    The 2026-09-23 incident's open question was *who* kept polling — the
+    leaked grok children were countable but the ~15s caller was never
+    identified. Every fetch() that reaches a real probe attempt (including
+    ones the single-probe lock then skips) writes one line here:
+    wall-clock time, this process's pid/ppid/argv, the parent process's
+    cmdline, and the Python call path that reached the probe. Logging is
+    best-effort and never raises — a probe must not fail because its
+    audit line could not be written.
+    """
+
+    try:
+        workdir = Path(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        ppid = os.getppid()
+        parent = _clip(_cmdline(ppid) or "?")
+        frames = []
+        frame = sys._getframe(1)
+        while frame is not None and len(frames) < 6:
+            frames.append(f"{Path(frame.f_code.co_filename).name}:{frame.f_code.co_name}")
+            frame = frame.f_back
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+        argv = _clip(" ".join(sys.argv) or "?")
+        line = (
+            f"{stamp} probe={provider} pid={os.getpid()} ppid={ppid} "
+            f"argv={argv} parent={parent} via={' < '.join(frames)}\n"
+        )
+        # 0600: a parent cmdline can carry tokens in argv — the audit log is
+        # owner-only. fchmod tightens files an older version created 0664.
+        log_fd = os.open(workdir / _CALL_LOG_NAME, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            with contextlib.suppress(OSError):
+                os.fchmod(log_fd, 0o600)
+            os.write(log_fd, line.encode("utf-8", errors="replace"))
+        finally:
+            os.close(log_fd)
+    except Exception:  # noqa: BLE001 - audit logging must never break a probe
+        pass
+
+
+def _clip(text: str, limit: int = 300) -> str:
+    """Bound one log field — a caller's full cmdline is diagnostic, not a log flood."""
+
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _cmdline(pid: int) -> str | None:
+    """Best-effort cmdline of ``pid`` — /proc first, ``ps`` elsewhere."""
+
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv; numeric pid only
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_LSOF_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() or None
 
 
 def spawn_reaper(

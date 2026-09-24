@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pathlib
+
 from scopefuel.providers import kimi
 
 SAMPLE = "\x1b[2KWeekly: 75% left (resets in 5d 12h)\r\n\x1b[2K5h: 30% left (resets in 2h 10m)\r\n"
@@ -34,6 +36,175 @@ def test_parse_rate_limit_is_an_immediate_error_without_retry():
     assert result.error == "Kimi CLI usage rate limited (HTTP 429/rate limit; retry 금지)"
     assert result.buckets == []
     assert result.raw == {"stdout": "HTTP 429 Too Many Requests\n"}
+
+
+# ------------------------------------------------------------------ #573
+# The /usage panel renders one row per managed /usages entry — 5h, weekly,
+# AND monthly (the membership quota that freezes all usage on its own). The
+# parser used to drop the monthly row and ignore quota-403 text printed next
+# to otherwise-healthy rows, so an exhausted pool surfaced as "5h 0% · 주 0%".
+
+
+def test_parse_monthly_limit_row_is_a_third_account_bucket():
+    result = kimi.parse(
+        "5h limit: 0% used (resets in 3h)\nWeekly limit: 12% used (resets in 4d)\nMonthly limit: 47% used\n"
+    )
+
+    assert result.error is None
+    assert [(b.label, b.window, b.horizon, b.used_pct) for b in result.buckets] == [
+        ("5h", "5h", "now", 0.0),
+        ("weekly", "7d", "week", 12.0),
+        ("monthly", "30d", "month", 47.0),
+    ]
+    assert all(bucket.scope.kind == "account" for bucket in result.buckets)
+
+
+def test_parse_quota_403_text_is_an_error_even_with_healthy_rows():
+    # The incident rendering: rows read 0% used while the account was blocked.
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "403 You've reached your 5-hour usage limit. Your quota will reset "
+        "when the current 5-hour window ends.\n"
+    )
+
+    assert result.error is not None
+    assert "사용 한도" in result.error
+    assert "5-hour usage limit" in result.error
+    assert result.buckets == []
+
+
+def test_parse_weekly_usage_limit_text_is_an_error():
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "403 You've reached your weekly usage limit for this billing cycle.\n"
+    )
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_failed_to_fetch_usage_is_an_error():
+    result = kimi.parse("Failed to fetch usage: HTTP 403\n")
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_monthly_only_output_is_unmeasurable():
+    # Shape change: only the membership row rendered — the 5h/weekly windows
+    # are invisible, so the reading must not become a usable measurement.
+    result = kimi.parse("Monthly limit: 100% used\n")
+
+    assert result.error is not None
+    assert "quota 줄을 찾지 못함" in result.error
+    assert result.buckets == []
+
+
+def test_parse_changed_panel_shape_is_unmeasurable_not_zero():
+    result = kimi.parse("Plan usage\n  No usage data available.\n")
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_dollar_amounts_do_not_trip_the_403_marker():
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "Extra Usage\n"
+        "  Used this month  $403.20\n"
+        "  Monthly limit    Unlimited\n"
+        "  Balance          $96.80\n"
+    )
+
+    assert result.error is None
+    assert [(b.label, b.used_pct) for b in result.buckets] == [
+        ("5h", 0.0),
+        ("weekly", 0.0),
+    ]
+
+
+# The panel the real CLI actually draws (from buildManagedUsageSection in the
+# installed bundle): no parens around "resets in", and the hint always carries
+# an hour component — "resets in 20d 15h 2m" contains the substring "15h".
+REAL_EXHAUSTED_MONTHLY = (
+    "Plan usage\n"
+    "  5h limit       ░░░░    0% used   resets in 3h 12m\n"
+    "  Weekly limit   ░░░░    0% used   resets in 4d 2h 1m\n"
+    "  Monthly limit  ████  100% used   resets in 20d 15h 2m\n"
+)
+
+
+def test_parse_real_render_monthly_row_with_15h_reset_is_monthly():
+    """#573 tester blocker B1: a monthly reset hint containing "5h"/"15h" must
+    not classify the row as session — an exhausted monthly cap was dropped."""
+    result = kimi.parse(REAL_EXHAUSTED_MONTHLY)
+
+    assert result.error is None
+    assert [(b.label, b.window, b.used_pct) for b in result.buckets] == [
+        ("5h", "5h", 0.0),
+        ("weekly", "7d", 0.0),
+        ("monthly", "30d", 100.0),
+    ]
+    # Bare (paren-less) reset hints are parsed too.
+    assert all(bucket.resets_at for bucket in result.buckets)
+
+
+def test_parse_real_render_monthly_row_with_5h_reset_is_monthly():
+    result = kimi.parse(
+        "  5h limit       ░░░░    0% used   resets in 3h 12m\n"
+        "  Weekly limit   ░░░░    0% used   resets in 4d 2h 1m\n"
+        "  Monthly limit  ████  100% used   resets in 20d 5h 2m\n"
+    )
+
+    assert result.error is None
+    assert [(b.label, b.used_pct) for b in result.buckets] == [
+        ("5h", 0.0),
+        ("weekly", 0.0),
+        ("monthly", 100.0),
+    ]
+
+
+def test_parse_monthly_only_with_5h_in_reset_is_unmeasurable():
+    # Monthly row at month-end can reset within hours ("resets in 5h 10m") —
+    # it must not turn into a session bucket.
+    result = kimi.parse("  Monthly limit  ████  100% used   resets in 5h 10m\n")
+
+    assert result.error is not None
+    assert result.buckets == []
+
+
+def test_parse_dollar_429_does_not_trip_the_rate_limit_marker():
+    result = kimi.parse(
+        "5h limit: 0% used\n"
+        "Weekly limit: 0% used\n"
+        "Extra Usage\n"
+        "  Used this month  $429.10\n"
+        "  Balance          $70.90\n"
+    )
+
+    assert result.error is None
+    assert len(result.buckets) == 2
+
+
+def test_parse_context_token_counts_do_not_trip_the_403_marker():
+    result = kimi.parse(
+        "5h limit: 0% used\nWeekly limit: 0% used\nContext  (403 / 256k)\nSession tokens  403k\n"
+    )
+
+    assert result.error is None
+    assert len(result.buckets) == 2
+
+
+def test_parse_unknown_limit_row_is_unmeasurable():
+    # A new quota dimension we cannot classify must not be silently dropped —
+    # it may be the binding constraint.
+    result = kimi.parse("5h limit: 0% used\nWeekly limit: 0% used\nDaily limit 100% used\n")
+
+    assert result.error is not None
+    assert "알 수 없는 quota 행" in result.error
 
 
 def test_fetch_uses_a_pty_and_sends_usage_once(tmp_path, monkeypatch):
@@ -92,7 +263,14 @@ def test_fetch_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypatch):
     assert "LINES=50" in result.raw["stdout"] or "COLUMNS=200" in result.raw["stdout"]
 
 
-def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch):
+def test_fetch_auto_accepts_trust_in_a_per_probe_instance_dir(tmp_path, monkeypatch):
+    """Each probe gets a fresh flocked ``probe-*`` instance dir as child cwd.
+
+    #608: the child's cwd moved from the shared workdir to a per-probe
+    instance directory so proctrack can identify its descendants. The fake's
+    ``.trusted`` marker therefore does not survive between probes — the trust
+    prompt reappears and is auto-accepted every run.
+    """
     binary = tmp_path / "fake-kimi-trust"
     binary.write_text(
         "#!/bin/sh\n"
@@ -125,10 +303,19 @@ def test_fetch_auto_accepts_trust_and_reuses_fixed_workdir(tmp_path, monkeypatch
     assert second.error is None
     assert "Trust this folder?" in first_output
     assert "TRUST_ACCEPTED" in first_output
-    assert "Trust this folder?" not in second_output
-    assert "TRUST_ALREADY_ACCEPTED" in second_output
-    assert f"CWD={workdir}" in first_output
-    assert f"CWD={workdir}" in second_output
+    assert "Trust this folder?" in second_output
+    assert "TRUST_ACCEPTED" in second_output
+    cwds = [
+        pathlib.Path(line.removeprefix("CWD=").strip())
+        for line in (first_output + second_output).splitlines()
+        if line.startswith("CWD=")
+    ]
+    assert len(cwds) == 2
+    for cwd in cwds:
+        assert cwd.resolve().parent == workdir.resolve()
+        assert cwd.name.startswith("probe-")
+    # Probe exit removes the instance dirs; only the sweep lock file remains.
+    assert [p for p in workdir.iterdir() if p.name.startswith("probe-")] == []
     assert [(bucket.label, bucket.used_pct) for bucket in second.buckets] == [
         ("5h", 50.0),
         ("weekly", 20.0),
