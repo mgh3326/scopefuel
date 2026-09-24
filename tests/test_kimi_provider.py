@@ -47,9 +47,7 @@ def test_parse_rate_limit_is_an_immediate_error_without_retry():
 
 def test_parse_monthly_limit_row_is_a_third_account_bucket():
     result = kimi.parse(
-        "5h limit: 0% used (resets in 3h)\n"
-        "Weekly limit: 12% used (resets in 4d)\n"
-        "Monthly limit: 47% used\n"
+        "5h limit: 0% used (resets in 3h)\nWeekly limit: 12% used (resets in 4d)\nMonthly limit: 47% used\n"
     )
 
     assert result.error is None

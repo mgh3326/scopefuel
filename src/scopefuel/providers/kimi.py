@@ -322,9 +322,7 @@ def parse(text: str) -> ProviderResult:
             raw={"stdout": clean},
             pool_class="spend",
         )
-    limit_line = next(
-        (line.strip() for line in clean.splitlines() if _QUOTA_LIMIT.search(line)), ""
-    )
+    limit_line = next((line.strip() for line in clean.splitlines() if _QUOTA_LIMIT.search(line)), "")
     if limit_line:
         return ProviderResult(
             id="kimi",
@@ -375,9 +373,7 @@ def parse(text: str) -> ProviderResult:
             ),
         )
 
-    buckets = [
-        buckets_by_kind[k] for k in ("session", "weekly", "monthly") if k in buckets_by_kind
-    ]
+    buckets = [buckets_by_kind[k] for k in ("session", "weekly", "monthly") if k in buckets_by_kind]
     if "session" not in buckets_by_kind and "weekly" not in buckets_by_kind:
         error = "/usage 출력에서 Weekly/5h quota 줄을 찾지 못함"
         if "monthly" in buckets_by_kind:

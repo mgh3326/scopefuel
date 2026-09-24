@@ -768,9 +768,7 @@ def _kimi_result(
 
 def test_gate_kimi_monthly_exhausted_blocks_despite_zero_windows():
     # 사고 형태: 5h/주간은 0% 인데 monthly 캡이 소진 → 소진이 아니라 통과하면 안 됨.
-    result = gate_check(
-        [_kimi_result(0.0, 0.0, monthly=100.0)], "kimi-k3", today=TODAY, now=NOW
-    )
+    result = gate_check([_kimi_result(0.0, 0.0, monthly=100.0)], "kimi-k3", today=TODAY, now=NOW)
     assert result.ok is False
     assert result.unmeasurable is False
     assert "100%" in result.reason
@@ -791,16 +789,12 @@ def test_gate_kimi_quota_error_is_unmeasurable():
 
 
 def test_gate_kimi_healthy_values_still_pass():
-    result = gate_check(
-        [_kimi_result(30.0, 20.0, monthly=45.0)], "kimi-k3", today=TODAY, now=NOW
-    )
+    result = gate_check([_kimi_result(30.0, 20.0, monthly=45.0)], "kimi-k3", today=TODAY, now=NOW)
     assert result.ok is True
     assert result.provider_id == "kimi"
 
 
 def test_gate_kimi_zero_windows_without_monthly_is_the_known_shape():
     # 정상 회귀: 패널이 5h/주간만 렌더하고 0% 면 계측된 건강 상태로 통과한다.
-    result = gate_check(
-        [_kimi_result(0.0, 0.0)], "kimi-k3", today=TODAY, now=NOW
-    )
+    result = gate_check([_kimi_result(0.0, 0.0)], "kimi-k3", today=TODAY, now=NOW)
     assert result.ok is True
