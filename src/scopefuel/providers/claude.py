@@ -9,7 +9,9 @@ Keychain(`Claude Code-credentials`)에만 토큰을 두며, 그 경우 파일은
 파일만 보면 로그인된 계정을 "미로그인"으로 오판해 gate 가 fail-closed 로 풀 전체를
 막아버린다 — 파일을 우선하되 없으면 Keychain 으로 폴백한다.
 
-토큰 갱신은 하지 않는다(실행 중인 claude 세션이 갱신한다). 만료 시 힌트만 남긴다.
+토큰 갱신은 하지 않는다(실행 중인 claude 세션이 갱신한다 — 자동 갱신은 #616 으로 금지).
+expiresAt 가 이미 지난 자격으로는 usage API 를 호출하지 않는다 — 호출 전에
+"token expired" 로 실패시킨다(task #653: 만료가 401/429 로 오분류되던 경로 제거).
 """
 
 from __future__ import annotations
@@ -25,9 +27,10 @@ import time
 
 from ..http import HttpError, classify_error, request_json
 from ..model import Bucket, ProviderResult, Scope
-from ..quota_v2_contract import claude_attempt
+from ..quota_v2_contract import Attempt, claude_attempt
 
 CREDENTIALS = pathlib.Path.home() / ".claude" / ".credentials.json"
+CLAUDE_JSON = pathlib.Path.home() / ".claude.json"
 KEYCHAIN_SERVICE = os.environ.get("SCOPEFUEL_CLAUDE_KEYCHAIN_SERVICE", "Claude Code-credentials")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 BETA_HEADER = "oauth-2025-04-20"
@@ -82,21 +85,71 @@ def _load_oauth() -> tuple[dict, str] | None:
     return None
 
 
-def _account_fp(oauth: dict) -> str | None:
-    """로컬 자격 지문 — 토큰 원문은 저장하지 않는다.
+def _claude_json_path() -> pathlib.Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return pathlib.Path(configured) / ".claude.json" if configured else CLAUDE_JSON
 
-    자문 2558: 토큰 갱신과 계정 변경을 로컬에서 구별할 수 없으므로 지문이 바뀌면
-    전부 '계정/구독 변경 의심'으로 fail-closed 처리한다.
+
+def _account_uuid() -> str | None:
+    """계정 uuid — ``~/.claude.json`` 최상위의 ``oauthAccount.accountUuid``.
+
+    자격 파일/Keychain 의 ``claudeAiOauth`` 에는 토큰·만료·플랜만 있고 계정
+    식별자는 없다 — uuid 는 Claude Code 주 설정 파일에만 있다(읽기 전용).
+    """
+    try:
+        payload = json.loads(_claude_json_path().read_text())
+    except (OSError, ValueError):
+        return None
+    account = payload.get("oauthAccount") if isinstance(payload, dict) else None
+    uuid = account.get("accountUuid") if isinstance(account, dict) else None
+    return uuid.strip() if isinstance(uuid, str) and uuid.strip() else None
+
+
+def _account_fp(oauth: dict) -> str | None:
+    """계정 지문 — 호스트를 넘어 같은 계정을 식별한다 (task #653/#654).
+
+    정본은 ``oauthAccount.accountUuid`` 다 — accessToken 은 로그인 회차·호스트마다
+    다르므로 토큰 해시를 정본으로 쓰면 같은 계정이 '다른 계정'으로 오판돼 원격
+    스냅샷 공유(AC2)가 깨진다. uuid 를 읽을 수 없는 호스트는 #576 의 로컬 stale
+    일치를 위해 토큰 해시로 폴백한다 — 그 지문은 다른 토큰의 원격 스냅샷과
+    어차피 불일치하므로 fail-closed 는 유지된다. 자문 2558 의 '계정/구독 변경
+    의심' 계약도 유지된다 — uuid·토큰이 바뀌면 지문도 바뀐다.
+    """
+    plan = str(oauth.get("subscriptionType") or "")
+    uuid = _account_uuid()
+    if uuid:
+        return hashlib.sha256(f"claude-account|{plan}|{uuid}".encode()).hexdigest()[:16]
+    token = (oauth.get("accessToken") or "").strip()
+    if not token:
+        return None
+    return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16]
+
+
+def _session_fp(oauth: dict) -> str | None:
+    """측정 세션 지문 — 어느 토큰 세션이 관측했는지의 provenance.
+
+    hk 스냅샷의 ``measured_by`` 에만 실린다. 비가역 해시라 원문을 복원할 수
+    없고, 계정 지문과 달리 토큰 회전을 따라 바뀐다 — 그게 목적이다(AC5: 한
+    세션의 429 가 다른 세션의 계정 판정으로 번지지 않는다는 관측 가능성).
     """
     token = (oauth.get("accessToken") or "").strip()
     if not token:
         return None
-    plan = str(oauth.get("subscriptionType") or "")
-    return hashlib.sha256(f"{plan}|{token}".encode()).hexdigest()[:16]
+    return hashlib.sha256(f"claude-session|{token}".encode()).hexdigest()[:16]
+
+
+def _expiry_epoch(oauth: dict) -> float | None:
+    """expiresAt 를 epoch 초로. claude 자격은 밀리초이지만 초 단위도 받는다."""
+    raw = oauth.get("expiresAt")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if not math.isfinite(raw) or raw <= 0:
+        return None
+    return raw / 1000 if raw > 1e12 else raw
 
 
 def current_account_fp() -> str | None:
-    """네트워크 없이 로컬 자격 파일만으로 지문을 계산한다 (backoff 중 계정 검증용)."""
+    """네트워크 없이 로컬 자격 파일만으로 지문을 계산한다 (backoff·원격 조회의 계정 검증용)."""
     loaded = _load_oauth()
     return None if loaded is None else _account_fp(loaded[0])
 
@@ -116,6 +169,21 @@ def fetch() -> ProviderResult:
     oauth, origin = loaded
     token = oauth["accessToken"].strip()
     fp = _account_fp(oauth)
+    session_fp = _session_fp(oauth)
+
+    # task #653 — 만료는 호출 전에 판정한다. 이미 지난 자격으로 친 401 은
+    # rate limit 으로도 '측정 불가' 로도 기록되면 안 된다 — 원인은 '만료'다.
+    expiry = _expiry_epoch(oauth)
+    if expiry is not None and expiry <= time.time():
+        return ProviderResult(
+            id="claude",
+            error="token expired — claude access token 만료",
+            error_kind="token_expired",
+            account_fp=fp,
+            session_fp=session_fp,
+            hint="expiresAt 과거 — 실행 중인 claude 세션이 갱신하거나 재로그인 필요",
+            v2_attempt=Attempt("auth_error", "auth_error:token_expired"),
+        )
 
     http_status: list[int] = []
     try:
@@ -135,6 +203,10 @@ def fetch() -> ProviderResult:
         # "측정 불가"를 구분한다(실패 결과에도 지문을 실어 stale 수용 판정에 쓴다).
         kind, status, retry_after = classify_error(exc)
         seen = exc.status if isinstance(exc, HttpError) else (http_status[-1] if http_status else None)
+        # task #653 — expiresAt 가 미래인데도 서버가 401 expired 를 돌려주면
+        # (로컬 시계 드리프트·서버 측 회전) 그것도 '만료'로 보고한다.
+        if isinstance(exc, HttpError) and exc.status == 401 and "expired" in (exc.body or "").lower():
+            kind = "token_expired"
         return ProviderResult(
             id="claude",
             error=str(exc),
@@ -142,8 +214,13 @@ def fetch() -> ProviderResult:
             http_status=status,
             retry_after_s=retry_after,
             account_fp=fp,
+            session_fp=session_fp,
             hint="usage API 속도 제한" if kind == "rate_limited" else None,
-            v2_attempt=claude_attempt(http_status=seen, exc=exc),
+            v2_attempt=(
+                Attempt("auth_error", "auth_error:token_expired")
+                if kind == "token_expired"
+                else claude_attempt(http_status=seen, exc=exc)
+            ),
         )
 
     buckets: list[Bucket] = []
@@ -186,12 +263,9 @@ def fetch() -> ProviderResult:
         )
 
     note = None
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
-        note = "access token 만료 — 실행 중인 claude 세션이 갱신하거나 재로그인 필요"
     extra = raw.get("extra_usage") or {}
     if extra.get("is_enabled"):
-        note = f"{note + ' / ' if note else ''}extra usage {extra.get('utilization')}%"
+        note = f"extra usage {extra.get('utilization')}%"
 
     return ProviderResult(
         id="claude",
@@ -202,6 +276,7 @@ def fetch() -> ProviderResult:
         raw=raw,
         http_status=200,
         account_fp=fp,
+        session_fp=session_fp,
         v2_attempt=claude_attempt(http_status=http_status[-1] if http_status else 200, body=raw),
     )
 

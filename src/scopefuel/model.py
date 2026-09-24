@@ -243,6 +243,10 @@ class ProviderResult:
     # stale 폴백 결과에서: 스냅샷 지문과 이번 시도 지문의 일치 여부.
     # None = provider 가 지문을 제공하지 않아 계정 동일성을 증명할 수 없다.
     account_fp_match: bool | None = None
+    # task #654 — 측정 세션 지문(토큰 해시). hk 스냅샷의 measured_by provenance
+    # 로만 쓰인다 — 계정 지문과 달리 토큰 회전을 따라 바뀌는 것이 목적이다.
+    # as_dict/--json 출력에는 싣지 않는다.
+    session_fp: str | None = None
     last_error_at: float | None = None
     # host-local backoff 창의 끝(epoch). 창 안에서는 어느 경로도 네트워크를 치지 않는다.
     backoff_until: float | None = None

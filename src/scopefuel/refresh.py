@@ -13,7 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from . import cache, proctrack, quota_v2
+from . import cache, proctrack, quota_share, quota_v2
 from .http import classify_error
 from .model import PROBE_IN_PROGRESS, ProviderResult
 from .providers import BUILTIN
@@ -150,6 +150,9 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
             result.stale = False
             cache.update_entry(pool, result, now)
             _v2_record(pool, result, started_at, completed_at, v2_identities)
+            # task #654 — 정상 측정의 정제 스냅샷을 hk 에 게시한다(fail-open).
+            with contextlib.suppress(Exception):
+                quota_share.publish_result(pool, result, now=now)
             print(f"refresh: pool={pool} updated fetched_at={now:.6f}", flush=True)
             return 0
         finally:
