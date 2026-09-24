@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import os
 import signal
@@ -13,9 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from scopefuel import cli, proctrack
+from scopefuel import cli, launch, proctrack
 from scopefuel.providers import BUILTIN, devin
 from scopefuel.recommend import (
+    DEVIN_DS41_GRADE_ANNOTATION,
     DEVIN_SWE2_ESTIMATE_REASON,
     DEVIN_SWE2_PLACEMENT_NOTE,
     ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
@@ -27,6 +29,7 @@ from scopefuel.recommend import (
 
 FREE_NOTE = "free until ~2026-10-10"
 NEW_DEVIN_PROFILES = ("devin-glm52", "devin-swe17", "devin-ds41")
+UNMEASURED_DEVIN_PROFILES = ("devin-glm52", "devin-swe17")
 
 
 def _fixture(fixture_text) -> str:
@@ -852,9 +855,9 @@ def test_fetch_writes_one_caller_log_line(tmp_path, monkeypatch, fixture_text):
 # -- task295: devin 계정 풀 공유 3종 등재 ------------------------------------
 
 
-def test_task295_new_devin_profiles_are_c_only_and_unmeasured():
+def test_task295_remaining_unmeasured_devin_profiles_stay_c_only():
     names = {grade: [p.name for p in profiles] for grade, profiles in GRADE_TABLE.items()}
-    for name in NEW_DEVIN_PROFILES:
+    for name in UNMEASURED_DEVIN_PROFILES:
         assert name in names["C"]
         for grade in ("S+", "S", "A+", "A", "B"):
             assert name not in names[grade], (name, grade)
@@ -871,14 +874,63 @@ def test_task295_new_devin_profiles_are_c_only_and_unmeasured():
         assert profile.benchmark_effort is None
 
 
-def test_task295_recommend_c_lists_new_devin_profiles_as_unmeasured(fixture_text):
+def test_task295_recommend_c_lists_remaining_devin_profiles_as_unmeasured(fixture_text):
     providers = [devin.parse(_fixture(fixture_text))]
     out = recommend(providers, "C")
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    for name in NEW_DEVIN_PROFILES:
+    for name in UNMEASURED_DEVIN_PROFILES:
         row = next((line for line in ranked if line.split()[1] == name), None)
         assert row is not None, (name, out)
         assert "미측정" in row, (name, row)
+
+
+def test_task631_ds41_measured_grade_is_in_both_snapshot_consumers(capsys, fixture_text):
+    placements = [
+        grade for grade, profiles in GRADE_TABLE.items() if any(p.name == "devin-ds41" for p in profiles)
+    ]
+    assert placements == ["A+"]
+    profile = next(p for p in GRADE_TABLE["A+"] if p.name == "devin-ds41")
+    assert profile.benchmark is None  # operational reps are not an AA-agent score
+    assert profile.benchmark_source is None
+    assert profile.benchmark_annotation == DEVIN_DS41_GRADE_ANNOTATION
+    assert "reps 3/3" in profile.benchmark_annotation
+    assert "BLOCKER 1건" in profile.benchmark_annotation
+    assert "hk:doc 2227" in profile.benchmark_annotation
+
+    rows = [entry for entry in launch.snapshot_entries() if entry.profile == "devin-ds41"]
+    assert len(rows) == 1
+    assert rows[0].grade == "A+"
+    assert rows[0].score is None
+    assert rows[0].benchmark_annotation == DEVIN_DS41_GRADE_ANNOTATION
+    assert rows[0].model_id == "deepseek-v4-1-flash-high"
+    assert rows[0].pool == "devin"
+
+    assert cli.main(["policy", "launch", "devin-ds41", "--json"]) == 0
+    launched = json.loads(capsys.readouterr().out)
+    assert launched["grade"] == "A+"
+    assert launched["model_id"] == "deepseek-v4-1-flash-high"
+    assert launched["catalog"]["source"] == "snapshot"
+
+    providers = [devin.parse(_fixture(fixture_text))]
+    aplus = recommend(providers, "A+")
+    c_grade = recommend(providers, "C")
+    assert "devin-ds41" in aplus
+    assert "hk:doc 2227" in aplus
+    assert "devin-ds41" not in c_grade
+
+
+def test_task631_other_unscored_c_rows_keep_their_placements():
+    expected = {"codex-luna", "kiro-cheap", "oc-omni", "devin-glm52", "devin-swe17"}
+    actual = {p.name for p in GRADE_TABLE["C"] if p.benchmark is None}
+    assert actual == expected
+    snapshot = {
+        entry.profile: entry
+        for entry in launch.snapshot_entries()
+        if entry.profile in expected and (entry.effort == "low" if entry.profile == "codex-luna" else True)
+    }
+    assert set(snapshot) == expected
+    assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())
+    assert snapshot["oc-omni"].gate == "escalation"
 
 
 def test_task295_profile_pool_shares_devin_pool():

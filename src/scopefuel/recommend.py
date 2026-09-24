@@ -194,6 +194,12 @@ _HARNESS_LABELS = {
 OPUS_MAX_ESCALATION_REASON = "더 깊은 탐색이 필요하거나 xhigh 실패 후 재시도할 때"
 CODEX_SOL_XHIGH_ESCALATION_REASON = "쿼타 절약·속도 우선"
 UNMEASURED_ANNOTATION = "미측정"
+# hk:doc decision/2026-09-20/provider-family-and-ds41-grade (id 2227):
+# DeepSeek-family operational grade A+ from 3/3 reps, with one BLOCKER found.
+# This is a measured *placement*, not an AA-agent benchmark score.
+DEVIN_DS41_GRADE_ANNOTATION = (
+    "급 실측(A+; DeepSeek 계열, reps 3/3, BLOCKER 1건 탐지; hk:doc 2227) · AA-agent 점수 미측정"
+)
 # ROB-1202: "추정" 표시를 근거 계열로 세분화한다.
 # 내삽(interpolation) — 상하로 대조 가능한 기준점(실측 곡선 등) 사이에서 추정.
 # 외삽(extrapolation) — 단일 기준점에서 투사하거나 대조 기준점이 아예 없는 추정.
@@ -762,6 +768,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # Same canonical profile is listed in A+/A/B so --recommend at those
         # grades can use the free SWE-2 lane. Not in S/S+ (vendor TB4 27.3).
         _devin_swe2_profile(),
+        Profile(
+            "devin-ds41",
+            "DeepSeek V4.1 Flash (high)",
+            None,
+            benchmark_annotation=DEVIN_DS41_GRADE_ANNOTATION,
+        ),
     ],
     "A": [
         # ROB-1251: AA v1.3 실측 55@codex(max) — 내삽 44.7을 대체. $0.14/M 최저가.
@@ -1011,19 +1023,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             gate="escalation",
             gate_reason=OC_OMNI_ESCALATION_REASON,
         ),
-        # task295: devin 계정 풀 공유 3종. profile_pool 의 `devin-` prefix 라우팅이
-        # 셋 다 devin 풀에 묶는다(신설 풀 없음). wrk `--model` 매핑:
-        # devin-glm52→glm-5-2, devin-swe17→swe-1-7, devin-ds41→deepseek-v4-1-flash-high.
-        # reps 0건이라 무점수 미측정 — C 는 benchmark=None 무점수 행의 기존 관례
-        # (codex-luna low, kiro-cheap, oc-omni)를 따른다.
+        # task295: devin 계정 풀 공유. profile_pool 의 `devin-` prefix 라우팅이
+        # 모두 devin 풀에 묶는다(신설 풀 없음). wrk `--model` 매핑은 launch.py.
+        # glm52/swe17은 급 실측이 없어 C에 남긴다. ds41은 hk:doc 2227의
+        # reps 3/3 A+ 확정에 따라 위 A+ 행으로 이동했다.
         Profile("devin-glm52", "GLM-5.2", None, benchmark_annotation=UNMEASURED_ANNOTATION),
         Profile("devin-swe17", "SWE-1.7", None, benchmark_annotation=UNMEASURED_ANNOTATION),
-        Profile(
-            "devin-ds41",
-            "DeepSeek V4.1 Flash (high)",
-            None,
-            benchmark_annotation=UNMEASURED_ANNOTATION,
-        ),
     ],
 }
 
