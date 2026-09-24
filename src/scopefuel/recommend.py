@@ -299,6 +299,9 @@ DEVIN_SWE2_ESTIMATE_REASON = (
     "Terminal-Bench 4 27.3 — AA-agent 미측정. TB4 약점으로 S/S+ 배제"
 )
 DEVIN_SWE2_PLACEMENT_NOTE = "보수 배치(A+; reps 3건 전 · AA-agent 미측정)"
+# #635: devin 은 effort 를 모델 id 안에 둔다(--model swe-2-max). 변형 rung 은 high 의
+# 급을 상속하지 않는다 — high 의 A+ 는 참조로만 적고 #594 E6 판정까지 C 무점수 미측정.
+DEVIN_EFFORT_VARIANT_ANNOTATION = "미측정(high A+ 참조 · 급 비상속 · #594 E6 판정 대기)"
 
 # task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
 # opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
@@ -1031,6 +1034,25 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "DeepSeek V4.1 Flash (high)",
             None,
             benchmark_annotation=UNMEASURED_ANNOTATION,
+        ),
+        # #635: effort 변형 rung. 모델 id 는 launch.LAUNCH_MODEL_IDS.
+        Profile(
+            "devin-swe2-medium",
+            "SWE-2 (medium)",
+            None,
+            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
+        ),
+        Profile(
+            "devin-swe2-max",
+            "SWE-2 (max)",
+            None,
+            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
+        ),
+        Profile(
+            "devin-ds41-max",
+            "DeepSeek V4.1 Flash (max)",
+            None,
+            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
         ),
     ],
 }

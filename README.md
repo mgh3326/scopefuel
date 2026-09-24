@@ -220,7 +220,7 @@ claude·max · now 6% · wk 97% · [Fable 100%] · credential=default
 | `kiro` | `kiro-cli` 에 `/usage` 를 물려 출력 파싱 | 월 크레딧 1줄 (플랜+애드온 합산) | 5h급 창 없음, 호출 7초(아래) |
 | `grok` | 인증된 `grok` CLI를 PTY로 실행해 `/usage` 출력 파싱 | 주간 account 한도 → used_pct/reset | 출력 형식 의존; 실패 시 월간 폴백 없이 degraded |
 | `kimi` | `kimi` CLI를 PTY로 실행해 `/usage` 출력 파싱 | 5h·weekly account 한도 | CLI 출력 형식 의존; 429/rate-limit 재시도 없음 |
-| `devin` | 인증된 `devin models list` 출력에서 SWE-2 행의 `Free` 태그만 파싱 | SWE-2 Free이면 account used_pct=0 | Free-only; SWE-2/Free 누락·다른 모델만 Free·출력/프로세스 실패는 unknown fail-closed. 추천표·gate 등재는 `devin-swe2`·`devin-glm52`·`devin-swe17`(Free)·`devin-ds41`(최저가 유료) 4종이며 모두 같은 devin 계정 풀을 공유 |
+| `devin` | 인증된 `devin models list` 출력에서 SWE-2 행의 `Free` 태그만 파싱 | SWE-2 Free이면 account used_pct=0 | Free-only; SWE-2/Free 누락·다른 모델만 Free·출력/프로세스 실패는 unknown fail-closed. 추천표·gate 등재는 `devin-swe2`·`devin-glm52`·`devin-swe17`(Free)·`devin-ds41`(최저가 유료) 4종과 effort 변형 `devin-swe2-medium`·`devin-swe2-max`(Free)·`devin-ds41-max` 3종(#635; effort 는 모델 id 안에 있고, high 급을 상속하지 않는 C 미측정)이며 모두 같은 devin 계정 풀을 공유 |
 
 **kiro는 API가 아니라 CLI를 읽습니다.** 같은 값을 주는 `GetUsageLimits` API가 있지만 토큰이
 JSON 파일이 아니라 sqlite(`data.sqlite3`의 `auth_kv`)에 있고 만료 시 갱신이 필요합니다. 읽기 전용
@@ -238,7 +238,7 @@ CLI 호출 자체가 갱신하므로 1회 재시도합니다.
 `used_pct`로 변환합니다. 출력이 바뀌거나 rate limit/429가 나오면 추측·재시도하지 않고 error로
 보고합니다.
 
-**devin도 API가 아니라 CLI 모델 목록만 읽습니다.** 소스는 `devin models list`의 SWE-2 패밀리 행뿐이며, 그 행에 `Free` 태그가 있을 때만 account 버킷 `used_pct=0`(note `free until ~2026-10-10`)을 냅니다. SWE-2 또는 Free가 없거나, SWE-1.x·GLM 등 다른 모델만 Free이거나, Fusion 이름에 SWE-2가 섞여 있거나, 출력을 해석할 수 없거나, binary/프로세스가 실패하면 사용률을 추정하지 않고 error/unknown으로 fail-closed 합니다. 추천표·gate 등재는 `devin-swe2`·`devin-glm52`·`devin-swe17`(Free)·`devin-ds41`(최저가 유료) 4종이며 모두 같은 devin 계정 풀을 공유합니다. 그 외 유료 Devin 모델(Fusion/Claude/OpenAI/Gemini 등)은 추천표·gate 등재 범위 밖입니다. credential/config 파일은 읽지 않습니다.
+**devin도 API가 아니라 CLI 모델 목록만 읽습니다.** 소스는 `devin models list`의 SWE-2 패밀리 행뿐이며, 그 행에 `Free` 태그가 있을 때만 account 버킷 `used_pct=0`(note `free until ~2026-10-10`)을 냅니다. SWE-2 또는 Free가 없거나, SWE-1.x·GLM 등 다른 모델만 Free이거나, Fusion 이름에 SWE-2가 섞여 있거나, 출력을 해석할 수 없거나, binary/프로세스가 실패하면 사용률을 추정하지 않고 error/unknown으로 fail-closed 합니다. 추천표·gate 등재는 `devin-swe2`·`devin-glm52`·`devin-swe17`(Free)·`devin-ds41`(최저가 유료) 4종과 effort 변형 `devin-swe2-medium`·`devin-swe2-max`(Free)·`devin-ds41-max` 3종(#635; effort 는 모델 id 안에 있고, high 급을 상속하지 않는 C 미측정)이며 모두 같은 devin 계정 풀을 공유합니다. 그 외 유료 Devin 모델(Fusion/Claude/OpenAI/Gemini 등)은 추천표·gate 등재 범위 밖입니다. credential/config 파일은 읽지 않습니다.
 
 **agy 모델별 분해는 불가능합니다.** 클라우드 응답은 모델 이름별 행을 주지만 값이 그룹 공유입니다
 (gemini 계열 전부 동일 fraction, claude/gpt-oss 전부 동일 fraction — 로컬 그룹값과 일치).
