@@ -364,6 +364,99 @@ def test_observe_episode_transitions(tmp_path):
     assert len(calls) == 2
 
 
+def test_scope_keyed_episodes_do_not_cross_clear(tmp_path):
+    """같은 풀의 다른 scope(agy group 등)는 독립 에피소드 — 한쪽 회복이 다른 쪽을 지우지 않는다."""
+    _write_config(tmp_path, '[pools.agy]\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+
+    status = exhaust.observe(
+        "agy",
+        exhausted=True,
+        used_pct=100.0,
+        cutoff=99.0,
+        scope="gemini",
+        now=NOW,
+        sink=_fake_sink(calls),
+    )
+    assert "알림 발송" in status
+    # 다른 scope 의 건강 관측은 gemini 에피소드를 건드리지 않는다.
+    assert exhaust.observe("agy", exhausted=False, scope="3p", now=NOW, sink=_fake_sink(calls)) is None
+    # gemini 재관측 — 기통지 억제(재발송 없음)가 유지된다.
+    status = exhaust.observe(
+        "agy",
+        exhausted=True,
+        used_pct=100.0,
+        cutoff=99.0,
+        scope="gemini",
+        now=NOW,
+        sink=_fake_sink(calls),
+    )
+    assert "기통지" in status
+    assert len(calls) == 1
+    assert "scope=gemini" in calls[0]
+
+
+def test_state_storage_failure_does_not_abort_gate(tmp_path, monkeypatch):
+    """락/디렉토리 접근 실패는 게이트를 중단시키지 않는다 — 차단 + 실패 상태 표시."""
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+
+    def broken_lock():
+        raise OSError("read-only fs")
+
+    monkeypatch.setattr(exhaust, "_locked_state", broken_lock)
+    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert calls == []  # 저장소 없이는 dedup 보장 불가 — 발송하지 않는다
+    assert "저장소 접근 불가" in result.reason
+
+
+def test_state_save_failure_reports_record_loss(tmp_path, monkeypatch):
+    """발송 성공 + 상태 기록 실패 → '기록 실패' 표시 + 같은 프로세스 안 억제."""
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    sink = _fake_sink(calls)
+    monkeypatch.setattr(exhaust, "_save_state", lambda state: False)
+
+    status = exhaust.observe("codex", exhausted=True, used_pct=100.0, cutoff=99.0, now=NOW, sink=sink)
+    assert "알림 발송(기록 실패)" in status
+    assert len(calls) == 1
+
+    # 파일엔 없지만 ephemeral dedup 이 같은 에피소드 재발송을 막는다.
+    status = exhaust.observe("codex", exhausted=True, used_pct=100.0, cutoff=99.0, now=NOW, sink=sink)
+    assert "기통지" in status
+    assert len(calls) == 1
+    exhaust._EPHEMERAL.clear()
+
+
+def test_block_mode_recovery_clears_episode(tmp_path):
+    """block 모드 동안의 회복 관측도 에피소드를 지운다 — 모드 재설정 후 재알림 가능."""
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    sink = _fake_sink(calls)
+    exhaust.observe("codex", exhausted=True, used_pct=100.0, cutoff=99.0, now=NOW, sink=sink)
+    assert len(calls) == 1
+
+    # on_exhaust 를 block(미설정)으로 바꾼 뒤 회복 관측 — 기록이 지워진다.
+    _write_config(tmp_path, "[pools.codex]\ncutoff = 99\n")
+    assert exhaust.observe("codex", exhausted=False, now=NOW, sink=sink) is None
+
+    # operator-switch 재설정 → 새 소진은 다시 알린다(기통지 억제에 갇히지 않음).
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    status = exhaust.observe("codex", exhausted=True, used_pct=100.0, cutoff=99.0, now=NOW, sink=sink)
+    assert "알림 발송" in status
+    assert len(calls) == 2
+
+
+def test_invalid_cutoff_status_visible_on_success(tmp_path):
+    """무효 cutoff 는 통과 판정의 reason 에도 폴백 상태가 노출된다."""
+    _write_config(tmp_path, "[pools.codex]\ncutoff = 150\n")
+    result = gate_check([_result("codex", 50.0)], "codex-terra", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert "invalid cutoff" in result.reason
+
+
 def test_observe_state_file_shape(tmp_path):
     """dedup 상태는 소진 풀·창·시각을 기록한다(감사 가능)."""
     _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')

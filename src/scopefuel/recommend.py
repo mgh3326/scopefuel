@@ -1488,7 +1488,11 @@ def _exhaust_suffix(cutoff_status: str | None, notify_status: str | None) -> str
 
 
 def _observe_exhaustion(
-    provider_id: str, over: _WindowState | None, cutoff: float, now: dt.datetime
+    provider_id: str,
+    over: _WindowState | None,
+    cutoff: float,
+    now: dt.datetime,
+    scope: str | None = None,
 ) -> str | None:
     """task #638 — 소진/회복 관측을 exhaust.observe 로 넘겨 알림 상태 조각을 받는다."""
     return exhaust.observe(
@@ -1498,6 +1502,7 @@ def _observe_exhaustion(
         cutoff=cutoff,
         window=over.window if over is not None else None,
         reset_at=over.reset_at if over is not None else None,
+        scope=scope,
         now=now,
     )
 
@@ -1791,7 +1796,7 @@ def _build_escalation_entry(
             constraint = _select_constraint(states)
             cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
             over = _any_window_over_cutoff(states, cutoff)
-            notify_status = _observe_exhaustion(provider_id, over, cutoff, now)
+            notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
             if over is not None:
                 status_notes.append(
                     f"{_exhaust_display(over, cutoff)} (reset {_reset_display(over.reset_at)})"
@@ -2229,7 +2234,7 @@ def gate_check(
             )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
-        notify_status = _observe_exhaustion(provider_id, over, cutoff, now)
+        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
         if over is not None:
             return GateResult(
                 ok=False,
@@ -2246,6 +2251,7 @@ def gate_check(
                 **audit,
             )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+        reason += _exhaust_suffix(cutoff_status, notify_status)
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -2396,7 +2402,7 @@ def gate_check(
 
     cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
-    notify_status = _observe_exhaustion(provider_id, over, cutoff, now)
+    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
     if over is not None:
         alts = alternatives()
         return GateResult(
@@ -2420,6 +2426,7 @@ def gate_check(
             f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
             f"class={effective_class} — {profile.gate_reason or ''}"
         )
+        reason += _exhaust_suffix(cutoff_status, notify_status)
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -2440,6 +2447,7 @@ def gate_check(
         )
 
     reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
+    reason += _exhaust_suffix(cutoff_status, notify_status)
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
     if operator_request is not None:
@@ -2575,7 +2583,7 @@ def recommend(
 
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
-        notify_status = _observe_exhaustion(provider_id, over, cutoff, now)
+        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
         if over is not None:
             excluded.append(
                 _Excluded(

@@ -142,22 +142,44 @@ def _label(result: ProviderResult, credential: str) -> str:
     return " · ".join(parts)[:80]
 
 
-def _observe_exhaustion(provider: str, result: ProviderResult) -> None:
+def _observe_exhaustion(provider: str, result: ProviderResult, credential: str) -> None:
     """task #638 — 실행 중 잡의 풀 소진도 gate 와 같은 operator-switch 알림을 올린다.
 
     pane 이벤트로 갱신된 스냅샷이 확인된 account 소진을 보이면 ``exhaust.observe``
     에 넘긴다. 미설정 풀은 observe 가 조기 반환해 파일도 건드리지 않는다.
+    stale·error 스냅샷과 리셋 시각이 지난 버킷은 소진 근거로 쓰지 않는다 —
+    오래된 측정이 "계정 전환 필요" 를 오발하지 않게 한다(CodeRabbit PR#77).
     """
     import datetime as dt
 
     from . import exhaust, manual
+    from .model import _is_valid_used_pct, _parse_reset
 
-    breach = manual.confirmed_automatic_cutoff(result, now=dt.datetime.now(dt.UTC))
+    if result.stale or result.error:
+        return
+    now = dt.datetime.now(dt.UTC)
+    breach = manual.confirmed_automatic_cutoff(result, now=now)
+    over_bucket = None
+    if breach is not None:
+        cutoff = breach[1]
+        candidates = [
+            bucket
+            for bucket in result.buckets
+            if bucket.scope.kind == "account"
+            and _is_valid_used_pct(bucket.used_pct)
+            and float(bucket.used_pct) >= cutoff
+            and (bucket.resets_at is None or (reset := _parse_reset(bucket.resets_at)) is None or reset > now)
+        ]
+        over_bucket = max(candidates, key=lambda b: float(b.used_pct), default=None)
     exhaust.observe(
         provider,
-        exhausted=breach is not None,
+        exhausted=over_bucket is not None,
         used_pct=breach[0] if breach is not None else None,
         cutoff=breach[1] if breach is not None else None,
+        window=over_bucket.window if over_bucket else None,
+        reset_at=over_bucket.resets_at if over_bucket else None,
+        scope=credential if credential != "default" else None,
+        now=now,
     )
 
 
@@ -222,7 +244,7 @@ def handle_event(fetchers: dict[str, Callable[[], ProviderResult]]) -> int:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        _observe_exhaustion(provider, result)
+        _observe_exhaustion(provider, result, credential)
         label = _label(result, credential)
         state[key] = {"at": now, "label": label}
         _save_state(state)
