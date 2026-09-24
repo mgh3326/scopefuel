@@ -23,6 +23,7 @@ import fcntl
 import json
 import os
 import pathlib
+import secrets
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -80,6 +81,10 @@ def _save_state(state: dict) -> bool:
 # 억제가 낫다(CodeRabbit PR#77 Major).
 _EPHEMERAL: dict[str, dict] = {}
 
+# 테스트에서 차단된 실 발송 시도 — conftest 의 autouse 스텁만 여기에 기록한다.
+# 운영 경로에서는 쓰이지 않는다.
+_BLOCKED_EMIT_CALLS: list[tuple[str, str]] = []
+
 
 def _clear_if_recorded(key: str) -> None:
     """비-operator-switch 모드에서의 회복 관측도 기록된 에피소드를 지운다.
@@ -111,6 +116,12 @@ def emit_lane_event(text: str, event_id: str) -> bool:
     거절하는데, 그건 첫 발송이 파일에 기록됐다는 뜻이므로 전달 성공으로 친다 —
     실패로 오분류하면 같은 이벤트를 영원히 재시도한다.
     """
+    # 런타임 가드: pytest 안에서는 PANEWIRE_BIN 스텁을 명시한 테스트만 실
+    # subprocess 로 나간다. 그 외(기본 싱크가 PATH 의 실 panewire 를 집는 경우)는
+    # 거부한다 — 15:2x 테스트발 실 operator-desk 이벤트 사고 재발 방지. 실 발송은
+    # 설치 후 운영자 입회 witness 절차(pytest 바깥)에서만 한다.
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("PANEWIRE_BIN"):
+        return False
     panewire = shutil.which(os.environ.get("PANEWIRE_BIN", "panewire"))
     if panewire is None:
         return False
@@ -143,13 +154,17 @@ def emit_lane_event(text: str, event_id: str) -> bool:
     return b"duplicate event_id" in (completed.stderr or b"")
 
 
-def _event_id(key: str, window: str | None, reset_at: str | None) -> str:
-    """에피소드 식별 event id — (pool, scope, window, reset) 으로 결정적.
+def _event_id(key: str, window: str | None, reset_at: str | None, episode: str) -> str:
+    """에피소드 식별 event id — (pool, scope, window, reset, episode 토큰).
 
-    상태 파일이 유실돼도 같은 소진 창의 재발송은 panewire 의 자체 dedupe
-    (duplicate event_id)에 걸리고, 우리는 그것을 전달 성공으로 기록한다.
+    같은 에피소드의 재시도는 같은 id 를 쓰므로 panewire 의 자체 dedupe
+    (duplicate event_id)가 멱등 재발송을 흡수한다. 회복 → 같은 reset 창
+    재소진은 새 에피소드이므로 새 토큰을 발급한다 — 이전 에피소드의 id 를
+    재사용하면 panewire 가 duplicate 로 삼켜 알림이 조용히 유실된다(PR#77
+    라운드 2 BLOCKER R2-1). 상태 유실 후 재진입은 새 id 로 재발송된다 —
+    무소음 유실보다 중복 알림이 안전한 실패 방향이다.
     """
-    return f"scopefuel.exhaust:{key}:{window or '-'}:{reset_at or '-'}"
+    return f"scopefuel.exhaust:{key}:{window or '-'}:{reset_at or '-'}:{episode}"
 
 
 def _message(
@@ -240,17 +255,29 @@ def observe(
                 if attempted is not None and (now - attempted).total_seconds() < RETRY_COOLDOWN_S:
                     return f"{pool} 계정 전환 필요 — 발송 실패(재시도 대기)"
 
+            # 에피소드 id: 진행 중 에피소드(재시도)는 기록된 것을 재사용하고,
+            # 새 에피소드는 새 토큰을 발급한다 — 같은 reset 창 재진입이
+            # panewire duplicate 에 삼켜지는 유실을 막는다.
+            event_id = entry.get("event_id") if isinstance(entry, dict) else None
+            if not isinstance(event_id, str) or not event_id:
+                event_id = _event_id(key, window, reset_at, secrets.token_hex(4))
+
             send = sink if sink is not None else emit_lane_event
             try:
                 delivered = bool(
                     send(
                         _message(pool, used_pct, cutoff, window, reset_at, scope),
-                        _event_id(key, window, reset_at),
+                        event_id,
                     )
                 )
             except Exception:
                 delivered = False
-            record = {"window": window, "reset_at": reset_at, "used_pct": used_pct}
+            record = {
+                "window": window,
+                "reset_at": reset_at,
+                "used_pct": used_pct,
+                "event_id": event_id,
+            }
             record["notified_at" if delivered else "attempted_at"] = now.isoformat()
             state[key] = record
             saved = _save_state(state)

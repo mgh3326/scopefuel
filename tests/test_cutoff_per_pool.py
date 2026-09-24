@@ -647,6 +647,190 @@ def test_herdr_stale_result_neither_notifies_nor_clears(tmp_path, monkeypatch):
     assert len(calls) == 1  # stale 관측은 발송도 해제도 하지 않는다
 
     # 다음 fresh 소진 관측은 기통지 억제가 유지된다(에피소드가 안 지워졌다).
+    # collect 의 TTL 캐시가 첫 호출의 stale 스냅샷을 돌려주지 않게 지운다.
+    (tmp_path / "snapshots.json").unlink(missing_ok=True)
     herdr._save_state({})
     assert herdr.handle_event({"codex": lambda: _live_result("codex", 100.0)}) == 0
+    assert len(calls) == 1
+
+
+def test_herdr_expired_reset_does_not_notify(tmp_path, monkeypatch):
+    """리셋 시각이 지난 버킷은 소진 근거가 아니다 — 오래된 측정이 알림을 오발하지 않는다."""
+    import dataclasses
+
+    herdr = _herdr_env(tmp_path, monkeypatch)
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+
+    expired = _live_result("codex", 100.0)
+    expired.buckets[0] = dataclasses.replace(expired.buckets[0], resets_at="2026-08-07T11:00:00+00:00")
+    assert herdr.handle_event({"codex": lambda: expired}) == 0
+    assert not calls  # 만료된 reset 의 소진 관측은 발송하지 않는다
+
+
+def test_herdr_credential_scope_in_event_id(tmp_path, monkeypatch):
+    """N6: herdr 경로는 credential 을 에피소드 scope 로 쓴다 — 계정별 독립 에피소드."""
+    herdr = _herdr_env(tmp_path, monkeypatch)
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    ids: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": ids.append(event_id) or True)
+    monkeypatch.setenv(
+        "HERDR_PLUGIN_EVENT_JSON",
+        json.dumps({"data": {"pane_id": "wB:p9Z", "agent": "codex", "env": {"CODEX_HOME": "/acct2"}}}),
+    )
+    assert herdr.handle_event({"codex": lambda: _live_result("codex", 100.0)}) == 0
+    assert len(ids) == 1
+    assert ids[0].startswith("scopefuel.exhaust:codex@"), "credential scope 가 키에 들어가야 한다"
+
+
+# --------------------------------------------------- 실 발송 차단 (15:2x 사고 대책)
+
+
+def test_autouse_fixture_intercepts_default_sink(tmp_path):
+    """conftest autouse 픽스처(mutant a 대상): 기본 싱크는 기록 스텁으로 치환된다.
+
+    픽스처를 지우면 emit_lane_event 는 원래 함수라 ``_test_stub`` 속성이 없고,
+    발송 시도가 ``_BLOCKED_EMIT_CALLS`` 에 기록되지 않아 이 테스트는 RED.
+    """
+    assert getattr(exhaust.emit_lane_event, "_test_stub", False)
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    assert exhaust._BLOCKED_EMIT_CALLS, "발송 시도가 차단 스텁에 기록돼야 한다"
+
+
+def test_pytest_guard_blocks_real_panewire(tmp_path, monkeypatch):
+    """PYTEST_CURRENT_TEST 가드(mutant b 대상): PATH 의 panewire 가 가짜여도
+    PANEWIRE_BIN 미지정이면 실 emit 은 subprocess 를 만들지 않는다.
+
+    가드를 지우면 PATH 첫 자리의 가짜 panewire 가 마커 파일을 남겨 RED.
+    """
+    import importlib
+    import os
+    import stat
+
+    marker = tmp_path / "panewire-called"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shim = bindir / "panewire"
+    shim.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n")
+    shim.chmod(shim.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("PANEWIRE_BIN", raising=False)
+
+    real = importlib.reload(exhaust)  # autouse 스텁 우회 — 원래 함수를 직접 검증
+    try:
+        assert real.emit_lane_event("probe", "t638-guard-probe") is False
+        assert not marker.exists(), "테스트에서 실 panewire subprocess 가 실행됐다"
+    finally:
+        importlib.reload(exhaust)
+
+
+# ------------------------------------------------------------- 에피소드 event id (R2-1)
+
+
+def test_reentry_same_reset_window_gets_new_event_id(tmp_path, monkeypatch):
+    """R2-1: 회복 → 같은 reset 창 재소진은 새 에피소드 → 새 event id 로 재발송한다.
+
+    같은 id 를 재사용하면 panewire 의 duplicate dedupe 가 알림을 조용히 삼킨다.
+    """
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        exhaust, "emit_lane_event", lambda text, event_id="": sent.append((text, event_id)) or True
+    )
+    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    gate_check([_result("codex", 10.0)], "codex-terra", today=TODAY, now=NOW)  # 회복
+    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)  # 같은 reset 재소진
+    assert len(sent) == 2
+    assert sent[0][1] != sent[1][1], "새 에피소드는 새 event id 를 써야 한다"
+
+
+def test_event_id_contains_key_window_reset_and_episode(tmp_path, monkeypatch):
+    """N12: event id 형식 — key·window·reset·에피소드 토큰을 전부 담는다."""
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    ids: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": ids.append(event_id) or True)
+    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    reset = _reset_almost_full("7d")
+    assert len(ids) == 1
+    assert ids[0].startswith(f"scopefuel.exhaust:codex:7d:{reset}:")
+    assert len(ids[0].rsplit(":", 1)[1]) >= 8, "에피소드 토큰이 있어야 한다"
+
+
+def test_same_episode_retry_reuses_event_id(tmp_path, monkeypatch):
+    """발송 실패 후 재시도는 같은 event id — panewire dedupe 가 멱등성을 보장한다."""
+    _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
+    ids: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": ids.append(event_id) or False)
+    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    later = NOW + dt.timedelta(seconds=exhaust.RETRY_COOLDOWN_S + 1)
+    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=later)
+    assert len(ids) == 2 and ids[0] == ids[1]
+
+
+# ------------------------------------------------------------- 호출부 배선 (scope/cutoff)
+
+
+def test_gate_scope_wired_into_event_id(tmp_path, monkeypatch):
+    """N7: gate 호출부가 scope(group_name)를 observe 에 넘긴다 — agy 그룹 분리."""
+    _write_config(tmp_path, '[pools.agy]\non_exhaust = "operator-switch"\n')
+    ids: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": ids.append(event_id) or True)
+    agy = ProviderResult(
+        id="agy",
+        pool_class="spend",
+        buckets=[
+            Bucket(
+                label="gemini",
+                window="7d",
+                used_pct=100.0,
+                resets_at=_reset_almost_full("7d"),
+                scope=Scope("group", "gemini"),
+                horizon="week",
+            )
+        ],
+    )
+    gate_check([agy], "agy-flash", today=TODAY, now=NOW)
+    assert len(ids) == 1
+    assert ids[0].startswith("scopefuel.exhaust:agy@gemini:")
+
+
+def test_d3_gate_path_uses_configured_cutoff(tmp_path, monkeypatch):
+    """M14: D3(급표 밖 프로필) 경로도 configured cutoff 를 쓴다."""
+    _write_config(tmp_path, '[pools.codex]\ncutoff = 90\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+    result = gate_check([_result("codex", 95.0)], "codex-fable", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert "차단선 90%" in result.reason
+    assert len(calls) == 1
+
+
+def test_d3_pass_shows_invalid_cutoff_status(tmp_path):
+    """N13: D3 통과 경로도 무효 cutoff 상태를 노출한다."""
+    _write_config(tmp_path, '[pools.codex]\ncutoff = "85"\n')
+    result = gate_check([_result("codex", 87.0)], "codex-fable", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert "invalid cutoff" in result.reason
+
+
+def test_escalation_pass_shows_invalid_cutoff_status(tmp_path):
+    """N14: escalation 평가 통과 경로도 무효 cutoff 상태를 노출한다."""
+    from scopefuel.recommend import Profile
+
+    _write_config(tmp_path, '[pools.codex]\ncutoff = "bogus"\n')
+    table = {g: [] for g in ("S+", "S", "A", "B", "C")}
+    table["A+"] = [Profile("codex-sol", "Sol", 65.0, gate="escalation", gate_reason="t")]
+    out = recommend([_result("codex", 60.0)], "A+", today=TODAY, now=NOW, grade_table=table)
+    assert "invalid cutoff" in out
+
+
+def test_recommend_render_path_observes_pool(tmp_path, monkeypatch):
+    """M21: escalation 엔트리가 관측하지 않는 풀(kiro)도 렌더 경로가 관측한다."""
+    _write_config(tmp_path, '[pools.kiro]\non_exhaust = "operator-switch"\n')
+    calls: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
+    out = recommend([_result("kiro", 100.0)], "A+", today=TODAY, now=NOW)
+    assert "소진" in out
     assert len(calls) == 1

@@ -1806,6 +1806,7 @@ def _build_escalation_entry(
                 note = f"사용 {_format_windows_display(states, constraint)}"
                 if accepted is not None:
                     note += f" [{_stale_tag(result, accepted)}]"
+                note += _exhaust_suffix(cutoff_status, notify_status)
                 status_notes.append(note)
 
     return _EscalationEntry(
