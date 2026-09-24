@@ -303,7 +303,11 @@ def test_gate_cli_passes_while_probe_in_progress(monkeypatch, capsys):
 def test_every_cli_probe_marks_lock_skip_not_failure(pool, monkeypatch, tmp_path):
     """각 provider 의 fetch() 는 잠금 보유 시 skip 마커를 단다 — 자식 미실행."""
     module = CLI_PROBES[pool]
-    monkeypatch.setattr(module, "BINARY", "/bin/true")
+    # /bin/true 는 macOS runner 에서 shutil.which 가 None 을 반환한다 — tmp 실행 스텁을 쓴다.
+    stub = tmp_path / "fake-cli"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(module, "BINARY", str(stub))
     workdir = module.PROBE_WORKDIR  # conftest 가 tmp 로 돌려 놓은 값
     with proctrack.single_probe_lock(workdir) as acquired:
         assert acquired is True
