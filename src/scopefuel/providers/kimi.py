@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 from .. import proctrack
-from ..model import Bucket, ProviderResult, Scope
+from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_KIMI_BIN") or "kimi"
 TIMEOUT_S = 30.0
@@ -92,6 +92,7 @@ def fetch() -> ProviderResult:
                     hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
                     source="cli:/usage",
                     pool_class="spend",
+                    error_kind=PROBE_IN_PROGRESS,
                 )
             output = _probe_once()
     except subprocess.TimeoutExpired:

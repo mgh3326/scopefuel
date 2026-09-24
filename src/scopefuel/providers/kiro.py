@@ -39,7 +39,7 @@ import signal
 import subprocess
 
 from .. import proctrack
-from ..model import Bucket, ProviderResult, Scope
+from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_KIRO_BIN") or "kiro-cli"
 PROBE_INPUT = "/usage\n/quit\n"
@@ -78,6 +78,7 @@ def fetch() -> ProviderResult:
                     error=f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
                     hint="kiro-cli 를 직접 실행해 로그인 상태를 확인하세요",
                     source="cli:/usage",
+                    error_kind=PROBE_IN_PROGRESS,
                 )
             result = _probe_once()
             if result.error and _EXPIRED.search((result.raw or {}).get("stdout", "")):

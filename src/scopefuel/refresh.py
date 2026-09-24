@@ -15,7 +15,7 @@ from contextlib import contextmanager
 
 from . import cache, proctrack
 from .http import classify_error
-from .model import ProviderResult
+from .model import PROBE_IN_PROGRESS, ProviderResult
 from .providers import BUILTIN
 
 # Sorted so argparse choices stay stable in `scopefuel refresh --help`.
@@ -108,6 +108,11 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
                 return 0
             fetcher = fetchers[pool]
             result = _fetch(fetcher, pool)
+            if result.error_kind == PROBE_IN_PROGRESS:
+                # provider 의 single-probe 잠금을 다른 프로브가 쥐고 있다 —
+                # 측정 실패가 아니므로 캐시 감사도 남기지 않는다(#639).
+                print(f"refresh: pool={pool} probe in progress; skipped")
+                return 0
             if result.error or result.warning:
                 detail = result.error or result.warning
                 cache.record_failure(pool, result, now)

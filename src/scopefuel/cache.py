@@ -18,7 +18,15 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 
 from .http import classify_error
-from .model import Bucket, PoolClass, ProviderResult, Scope, _is_valid_used_pct, _normalize_pool_class
+from .model import (
+    PROBE_IN_PROGRESS,
+    Bucket,
+    PoolClass,
+    ProviderResult,
+    Scope,
+    _is_valid_used_pct,
+    _normalize_pool_class,
+)
 from .policy import get_policy
 
 DEFAULT_TTL_S = 60.0
@@ -315,6 +323,47 @@ def _backoff_result(
     )
 
 
+def _in_progress_result(
+    name: str,
+    fetcher: object,
+    entry: dict | None,
+    skipped: ProviderResult,
+    now: float,
+    ttl_s: float,
+    policy_class: PoolClass,
+) -> ProviderResult:
+    """잠금으로 건너뛴 회차의 결과 — 측정 실패가 아니므로 스냅샷을 유지한다(#639).
+
+    fresh TTL 안이면 그대로 통과, 밖이면 stale 폴백으로 표시해 게이트의
+    stale_accepted 판정에 맡긴다. 스냅샷이 없거나 STALE_MAX_S 를 넘었으면
+    건너뜀 결과를 그대로 돌려준다 — 마지막 정상 값 없음(측정 불가)은 유지.
+    """
+    if isinstance(entry, dict):
+        age = now - float(entry.get("fetched_at") or 0)
+        if age <= ttl_s:
+            kept = _from_entry(entry, name, now, policy_class)
+            kept.stale = False
+            kept.note = f"탐침 진행 중 — 직전 값 {format_age(age)}"
+            return kept
+        if age <= STALE_MAX_S:
+            stale = _from_entry(entry, name, now, policy_class)
+            stale.note = f"탐침 진행 중 — 직전 값 {format_age(age)}"
+            stale.last_error = skipped.error
+            stale.last_error_at = now
+            stale.error_kind = skipped.error_kind
+            # 지문 대조는 로컬 프로브만으로 한다 — 건너뛴 회차는 새 자격 관측이 없다.
+            probe = getattr(fetcher, "current_account_fp", None)
+            current_fp = probe() if callable(probe) else None
+            stored_fp = (entry.get("result") or {}).get("account_fp")
+            stale.account_fp_match = (
+                None
+                if stored_fp is None and current_fp is None
+                else stored_fp is not None and stored_fp == current_fp
+            )
+            return stale
+    return skipped
+
+
 def _merge_results(
     successes: dict[str, ProviderResult],
     failures: dict[str, ProviderResult],
@@ -358,7 +407,7 @@ def collect(
     cache = _load()
     backoff = _load_backoff()
     results: list[ProviderResult | None] = [None] * len(names)
-    misses: list[tuple[int, str, object, dict | None, PoolClass]] = []
+    misses: list[tuple[int, str, object, dict | None, PoolClass, float]] = []
 
     for index, name in enumerate(names):
         entry = cache.get(name)
@@ -384,7 +433,9 @@ def collect(
             results[index] = _backoff_result(name, fetcher, entry, state, now, until, policy_class)
             continue
 
-        misses.append((index, name, fetcher, entry if isinstance(entry, dict) else None, policy_class))
+        misses.append(
+            (index, name, fetcher, entry if isinstance(entry, dict) else None, policy_class, effective_ttl_s)
+        )
 
     def fetch_one(fetcher: object) -> ProviderResult:
         if fetcher is None:
@@ -404,18 +455,24 @@ def collect(
     fetched: dict[int, Future[ProviderResult]] = {}
     if misses:
         with ThreadPoolExecutor(max_workers=min(MAX_FETCH_WORKERS, len(misses))) as pool:
-            for index, _name, fetcher, _entry, _policy_class in misses:
+            for index, _name, fetcher, _entry, _policy_class, _ttl in misses:
                 fetched[index] = pool.submit(fetch_one, fetcher)
 
     successes: dict[str, ProviderResult] = {}
     failures: dict[str, ProviderResult] = {}
-    for index, name, _fetcher, entry, policy_class in misses:
+    for index, name, _fetcher, entry, policy_class, effective_ttl_s in misses:
         result = fetched[index].result()
         result.id = name
 
         result.pool_class = _effective_class(name, _fetcher, result.pool_class)
 
         if result.error:
+            if result.error_kind == PROBE_IN_PROGRESS:
+                # 잠금으로 건너뛴 회차 — 실패 감사도 쓰지 않고 스냅샷을 유지한다.
+                results[index] = _in_progress_result(
+                    name, _fetcher, entry, result, now, effective_ttl_s, policy_class
+                )
+                continue
             failures[name] = result
             if isinstance(entry, dict):
                 age = now - float(entry.get("fetched_at") or 0)

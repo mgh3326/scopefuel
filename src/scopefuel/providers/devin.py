@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 from .. import proctrack
-from ..model import Bucket, ProviderResult, Scope
+from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_DEVIN_BIN") or "devin"
 TIMEOUT_S = 30.0
@@ -91,7 +91,10 @@ def fetch() -> ProviderResult:
         with proctrack.single_probe_lock(workdir) as acquired:
             if not acquired:
                 # Not an error: another probe is already measuring this pool.
-                return _failed(f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀")
+                return _failed(
+                    f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                    error_kind=PROBE_IN_PROGRESS,
+                )
             banner = _banner_result()
             models = _fetch_models_list()
     except OSError as exc:
@@ -538,7 +541,13 @@ def _child_env() -> dict[str, str]:
     return env
 
 
-def _failed(error: str, *, hint: str | None = None, stdout: str | None = None) -> ProviderResult:
+def _failed(
+    error: str,
+    *,
+    hint: str | None = None,
+    stdout: str | None = None,
+    error_kind: str | None = None,
+) -> ProviderResult:
     raw = {"stdout": stdout} if stdout else None
     return ProviderResult(
         id=PROVIDER_ID,
@@ -547,4 +556,5 @@ def _failed(error: str, *, hint: str | None = None, stdout: str | None = None) -
         source=SOURCE,
         raw=raw,
         pool_class="spend",
+        error_kind=error_kind,
     )

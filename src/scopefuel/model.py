@@ -29,6 +29,11 @@ CRIT_PCT = 90.0
 WASTE_PCT = 70.0
 WASTE_WINDOW_S = 24 * 3600
 
+# task #639 — single-probe 잠금으로 건너뛴 회차의 error_kind 계약값.
+# 측정 실패가 아니다: 같은 호스트의 다른 프로브가 지금 이 풀을 측정 중이라
+# 이번 회차만 생략됐다는 뜻이다. 캐시는 마지막 정상 스냅샷을 유지한다.
+PROBE_IN_PROGRESS = "probe_in_progress"
+
 # 이 이하의 창은 "지금"으로 본다 (5h 창 = 21600초).
 NOW_HORIZON_MAX_S = 6 * 3600
 
