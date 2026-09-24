@@ -415,7 +415,7 @@ def log_probe_call(workdir: Path, provider: str) -> None:
         )
         with (workdir / _CALL_LOG_NAME).open("a", encoding="utf-8") as log_file:
             log_file.write(line)
-    except OSError:
+    except Exception:  # noqa: BLE001 - audit logging must never break a probe
         pass
 
 
