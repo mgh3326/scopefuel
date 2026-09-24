@@ -11,6 +11,12 @@ hk 는 dict-backed fake 이다 — ``quota_share.request_json`` 을 바꿔 실 �
 - M4  신선 로컬 결과도 원격으로 덮기 → not-eligible 테스트가 RED
 - M5  expiresAt 사전 검사 제거 → 만료 테스트가 RED(usage 호출이 일어남)
 - M6  publish 가 usage API 를 추가 호출 → 호출 카운터 테스트가 RED
+- M6b refresh writer 경로의 게시가 usage API 를 추가 호출 → 카운터 테스트가 RED
+- M7  backoff 결과의 policy_class 보존 제거 → backoff 테스트가 RED
+- M8  (#659) 다른 컨텍스트에서 uuid 읽기(기본 .claude.json) → cross-context 테스트가 RED
+- M9  (#659) measured_by.account_fp 검사 제거 → provenance mismatch 테스트가 RED
+- M10 (#659) kind=="account" 게시 게이트 제거 → token-fallback 거부 테스트가 RED
+- M11 (#659) keychain-토큰 SSCD≠CCD 가드 제거 → uuid-unbound 테스트가 RED
 """
 
 from __future__ import annotations
@@ -1041,6 +1047,40 @@ def test_keychain_fallback_reads_context_item_only(monkeypatch, tmp_path):
     assert result.account_fp == hashlib.sha256(b"claude-account|max|u-A").hexdigest()[:16]
 
 
+def test_keychain_token_from_other_secure_context_is_uuid_unbound(monkeypatch, tmp_path):
+    """M11 — AC1: SSCD≠CCD 일 때 Keychain 토큰은 SSCD 컨텍스트 것, uuid 는 CCD 것.
+
+    둘을 묶으면 다른 계정의 지문으로 게시될 수 있으므로 uuid 묶음을 거부하고
+    토큰 폴백(kind="token")으로 내린다(CodeRabbit PR#86 Major). 파일 경로의
+    자격은 항상 CCD 컨텍스트라 이 가드를 타지 않는다.
+    """
+    cfg = tmp_path / "ccd-ctx"
+    cfg.mkdir()
+    (cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-A"}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(tmp_path / "sscd-other"))
+    blob = json.dumps({"claudeAiOauth": {"accessToken": "kc-token-b", "subscriptionType": "max"}})
+    services = _keychain_stub(monkeypatch, blob)
+    monkeypatch.setattr(claude, "request_json", _usage_ok)
+
+    result = claude.fetch()
+
+    expected = (
+        "Claude Code-credentials-" + hashlib.sha256(str(tmp_path / "sscd-other").encode()).hexdigest()[:8]
+    )
+    assert services == [expected]  # SSCD 컨텍스트 아이템을 읽었다
+    assert result.error is None
+    assert result.account_fp_kind == "token"  # uuid 묶음 거부 → 게시 불가
+    assert result.account_fp == hashlib.sha256(b"max|kc-token-b").hexdigest()[:16]
+    assert "secure-storage" in (result.note or "")  # 거부 사유가 보인다(AC1)
+
+    # 같은 환경에서 파일 자격(CCD/.credentials.json)은 같은 컨텍스트라 묶인다.
+    (cfg / ".credentials.json").write_text(blob)
+    result2 = claude.fetch()
+    assert result2.account_fp_kind == "account"
+    assert result2.account_fp == hashlib.sha256(b"claude-account|max|u-A").hexdigest()[:16]
+
+
 def test_default_context_reads_unsuffixed_item(monkeypatch, tmp_path):
     """AC1 — 기본 컨텍스트는 무접미사 아이템 + 기본 .claude.json."""
     default_json = tmp_path / "default-claude.json"
@@ -1060,7 +1100,7 @@ def test_default_context_reads_unsuffixed_item(monkeypatch, tmp_path):
 
 
 def test_token_and_uuid_never_come_from_different_contexts(monkeypatch, tmp_path):
-    """AC1 뮤턴트 킬러 — CCD 토큰 + 기본 디렉터리 uuid 조합은 만들어지지 않는다.
+    """M8 — AC1 뮤턴트 킬러: CCD 토큰 + 기본 디렉터리 uuid 조합은 만들어지지 않는다.
 
     시나리오: CLAUDE_CONFIG_DIR 의 자격 파일에는 계정 A 의 토큰이 있고,
     CCD 의 .claude.json 에는 uuid 가 없다. 기본 ``~/.claude.json``(뮤턴트가
@@ -1220,7 +1260,7 @@ def test_multi_account_publish_and_read_isolation(monkeypatch, tmp_path):
 
 
 def test_token_fallback_fp_never_publishes(monkeypatch):
-    """AC5/N-1 — 토큰 해시 폴백 지문은 게시하지 않는다(회전마다 orphan 문서)."""
+    """M10 — AC5/N-1: 토큰 해시 폴백 지문은 게시하지 않는다(회전마다 orphan 문서)."""
     hk = _enable(monkeypatch)
     cache.collect({"claude": lambda: _ok(fp_kind="token")}, ["claude"], now=EPOCH)
     assert hk.puts == []
@@ -1241,7 +1281,7 @@ def test_token_fallback_reader_never_reads_remote(monkeypatch):
 
 
 def test_snapshot_refused_when_provenance_fp_mismatch(monkeypatch):
-    """measured_by.account_fp 가 문서 accept-key 지문과 어긋나면 거부한다."""
+    """M9 — measured_by.account_fp 가 문서 accept-key 지문과 어긋나면 거부한다."""
     hk = _enable(monkeypatch)
     key = _seed_remote(hk, measured_at=EPOCH - 60.0)
     tampered = json.loads(hk.docs[key]["body"])

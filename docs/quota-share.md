@@ -55,7 +55,12 @@ containing `@` and strips quotes/control characters before it can be rendered.
   unsuffixed `Claude Code-credentials` only in the default context). A token
   from one context is therefore never combined with a UUID from another — when
   the context's `.claude.json` has no UUID the measurement degrades to the
-  token fallback below instead of borrowing another context's identity.
+  token fallback below instead of borrowing another context's identity. The
+  same rule applies when `CLAUDE_SECURESTORAGE_CONFIG_DIR` differs from
+  `CLAUDE_CONFIG_DIR` and credentials arrive via the Keychain fallback: the
+  token then belongs to the secure-storage context while the UUID belongs to
+  the config context, so the UUID binding is refused and the fingerprint
+  degrades to the token fallback (fail-closed — nothing is published).
 - Hosts where `accountUuid` is unreadable in *that* context fall back to the
   legacy `sha256("<subscriptionType>|<accessToken>")[:16]` fingerprint
   (`account_fp_kind = "token"`). That keeps host-local stale acceptance (#576)
