@@ -5,6 +5,19 @@ command.  It renders usage only when attached to a terminal, so this provider
 uses a short-lived POSIX pseudo-terminal and never reads or updates Kimi's
 credential/config files.  The CLI owns authentication and any upstream HTTP
 details; scopefuel only parses the rendered quota summary.
+
+The panel draws ``round(used_ratio * 100)`` verbatim per row (``N% used`` —
+the CLI passes the managed ``GET /usages`` ``limit_5h``/``limit_7d``/
+``limit_month_total`` ``used_ratio`` through unmodified), so ``% used`` is
+read as used and ``% left`` as ``100 - remaining``.  ``used_ratio`` does not
+reflect an enforcement lockout: a weekly-limited account renders ``0% used``
+while real requests 403 (task #705).  The only local signal for that state is
+the CLI's own session records (``sessions/*/session_*/logs/kimi-code.log`` and
+``sessions/*/session_*/agents/*/wire.jsonl``), which carry timestamped
+``provider.auth_error`` / ``403 ... usage limit`` entries.  A successful parse
+is therefore crossed against those records: an observed limit error inside the
+current window marks that window exhausted, and one that cannot be placed in a
+window makes the reading unmeasurable rather than silently trusting ``0%``.
 """
 
 from __future__ import annotations
@@ -26,7 +39,7 @@ import time
 from pathlib import Path
 
 from .. import proctrack
-from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
+from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope, _parse_reset, _window_seconds
 
 BINARY = os.environ.get("SCOPEFUEL_KIMI_BIN") or "kimi"
 TIMEOUT_S = 30.0
@@ -66,6 +79,19 @@ _QUOTA_LIMIT = re.compile(
 # hint would otherwise match ``"5h" in line`` and misclassify the row.
 _SESSION_ROW = re.compile(r"(?<!\d)5h\b|hour", re.IGNORECASE)
 _PLAN = re.compile(r"\b(?:plan|tier)\s*[:|]\s*(?P<plan>[A-Za-z][A-Za-z0-9+ -]*)", re.IGNORECASE)
+_PERCENT_ANY = re.compile(r"\d+(?:\.\d+)?\s*%")
+
+# task #705 — session-record lockout signal.  The /usage panel's used_ratio
+# reads 0 even while the provider is answering 403 "usage limit"; those errors
+# are only visible in the records the CLI itself writes per session.
+SESSIONS_DIR = Path.home() / ".kimi-code" / "sessions"
+_SESSION_LOG_MAX_AGE_S = 8 * 86400  # a lockout cannot outlive its 7d window
+_SESSION_LOG_TAIL_BYTES = 1_048_576
+_SESSION_LIMIT_ERR = re.compile(r"usage\s+limit", re.IGNORECASE)
+_SESSION_ERR_AUTH = re.compile(r"403|auth_error|apistatuserror", re.IGNORECASE)
+_SESSION_LOG_TS = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z")
+_WIRE_TS = re.compile(r'"time"\s*:\s*(?P<ms>\d{10,13})')
+_LOCKOUT_WINDOW = {"session": "5h", "weekly": "7d", "monthly": "30d"}
 
 
 def fetch() -> ProviderResult:
@@ -110,7 +136,10 @@ def fetch() -> ProviderResult:
             pool_class="spend",
         )
 
-    return parse(output)
+    result = parse(output)
+    if result.error is None:
+        result = _apply_observed_lockouts(result)
+    return result
 
 
 def _probe_once() -> str:
@@ -310,14 +339,16 @@ def _usage_percent_present(line: str) -> bool:
 
 
 def parse(text: str) -> ProviderResult:
-    """Parse Kimi CLI remaining percentages into scopefuel used percentages.
+    """Parse the /usage panel's percentages into scopefuel used percentages.
 
     The panel renders one row per entry of the managed ``GET /usages``
     payload: ``5h limit``, ``Weekly limit`` and ``Monthly limit`` (the
-    membership quota that freezes all usage on its own).  A quota 403 or a
-    fetch failure can appear next to otherwise healthy-looking rows, so any
-    such marker makes the whole reading unmeasurable — a partially rendered
-    panel is never evidence of a healthy pool.
+    membership quota that freezes all usage on its own).  Each row's number is
+    ``used_ratio`` verbatim when labelled ``% used`` and ``100 - remaining``
+    when labelled ``% left``.  A quota row whose percentage carries neither
+    qualifier is never guessed — like a quota 403 or a fetch failure it makes
+    the whole reading unmeasurable, because a partially understood panel is
+    never evidence of a healthy pool.
     """
 
     clean = _clean(text)
@@ -346,6 +377,14 @@ def parse(text: str) -> ProviderResult:
     for line in clean.splitlines():
         lower = line.lower()
         if not _usage_percent_present(lower):
+            # task #705 — a quota-looking row carrying a bare ``N%`` is
+            # unmeasurable: without a left/used qualifier we cannot tell
+            # remaining from used, and guessing 0% used is how the gate ended
+            # up assigning a locked-out pool.
+            if _PERCENT_ANY.search(line) and (
+                "limit" in lower or _SESSION_ROW.search(lower) or "week" in lower or "month" in lower
+            ):
+                unknown_rows.append(line.strip())
             continue
 
         # Order matters: classify by the row's own label, and check ``month``
@@ -416,11 +455,140 @@ def parse(text: str) -> ProviderResult:
         id="kimi",
         plan=plan_match["plan"].strip() if plan_match else None,
         buckets=buckets,
-        note="Kimi CLI /usage의 남은 비율을 used_pct로 변환",
+        note="Kimi CLI /usage 패널의 % used 를 used_pct로 읽음 (% left 는 100-remaining 환산)",
         source="cli:/usage",
         raw={"stdout": clean},
         pool_class="spend",
     )
+
+
+def _line_timestamp(line: str) -> dt.datetime | None:
+    """Timestamp of one session-record line: ISO prefix (kimi-code.log) or a
+    wire.jsonl ``"time"`` epoch-ms field."""
+    log_match = _SESSION_LOG_TS.search(line)
+    if log_match:
+        try:
+            return dt.datetime.fromisoformat(log_match["ts"] + "+00:00")
+        except ValueError:
+            pass
+    wire_match = _WIRE_TS.search(line)
+    if wire_match:
+        try:
+            return dt.datetime.fromtimestamp(int(wire_match["ms"]) / 1000, dt.UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+    return None
+
+
+def _lockout_window(line: str) -> str | None:
+    """Which quota window a 'usage limit' error names, or None when the line
+    does not say — an unplaceable error is unmeasurable, not guesswork."""
+    lower = line.lower()
+    if "month" in lower:
+        return "monthly"
+    if "week" in lower or "7-day" in lower or "7d" in lower:
+        return "weekly"
+    if _SESSION_ROW.search(lower):
+        return "session"
+    return None
+
+
+def _scan_quota_errors(path: Path, *, fallback_ts: dt.datetime) -> list[tuple[dt.datetime, str | None]]:
+    """(timestamp, window-kind) pairs for provider usage-limit errors in one file."""
+    try:
+        with path.open("rb") as fh:
+            if path.stat().st_size > _SESSION_LOG_TAIL_BYTES:
+                fh.seek(-_SESSION_LOG_TAIL_BYTES, os.SEEK_END)
+            data = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    hits = []
+    for line in data.splitlines():
+        if not (_SESSION_LIMIT_ERR.search(line) and _SESSION_ERR_AUTH.search(line)):
+            continue
+        hits.append((_line_timestamp(line) or fallback_ts, _lockout_window(line)))
+    return hits
+
+
+def _observed_lockouts(now: dt.datetime) -> dict[str | None, dt.datetime]:
+    """Latest observed provider usage-limit error per window kind.
+
+    Reads only the timestamped records the CLI already writes (never
+    credentials or config).  Files untouched for longer than the longest
+    lockout window cannot describe a current window and are skipped.
+    """
+    root = Path(SESSIONS_DIR).expanduser()
+    if not root.is_dir():
+        return {}
+    min_mtime = now.timestamp() - _SESSION_LOG_MAX_AGE_S
+    latest: dict[str | None, dt.datetime] = {}
+    for pattern in ("*/*/logs/kimi-code.log", "*/*/agents/*/wire.jsonl"):
+        for path in root.glob(pattern):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < min_mtime:
+                continue
+            fallback = dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC)
+            for ts, kind in _scan_quota_errors(path, fallback_ts=fallback):
+                if kind not in latest or ts > latest[kind]:
+                    latest[kind] = ts
+    return latest
+
+
+def _apply_observed_lockouts(result: ProviderResult, *, now: dt.datetime | None = None) -> ProviderResult:
+    """Cross a successful /usage parse against observed provider lockouts.
+
+    The panel's ``used_ratio`` does not reflect an enforcement lockout (#705):
+    the exhausted account renders ``0% used``.  When kimi's session records
+    show a 'usage limit' error inside the window the panel reports, that
+    window is exhausted regardless of the rendered number.  An error that
+    cannot be placed in a current window fails closed as unmeasurable; one
+    older than the window start is stale and ignored.
+    """
+    now = now or dt.datetime.now(dt.UTC)
+    observed = _observed_lockouts(now)
+    if not observed:
+        return result
+
+    def unmeasurable(kind: str | None, ts: dt.datetime) -> ProviderResult:
+        return ProviderResult(
+            id="kimi",
+            error=(
+                f"Kimi 세션 기록에 usage-limit 오류 관측({kind or '창 불명'}, "
+                f"{ts.isoformat()})됐으나 /usage 패널의 현재 창과 대응할 수 없어 측정 불가"
+            ),
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw=result.raw,
+            pool_class="spend",
+        )
+
+    for kind, ts in sorted(observed.items(), key=lambda item: str(item[0])):
+        window = _LOCKOUT_WINDOW.get(kind or "")
+        if window is None:
+            # The error text does not name a window — if it is plausibly
+            # current the whole reading is unmeasurable rather than guessed.
+            if ts >= now - dt.timedelta(hours=24):
+                return unmeasurable(kind, ts)
+            continue
+        bucket = next((b for b in result.buckets if b.window == window), None)
+        window_s = _window_seconds(window) or 0.0
+        reset_dt = _parse_reset(bucket.resets_at) if bucket is not None else None
+        if reset_dt is not None and bucket is not None:
+            window_start = reset_dt - dt.timedelta(seconds=window_s)
+            if ts < window_start:
+                continue  # stale: the 403 belongs to a window that already reset
+            bucket.used_pct = 100.0
+            bucket.note = (
+                (bucket.note + " · ") if bucket.note else ""
+            ) + f"provider 'usage limit' 오류 관측 {ts.isoformat()} — 패널 수치 대신 소진 처리"
+            continue
+        if ts >= now - dt.timedelta(seconds=window_s):
+            # The panel cannot bound the window this error belongs to.
+            return unmeasurable(kind, ts)
+    return result
 
 
 def _clean(text: str) -> str:

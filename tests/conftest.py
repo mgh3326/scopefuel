@@ -85,6 +85,10 @@ def isolated_cache(tmp_path, monkeypatch):
 
     for module, name in ((devin, "devin"), (grok, "grok"), (kimi, "kimi"), (kiro, "kiro")):
         monkeypatch.setattr(module, "PROBE_WORKDIR", tmp_path / f"{name}-probe-workdir")
+    # task #705: kimi.fetch also reads the CLI's own session records for
+    # observed usage-limit 403s — point it at an absent dir so no test sees the
+    # developer's real ~/.kimi-code/sessions (which may hold a live lockout).
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "kimi-sessions-absent")
     # The catalog is memoised per process so one command cannot straddle the TTL
     # boundary; that memo must not survive from one test into the next.
     bench.reset_catalog_memo()
