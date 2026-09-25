@@ -38,7 +38,7 @@ def local_task_backend(tmp_path, monkeypatch):
         "request_json",
         lambda *args, **kwargs: pytest.fail("task173 fixture attempted network access"),
     )
-    assert bench.bench_backend().name == bench.BENCH_BACKEND_LOCAL
+    assert bench.bench_backend(use="catalog").name == bench.BENCH_BACKEND_LOCAL
 
 
 def _provider(provider_id: str, used: float = 10.0) -> ProviderResult:
@@ -562,5 +562,5 @@ def test_ac16_runtime_rejects_remote_sol_move_and_falls_back_without_network(mon
 def test_ac17_task_fixture_is_local_and_environment_isolated():
     assert os.environ.get("HANDOFFKEEP_URL") is None
     assert os.environ.get("HANDOFFKEEP_TOKEN") is None
-    assert bench.bench_backend().name == bench.BENCH_BACKEND_LOCAL
+    assert bench.bench_backend(use="catalog").name == bench.BENCH_BACKEND_LOCAL
     assert "pytest-" in str(bench.db_path()) or "/tmp" in str(bench.db_path())

@@ -402,7 +402,7 @@ def test_auto_backend_uses_handoffkeep_when_the_cli_credentials_exist(tmp_path, 
     env.write_text("HANDOFFKEEP_URL=https://hk.example\nHANDOFFKEEP_TOKEN=secret\n", encoding="utf-8")
     monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(env))
 
-    backend = bench.bench_backend()
+    backend = bench.bench_backend(use="catalog")
     assert backend.name == bench.BENCH_BACKEND_HANDOFFKEEP
     assert backend.reason == "auto-credentials"
 
@@ -417,10 +417,10 @@ def test_auto_backend_stays_local_when_the_url_would_leak_the_token(tmp_path, mo
     env.write_text("HANDOFFKEEP_URL=http://100.122.100.56:8800\nHANDOFFKEEP_TOKEN=secret\n", encoding="utf-8")
     monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(env))
 
-    backend = bench.bench_backend()
+    backend = bench.bench_backend(use="catalog")
     assert backend.name == bench.BENCH_BACKEND_LOCAL
     assert backend.reason == "auto-local-insecure-url"
-    assert "allow_plaintext_url" in bench.catalog_status_report()
+    assert "allow_plaintext_catalog" in bench.catalog_status_report()
 
 
 def test_explicit_opt_in_allows_a_private_tunnel_endpoint(tmp_path, monkeypatch):
@@ -431,12 +431,58 @@ def test_explicit_opt_in_allows_a_private_tunnel_endpoint(tmp_path, monkeypatch)
     monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(env))
     config_file = tmp_path / "config" / "scopefuel" / "config.toml"
     config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text("[bench]\nallow_plaintext_url = true\n", encoding="utf-8")
+    config_file.write_text("[bench]\nallow_plaintext_catalog = true\n", encoding="utf-8")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
 
-    backend = bench.bench_backend()
+    backend = bench.bench_backend(use="catalog")
     assert backend.name == bench.BENCH_BACKEND_HANDOFFKEEP
     assert backend.allow_plaintext_url is True
+
+
+def test_deprecated_allow_plaintext_url_alias_opts_in_every_use(tmp_path, monkeypatch, capsys):
+    """task #697: the old flag keeps its exact old meaning — all three uses —
+    so existing configs behave identically; it prints one deprecation warning."""
+
+    monkeypatch.delenv("HANDOFFKEEP_URL", raising=False)
+    monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
+    env = tmp_path / "hk.env"
+    env.write_text("HANDOFFKEEP_URL=http://100.122.100.56:8800\nHANDOFFKEEP_TOKEN=secret\n", encoding="utf-8")
+    monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(env))
+    config_file = tmp_path / "config" / "scopefuel" / "config.toml"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text("[bench]\nallow_plaintext_url = true\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    bench._WARNED_DEPRECATED_KEYS.clear()
+
+    for use in bench.PLAINTEXT_USES:
+        backend = bench.bench_backend(use=use)
+        assert backend.name == bench.BENCH_BACKEND_HANDOFFKEEP, use
+        assert backend.allow_plaintext_url is True, use
+    warnings = [line for line in capsys.readouterr().err.splitlines() if "allow_plaintext_url" in line]
+    assert warnings == [
+        "warning: [bench] allow_plaintext_url is deprecated and enables plaintext http for "
+        "all uses; prefer allow_plaintext_catalog / allow_plaintext_quota_share / allow_plaintext_reps"
+    ]
+
+
+def test_a_per_use_opt_in_overrides_the_deprecated_alias(tmp_path, monkeypatch):
+    """An explicit allow_plaintext_<use> = false wins over the alias for that
+    use — the operator can narrow the alias without deleting it."""
+
+    monkeypatch.delenv("HANDOFFKEEP_URL", raising=False)
+    monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
+    env = tmp_path / "hk.env"
+    env.write_text("HANDOFFKEEP_URL=http://100.122.100.56:8800\nHANDOFFKEEP_TOKEN=secret\n", encoding="utf-8")
+    monkeypatch.setenv("HANDOFFKEEP_CONFIG", str(env))
+    config_file = tmp_path / "config" / "scopefuel" / "config.toml"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        "[bench]\nallow_plaintext_url = true\nallow_plaintext_catalog = false\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert bench.bench_backend(use="catalog").name == bench.BENCH_BACKEND_LOCAL
+    assert bench.bench_backend(use="reps").name == bench.BENCH_BACKEND_HANDOFFKEEP
 
 
 def test_a_public_plaintext_endpoint_is_refused_even_with_the_opt_in_absent(tmp_path, monkeypatch):
@@ -626,7 +672,7 @@ def test_a_half_set_environment_override_is_not_completed_from_config_env(tmp_pa
     url, token = bench._handoffkeep_credentials()
     assert url == "https://attacker.example"
     assert token is None, "the config.env token must not follow an environment-chosen URL"
-    backend = bench.bench_backend()
+    backend = bench.bench_backend(use="catalog")
     assert backend.name == bench.BENCH_BACKEND_LOCAL
     assert "all-or-nothing" in bench.catalog_status_report()
 

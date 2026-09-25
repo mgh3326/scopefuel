@@ -248,7 +248,7 @@ def test_default_backend_is_local_without_creating_a_cache(tmp_path, monkeypatch
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(bench, "request_json", lambda *args, **kwargs: pytest.fail("network called"))
 
-    resolved = bench.bench_backend()
+    resolved = bench.bench_backend(use="catalog")
     assert resolved.name == bench.BENCH_BACKEND_LOCAL
     assert resolved.cache_ttl_s == 21600
     assert bench.read_scores() == []
@@ -458,7 +458,11 @@ def test_push_local_preserves_source_rows_and_rejects_local_backend(tmp_path, mo
     before_scores = bench._read_local_scores()
     before_reps = bench._read_local_reps_for_push()
     assert cli.main(["bench", "push-local"]) == 2
-    assert capsys.readouterr().err.splitlines() == ["error: bench push-local requires backend = handoffkeep"]
+    assert capsys.readouterr().err.splitlines() == [
+        "error: bench push-local: scores require the handoffkeep backend "
+        "(resolved local/configured; needs https, or "
+        "[bench] allow_plaintext_catalog = true on a private tunnel)"
+    ]
 
     _set_backend(tmp_path, monkeypatch, "handoffkeep")
     fake = FakeHandoffkeep()
