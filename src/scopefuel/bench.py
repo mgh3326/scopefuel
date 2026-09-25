@@ -57,6 +57,53 @@ CATALOG_GATES = ("default", "escalation", "consult_only")
 # "" is the profile-default row and sorts first; the named rungs are ordered.
 CATALOG_EFFORT_RANKS: dict[str, int] = {"": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
 _WARNED_UNKNOWN_BACKENDS: set[str] = set()
+_WARNED_DEPRECATED_KEYS: set[str] = set()
+
+# task #697 — the plaintext-http opt-in is per use, not global: a host may
+# share quota snapshots and rep records over a private-tunnel http endpoint
+# without letting the catalog leave local mode (the #667 failure mode — a
+# 1-row server catalog made wrk briefs go unsent — cannot recur from the reps
+# or quota flags). ``catalog`` covers the canonical bench tables — the catalog
+# route, its legacy ``grades`` projection, and the ``scores`` canon — so every
+# surface that decides placements and rankings moves together.
+PLAINTEXT_USES = ("catalog", "quota_share", "reps")
+# The deprecated single flag means "all uses", exactly its old behavior.
+_PLAINTEXT_ALIAS_KEY = "allow_plaintext_url"
+# Each bench wire scope belongs to exactly one use (task #697): the canonical
+# tables are the catalog use; only rep records are the reps use.
+_SCOPE_USE = {"catalog": "catalog", "grades": "catalog", "scores": "catalog", "reps": "reps"}
+
+
+def plaintext_opt_in_key(use: str) -> str:
+    """The ``[bench]`` config key that opts one use into plaintext http."""
+
+    if use not in PLAINTEXT_USES:
+        raise BenchBackendError(f"unknown plaintext use: {use}")
+    return f"allow_plaintext_{use}"
+
+
+def plaintext_opt_in(bench_config: dict, use: str, *, stderr: TextIO | None = None) -> bool:
+    """Whether one use may carry the bearer token over plaintext http.
+
+    A per-use ``allow_plaintext_<use>`` key wins when present;
+    ``allow_plaintext_url`` is a deprecated alias that opts in every use at
+    once (its old behavior) and prints one warning per process so the operator
+    knows the flag's reach.
+    """
+
+    key = plaintext_opt_in_key(use)
+    if _PLAINTEXT_ALIAS_KEY in bench_config and _PLAINTEXT_ALIAS_KEY not in _WARNED_DEPRECATED_KEYS:
+        print(
+            f"warning: [bench] {_PLAINTEXT_ALIAS_KEY} is deprecated and enables plaintext http for "
+            "all uses; prefer " + " / ".join(f"allow_plaintext_{name}" for name in PLAINTEXT_USES),
+            file=stderr or sys.stderr,
+        )
+        _WARNED_DEPRECATED_KEYS.add(_PLAINTEXT_ALIAS_KEY)
+    specific = bench_config.get(key)
+    if isinstance(specific, bool):
+        return specific
+    return bench_config.get(_PLAINTEXT_ALIAS_KEY) is True
+
 
 # ROB-1190 ②-1: AA-model slug 의 effort 접미사. 순서가 중요하다 — "non-reasoning" 이
 # "-high"/"-low" 등 다른 접미사의 부분열이 아니므로 순서 무관하지만, 길이가 긴 접미사부터
@@ -212,6 +259,8 @@ class BenchBackend:
     # | "auto-local-insecure-url"), so ``bench catalog status`` can explain a
     # host's mode without the reader having to guess.
     reason: str = "configured"
+    # Whether this resolved backend may send the bearer token over plaintext
+    # http — the resolved per-use opt-in (task #697), not the raw config key.
     allow_plaintext_url: bool = False
 
 
@@ -309,11 +358,14 @@ class RepComparison:
     downward_count: int = 0
 
 
-def bench_backend(*, stderr: TextIO | None = None) -> BenchBackend:
-    """Resolve the configured backend without touching the benchmark database.
+def bench_backend(*, use: str, stderr: TextIO | None = None) -> BenchBackend:
+    """Resolve the configured backend for one use, without touching the database.
 
-    A typo must never make normal local commands unavailable, so unknown values
-    deliberately degrade to ``local`` with one actionable warning.
+    ``use`` is one of ``PLAINTEXT_USES`` and selects which per-use plaintext
+    opt-in applies to the ``auto`` resolution and the resolved backend
+    (task #697). A typo must never make normal local commands unavailable, so
+    unknown values deliberately degrade to ``local`` with one actionable
+    warning.
     """
 
     config = load_config()
@@ -342,7 +394,7 @@ def bench_backend(*, stderr: TextIO | None = None) -> BenchBackend:
     # mode keeps dispatching from its bundled table and nothing says so. A host
     # with no credentials is exactly as local as before, and an explicit
     # ``backend = "local"`` still pins local.
-    allow_plaintext = bench_config.get("allow_plaintext_url") is True
+    allow_plaintext = plaintext_opt_in(bench_config, use, stderr=stderr)
     if name == BENCH_BACKEND_AUTO:
         if not (url and token):
             name, reason = BENCH_BACKEND_LOCAL, "auto-local"
@@ -871,12 +923,13 @@ def _plaintext_allowed(url: str, *, allow_plaintext: bool) -> bool:
 
     ``https://`` is always allowed. ``http://`` is allowed only to
     localhost/127.0.0.1/::1 (test and local-dev servers, where the request never
-    reaches a network), or — when the operator has explicitly opted in with
-    ``[bench] allow_plaintext_url = true`` — to any host. The opt-in exists for
-    a handoffkeep endpoint reached over a WireGuard tunnel (a Tailscale
-    100.64.0.0/10 address), where the transport is already encrypted end to end;
-    it is off by default and never enabled by auto-detection, because "the
-    operator says this link is private" is a claim only the operator can make.
+    reaches a network), or — when the operator has explicitly opted in for this
+    use with ``[bench] allow_plaintext_<use> = true`` — to any host. The opt-in
+    exists for a handoffkeep endpoint reached over a WireGuard tunnel (a
+    Tailscale 100.64.0.0/10 address), where the transport is already encrypted
+    end to end; it is off by default and never enabled by auto-detection,
+    because "the operator says this link is private" is a claim only the
+    operator can make.
     """
 
     parsed = urllib.parse.urlsplit(url)
@@ -889,14 +942,14 @@ def _plaintext_allowed(url: str, *, allow_plaintext: bool) -> bool:
     return allow_plaintext
 
 
-def _check_handoffkeep_scheme(url: str, *, allow_plaintext: bool = False) -> None:
+def _check_handoffkeep_scheme(url: str, *, allow_plaintext: bool = False, use: str = "catalog") -> None:
     """Refuse to build a request URL that would send the bearer token in the clear."""
 
     if _plaintext_allowed(url, allow_plaintext=allow_plaintext):
         return
     raise BenchBackendError(
         "HANDOFFKEEP_URL must use https (http allowed only to localhost, or to a "
-        "private tunnel with [bench] allow_plaintext_url = true)"
+        f"private tunnel with [bench] {plaintext_opt_in_key(use)} = true)"
     )
 
 
@@ -955,7 +1008,7 @@ def _backend_url(backend: BenchBackend, scope: str) -> str:
         raise BenchBackendError("invalid bench cache scope")
     if not backend.url or not backend.token:
         raise BenchBackendError("handoffkeep URL and token are required")
-    _check_handoffkeep_scheme(backend.url, allow_plaintext=backend.allow_plaintext_url)
+    _check_handoffkeep_scheme(backend.url, allow_plaintext=backend.allow_plaintext_url, use=_SCOPE_USE[scope])
     return f"{backend.url.rstrip('/')}/v1/bench/{scope}"
 
 
@@ -1238,7 +1291,7 @@ def _read_scores_handoffkeep(
 def read_scores(model_id: str | None = None, *, path: pathlib.Path | str | None = None) -> list[ModelScore]:
     """Read canonical scores when configured, otherwise preserve local behavior."""
 
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name == BENCH_BACKEND_LOCAL:
         return _read_local_scores(model_id, path=path)
     return _read_scores_handoffkeep(model_id, path=path, backend=backend)
@@ -1553,7 +1606,7 @@ def upsert_scores(scores: Iterable[ModelScore], *, path: pathlib.Path | str | No
     checked = [_validate_score(score) for score in scores]
     if not checked:
         return 0
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
         return _write_scores_handoffkeep(checked, path=path, backend=backend, recompute_ranks=True)
     conn = connect(path)
@@ -1789,7 +1842,7 @@ def sync_scores(
     payload = fetch(AA_API_URL, headers={"x-api-key": key})
     scores = _aa_scores(payload, captured_at=timestamp)
     prices = _aa_prices(payload, captured_at=timestamp)
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
         return _write_scores_handoffkeep(scores, path=path, backend=backend, recompute_ranks=True)
     conn = connect(path)
@@ -1916,7 +1969,7 @@ def import_scores(path: pathlib.Path | str, *, db: pathlib.Path | str | None = N
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise BenchError("cannot read valid TOML import file") from exc
     rows = _import_rows(payload)
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
         return _write_scores_handoffkeep(rows, path=db, backend=backend, recompute_ranks=True)
     conn = connect(db)
@@ -2041,7 +2094,7 @@ def _commit_grade_cache(
 def read_grades(*, path: pathlib.Path | str | None = None) -> list[GradeAssignment]:
     """Read canonical grade placements, failing open to a matching cache."""
 
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name == BENCH_BACKEND_LOCAL:
         return []
     conn = _cache_connect(path)
@@ -2093,7 +2146,7 @@ def set_grade(
     if normalized_grade not in REP_GRADES:
         raise BenchError(f"grade must be one of: {', '.join(REP_GRADES)}")
     normalized_boundary = _optional_text(boundary_version, "boundary_version")
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchBackendError("bench grades require backend = handoffkeep")
     written = [
@@ -2364,7 +2417,7 @@ def read_catalog(*, path: pathlib.Path | str | None = None) -> CatalogView:
     non-default gate while this view is stale.
     """
 
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     memo_key = (str(path or ""), backend.name, backend.endpoint_id)
     memoized = _CATALOG_MEMO.get(memo_key)
     if memoized is not None:
@@ -2491,7 +2544,7 @@ def _catalog_rows_from_json(payload: object) -> list[CatalogEntry]:
 def push_catalog(source: pathlib.Path | str, *, path: pathlib.Path | str | None = None) -> int:
     """Write catalog rows to handoffkeep (operator token) and refresh the cache."""
 
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     if backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchError(
             "bench push-catalog requires the handoffkeep backend "
@@ -2550,7 +2603,7 @@ def catalog_report(*, path: pathlib.Path | str | None = None) -> str:
 def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     """One screen answering "is this host reading the canon, and if not, why?"."""
 
-    backend = bench_backend()
+    backend = bench_backend(use="catalog")
     view = read_catalog(path=path)
     # Report the credentials that exist on the host, not the ones the resolved
     # backend kept — "token missing" on a host that has one sends the reader to
@@ -2586,7 +2639,7 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     if backend.reason == "auto-local-insecure-url":
         lines.append(
             "blocked: handoffkeep credentials exist but the URL is plaintext http to a "
-            "non-local host; serve it over https, or set [bench] allow_plaintext_url = true "
+            "non-local host; serve it over https, or set [bench] allow_plaintext_catalog = true "
             "for a private WireGuard/Tailscale tunnel"
         )
     if view.stale:
@@ -2732,7 +2785,7 @@ def runtime_grade_table(*, path: pathlib.Path | str | None = None) -> dict:
 
     from .recommend import GRADE_TABLE, validate_grade_table
 
-    if bench_backend().name != BENCH_BACKEND_HANDOFFKEEP:
+    if bench_backend(use="catalog").name != BENCH_BACKEND_HANDOFFKEEP:
         return GRADE_TABLE
 
     # Only a view that actually came from the canon may rebuild the table. A
@@ -3301,7 +3354,7 @@ def add_rep(
     notes = _optional_text(notes, "notes")
     recorded_at = _captured_at(recorded_at or _utc_now())
 
-    backend = bench_backend()
+    backend = bench_backend(use="reps")
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
         origin_id = _next_origin_id(path)
         record = RepRecord(
@@ -3380,7 +3433,7 @@ def read_reps(
     grade = _rep_choice(grade, "grade", REP_GRADES)
     effort = _rep_choice(effort, "effort", REP_EFFORTS)
     profile = _optional_text(profile, "profile")
-    backend = bench_backend()
+    backend = bench_backend(use="reps")
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
         return _read_reps_handoffkeep(
             path=path,
@@ -3454,7 +3507,8 @@ def _commit_push_cache(
     written_scores: list[ModelScore],
     fetched_reps: list[_RemoteRep],
     written_reps: list[_RemoteRep],
-    backend: BenchBackend,
+    score_backend: BenchBackend,
+    rep_backend: BenchBackend,
 ) -> None:
     """Publish both migrated scopes together only after every PUT succeeded."""
 
@@ -3463,15 +3517,15 @@ def _commit_push_cache(
         now = _cache_now()
         conn.execute("BEGIN")
         if written_scores:
-            _replace_cached_scores(conn, fetched_scores, backend, now)
+            _replace_cached_scores(conn, fetched_scores, score_backend, now)
             for score in written_scores:
                 _put_cached_score(conn, score)
-            _stamp_cache(conn, "scores", backend, now)
+            _stamp_cache(conn, "scores", score_backend, now)
         if written_reps:
-            _replace_cached_reps(conn, fetched_reps, backend, now)
+            _replace_cached_reps(conn, fetched_reps, rep_backend, now)
             for item in written_reps:
                 _put_cached_rep(conn, item)
-            _stamp_cache(conn, "reps", backend, now)
+            _stamp_cache(conn, "reps", rep_backend, now)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -3481,23 +3535,38 @@ def _commit_push_cache(
 
 
 def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
-    """Upload existing local source rows without deleting or rewriting them."""
+    """Upload existing local source rows without deleting or rewriting them.
 
-    backend = bench_backend()
-    if backend.name != BENCH_BACKEND_HANDOFFKEEP:
-        raise BenchBackendError("bench push-local requires backend = handoffkeep")
+    Scores are canonical-table writes (the ``catalog`` plaintext opt-in) while
+    reps follow the ``reps`` opt-in (task #697); a scope with rows requires its
+    own resolved handoffkeep backend.
+    """
+
+    catalog_backend = bench_backend(use="catalog")
+    reps_backend = bench_backend(use="reps")
     scores = _read_local_scores(path=path)
     reps = _read_local_reps_for_push(path=path)
     remote_reps = [_RemoteRep(record=record, origin_id=record.id) for record in reps]
 
+    if scores and catalog_backend.name != BENCH_BACKEND_HANDOFFKEEP:
+        raise BenchBackendError(
+            "bench push-local: scores require the handoffkeep backend "
+            "(https, or [bench] allow_plaintext_catalog = true on a private tunnel)"
+        )
+    if remote_reps and reps_backend.name != BENCH_BACKEND_HANDOFFKEEP:
+        raise BenchBackendError(
+            "bench push-local: reps require the handoffkeep backend "
+            "(https, or [bench] allow_plaintext_reps = true on a private tunnel)"
+        )
+
     # Fetch both scopes before the first PUT so a failed refresh or write leaves
     # all local cache tables and their timestamps untouched.
-    fetched_scores = _fetch_scores(backend) if scores else []
-    fetched_reps = _fetch_reps(backend) if remote_reps else []
+    fetched_scores = _fetch_scores(catalog_backend) if scores else []
+    fetched_reps = _fetch_reps(reps_backend) if remote_reps else []
     if scores:
-        _put_score_batches(backend, scores)
+        _put_score_batches(catalog_backend, scores)
     if remote_reps:
-        _put_rep_batches(backend, remote_reps)
+        _put_rep_batches(reps_backend, remote_reps)
     try:
         _commit_push_cache(
             path=path,
@@ -3505,7 +3574,8 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
             written_scores=scores,
             fetched_reps=fetched_reps,
             written_reps=remote_reps,
-            backend=backend,
+            score_backend=catalog_backend,
+            rep_backend=reps_backend,
         )
     except (sqlite3.Error, OSError) as exc:
         raise BenchBackendError("local bench cache update failed") from exc
