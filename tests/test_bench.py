@@ -282,6 +282,85 @@ def test_sync_rejects_non_numeric_non_null_aa_metric(bench_home, monkeypatch):
     assert not bench.db_path().exists()
 
 
+def test_task689_sync_parses_recorded_aa_v2_fixture(bench_home, monkeypatch, fixture_json):
+    """#689: recorded GET /api/v2/data/llms/models response (2026-09-25, 6 rows
+    covering the newly mapped slugs) loads offline — no network in tests."""
+    payload = fixture_json("aa_v2_llms_models_20260925")
+
+    def fake_request(url, **kwargs):
+        assert url == bench.AA_API_URL
+        assert set(kwargs["headers"]) == {"x-api-key"}
+        return payload
+
+    monkeypatch.setenv("ARTIFICIAL_ANALYSIS_API_KEY", "x")
+    monkeypatch.setattr(bench, "request_json", fake_request)
+    assert bench.sync_scores(captured_at="2026-09-25T00:00:00+00:00") == 9
+
+    rows = {
+        (row.model_id, row.effort, row.metric): row for row in bench.read_scores() if row.source == "AA-model"
+    }
+    assert rows[("kimi-k3", None, "coding_index")].score == 76.2
+    assert rows[("kimi-k3", None, "intelligence")].score == 43.6
+    assert rows[("kimi-k3", "low", "coding_index")].score == 72.0
+    assert rows[("deepseek-v4-1-flash", None, "intelligence")].score == 39.5
+    assert rows[("deepseek-v4-1-flash", "non-reasoning", "intelligence")].score == 24.7
+    assert rows[("claude-sonnet-5", None, "coding_index")].score == 71.5
+    assert rows[("claude-sonnet-5", "xhigh", "intelligence")].score == 34.4
+    # deepseek-v4-1-flash has coding_index: null upstream — skipped, not stored.
+    assert ("deepseek-v4-1-flash", None, "coding_index") not in rows
+
+    prices = bench.read_prices()
+    assert prices["kimi-k3"].price_1m_blended_3_to_1 == 6.0
+    assert prices["deepseek-v4-1-flash"].price_1m_blended_3_to_1 == 0.525
+    assert prices["claude-sonnet-5"].price_1m_blended_3_to_1 == 4.0
+
+
+def test_task689_requested_fields_absent_from_aa_v2(fixture_json):
+    """#689(a): the operator-requested enrichments are not in the free v2 API.
+
+    Recorded response pins the absence — per-task tokens/time/cost and the
+    engineering-category score appear on the website only (no scraping).  If AA
+    later adds them upstream this test fails and the fields can be loaded.
+    """
+    payload = fixture_json("aa_v2_llms_models_20260925")
+    row_keys = {key for row in payload["data"] for key in row}
+    eval_keys = {key for row in payload["data"] for key in row["evaluations"]}
+    pricing_keys = {key for row in payload["data"] for key in row["pricing"]}
+
+    assert not (row_keys | eval_keys | pricing_keys) & {
+        "tokens_per_task",
+        "tokens_per_task_total",
+        "tokens_per_task_input",
+        "tokens_per_task_output",
+        "cost_per_task",
+        "cost_per_task_usd",
+        "time_per_task",
+        "time_per_task_s",
+        "engineering_score",
+        "engineering_index",
+        "artificial_analysis_engineering_index",
+    }
+    # The only token/time/cost-shaped fields are per-1M prices and latency/speed
+    # medians — not per-task quantities.
+    assert pricing_keys == {
+        "price_1m_blended_3_to_1",
+        "price_1m_input_tokens",
+        "price_1m_output_tokens",
+    }
+    assert row_keys == {
+        "id",
+        "name",
+        "slug",
+        "release_date",
+        "model_creator",
+        "evaluations",
+        "pricing",
+        "median_output_tokens_per_second",
+        "median_time_to_first_token_seconds",
+        "median_time_to_first_answer_token",
+    }
+
+
 def test_missing_key_is_warning_only_and_preserves_existing_rows(bench_home, monkeypatch, capsys):
     bench.upsert_scores([_score()])
     monkeypatch.delenv("ARTIFICIAL_ANALYSIS_API_KEY", raising=False)

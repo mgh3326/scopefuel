@@ -493,6 +493,25 @@ def test_ac1b_opus_low_moved_to_s():
         assert alt in s_low.gate_reason
 
 
+def test_task689_aa_model_mappings_pinned_by_exact_equality():
+    """#689(b): profile → AA-model slug mappings, pinned verbatim.
+
+    Slugs verified against the recorded GET /api/v2/data/llms/models response
+    (2026-09-25): claude-sonnet-5, deepseek-v4-1-flash, kimi-k3.
+    """
+    sonnet_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "sonnet"]
+    assert len(sonnet_rows) == 4  # A+ high/xhigh, A medium/low
+    for profile in sonnet_rows:
+        assert profile.aa_model_id == "claude-sonnet-5"
+
+    ds41 = next(p for p in GRADE_TABLE["A+"] if p.name == "devin-ds41")
+    assert ds41.aa_model_id == "deepseek-v4-1-flash"
+
+    kimi = next(p for p in GRADE_TABLE["S"] if p.name == "kimi-k3")
+    assert kimi.aa_model_id == "kimi-k3"
+    assert kimi.aa_agent_model_id == "kimi-k3"
+
+
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     providers = [_result("codex", 10.0, pool_class="preserve")]
     measured = [
