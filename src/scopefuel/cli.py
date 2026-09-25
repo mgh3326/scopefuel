@@ -339,7 +339,8 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         choices=sorted(rung for rung in bench.CATALOG_EFFORT_RANKS if rung),
         help=(
             "#692: 판정할 런그(예: low/max). 주어지면 그 런그의 행으로 판정하고, "
-            "표가 모르는 런그는 프로필 기본 배치로 답한다. 미측정 E6 측정 런그는 "
+            "표가 모르는 런그는 프로필 기본 배치로 답한다. #716: 배치 행은 그 런그의 "
+            "쿼타 규칙으로 판정한다(escalation 대안 거부 없음). 미측정 E6 측정 런그는 "
             f"{recommend.E6_ARM_MARKER_ENV}=<profile>@<effort> 표식이 있을 때만 열린다"
         ),
     )

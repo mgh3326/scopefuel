@@ -188,7 +188,16 @@ SCOPEFUEL_E6_ARM=sonnet@max scopefuel gate -m sonnet --effort max  # → exit 0,
 - `--recommend`는 어느 급에서도 E6 런그를 나열하지 않습니다. 캐논이 그 런그를 C 밖으로
   측정하면 제한은 자동으로 풀립니다(그때는 평범한 런그).
 - 게이트의 `--effort`는 판정 대상을 런그로 좁힙니다 — `gate -m opus --effort low`는 low 런그
-  (S, escalation)의 판정이고, 표가 모르는 런그는 프로필 기본 배치로 답합니다(기존 동작).
+  (S)의 판정입니다. #716: **배치 행을 가리키는 `--effort`는 그 런그를 배치로 판정합니다**
+  — 측정불가·제외·cutoff 등 `--effort` 없는 경로와 같은 쿼타 규칙이며, escalation 의
+  "같은 grade 정상 대안 거부"는 적용하지 않습니다(그 거부는 기본 배치 해석과 `--recommend`
+  사다리의 개념이라, 호출자가 지명한 런그에는 답이 아닙니다). escalation 행임은 사유 줄의
+  `[rung <profile>@<effort>, escalation-gated]` 태그에 남습니다. 표가 모르는 런그는 프로필
+  기본 배치로 답합니다(기존 동작). 별칭은 순수한 이름 바꿔쓰기입니다 — `gate -m codex-max
+  --effort xhigh`는 `codex-sol@xhigh`를 판정하고, `gate -m codex-max --effort high`는
+  미측정 C 런그 `codex-sol@high`에 걸려 런그와 remedy 를 댄 거부(exit 3)입니다.
+  ambient 표식과 달리 `--effort`는 명령 단위의 명시 지명이므로 이 계약이 성립합니다 —
+  표식만으로 골라진 배치 런그는 위 bullet 대로 그 행 자체의 게이트를 따릅니다.
 - 아직 wrk에 effort 경로가 없는 런그(`kimi-k3`)는 카탈로그 행이 먼저 서 있습니다. 표식은
   ambient 환경변수이므로 자식 스폰에 상속되면 그 스폰의 게이트 태그도 표식 런그를 가리킵니다 —
   arm 단위로만 설정하세요.

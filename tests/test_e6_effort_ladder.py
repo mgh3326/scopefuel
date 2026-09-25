@@ -601,3 +601,221 @@ def test_every_e6_row_is_unmeasured_and_grade_c():
         assert row.benchmark_source is None
         assert row.launcher_effort
         assert row.benchmark_annotation is not None
+
+
+# --- #716: an explicitly named placed rung is a placement judgement ----------
+
+
+def _healthy_providers() -> list[ProviderResult]:
+    """Every pool the S+ ladder can draw on, healthy and inside quota — a
+    refusal here can never hide behind "no same-grade alternative exists"."""
+    return [_provider(pid, pool_class="spend") for pid in ("claude", "codex", "grok", "kimi", "kiro")]
+
+
+def _gate_cli_pools(monkeypatch, capsys, tmp_path, argv, used=None):
+    """`scopefuel gate` with every pool registered; ``used`` overrides a pool's
+    used_pct (e.g. {"codex": 99.5} puts the codex spend pool over cutoff)."""
+    used_pct = {"claude": 10.0, "codex": 10.0, "grok": 10.0, "kimi": 10.0, "kiro": 10.0}
+    used_pct.update(used or {})
+    registry = {
+        pid: (lambda _pid=pid: _provider(_pid, used_pct[_pid], pool_class="spend")) for pid in used_pct
+    }
+    monkeypatch.setattr(cli, "registry", lambda: registry)
+    record_path = tmp_path / "gate.json"
+    rc = cli.main([*argv, "--no-cache", "--gate-output", str(record_path)])
+    captured = capsys.readouterr()
+    record = json.loads(record_path.read_text()) if record_path.exists() else {}
+    return rc, captured.out, captured.err, record
+
+
+def test_a_placed_rung_named_by_effort_is_admitted_despite_same_grade_alternatives():
+    """#716 root case. codex-sol@xhigh is a real placement row (S+); naming it
+    with --effort judges that placement by quota rules — the escalation
+    alternatives-refusal is a default-resolution concept, not a verdict on a
+    rung the caller named."""
+    result = gate_check(_healthy_providers(), "codex-sol", effort="xhigh", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.grade == "S+"
+    assert "codex-sol@xhigh" in result.reason
+    assert "escalation 후보" not in result.reason
+
+
+def test_the_reproduction_commands_all_admit(monkeypatch, capsys, tmp_path):
+    """The three reproduction commands from #716, verbatim."""
+    rc, out, _err, record = _gate_cli_pools(monkeypatch, capsys, tmp_path, ["gate", "-m", "codex-max"])
+    assert rc == 0
+    assert record["ok"] is True
+
+    rc, out, _err, record = _gate_cli_pools(
+        monkeypatch, capsys, tmp_path, ["gate", "-m", "codex-sol", "--effort", "xhigh"]
+    )
+    assert rc == 0
+    assert record["ok"] is True
+    assert record["grade"] == "S+"
+    assert "codex-sol@xhigh" in out  # the judged rung is named on the allow line's reason
+    assert "escalation" not in record["alternatives"]
+
+    rc, out, _err, record = _gate_cli_pools(
+        monkeypatch, capsys, tmp_path, ["gate", "-m", "codex-max", "--effort", "xhigh"]
+    )
+    assert rc == 0
+    assert record["ok"] is True
+    # codex-max is a pure spelling alias — the judged rung is the canonical one.
+    assert "codex-sol@xhigh" in out
+
+
+def test_codex_max_effort_max_names_the_pinned_rung(monkeypatch, capsys, tmp_path):
+    """Alias rule: codex-max is codex-sol@max — spelling it out lands on the
+    same placement row and is admitted by quota, not as a special case."""
+    rc, out, _err, record = _gate_cli_pools(
+        monkeypatch, capsys, tmp_path, ["gate", "-m", "codex-max", "--effort", "max"]
+    )
+    assert rc == 0
+    assert "codex-sol@max" in out
+
+
+def test_grok_hi_high_is_admitted_by_effort(monkeypatch, capsys, tmp_path):
+    rc, _out, _err, record = _gate_cli_pools(
+        monkeypatch, capsys, tmp_path, ["gate", "-m", "grok-hi", "--effort", "high"]
+    )
+    assert rc == 0
+    assert record["grade"] == "S"
+
+
+def test_codex_max_effort_high_is_the_c_rung_refusal_with_a_named_remedy(monkeypatch, capsys, tmp_path):
+    """The pinned-alias conflict case: codex-max --effort high lands on
+    codex-sol@high — an unmeasured C E6 rung — so the gate refuses, naming the
+    rung and the exact remedy. Never a silent alternative list."""
+    rc, _out, err, record = _gate_cli_pools(
+        monkeypatch, capsys, tmp_path, ["gate", "-m", "codex-max", "--effort", "high"]
+    )
+    assert rc == 3
+    assert record["grade"] == "C"
+    assert "codex-sol@high" in err
+    assert "SCOPEFUEL_E6_ARM=codex-sol@high" in err
+    assert "대안(" not in err  # refused on the rung, not folded into an alt list
+
+
+def test_an_explicit_rung_refusal_is_quota_based_and_drops_the_alias_self(monkeypatch, capsys, tmp_path):
+    """Placement judgement means quota rules: with the codex pool over cutoff
+    the rung is refused on quota — and the alternatives never echo the alias's
+    own canonical rows (pre-#716 `codex-max` listed `codex-sol` against itself)."""
+    rc, _out, err, record = _gate_cli_pools(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        ["gate", "-m", "codex-max", "--effort", "xhigh"],
+        used={"codex": 99.5},
+    )
+    assert rc == 3
+    assert "codex-sol@xhigh" in err  # the refusal still names the judged rung
+    assert "소진" in err or "cutoff" in err  # quota reason, not the ladder
+    alt_lines = [line for line in err.splitlines() if line.startswith("대안")]
+    assert alt_lines, err
+    assert "codex-sol" not in alt_lines[0]
+    assert "opus" in alt_lines[0]
+
+
+def test_alias_spelling_is_not_listed_as_its_own_alternative(monkeypatch, capsys, tmp_path):
+    """Isolation for the exclusion bug on the plain path: `gate -m codex-max`
+    refused on quota must not offer codex-sol — the same rows — as an out."""
+    rc, _out, err, _record = _gate_cli_pools(
+        monkeypatch, capsys, tmp_path, ["gate", "-m", "codex-max"], used={"codex": 99.5}
+    )
+    assert rc == 3
+    alt_lines = [line for line in err.splitlines() if line.startswith("대안")]
+    assert alt_lines, err
+    assert "codex-sol" not in alt_lines[0]
+
+
+def test_the_escalation_refusal_never_offers_the_canonical_self():
+    """The exclusion-bug pin that quota tests cannot provide: driving the codex
+    pool over cutoff hides every codex-sol row from recommend() anyway, so those
+    tests cannot tell ``canonical_profile`` from ``profile_name`` in the
+    exclusion. On the escalation-refusal branch with healthy pools the codex
+    rows stay recommendable — pre-#716 ``gate -m codex-max`` listed codex-sol,
+    itself, as an alternative."""
+    result = gate_check(
+        _healthy_providers(),
+        "codex-max",
+        e6_arm="codex-sol@xhigh",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "escalation 후보" in result.reason
+    assert result.alternatives
+    assert "codex-sol" not in result.alternatives
+    assert "opus" in result.alternatives
+
+
+def test_an_unknown_rung_on_an_escalation_profile_keeps_the_ladder():
+    """explicit_rung requires a real catalog row: an effort the table does not
+    know (oc-omni has no @low row) still falls back to the default placement —
+    and that default is escalation-gated, so the alternatives-refusal applies.
+    A spelled rung must never waive escalation by not existing."""
+    result = gate_check(_healthy_providers(), "oc-omni", effort="low", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert "escalation 후보" in result.reason
+    assert result.alternatives
+
+
+def test_an_explicit_rung_allow_never_claims_escalation_qualification():
+    """Audit-text pin: with --effort the escalation ladder is skipped entirely,
+    so the allow reason must not claim 'escalation 자격 충족' — a check that
+    never ran. The tag still records that the judged row is escalation-gated."""
+    result = gate_check(_healthy_providers(), "codex-sol", effort="xhigh", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert "자격 충족" not in result.reason
+    assert "codex-sol@xhigh, escalation-gated" in result.reason
+
+
+def test_the_marker_alone_keeps_the_named_placed_rungs_own_gate():
+    """#716 asymmetry, pinned: --effort is an explicit per-command nomination
+    judged as a placement; the ambient SCOPEFUEL_E6_ARM only *selects* the rung —
+    the row's own gate (here: escalation) still applies. An env var that leaks
+    into child contexts must never widen admission."""
+    result = gate_check(
+        _healthy_providers(),
+        "codex-max",
+        e6_arm="codex-sol@xhigh",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "escalation 후보" in result.reason
+    assert "codex-sol@xhigh" in result.reason  # the rung is still named for audit
+
+
+def test_an_explicit_effort_wins_over_a_marker_naming_a_different_rung():
+    """Selection precedence pin: --effort names the judged rung; a marker
+    pointing at a different rung of the same profile cannot override it."""
+    result = gate_check(
+        _healthy_providers(),
+        "codex-max",
+        effort="xhigh",
+        e6_arm="codex-sol@high",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True
+    assert result.grade == "S+"  # xhigh's placement — not the marker's C rung
+    assert result.e6_arm is None
+    assert "codex-sol@xhigh" in result.reason
+
+
+def test_an_effort_the_table_does_not_know_still_falls_back_to_the_default():
+    """Unchanged #692 fallback: a spelled rung with no row answers the profile's
+    default placement (grok-hi has no @medium row — only the C E6 rung at xhigh)."""
+    result = gate_check(_healthy_providers(), "grok-hi", effort="medium", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.grade == "S"
+
+
+def test_the_recommend_ladder_is_untouched_by_the_gate_fix():
+    """--recommend unchanged: the rung still sits in the escalation section —
+    the fix is in the gate, not the ladder."""
+    out = recommend(_healthy_providers(), "S+", today=TODAY, now=NOW)
+    assert "승급 후보" in out
+    escalation_section = out.split("승급 후보", 1)[1]
+    assert "codex-sol --effort xhigh" in escalation_section
