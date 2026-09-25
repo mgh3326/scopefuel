@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import datetime as dt
+import json
+import os
 import pathlib
+import re
 
 from scopefuel.providers import kimi
+from scopefuel.recommend import gate_check
 
 SAMPLE = "\x1b[2KWeekly: 75% left (resets in 5d 12h)\r\n\x1b[2K5h: 30% left (resets in 2h 10m)\r\n"
 
@@ -332,3 +337,382 @@ def test_child_env_removes_herdr_integration_variables(monkeypatch):
     assert "HERDR_AGENT_STATE" not in child_env
     assert child_env["COLUMNS"] == "200"
     assert child_env["LINES"] == "50"
+
+
+# ------------------------------------------------------------------ #705
+# Real v2.1.0 capture (one allowed live probe, 2026-09-25, identifiers
+# redacted): the weekly quota was locked out at the provider — the account's
+# sessions were failing with '403 weekly (7-day) usage limit' — while the
+# /usage panel still rendered '0% used' for both windows.  Field semantics:
+# the panel prints the server's used_ratio verbatim ('% used' = used; only the
+# legacy '% left' spelling needs the 100-remaining inversion).
+
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+PANEL_LOCKOUT = (FIXTURES / "kimi_usage_v210_weekly_lockout.txt").read_text()
+SESSION_LOCKOUT_LOG = (FIXTURES / "kimi_session_weekly_lockout_log.txt").read_text().strip()
+
+
+def _session_log_at(ts: dt.datetime) -> str:
+    """The fixture WARN line re-dated: the lockout timestamp is relative to now."""
+    return re.sub(r"^\S+", ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", SESSION_LOCKOUT_LOG)
+
+
+def _write_session_log(root: pathlib.Path, body: str, *, when: dt.datetime) -> None:
+    path = root / "wd_test" / "session_x" / "logs" / "kimi-code.log"
+    path.parent.mkdir(parents=True)
+    path.write_text(body)
+    os.utime(path, (when.timestamp(), when.timestamp()))
+
+
+def test_parse_real_panel_fixture_reads_used_pct_verbatim():
+    """The captured panel literally reports '0% used' — parse reads it as used,
+    not remaining.  The lockout signal lives in session records, not here."""
+    result = kimi.parse(PANEL_LOCKOUT)
+
+    assert result.error is None
+    assert [(b.label, b.window, b.used_pct) for b in result.buckets] == [
+        ("5h", "5h", 0.0),
+        ("weekly", "7d", 0.0),
+    ]
+
+
+def test_parse_zero_percent_left_is_fully_used_and_gate_refuses():
+    """Exhausted in the 'remaining' spelling: 0% left means used_pct 100, and a
+    spend pool over the 99% cutoff is refused.  Mutant guard — dropping the
+    100-remaining inversion in parse() turns this RED (0.0 would pass)."""
+    result = kimi.parse("5h limit: 0% left (resets in 3h)\nWeekly limit: 0% left (resets in 5d)\n")
+
+    assert [b.used_pct for b in result.buckets] == [100.0, 100.0]
+    gate = gate_check([result], "kimi-k3")
+    assert gate.ok is False
+    assert gate.unmeasurable is False
+    assert "소진" in gate.reason
+
+
+def test_parse_half_remaining_is_half_used():
+    result = kimi.parse("5h limit: 50% left (resets in 3h)\nWeekly limit: 50% left (resets in 5d)\n")
+
+    assert [b.used_pct for b in result.buckets] == [50.0, 50.0]
+
+
+def test_parse_ambiguous_bare_percent_row_fails_closed():
+    """A quota row whose percentage has no left/used qualifier cannot be read —
+    it must poison the whole reading instead of being dropped as a silent 0."""
+    result = kimi.parse(
+        "5h limit      ░░░░  40%   resets in 2h\nWeekly limit  ░░░░  40% used   resets in 5d\n"
+    )
+
+    assert result.error is not None
+    assert result.buckets == []
+    gate = gate_check([result], "kimi-k3")
+    assert gate.ok is False
+    assert gate.unmeasurable is True
+
+
+def test_observed_weekly_lockout_marks_weekly_exhausted(tmp_path, monkeypatch):
+    """#705 incident shape end to end: panel says 0% used, session log shows a
+    weekly-limit 403 inside the current window -> weekly is exhausted and the
+    gate refuses with the 소진 reason, not a clean pass."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 0.0), ("weekly", 100.0)]
+    assert "usage limit" in checked.buckets[1].note
+    gate = gate_check([checked], "kimi-k3")
+    assert gate.ok is False
+    assert "소진" in gate.reason
+
+
+def test_lockout_from_a_prior_window_is_stale_and_ignored(tmp_path, monkeypatch):
+    """A 403 older than the current window start belongs to a window that has
+    already reset — it must not mark the pool exhausted."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(days=9)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+
+
+def test_lockout_error_without_matching_panel_window_is_unmeasurable(tmp_path, monkeypatch):
+    """A monthly-limit 403 with no monthly row on the panel cannot be bounded —
+    fail closed as unmeasurable rather than ignore it."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorName=APIStatusError "
+        'errorMessage="403 You\'ve reached your monthly usage limit." statusCode=403\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is not None
+    assert "측정 불가" in checked.error
+    gate = gate_check([checked], "kimi-k3")
+    assert gate.ok is False
+    assert gate.unmeasurable is True
+
+
+def test_lockout_error_without_a_window_name_is_unmeasurable(tmp_path, monkeypatch):
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorName=APIStatusError "
+        'errorMessage="403 usage limit reached" statusCode=403\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is not None
+    assert "측정 불가" in checked.error
+
+
+def test_wire_jsonl_lockout_marks_exhausted(tmp_path, monkeypatch):
+    """The same signal in the protocol record (epoch-ms 'time' field)."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ms = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    path = tmp_path / "wd_test" / "session_x" / "agents" / "main"
+    path.mkdir(parents=True)
+    wire = path / "wire.jsonl"
+    wire.write_text(
+        '{"type":"turn.ended","agentId":"main","turnId":0,"reason":"failed",'
+        '"error":{"code":"provider.auth_error","message":"403 You\'ve reached your '
+        'weekly (7-day) usage limit."},"time":' + str(ms) + "}\n"
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 0.0), ("weekly", 100.0)]
+
+
+def test_no_session_records_leaves_result_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    result = kimi.parse(PANEL_LOCKOUT)
+
+    checked = kimi._apply_observed_lockouts(result, now=dt.datetime.now(dt.UTC))
+
+    assert checked is result
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+
+
+def test_wire_transcript_records_are_not_lockouts(tmp_path, monkeypatch):
+    """#705 tester F1: wire.jsonl embeds whole conversation and tool-result
+    records — text quoting a 403 usage-limit message (or this repo's own
+    files) must never be read as an observed provider lockout."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ms = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    path = tmp_path / "wd_test" / "session_x" / "agents" / "main"
+    path.mkdir(parents=True)
+    (path / "wire.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "agent.message.appended",
+                "agentId": "main",
+                "message": {
+                    "role": "assistant",
+                    "content": "other panes saw: " + SESSION_LOCKOUT_LOG,
+                },
+                "time": ms,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "context.append_loop_event",
+                "agentId": "main",
+                "payload": {
+                    "tool": "cat",
+                    "output": "src/scopefuel/providers/kimi.py mentions 403 usage limit and monthly windows",
+                },
+                "time": ms,
+            }
+        )
+        + "\n"
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+
+
+def test_log_line_outside_the_anchored_shape_is_not_a_lockout(tmp_path, monkeypatch):
+    """#705 tester F1: only '<ISO>Z WARN/ERROR llm request failed' lines with an
+    APIStatusError/auth_error context and a usage-limit errorMessage count —
+    a quoted or malformed line does not."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        # no WARN/ERROR anchor — a pasted quote of a failure
+        f"{ts}Z INFO  panel note: 403 You've reached your weekly usage limit\n"
+        # WARN but no auth/403 context marker and no errorMessage field
+        f"{ts}Z WARN  something else: usage limit 403\n",
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+
+
+def test_wire_5h_lockout_with_7d_in_trace_id_stays_session(tmp_path, monkeypatch):
+    """#705 tester F2: a bare '7d' substring inside a hex traceId must not
+    reclassify a 5-hour lockout as weekly."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ms = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    path = tmp_path / "wd_test" / "session_x" / "agents" / "main"
+    path.mkdir(parents=True)
+    (path / "wire.jsonl").write_text(
+        '{"type":"turn.ended","agentId":"main","turnId":0,"reason":"failed",'
+        '"traceId":"ab7d9f4e7d11","error":{"code":"provider.auth_error","message":'
+        "\"403 You've reached your 5-hour usage limit. Your quota will reset when "
+        'the current 5-hour window ends."},"time":' + str(ms) + "}\n"
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 100.0), ("weekly", 0.0)]
+
+
+def test_lockout_between_window_start_and_now_minus_window_is_stale(tmp_path, monkeypatch):
+    """#705 tester F4: the window anchor is resets_at - window, not now -
+    window.  Fixture weekly resets in ~5d9h, so the current window started
+    ~1.6d ago; an error 2d ago predates it and must be ignored (under the
+    now-minus-window mutant it would wrongly mark weekly exhausted)."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(days=2)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+
+
+def test_fetch_applies_session_lockouts(tmp_path, monkeypatch):
+    """#705 tester F3: fetch() runs the lockout cross-check — kills the mutant
+    that returns parse(output) without _apply_observed_lockouts."""
+    binary = tmp_path / "fake-kimi-lockout"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "printf 'Kimi Code\\r\\n'\n"
+        "sleep 0.1\n"
+        "printf '│ >\\r\\n'\n"
+        "IFS= read -r command\n"
+        "[ \"$command\" = '/usage' ] || exit 9\n"
+        "printf '5h limit       0%% used   resets in 3m\\r\\n"
+        "Weekly limit   0%% used   resets in 5d\\r\\n'\n"
+    )
+    binary.chmod(binary.stat().st_mode | 0o111)
+    monkeypatch.setattr(kimi, "BINARY", str(binary))
+    sessions = tmp_path / "sessions"
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", sessions)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(sessions, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    result = kimi.fetch()
+
+    assert result.error is None
+    assert [(b.label, b.used_pct) for b in result.buckets] == [("5h", 0.0), ("weekly", 100.0)]
+    gate = gate_check([result], "kimi-k3")
+    assert gate.ok is False
+    assert "소진" in gate.reason
+
+
+def test_escaped_json_error_message_still_counts(tmp_path, monkeypatch):
+    """#705 tester N1: older kimi-code.log lines embed the 403 body as escaped
+    JSON inside errorMessage — '403 {\\"error\\":...}'.  A message extractor
+    that stops at the first backslash-quote drops these real records."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  model=kimi-for-coding errorName=APIStatusError "
+        'errorMessage="403 {\\"error\\":{\\"type\\":\\"permission_error\\",\\"message\\":'
+        '\\"You\'ve reached your weekly (7-day) usage limit.\\"}}" attempt=1\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 0.0), ("weekly", 100.0)]
+
+
+def test_each_log_guard_is_enforced(tmp_path, monkeypatch):
+    """#705 tester N2 (mutants j/k): one line per guard so each relaxation is
+    caught — an INFO line with an otherwise-complete record (level anchor),
+    and a WARN line with a limit-looking errorMessage but no auth/403 context
+    (context requirement)."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z INFO  llm request failed errorName=APIStatusError "
+        'errorMessage="403 You\'ve reached your weekly (7-day) usage limit."\n'
+        f"{ts}Z WARN  render failed "
+        'errorMessage="panel echoed usage limit 403 text"\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+
+
+def test_monthly_lockout_10d_old_is_still_scanned(tmp_path, monkeypatch):
+    """#705 tester F5/N2 (mutant l): lookback is 32d, not 8d — a 10-day-old
+    monthly lockout is still inside its 30d window and must fail closed."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = now - dt.timedelta(days=10)
+    log_ts = ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{log_ts}Z WARN  llm request failed errorName=APIStatusError "
+        'errorMessage="403 You\'ve reached your monthly usage limit."\n',
+        when=ts,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    # The panel has no monthly bucket -> the error cannot be placed -> fail closed.
+    assert checked.error is not None
+
+
+def test_sessions_dir_honours_kimi_code_home(tmp_path, monkeypatch):
+    """#705 tester F6/N2 (mutant m): with SESSIONS_DIR unset, KIMI_CODE_HOME
+    relocates the sessions dir."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", None)
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
+    sessions = tmp_path / "kimi-home" / "sessions"
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(sessions, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 0.0), ("weekly", 100.0)]
