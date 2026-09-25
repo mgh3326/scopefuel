@@ -467,3 +467,102 @@ def test_https_needs_no_opt_in_for_any_use(tmp_path, monkeypatch):
     assert fake.hits[("GET", "catalog")] == 1
     assert fake.hits[("PUT", "reps")] == 1
     assert fake.hits[("PUT", "documents")] == 1
+
+
+# --- task #713: pin the #697 r2 fixes the mutant sweep left surviving -------
+
+
+def test_nonbool_per_use_key_fails_closed_and_never_falls_to_the_alias(hk_plaintext):
+    """Mutant R_N2 (bench.py plaintext_opt_in): a present
+    ``allow_plaintext_<use>`` wins even when its value is not a bool. Falling
+    through to the alias — or testing truthiness — re-opens plaintext http for
+    a key the operator set to narrow it (fail-open, catalog bearer over http)."""
+
+    fake, config = hk_plaintext
+    config.write_text(
+        '[bench]\nallow_plaintext_url = true\nallow_plaintext_catalog = "false"\n',
+        encoding="utf-8",
+    )
+
+    assert bench.read_catalog().source == "snapshot"
+    assert fake.hits[("GET", "catalog")] == 0
+
+
+def test_plaintext_opt_in_values_must_be_the_bool_true():
+    """Same pin at unit level: only the literal TOML ``true`` opts a use in —
+    truthy strings fail closed, on the per-use key and on the alias alike."""
+
+    assert bench.plaintext_opt_in({"allow_plaintext_catalog": "yes"}, "catalog") is False
+    assert (
+        bench.plaintext_opt_in({"allow_plaintext_url": True, "allow_plaintext_catalog": 1}, "catalog")
+        is False
+    )
+    assert bench.plaintext_opt_in({"allow_plaintext_url": "yes"}, "quota_share") is False
+    assert bench.plaintext_opt_in({"allow_plaintext_reps": True}, "reps") is True
+
+
+def test_alias_warning_fires_only_when_the_alias_is_true(hk_plaintext, capsys):
+    """Mutant N3: a warning keyed on key *presence* (or unconditional) nags the
+    operator who explicitly set ``allow_plaintext_url = false``."""
+
+    fake, config = hk_plaintext
+    config.write_text(
+        "[bench]\nallow_plaintext_url = false\nallow_plaintext_catalog = true\n",
+        encoding="utf-8",
+    )
+    bench._WARNED_DEPRECATED_KEYS.clear()
+
+    assert bench.read_catalog().source == "server"
+    assert "allow_plaintext_url" not in capsys.readouterr().err
+
+
+def test_backend_resolved_for_one_use_cannot_serve_another_scope():
+    """Mutant N1 (bench.py _backend_url): drop the scope/use guard and a
+    backend resolved under the reps opt-in silently serves the catalog scopes —
+    one opt-in covering a use it was never granted."""
+
+    backend = bench.BenchBackend(
+        name=bench.BENCH_BACKEND_HANDOFFKEEP,
+        cache_ttl_s=60.0,
+        url=HK_URL,
+        token=HK_TOKEN,
+        endpoint_id="e",
+        allow_plaintext_url=True,
+        plaintext_use="reps",
+    )
+    for scope in ("catalog", "scores", "grades"):
+        with pytest.raises(bench.BenchBackendError, match="cannot serve scope"):
+            bench._backend_url(backend, scope)
+    assert bench._backend_url(backend, "reps").endswith("/v1/bench/reps")
+
+
+def test_runtime_grade_table_uses_the_catalog_opt_in(hk_plaintext):
+    """Mutant M15 (bench.py runtime_grade_table): resolving ``use="reps"``
+    instead of ``use="catalog"`` means a catalog-only host silently keeps the
+    code table and never reads the server canon it opted into."""
+
+    fake, config = hk_plaintext
+    config.write_text("[bench]\nallow_plaintext_catalog = true\n", encoding="utf-8")
+
+    table = bench.runtime_grade_table()
+    assert fake.hits[("GET", "catalog")] == 1
+    assert table is not recommend.GRADE_TABLE
+    assert any(profile.name == "opus" for profile in table["S+"])
+
+
+def test_per_use_false_wins_over_the_alias_for_reps(hk_plaintext):
+    """Mirror of the catalog pin in test_bench_catalog: alias on + reps
+    explicitly off → a rep write fails closed while the catalog still reads
+    from the server on the alias."""
+
+    fake, config = hk_plaintext
+    config.write_text(
+        '[bench]\nbackend = "handoffkeep"\nallow_plaintext_url = true\nallow_plaintext_reps = false\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_reps"):
+        _add_rep()
+    assert fake.hits[("PUT", "reps")] == 0
+    assert fake.hits[("GET", "reps")] == 0
+    assert bench.read_catalog().source == "server"
