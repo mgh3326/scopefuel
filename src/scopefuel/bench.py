@@ -3672,8 +3672,12 @@ def _migrate_src_host(notes: str | None) -> str | None:
     return marks[-1] if marks else None
 
 
-def _migrate_origin_id(host: str, local_id: int) -> int:
-    digest = hashlib.sha256(f"reps-migrate\x00{host}\x00{local_id}".encode()).digest()
+def _migrate_origin_id(host: str, profile: str, local_id: int) -> int:
+    # Profile participates so the collision domain stays inside the per-profile
+    # read window: a remote row with the same derived id necessarily sits under
+    # a profile this run fetches completely. It also lets two machines sharing
+    # a --host string coexist as long as their profiles differ.
+    digest = hashlib.sha256(f"reps-migrate\x00{host}\x00{profile}\x00{local_id}".encode()).digest()
     return _MIGRATE_ORIGIN_BASE + int.from_bytes(digest[:6], "big") % _MIGRATE_ORIGIN_SPAN
 
 
@@ -3814,7 +3818,7 @@ def _rep_present_remote(
 
     for item in index.get(_rep_content_key(rep), ()):
         remote_host = _remote_rep_host(item)
-        if remote_host == host and item.origin_id == _migrate_origin_id(host, rep.id):
+        if remote_host == host and item.origin_id == _migrate_origin_id(host, rep.profile, rep.id):
             # Identity, not just likeness: the stamped row must carry this
             # rep's derived origin_id. Two local reps can share a content key
             # (same profile/model/task/role/instant, different rounds) — a
@@ -3895,7 +3899,9 @@ def migrate_reps(
     # would silently overwrite it. Flagged in dry-run; refused under --apply
     # unless the operator passes --force.
     remote_by_origin = {item.origin_id: item for item in remote}
-    would_overwrite = [rep for rep in pending if _migrate_origin_id(host, rep.id) in remote_by_origin]
+    would_overwrite = [
+        rep for rep in pending if _migrate_origin_id(host, rep.profile, rep.id) in remote_by_origin
+    ]
     unwritable = [rep for rep in pending if not _rep_wire_timestamp(rep)]
     if unwritable:
         shown = ", ".join(str(rep.id) for rep in unwritable[:5])
@@ -3929,7 +3935,7 @@ def migrate_reps(
     written = [
         _RemoteRep(
             record=replace(rep, notes=_stamp_rep_notes(rep.notes, host)),
-            origin_id=_migrate_origin_id(host, rep.id),
+            origin_id=_migrate_origin_id(host, rep.profile, rep.id),
         )
         for rep in pending
     ]

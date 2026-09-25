@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 import urllib.parse
 from collections import Counter
+from dataclasses import replace
 
 from scopefuel import bench, cli
 
@@ -127,7 +128,7 @@ def _remote_from_record(rep: bench.RepRecord, *, host: str | None, created_by: s
         notes, origin_id = rep.notes, rep.id
     else:
         notes = f"{rep.notes} [src:{host}]" if rep.notes else f"[src:{host}]"
-        origin_id = bench._migrate_origin_id(host, rep.id)
+        origin_id = bench._migrate_origin_id(host, rep.profile, rep.id)
     return {
         "id": rep.id + 1000,
         "origin_id": origin_id,
@@ -207,7 +208,7 @@ def test_apply_inserts_stamps_host_and_rerun_inserts_nothing(tmp_path, monkeypat
                 continue
             assert remote[field_name] == getattr(local, field_name), field_name
         # origin_id is the stable derived id, not the raw local rowid.
-        assert remote["origin_id"] == bench._migrate_origin_id(HOST, local.id)
+        assert remote["origin_id"] == bench._migrate_origin_id(HOST, local.profile, local.id)
         assert remote["origin_id"] >= 1 << 40
         assert remote["created_by"] == CLIENT  # server-side stamp
 
@@ -486,7 +487,7 @@ def test_derived_origin_collision_refuses_without_force(tmp_path, monkeypatch, c
     _seed_local(tmp_path, [_rep("714-a")])
     fake = _remote_backend(tmp_path, monkeypatch)
     foreign = _remote_row(900, "m1-0")  # stamped for this host, different rep
-    foreign["origin_id"] = bench._migrate_origin_id(HOST, 1)
+    foreign["origin_id"] = bench._migrate_origin_id(HOST, "builder-devin", 1)
     fake.reps.append(foreign)
 
     assert cli.main(["reps", "migrate", "--host", HOST]) == 0
@@ -502,6 +503,22 @@ def test_derived_origin_collision_refuses_without_force(tmp_path, monkeypatch, c
     assert cli.main(["reps", "migrate", "--apply", "--host", HOST, "--force"]) == 0
     assert fake.reps[0]["task_ref"] == "714-a"  # deliberate overwrite
     assert len(fake.reps) == 1
+
+
+def test_same_host_different_profile_coexists(tmp_path, monkeypatch, capsys):
+    """Profile participates in the derived id: a foreign machine's migrated
+    rep under the same host string but a different profile is a different
+    derived id — it must neither collide nor be overwritten."""
+    _seed_local(tmp_path, [_rep("714-a")])  # profile builder-devin, local id 1
+    fake = _remote_backend(tmp_path, monkeypatch)
+    foreign_rep = replace(_local_reps()[0], profile="reviewer-x", task_ref="m1-0")
+    fake.reps.append(_remote_from_record(foreign_rep, host=HOST))
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    assert "inserted=1" in capsys.readouterr().out
+    assert len(fake.reps) == 2
+    survivor = next(r for r in fake.reps if r["profile"] == "reviewer-x")
+    assert survivor["task_ref"] == "m1-0"
 
 
 def test_renumbered_local_rowid_heals_via_identical_match(tmp_path, monkeypatch, capsys):
