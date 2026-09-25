@@ -13,6 +13,8 @@ import json
 import math
 import os
 import pathlib
+import re
+import socket
 import sqlite3
 import sys
 import tomllib
@@ -363,7 +365,9 @@ class RepComparison:
     downward_count: int = 0
 
 
-def bench_backend(*, use: str, stderr: TextIO | None = None) -> BenchBackend:
+def bench_backend(
+    *, use: str, stderr: TextIO | None = None, allow_plaintext_http: bool = False
+) -> BenchBackend:
     """Resolve the configured backend for one use, without touching the database.
 
     ``use`` is one of ``PLAINTEXT_USES`` and selects which per-use plaintext
@@ -371,6 +375,11 @@ def bench_backend(*, use: str, stderr: TextIO | None = None) -> BenchBackend:
     (task #697). A typo must never make normal local commands unavailable, so
     unknown values deliberately degrade to ``local`` with one actionable
     warning.
+
+    ``allow_plaintext_http`` is a per-call, non-persistent opt-in on top of the
+    configured one (task #714): ``reps migrate`` passes it so a one-time move
+    can run before the operator decides whether to set the persistent
+    ``allow_plaintext_<use>`` config key.
     """
 
     config = load_config()
@@ -399,7 +408,7 @@ def bench_backend(*, use: str, stderr: TextIO | None = None) -> BenchBackend:
     # mode keeps dispatching from its bundled table and nothing says so. A host
     # with no credentials is exactly as local as before, and an explicit
     # ``backend = "local"`` still pins local.
-    allow_plaintext = plaintext_opt_in(bench_config, use, stderr=stderr)
+    allow_plaintext = plaintext_opt_in(bench_config, use, stderr=stderr) or allow_plaintext_http
     if name == BENCH_BACKEND_AUTO:
         if not (url and token):
             name, reason = BENCH_BACKEND_LOCAL, "auto-local"
@@ -3617,6 +3626,241 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     except (sqlite3.Error, OSError) as exc:
         raise BenchBackendError("local bench cache update failed") from exc
     return len(scores), len(remote_reps)
+
+
+# --- task #714: one-time local bench.db reps -> handoffkeep migration --------
+#
+# The server keys rep dedup on ``(created_by, origin_id)`` and stamps
+# ``created_by`` itself from the bearer-token identity, so two things the wire
+# cannot carry are handled client-side here: the source host is recorded as a
+# ``[src:<host>]`` marker appended to the migrated row's ``notes`` (the only
+# free-text field the server stores verbatim), and ``origin_id`` is a stable
+# hash of ``(host, local rowid)`` in a band above any real local rowid — local
+# rowids collide across hosts that share one token identity, and a raw rowid
+# would silently overwrite the other host's migrated rep.
+_MIGRATE_SRC_RE = re.compile(r"\[src:([^\[\]]+)\]")
+_MIGRATE_ORIGIN_BASE = 1 << 40
+_MIGRATE_ORIGIN_SPAN = 1 << 48
+
+
+@dataclass(frozen=True)
+class RepMigration:
+    """Outcome of ``reps migrate`` — a dry-run plan or an applied result."""
+
+    host: str
+    applied: bool
+    local_count: int
+    present_count: int
+    pending: list[RepRecord]
+    inserted_count: int
+    remote_for_host: int | None
+    missing: list[RepRecord]
+    extra_remote_count: int
+
+
+def _migrate_src_host(notes: str | None) -> str | None:
+    if not notes:
+        return None
+    marks = _MIGRATE_SRC_RE.findall(notes)
+    return marks[-1] if marks else None
+
+
+def _migrate_origin_id(host: str, local_id: int) -> int:
+    digest = hashlib.sha256(f"reps-migrate\x00{host}\x00{local_id}".encode()).digest()
+    return _MIGRATE_ORIGIN_BASE + int.from_bytes(digest[:6], "big") % _MIGRATE_ORIGIN_SPAN
+
+
+def _stamp_rep_notes(notes: str | None, host: str) -> str:
+    marker = f"[src:{host}]"
+    return f"{notes} {marker}" if notes else marker
+
+
+def _recorded_at_key(value: str) -> object:
+    """Normalize an ISO timestamp for comparison — the server may serialize the
+    same instant differently (``Z`` vs ``+00:00``) than the local row."""
+
+    parsed = _cached_at(value)
+    return parsed if parsed is not None else value
+
+
+def _rep_content_key(record: RepRecord) -> tuple:
+    """The dedup key minus the host: what the rep records, not where it was taken."""
+
+    return (
+        record.profile,
+        record.model_id,
+        record.task_ref,
+        record.role,
+        _recorded_at_key(record.recorded_at),
+    )
+
+
+def _rep_row_key(record: RepRecord) -> tuple:
+    """Every rep field except the id, with recorded_at normalized to an instant."""
+
+    return tuple(
+        _recorded_at_key(record.recorded_at) if column == "recorded_at" else getattr(record, column)
+        for column in _REP_COLUMNS
+        if column != "id"
+    )
+
+
+def _same_rep_row(local: RepRecord, remote: RepRecord) -> bool:
+    """Every rep field equal except the id (the remote one is a server id)."""
+
+    return _rep_row_key(local) == _rep_row_key(remote)
+
+
+def _remote_rep_host(item: _RemoteRep) -> str | None:
+    """The recorded source host of a remote rep, if it was migrated."""
+
+    return _migrate_src_host(item.record.notes)
+
+
+def _rep_present_remote(
+    rep: RepRecord,
+    index: dict[tuple, list[_RemoteRep]],
+    host: str,
+) -> bool:
+    """Whether ``rep`` is already on the server for this host.
+
+    A row stamped ``[src:<host>]`` counts only for that host — the same rep
+    migrated from another machine is a different keyed row. An unstamped remote
+    row (e.g. an earlier ``bench push-local`` copy) counts only when every rep
+    field is identical, which is what makes it the same rep rather than a
+    coincidence.
+    """
+
+    for item in index.get(_rep_content_key(rep), ()):
+        remote_host = _remote_rep_host(item)
+        if remote_host is not None:
+            if remote_host == host:
+                return True
+            continue
+        if _same_rep_row(rep, item.record):
+            return True
+    return False
+
+
+def _rep_content_index(reps: list[_RemoteRep]) -> dict[tuple, list[_RemoteRep]]:
+    index: dict[tuple, list[_RemoteRep]] = {}
+    for item in reps:
+        index.setdefault(_rep_content_key(item.record), []).append(item)
+    return index
+
+
+def migrate_reps(
+    *,
+    path: pathlib.Path | str | None = None,
+    apply: bool = False,
+    host: str | None = None,
+    allow_plaintext_http: bool = False,
+) -> RepMigration:
+    """Upload local bench.db rep rows to the handoffkeep reps store, once.
+
+    Dry-run unless ``apply``: both modes read the local ``reps`` table and GET
+    the remote store, then report local / already-present / to-insert counts.
+    ``apply`` PUTs only the missing rows (each stamped ``[src:<host>]`` in
+    ``notes`` and given a stable ``origin_id`` derived from ``(host, local
+    id)``), commits the read-through cache, and re-fetches for reconciliation.
+
+    The per-use plaintext opt-in is respected: over plaintext http the command
+    refuses unless ``allow_plaintext_http`` is passed for this invocation (or
+    ``[bench] allow_plaintext_reps`` is already set). The flag is deliberately
+    one-shot — migrating history is a separate decision from enabling
+    persistent plaintext reps writes.
+    """
+
+    resolved_host = host or socket.gethostname()
+    resolved_host = _optional_text(resolved_host, "host")
+    if not resolved_host or "[" in resolved_host or "]" in resolved_host:
+        raise BenchError("reps migrate: could not determine source host (pass --host)")
+    host = resolved_host
+
+    backend = bench_backend(use="reps", allow_plaintext_http=allow_plaintext_http)
+    if backend.name != BENCH_BACKEND_HANDOFFKEEP:
+        if backend.reason == "auto-local-insecure-url":
+            raise BenchBackendError(
+                "reps migrate: the endpoint is plaintext http — pass --allow-plaintext-http for a "
+                "one-time run, or set [bench] allow_plaintext_reps = true"
+            )
+        raise BenchBackendError(
+            f"reps migrate requires the handoffkeep backend (resolved {backend.name}/{backend.reason}; "
+            "needs HANDOFFKEEP_URL+HANDOFFKEEP_TOKEN, and https or the reps plaintext opt-in)"
+        )
+    if backend.url and not _plaintext_allowed(backend.url, allow_plaintext=backend.allow_plaintext_url):
+        # An explicit backend = "handoffkeep" with a plaintext URL gets here —
+        # refuse before any request is built rather than inside _backend_url.
+        raise BenchBackendError(
+            "reps migrate: the endpoint is plaintext http — pass --allow-plaintext-http for a "
+            "one-time run, or set [bench] allow_plaintext_reps = true"
+        )
+
+    local_reps = _read_local_reps_for_push(path=path)
+    remote = _fetch_reps(backend)
+    index = _rep_content_index(remote)
+    pending = [rep for rep in local_reps if not _rep_present_remote(rep, index, host)]
+    if not apply:
+        return RepMigration(
+            host=host,
+            applied=False,
+            local_count=len(local_reps),
+            present_count=len(local_reps) - len(pending),
+            pending=pending,
+            inserted_count=0,
+            remote_for_host=None,
+            missing=[],
+            extra_remote_count=0,
+        )
+
+    written = [
+        _RemoteRep(
+            record=replace(rep, notes=_stamp_rep_notes(rep.notes, host)),
+            origin_id=_migrate_origin_id(host, rep.id),
+        )
+        for rep in pending
+    ]
+    origin_ids = [item.origin_id for item in written]
+    if len(set(origin_ids)) != len(origin_ids):
+        raise BenchBackendError("reps migrate: derived origin_id collision — do not proceed")
+    if written:
+        _put_rep_batches(backend, written)
+        try:
+            _commit_rep_cache(path=path, fetched=remote, written=written, backend=backend)
+        except (sqlite3.Error, OSError) as exc:
+            raise BenchBackendError("local bench cache update failed") from exc
+
+    remote_after = _fetch_reps(backend)
+    index_after = _rep_content_index(remote_after)
+    missing = [rep for rep in local_reps if not _rep_present_remote(rep, index_after, host)]
+    local_keys = {_rep_content_key(rep) for rep in local_reps}
+    local_rows = {_rep_row_key(rep) for rep in local_reps}
+    remote_for_host = 0
+    extra_remote_count = 0
+    for item in remote_after:
+        remote_host = _remote_rep_host(item)
+        if remote_host is not None:
+            if remote_host != host:
+                continue
+            remote_for_host += 1
+            # A migrated row no longer matching any local rep on the content
+            # key is an orphan (the local row was edited or deleted after an
+            # earlier migrate) — surfaced, not silently counted as coverage.
+            if _rep_content_key(item.record) not in local_keys:
+                extra_remote_count += 1
+        elif _rep_row_key(item.record) in local_rows:
+            remote_for_host += 1
+    return RepMigration(
+        host=host,
+        applied=True,
+        local_count=len(local_reps),
+        present_count=len(local_reps) - len(pending),
+        pending=pending,
+        inserted_count=len(written),
+        remote_for_host=remote_for_host,
+        missing=missing,
+        extra_remote_count=extra_remote_count,
+    )
 
 
 _REP_GRADE_ORDER: tuple[str, ...] = ("S+", "S", "A+", "A", "B", "C")

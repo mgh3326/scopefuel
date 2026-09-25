@@ -1,0 +1,348 @@
+"""task #714 — one-time local bench.db reps -> handoffkeep migration tests.
+
+``FakeRepStore`` models the deployed server contract faithfully: rep upserts
+key on ``(created_by, origin_id)`` and the server stamps ``created_by`` itself
+from the bearer-token identity (a client-supplied value is ignored), so the
+source host can only be recorded in the row's client-owned fields (``notes``).
+No test reaches the network — ``bench.request_json`` is replaced.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections import Counter
+
+from scopefuel import bench, cli
+
+HK_URL = "https://hk.invalid"
+HK_HTTP_URL = "http://hk.invalid:8800"  # private-tunnel shape: non-local http
+HK_TOKEN = "hk-test-token"
+CLIENT = "ops"  # the token's client identity, stamped server-side on PUT
+HOST = "test-host"
+
+
+class FakeRepStore:
+    """The reps scope only: GET/PUT /v1/bench/reps keyed on (created_by, origin_id)."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.reps: list[dict] = []
+        self.hits: Counter[str] = Counter()
+        # task_refs the fake silently loses on PUT while still ACKing the batch —
+        # the only way ``reconcile`` can observe a missing row.
+        self.drop_tasks: set[str] = set()
+
+    def __call__(self, url, *, method="GET", headers=None, body=None, timeout=None, **_kw):
+        assert (headers or {}).get("Authorization") == f"Bearer {HK_TOKEN}"
+        url = str(url)
+        assert url.startswith(self.url), f"request left the configured endpoint: {url}"
+        assert url.rstrip("/").endswith("/v1/bench/reps"), f"unexpected path: {url}"
+        self.hits[method] += 1
+        if method == "GET":
+            return {"reps": [dict(row) for row in self.reps]}
+        assert method == "PUT" and body is not None
+        rows = body["reps"]
+        assert 1 <= len(rows) <= 1000
+        for row in rows:
+            stored = dict(row)
+            # The server stamps created_by from the token identity and ignores
+            # any client-supplied value.
+            assert stored.get("created_by") is None
+            stored["created_by"] = CLIENT
+            stored.setdefault("created_at", "2026-09-25T00:00:00Z")
+            if stored.get("task_ref") in self.drop_tasks:
+                continue
+            match = next(
+                (
+                    old
+                    for old in self.reps
+                    if old["origin_id"] == stored["origin_id"] and old["created_by"] == CLIENT
+                ),
+                None,
+            )
+            if match is None:
+                stored["id"] = max((old["id"] for old in self.reps), default=0) + 1
+                self.reps.append(stored)
+            else:
+                stored["id"] = match["id"]
+                self.reps[self.reps.index(match)] = stored
+        return {"upserted": len(rows)}
+
+
+def _config(tmp_path, text: str) -> None:
+    config = tmp_path / "config" / "scopefuel" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(text, encoding="utf-8")
+
+
+def _seed_local(tmp_path, rows: list[dict]) -> None:
+    """Write fixture reps into a local-backend bench.db."""
+    _config(tmp_path, '[bench]\nbackend = "local"\n')
+    for row in rows:
+        bench.add_rep(**row)
+
+
+def _remote_backend(tmp_path, monkeypatch, url: str = HK_URL) -> FakeRepStore:
+    _config(tmp_path, '[bench]\nbackend = "handoffkeep"\n')
+    monkeypatch.setenv("HANDOFFKEEP_URL", url)
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", HK_TOKEN)
+    fake = FakeRepStore(url)
+    monkeypatch.setattr(bench, "request_json", fake)
+    return fake
+
+
+def _rep(task_ref: str, **overrides) -> dict:
+    row = {
+        "profile": "builder-devin",
+        "model_id": "swe-2",
+        "task_ref": task_ref,
+        "tier": "T1",
+        "role": "impl",
+        "rounds": 1,
+        "blockers_found": 0,
+        "completed": 1,
+        "recorded_at": "2026-09-20T10:00:00Z",
+    }
+    row.update(overrides)
+    return row
+
+
+def _remote_from_record(rep: bench.RepRecord, *, host: str | None, created_by: str = CLIENT) -> dict:
+    """The remote wire shape of a local rep: ``host=None`` is an unstamped
+    copy (e.g. written by ``bench push-local`` — raw origin rowid); a host gets
+    the ``[src:<host>]`` marker and the derived origin_id."""
+    if host is None:
+        notes, origin_id = rep.notes, rep.id
+    else:
+        notes = f"{rep.notes} [src:{host}]" if rep.notes else f"[src:{host}]"
+        origin_id = bench._migrate_origin_id(host, rep.id)
+    return {
+        "id": rep.id + 1000,
+        "origin_id": origin_id,
+        "created_by": created_by,
+        "created_at": "2026-09-25T00:00:00Z",
+        "profile": rep.profile,
+        "model_id": rep.model_id,
+        "task_ref": rep.task_ref,
+        "tier": rep.tier,
+        "role": rep.role,
+        "rounds": rep.rounds,
+        "blockers_found": rep.blockers_found,
+        "completed": rep.completed,
+        "input_tokens": rep.input_tokens,
+        "output_tokens": rep.output_tokens,
+        "notes": notes,
+        "recorded_at": rep.recorded_at,
+        "effort": rep.effort,
+        "grade": rep.grade,
+        "table_grade": rep.table_grade,
+    }
+
+
+def _local_reps() -> list[bench.RepRecord]:
+    return bench._read_local_reps_for_push()
+
+
+def test_dry_run_counts_sample_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    """Dry-run is the default: counts + sample, no PUT, no local writes."""
+    _seed_local(tmp_path, [_rep("714-a"), _rep("714-b", notes="E6 run"), _rep("714-c", role="verify")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    # One rep already migrated in an earlier run.
+    fake.reps.append(_remote_from_record(_local_reps()[0], host=HOST))
+
+    assert cli.main(["reps", "migrate", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "local=3 already-present=1 to-insert=2" in out
+    assert "dry-run" in out and "--apply" in out
+    assert "task=714-b" in out and "task=714-c" in out  # the sample shows pending rows
+    assert "task=714-a" not in out.split("dry-run")[1]  # present row is not a sample row
+
+    assert fake.hits["PUT"] == 0  # mutant target: a dry-run that PUTs turns RED
+    assert [rep.task_ref for rep in _local_reps()] == ["714-a", "714-b", "714-c"]
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert "bench_cache_reps" not in tables  # dry-run must not even create cache tables
+
+
+def test_apply_inserts_stamps_host_and_rerun_inserts_nothing(tmp_path, monkeypatch, capsys):
+    _seed_local(
+        tmp_path,
+        [
+            _rep("714-a"),
+            _rep("714-b", notes="토큰 미상", input_tokens=120000, effort="xhigh", grade="A+"),
+            _rep("714-c", role="verify", completed=0),
+        ],
+    )
+    fake = _remote_backend(tmp_path, monkeypatch)
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=3" in out
+    assert "local=3 remote-this-host=3 missing=0 extra-remote=0" in out
+    assert len(fake.reps) == 3
+    by_task = {row["task_ref"]: row for row in fake.reps}
+    assert by_task["714-a"]["notes"] == f"[src:{HOST}]"
+    assert by_task["714-b"]["notes"] == f"토큰 미상 [src:{HOST}]"
+    assert by_task["714-c"]["notes"] == f"[src:{HOST}]"
+    # Fields survive the trip: a dropped field here is data loss.
+    for local in _local_reps():
+        remote = by_task[local.task_ref]
+        for field_name in bench._REP_COLUMNS:
+            if field_name in ("id", "notes"):
+                continue
+            assert remote[field_name] == getattr(local, field_name), field_name
+        # origin_id is the stable derived id, not the raw local rowid.
+        assert remote["origin_id"] == bench._migrate_origin_id(HOST, local.id)
+        assert remote["origin_id"] >= 1 << 40
+        assert remote["created_by"] == CLIENT  # server-side stamp
+
+    # Rerun: every row already present, nothing is PUT again.
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=0 skipped=3" in out
+    assert fake.hits["PUT"] == 1  # mutant target: re-PUTing on rerun turns RED
+    assert len(fake.reps) == 3
+
+
+def test_http_refuses_without_opt_in_or_one_shot_flag(tmp_path, monkeypatch, capsys):
+    """CWE-319: plaintext http without any opt-in sends nothing — in auto mode
+    (auto-local-insecure-url) and under an explicit backend = "handoffkeep"."""
+    _seed_local(tmp_path, [_rep("714-a")])
+
+    # auto mode: credentials exist but the URL is plaintext http.
+    _config(tmp_path, "[bench]\n")
+    monkeypatch.setenv("HANDOFFKEEP_URL", HK_HTTP_URL)
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", HK_TOKEN)
+    fake = FakeRepStore(HK_HTTP_URL)
+    monkeypatch.setattr(bench, "request_json", fake)
+    for argv in (
+        ["reps", "migrate", "--host", HOST],
+        ["reps", "migrate", "--apply", "--host", HOST],
+    ):
+        assert cli.main(argv) == 2
+        assert "--allow-plaintext-http" in capsys.readouterr().err
+    assert not fake.hits
+
+    # explicit backend = "handoffkeep": same refusal before the wire.
+    _config(tmp_path, '[bench]\nbackend = "handoffkeep"\n')
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 2
+    assert "allow_plaintext_reps" in capsys.readouterr().err
+    assert not fake.hits
+
+
+def test_one_shot_flag_and_config_opt_in_each_allow_http(tmp_path, monkeypatch, capsys):
+    """The chosen trade-off: a per-invocation flag, not a config edit. The
+    migration exists to move history *before* enabling allow_plaintext_reps —
+    requiring the persistent flag would conflate the two decisions."""
+    _seed_local(tmp_path, [_rep("714-a")])
+
+    monkeypatch.setenv("HANDOFFKEEP_URL", HK_HTTP_URL)
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", HK_TOKEN)
+    fake = FakeRepStore(HK_HTTP_URL)
+    monkeypatch.setattr(bench, "request_json", fake)
+    _config(tmp_path, '[bench]\nbackend = "handoffkeep"\n')
+
+    # One-shot flag: works without touching config.
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST, "--allow-plaintext-http"]) == 0
+    assert len(fake.reps) == 1
+    assert fake.reps[0]["notes"] == f"[src:{HOST}]"
+
+    # The flag is per-call: the catalog use is unaffected, and a second call
+    # without it refuses again.
+    assert bench.read_catalog().source == "snapshot"
+    assert cli.main(["reps", "migrate", "--host", HOST]) == 2
+    capsys.readouterr()
+
+    # The persistent opt-in is also honored.
+    _config(tmp_path, '[bench]\nbackend = "handoffkeep"\nallow_plaintext_reps = true\n')
+    assert cli.main(["reps", "migrate", "--host", HOST]) == 0
+
+
+def test_unstamped_identical_remote_row_counts_as_present(tmp_path, monkeypatch, capsys):
+    """A rep already pushed by bench push-local (no marker, raw origin rowid)
+    is the same rep — migrate must not write a second copy."""
+    _seed_local(tmp_path, [_rep("714-a"), _rep("714-b")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_from_record(_local_reps()[0], host=None))
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=1 skipped=1" in out
+    assert len(fake.reps) == 2
+    pushed = next(row for row in fake.reps if row["task_ref"] == "714-b")
+    assert pushed["notes"].endswith(f"[src:{HOST}]")
+    # The pre-existing unstamped copy is counted for this host in reconcile.
+    assert "local=2 remote-this-host=2" in out
+
+
+def test_other_host_marker_does_not_dedup(tmp_path, monkeypatch, capsys):
+    """The dedup key includes the host: the same rep migrated from another
+    machine is a different row and must not block this host's copy."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_from_record(_local_reps()[0], host="other-host"))
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=1" in out
+    assert len(fake.reps) == 2
+    assert "remote-this-host=1" in out  # only this host's copy counts
+
+
+def test_reconcile_lists_missing_rows_and_fails(tmp_path, monkeypatch, capsys):
+    """A row the server ACK'd but lost shows up in the reconcile output."""
+    _seed_local(tmp_path, [_rep("714-a"), _rep("lost-1"), _rep("714-c")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.drop_tasks.add("lost-1")
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 2
+    out = capsys.readouterr().out
+    assert "missing=1" in out
+    assert "task=lost-1" in out
+
+
+def test_recorded_at_timezone_spelling_does_not_duplicate(tmp_path, monkeypatch, capsys):
+    """The server returns TIMESTAMPTZ in its own spelling — the same instant
+    written as +00:00 instead of Z must still dedup."""
+    _seed_local(tmp_path, [_rep("714-a", recorded_at="2026-09-20T10:00:00Z")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    remote = _remote_from_record(_local_reps()[0], host=HOST)
+    remote["recorded_at"] = "2026-09-20T10:00:00+00:00"
+    fake.reps.append(remote)
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    assert "inserted=0" in capsys.readouterr().out
+    assert len(fake.reps) == 1
+
+
+def test_migrate_without_handoffkeep_backend_names_the_blocker(tmp_path, monkeypatch, capsys):
+    _seed_local(tmp_path, [_rep("714-a")])
+    monkeypatch.delenv("HANDOFFKEEP_URL", raising=False)
+    monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
+
+    assert cli.main(["reps", "migrate", "--host", HOST]) == 2
+    assert "handoffkeep backend" in capsys.readouterr().err
+
+
+def test_migrate_rejects_bad_host_marker(tmp_path, monkeypatch, capsys):
+    """A host containing ']' would corrupt the [src:host] marker round-trip."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    _remote_backend(tmp_path, monkeypatch)
+    assert cli.main(["reps", "migrate", "--apply", "--host", "bad]host"]) == 2
+    assert "--host" in capsys.readouterr().err
+
+
+def test_dry_run_default_leaves_fixture_db_byte_identical(tmp_path, monkeypatch):
+    """fixture bench.db: the local file is opened read-only for the whole run."""
+    _seed_local(tmp_path, [_rep("714-a", notes="fixture"), _rep("714-b")])
+    db = bench.db_path()
+    before = db.read_bytes()
+    _remote_backend(tmp_path, monkeypatch)
+
+    result = bench.migrate_reps(host=HOST)
+    assert result.applied is False
+    assert result.local_count == 2 and len(result.pending) == 2
+    assert db.read_bytes() == before
