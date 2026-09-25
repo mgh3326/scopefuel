@@ -498,6 +498,7 @@ def test_plaintext_opt_in_values_must_be_the_bool_true():
         is False
     )
     assert bench.plaintext_opt_in({"allow_plaintext_url": "yes"}, "quota_share") is False
+    assert bench.plaintext_opt_in({"allow_plaintext_url": 1}, "reps") is False
     assert bench.plaintext_opt_in({"allow_plaintext_reps": True}, "reps") is True
 
 
