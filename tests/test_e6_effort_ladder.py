@@ -1,0 +1,439 @@
+"""#692: E6 effort-ladder rungs — catalog rows, the one E6 arm marker, and the gate.
+
+E6 (#594, plan hk:doc plan/2026-09-25/e6-effort-ladder) measures one model at
+several efforts on real tasks. The rungs it needs that the catalog did not carry
+are catalog *rows*, not placements: grade C, no benchmark, never a recommendation
+candidate, never a launcher default, and reachable only through the explicit arm
+marker ``SCOPEFUEL_E6_ARM=<profile>@<effort>``. Without the marker the gate
+refuses the rung with a reason naming it, and ``policy launch`` keeps its ordinary
+fallback so every existing spelling (``wrk -m codex`` pins codex-sol@high,
+``-m builder-grok`` pins grok-hi@xhigh) is unchanged.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+
+import pytest
+
+from scopefuel import bench, cli, launch
+from scopefuel.model import Bucket, ProviderResult, Scope
+from scopefuel.recommend import (
+    E6_ARM_ANNOTATION,
+    E6_ARM_GRADE,
+    E6_ARM_KEYS,
+    E6_ARM_MARKER_ENV,
+    E6_ARM_RUNGS,
+    GRADE_TABLE,
+    Profile,
+    e6_arm_rung_for,
+    gate_check,
+    parse_e6_arm_marker,
+    profile_pool,
+    recommend,
+)
+
+TODAY = dt.date(2026, 9, 25)
+NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
+
+# (profile, effort) -> (pool, catalog model id, the AA number scopefuel stores)
+NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
+    ("sonnet", "max"): ("claude", "claude-sonnet-5", "34.4"),
+    ("codex-sol", "high"): ("codex", "gpt-6-sol", "42.8"),
+    ("kimi-k3", "high"): ("kimi", "kimi-k3", "61.0"),
+    ("kimi-k3", "max"): ("kimi", "kimi-k3", "61.0"),
+    ("grok-hi", "xhigh"): ("grok", "grok-4.7", "46.3"),
+}
+# The rungs the E6 arms use that the catalog already placed — no new row may
+# appear for these, or the existing spelling's resolution would change.
+EXISTING_RUNGS: dict[tuple[str, str], str] = {
+    ("opus", "low"): "S",
+    ("opus", "medium"): "S+",
+    ("sonnet", "xhigh"): "A+",
+    ("codex-sol", "xhigh"): "S+",
+    ("codex-sol", "max"): "S+",
+    ("codex-luna", "xhigh"): "A+",
+    ("codex-terra", "high"): "A+",
+    ("codex-terra", "xhigh"): "A+",
+    ("grok", "medium"): "A+",
+}
+
+
+def _provider(provider_id: str, used: float = 10.0, pool_class: str = "preserve") -> ProviderResult:
+    return ProviderResult(
+        id=provider_id,
+        pool_class=pool_class,  # type: ignore[arg-type]
+        buckets=[
+            Bucket(
+                label="7d",
+                window="7d",
+                used_pct=used,
+                resets_at=(dt.datetime.now(dt.UTC) + dt.timedelta(hours=100)).isoformat(),
+                scope=Scope("account"),
+                horizon="week",  # type: ignore[arg-type]
+            )
+        ],
+    )
+
+
+def _gate_cli(monkeypatch, capsys, tmp_path, provider_id: str, argv: list[str]) -> tuple[int, str, str, dict]:
+    monkeypatch.setattr(
+        cli, "registry", lambda: {provider_id: lambda: _provider(provider_id, pool_class="spend")}
+    )
+    record_path = tmp_path / "gate.json"
+    rc = cli.main([*argv, "--no-cache", "--gate-output", str(record_path)])
+    captured = capsys.readouterr()
+    record = json.loads(record_path.read_text())
+    return rc, captured.out, captured.err, record
+
+
+# --- AC1: catalog rows -------------------------------------------------------
+
+
+def test_the_new_rungs_are_exactly_the_missing_ones():
+    assert set(E6_ARM_KEYS) == set(NEW_RUNGS)
+
+
+def test_no_new_row_appears_for_a_rung_that_already_existed():
+    """A row for these keys would change an existing spelling's resolution."""
+
+    catalog_keys = {(entry.profile, entry.effort) for entry in bench.catalog_snapshot()}
+    for profile, effort in EXISTING_RUNGS:
+        assert (profile, effort) in catalog_keys
+        assert (profile, effort) not in E6_ARM_KEYS
+
+
+@pytest.mark.parametrize(("key", "expected"), sorted(NEW_RUNGS.items()))
+def test_each_new_rung_is_a_catalog_row_of_grade_c(key, expected):
+    pool, model_id, aa_reference = expected
+    rows = [entry for entry in bench.catalog_snapshot() if entry.key == key]
+    assert len(rows) == 1, rows
+    (row,) = rows
+    assert row.grade == E6_ARM_GRADE
+    assert row.grade == "C"
+    assert row.score is None
+    assert row.pool == pool
+    assert row.model_id == model_id
+    assert row.gate == "default"
+    assert row.benchmark_source is None
+    assert row.benchmark_annotation.startswith(E6_ARM_ANNOTATION)
+    assert aa_reference in row.benchmark_annotation
+    assert "#594" in row.benchmark_annotation
+
+
+@pytest.mark.parametrize("key", sorted(NEW_RUNGS))
+def test_each_new_rung_keeps_the_profile_pool_and_aa_mapping(key):
+    profile, _ = key
+    row = e6_arm_rung_for(profile, key[1])
+    assert row is not None
+    assert profile_pool(profile) == (NEW_RUNGS[key][0], None)
+    assert row.benchmark is None
+    assert row.aa_model_id or row.aa_agent_model_id
+
+
+def test_new_rungs_stay_out_of_the_placement_snapshot():
+    """The snapshot mirrors the placement canon (Sol S+-only) — rows, not placements."""
+
+    placement_keys = {entry.key for entry in launch.snapshot_entries()}
+    assert not (set(E6_ARM_KEYS) & placement_keys)
+    # The catalog view does carry them, so `bench catalog list` shows the rung.
+    assert set(E6_ARM_KEYS) <= {entry.key for entry in bench.read_catalog().entries}
+
+
+def test_the_seed_emits_the_e6_rows_with_their_own_deviation_ref(capsys):
+    assert cli.main(["bench", "push-catalog", "--emit-seed", "--decided-by", "operator-desk"]) == 0
+    rows = {(row["profile"], row["effort"]): row for row in json.loads(capsys.readouterr().out)["catalog"]}
+    for key in NEW_RUNGS:
+        row = rows[key]
+        assert row["grade"] == "C"
+        assert row["decided_by"] == "operator-desk"
+        assert "e6-effort-ladder" in row["deviation_ref"]
+
+
+@pytest.mark.parametrize("key", sorted(NEW_RUNGS))
+def test_each_new_rung_resolves_to_the_right_pool_and_effort_with_the_marker(key):
+    profile, effort = key
+    pool, model_id, _ = NEW_RUNGS[key]
+    decision = launch.resolve_launch(profile, effort=effort, e6_arm=f"{profile}@{effort}")
+    assert decision.pool == pool
+    assert decision.effort == effort
+    assert decision.model_id == model_id
+    assert decision.grade == "C"
+    assert decision.e6_arm == f"{profile}@{effort}"
+
+
+def test_recommend_never_lists_a_new_rung_at_any_grade():
+    providers = [_provider("claude", 0.0, pool_class="spend"), _provider("codex", 0.0, pool_class="spend")]
+    for grade in ("S+", "S", "A+", "A", "B", "C"):
+        out = recommend(providers, grade, today=TODAY, now=NOW)
+        for profile, effort in NEW_RUNGS:
+            for line in out.splitlines():
+                if not line[:1].isdigit():
+                    continue
+                tokens = line.split()
+                assert tokens[1] != profile or f"--effort {effort}" not in line, (grade, line)
+        assert "미측정(#594 E6" not in out, (grade, out)
+
+
+def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
+    def entry(profile: str, effort: str, grade: str) -> bench.CatalogEntry:
+        return bench.CatalogEntry(
+            profile=profile,
+            effort=effort,
+            model_id="claude-sonnet-5" if profile == "sonnet" else "gpt-6-sol",
+            pool="claude" if profile == "sonnet" else "codex",
+            grade=grade,
+            benchmark_annotation=E6_ARM_ANNOTATION,
+        )
+
+    view = bench.CatalogView(
+        entries=tuple(entry(profile, effort, "C") for profile, effort in NEW_RUNGS)
+        + (entry("sonnet", "high", "A+"),),
+        source="server",
+        backend="handoffkeep",
+    )
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    placed = {(p.name, p.launcher_effort or "") for profiles in table.values() for p in profiles}
+    assert not (set(E6_ARM_KEYS) & placed)
+    assert ("sonnet", "high") in placed
+
+
+# --- AC2: the gate admits only an explicit E6 arm ----------------------------
+
+
+@pytest.mark.parametrize("key", sorted(NEW_RUNGS))
+def test_gate_refuses_an_unmarked_rung_with_the_rung_in_the_reason(key):
+    profile, effort = key
+    provider_id = NEW_RUNGS[key][0]
+    result = gate_check(
+        [_provider(provider_id, pool_class="spend")],
+        profile,
+        effort=effort,
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert result.role_denied is False
+    assert result.grade == "C"
+    assert "e6_arm_required" in result.reason
+    assert f"{profile}@{effort}" in result.reason
+    assert E6_ARM_MARKER_ENV in result.reason
+
+
+@pytest.mark.parametrize("key", sorted(NEW_RUNGS))
+def test_gate_admits_the_rung_with_the_marker_and_tags_the_allow_reason(key):
+    profile, effort = key
+    provider_id = NEW_RUNGS[key][0]
+    result = gate_check(
+        [_provider(provider_id, pool_class="spend")],
+        profile,
+        effort=effort,
+        e6_arm=f"{profile}@{effort}",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True, result.reason
+    assert result.grade == "C"
+    assert result.e6_arm == f"{profile}@{effort}"
+    assert f"[E6 arm, unmeasured C: {profile}@{effort}]" in result.reason
+
+
+def test_gate_cli_refuses_and_names_the_remedy(monkeypatch, capsys, tmp_path):
+    rc, out, err, record = _gate_cli(
+        monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet", "--effort", "max"]
+    )
+    assert rc == 3
+    assert "e6_arm_required" in err
+    assert "sonnet@max" in err
+    assert f"{E6_ARM_MARKER_ENV}=sonnet@max" in err
+    assert "대안(C) 없음" not in err  # not a quota/alternatives refusal
+    assert record["ok"] is False
+    assert record["e6_arm"] == "sonnet@max"
+    assert out == ""
+
+
+def test_gate_cli_admits_with_the_marker_and_prints_the_visible_tag(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "sonnet@max")
+    rc, out, _err, record = _gate_cli(
+        monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet", "--effort", "max"]
+    )
+    assert rc == 0
+    first_line = out.splitlines()[0]
+    assert "[E6 arm, unmeasured C: sonnet@max]" in first_line
+    assert record["ok"] is True
+    assert record["e6_arm"] == "sonnet@max"
+    assert record["grade"] == "C"
+
+
+def test_the_marker_alone_names_the_rung_for_the_gate(monkeypatch, capsys, tmp_path):
+    """The spawn path: wrk calls `gate -m <profile>` and passes no --effort."""
+
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "sonnet@max")
+    rc, out, _err, _record = _gate_cli(monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet"])
+    assert rc == 0
+    assert "[E6 arm, unmeasured C: sonnet@max]" in out.splitlines()[0]
+
+
+@pytest.mark.parametrize("marker", ["SONNET@MAX", " sonnet@max ", "Sonnet@Max"])
+def test_the_marker_is_normalized_like_an_effort_spelling(monkeypatch, capsys, tmp_path, marker):
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, marker)
+    rc, out, _err, _record = _gate_cli(monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet"])
+    assert rc == 0
+    assert "[E6 arm, unmeasured C: sonnet@max]" in out.splitlines()[0]
+
+
+def test_the_marker_accepts_the_launcher_alias(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "codex-max@high")
+    rc, out, _err, _record = _gate_cli(
+        monkeypatch, capsys, tmp_path, "codex", ["gate", "-m", "codex-max", "--effort", "high"]
+    )
+    assert rc == 0
+    assert "[E6 arm, unmeasured C: codex-sol@high]" in out.splitlines()[0]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "sonnet@high",  # a placed rung, not an E6 rung
+        "sonnet",  # no rung named
+        "sonnet@",  # empty rung
+        "@max",  # empty profile
+        "opus@low",  # a different profile's rung
+        "sonnet@max@max",  # not a rung name
+    ],
+)
+def test_a_marker_that_does_not_name_this_rung_opens_nothing(marker):
+    result = gate_check(
+        [_provider("claude", pool_class="spend")],
+        "sonnet",
+        effort="max",
+        e6_arm=marker,
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "e6_arm_required" in result.reason
+    assert "sonnet@max" in result.reason
+
+
+def test_the_marker_parser_folds_spelling_and_rejects_a_value_that_names_no_rung():
+    assert parse_e6_arm_marker(None) is None
+    assert parse_e6_arm_marker("") is None
+    assert parse_e6_arm_marker("sonnet") is None
+    assert parse_e6_arm_marker("sonnet@") is None
+    assert parse_e6_arm_marker("@max") is None
+    assert parse_e6_arm_marker(" Sonnet@MAX ").label == "sonnet@max"
+    assert parse_e6_arm_marker("codex-max@high").label == "codex-sol@high"
+
+
+def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
+    """sonnet@high is a placement: the marker neither opens nor closes anything."""
+
+    result = gate_check(
+        [_provider("claude", pool_class="spend")],
+        "sonnet",
+        effort="high",
+        e6_arm="sonnet@high",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True
+    assert result.grade == "A+"
+    assert result.e6_arm is None
+    assert "E6 arm" not in result.reason
+
+
+def test_the_gate_judges_the_rung_that_was_requested():
+    """`gate -m opus --effort low` is the low rung's judgement, not the profile's best."""
+
+    result = gate_check([_provider("claude", pool_class="spend")], "opus", effort="low", today=TODAY, now=NOW)
+    assert result.grade == "S"
+    assert "escalation" in result.reason
+    plain = gate_check([_provider("claude", pool_class="spend")], "opus", today=TODAY, now=NOW)
+    assert plain.grade == "S+"
+
+
+def test_a_measured_canon_row_lifts_the_e6_restriction():
+    """The restriction is 'unmeasured C' — once the canon measures the rung it is ordinary."""
+
+    table = {grade: list(profiles) for grade, profiles in GRADE_TABLE.items()}
+    table["B"].append(
+        Profile("sonnet", "Sonnet 5 (max)", 45.0, launcher_effort="max", benchmark_effort="max")
+    )
+    result = gate_check(
+        [_provider("claude", pool_class="spend")],
+        "sonnet",
+        effort="max",
+        today=TODAY,
+        now=NOW,
+        grade_table=table,
+    )
+    assert result.ok is True
+    assert result.grade == "B"
+    assert result.e6_arm is None
+
+
+# --- AC3: existing behavior is untouched -------------------------------------
+
+
+def test_an_unmarked_request_keeps_the_default_placement():
+    """`wrk -m codex` pins codex-sol@high; the C row must not answer for it."""
+
+    decision = launch.resolve_launch("codex-sol", effort="high")
+    assert decision.model_id == "gpt-6-sol"
+    assert decision.effort == "high"
+    assert decision.gate == "default"
+    assert decision.grade == "S+"
+    assert decision.e6_arm is None
+
+
+def test_builder_grok_pin_still_resolves_without_a_marker():
+    decision = launch.resolve_launch("grok-hi", effort="xhigh")
+    assert decision.model_id == "grok-4.7"
+    assert decision.effort == "xhigh"
+    assert decision.grade == "S"
+    assert decision.e6_arm is None
+
+
+def test_an_unmarked_new_rung_keeps_todays_fallback():
+    decision = launch.resolve_launch("sonnet", effort="max")
+    assert decision.effort == "max"
+    assert decision.grade == "A+"  # sonnet@high's placement, as before #692
+    assert decision.e6_arm is None
+
+
+def test_the_marker_does_not_change_a_request_that_names_no_rung(monkeypatch, capsys):
+    """wrk calls `policy launch <profile>` with no --effort on the sonnet spelling."""
+
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "sonnet@max")
+    assert cli.main(["policy", "launch", "sonnet", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effort"] == "high"
+    assert payload["grade"] == "A+"
+    assert payload["e6_arm"] is None
+
+
+@pytest.mark.parametrize(("key", "grade"), sorted(EXISTING_RUNGS.items()))
+def test_existing_rung_grades_are_unchanged(key, grade):
+    profile, effort = key
+    decision = launch.resolve_launch(profile, effort=effort, e6_arm=f"{profile}@{effort}")
+    assert decision.grade == grade
+    assert decision.e6_arm is None
+
+
+def test_the_plain_gate_output_carries_no_e6_field(monkeypatch, capsys, tmp_path):
+    rc, out, _err, record = _gate_cli(monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet"])
+    assert rc == 0
+    assert "E6 arm" not in out
+    assert "e6_arm" not in record
+
+
+def test_every_e6_row_is_unmeasured_and_grade_c():
+    for row in E6_ARM_RUNGS:
+        assert row.benchmark is None
+        assert row.benchmark_source is None
+        assert row.launcher_effort
+        assert row.benchmark_annotation is not None

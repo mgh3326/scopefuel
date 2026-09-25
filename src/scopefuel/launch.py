@@ -34,9 +34,15 @@ from .bench import (
 from .recommend import (
     ASTRA_ALLOWED_PURPOSES,
     ASTRA_ROLE_PROFILES,
+    E6_ARM_GRADE,
+    E6_ARM_RUNGS,
     GRADE_TABLE,
     PROFILE_ALIASES,
     REP_GRADES_ORDER,
+    e6_arm_matches,
+    e6_arm_rung_for,
+    normalize_effort,
+    parse_e6_arm_marker,
     profile_pool,
 )
 
@@ -161,6 +167,10 @@ def snapshot_entries() -> tuple[CatalogEntry, ...]:
     effort)`` and cannot express the multi-grade listing; the code table keeps it
     and stays authoritative for recommendation output while the catalog is out
     of reach.
+
+    These are *placements*.  The E6 measurement rungs live in
+    :func:`e6_arm_entries` instead: they are catalog rows, not placements, and
+    the placement snapshot must keep its invariants (Sol stays S+-only).
     """
 
     best: dict[tuple[str, str], tuple[int, CatalogEntry]] = {}
@@ -189,6 +199,38 @@ def snapshot_entries() -> tuple[CatalogEntry, ...]:
     return tuple(sorted(entries, key=lambda e: (e.profile, CATALOG_EFFORT_RANKS.get(e.effort, 99))))
 
 
+# #692: the E6 plan the measurement rungs exist for (hk:doc plan/2026-09-25/e6-effort-ladder).
+E6_ARM_DEVIATION_REF = "hk:doc plan/2026-09-25/e6-effort-ladder (#594 E6)"
+
+
+def e6_arm_entries() -> tuple[CatalogEntry, ...]:
+    """The E6 measurement rungs as catalog rows (#692).
+
+    Catalog rows, not placements: grade C with no score, never a recommendation
+    candidate, never a launcher default.  They are deliberately *not* part of
+    :func:`snapshot_entries` — that snapshot mirrors the reviewed placement canon
+    and must keep Sol S+-only — so ``bench.catalog_snapshot()`` merges them into
+    the catalog view (``bench catalog list``, ``read_catalog``, the canon seed)
+    while the placement snapshot stays untouched.
+    """
+
+    return tuple(
+        CatalogEntry(
+            profile=row.name,
+            effort=row.launcher_effort or "",
+            model_id=_snapshot_model_id(row.name, row),
+            pool=profile_pool(row.name)[0],
+            grade=E6_ARM_GRADE,
+            score=None,
+            gate=GATE_DEFAULT,
+            benchmark_source=row.benchmark_source,
+            benchmark_annotation=row.benchmark_annotation,
+            deviation_ref=E6_ARM_DEVIATION_REF,
+        )
+        for row in E6_ARM_RUNGS
+    )
+
+
 @dataclass(frozen=True)
 class LaunchDecision:
     """What a launcher needs, plus where the answer came from."""
@@ -204,6 +246,9 @@ class LaunchDecision:
     catalog_stale: bool
     catalog_age_s: float | None
     operator_request: bool = False
+    # #692: the E6 measurement rung this launch was resolved as ("<profile>@<effort>"),
+    # or None for every ordinary launch. Only an E6 arm marker opens one.
+    e6_arm: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         value = dataclasses.asdict(self)
@@ -227,6 +272,8 @@ class LaunchDecision:
         ]
         if self.gate_reason:
             lines.append(f"gate_reason {self.gate_reason}")
+        if self.e6_arm:
+            lines.append(f"e6_arm {self.e6_arm}")
         suffix = " (stale)" if self.catalog_stale else ""
         lines.append(f"catalog {self.catalog_source}{suffix}")
         return "\n".join(lines)
@@ -273,21 +320,6 @@ def _default_effort(profile: str, rows: list[CatalogEntry]) -> tuple[str, str]:
     # best-graded ordinary rung, cheapest rung on a tie.
     chosen = min(best, key=lambda row: CATALOG_EFFORT_RANKS.get(row.effort, 99)).effort
     return chosen, chosen
-
-
-def _normalize_effort(effort: str | None) -> str | None:
-    """Fold an effort to the spelling the catalog is keyed on.
-
-    Rung names are a closed lowercase vocabulary, so ``HIGH`` and ``"high "``
-    name the same rung. Matching them raw let a caller miss an exact gated row
-    and land on the profile's default placement instead — a gate bypass spelled
-    with a capital letter.
-    """
-
-    if effort is None:
-        return None
-    normalized = effort.strip().lower()
-    return normalized or None
 
 
 def _known_rung(effort: str, entries: tuple[CatalogEntry, ...] | list[CatalogEntry]) -> bool:
@@ -343,6 +375,7 @@ def resolve_launch(
     purpose: str | None = None,
     path: str | None = None,
     view: CatalogView | None = None,
+    e6_arm: str | None = None,
 ) -> LaunchDecision:
     """Resolve one launch against the canon, refusing to widen while stale.
 
@@ -350,6 +383,13 @@ def resolve_launch(
     profile, a rung the catalog retired, or a gate the caller has not been
     cleared for. A server outage is not an argument for any of those (hk:doc
     2558 — a down server is not free dispatch).
+
+    ``e6_arm``(#692) is the raw ``SCOPEFUEL_E6_ARM=<profile>@<effort>`` marker the
+    spawner set. A C-graded E6 measurement rung is resolved only when the marker
+    names exactly that rung; without it the request keeps the ordinary fallback
+    (today's answer for a rung the catalog never placed), so no existing spelling
+    changes. Once the canon carries the rung with a measured grade the row is
+    ordinary again and the marker is inert.
     """
 
     view = read_catalog(path=path) if view is None else view
@@ -377,7 +417,22 @@ def resolve_launch(
         rows = snapshot_rows
         from_snapshot = True
 
-    requested = _normalize_effort(effort)
+    requested = normalize_effort(effort)
+    marker = parse_e6_arm_marker(e6_arm)
+    e6_row = e6_arm_rung_for(canonical, requested)
+    e6_open = e6_row is not None and e6_arm_matches(marker, canonical, requested)
+    if e6_row is not None and not e6_open:
+        # #692: a C-graded E6 measurement rung is not a placement, so without the
+        # marker it must not answer for the request. Dropping the row (rather than
+        # refusing) keeps every existing spelling exactly as it was: ``wrk -m
+        # codex`` pins codex-sol@high and ``-m builder-grok`` pins grok-hi@xhigh,
+        # and a spawn that never asked for an E6 arm must not start failing. A row
+        # the canon placed above C is a placement and stays.
+        rows = [
+            row
+            for row in rows
+            if (row.profile, row.effort) != (canonical, requested) or row.grade != E6_ARM_GRADE
+        ]
     profile_entries = (
         rows if from_snapshot else [entry for entry in view.entries if entry.profile == canonical]
     )
@@ -396,6 +451,11 @@ def resolve_launch(
     # the profile-default row's permissive gate while the canon has gated the
     # high rung specifically.
     matched = [row for row in rows if row.effort == resolved_effort]
+    if not matched and e6_open:
+        # The canon is silent about this rung (a server that has not been seeded
+        # with the E6 rows yet). The bundled measurement row is the answer — the
+        # marker named it, and its grade C is the statement being made.
+        matched = [entry for entry in e6_arm_entries() if entry.effort == resolved_effort]
     if not matched:
         if _retired_rung(view, canonical, resolved_effort):
             raise LaunchError(f"profile '{profile}' rung '{resolved_effort}' is retired in the catalog")
@@ -411,6 +471,14 @@ def resolve_launch(
                 f"profile '{profile}' has no '{resolved_effort}' rung in the catalog (have: {available})"
             )
     row = matched[0]
+    # The arm is opened only when the resolved row *is* the unmeasured rung the
+    # marker named — a canon row placed above C is an ordinary row, and the marker
+    # must not claim it as an E6 admission.
+    opened_arm = (
+        f"{canonical}@{resolved_effort}"
+        if e6_open and row.grade == E6_ARM_GRADE and (row.profile, row.effort) == (canonical, resolved_effort)
+        else None
+    )
 
     # The gate rules. consult_only always needs an explicit operator request.
     # A non-default gate under a stale catalog needs one too: the snapshot saying
@@ -448,4 +516,5 @@ def resolve_launch(
         catalog_stale=view.stale or from_snapshot,
         catalog_age_s=view.age_s,
         operator_request=operator_request,
+        e6_arm=opened_arm,
     )

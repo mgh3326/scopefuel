@@ -1072,6 +1072,186 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
 }
 
 
+# ── #692: E6 measurement rungs (#594, plan hk:doc plan/2026-09-25/e6-effort-ladder) ──
+# E6 compares one model at several efforts on real tasks. A rung the catalog has
+# no row for is answered from the profile's default placement (see
+# ``launch._default_effort``) — that is how an unmeasured rung quietly inherits a
+# measured grade. These rows exist so the catalog knows the rung and the gate can
+# judge it, but they are *measurement* rows, never placements:
+#
+#   * grade C with no benchmark — no grade claim is made (nothing above C);
+#   * never in ``GRADE_TABLE``, so ``--recommend`` cannot propose them at any
+#     grade and no launcher default moves onto them;
+#   * resolved only by an explicit E6 arm request — the env marker
+#     ``SCOPEFUEL_E6_ARM=<profile>@<effort>`` (see :func:`parse_e6_arm_marker`).
+#     Without the marker the gate refuses the rung with a reason naming it
+#     (rc 3) and ``policy launch`` keeps its ordinary fallback, so every existing
+#     spelling is unchanged (``wrk -m codex`` pins codex-sol@high, ``-m
+#     builder-grok`` pins grok-hi@xhigh — refusing those would break spawns that
+#     never asked for an E6 arm).
+#
+# The restriction is keyed on the *effective* row's grade: once the canon carries
+# the rung with a measured grade, the row is ordinary again and the marker is
+# inert. ``launch.e6_arm_entries()`` turns this table into catalog rows;
+# ``bench.catalog_snapshot()`` merges them into the catalog view.
+E6_ARM_GRADE: Grade = "C"
+E6_ARM_ANNOTATION = "미측정(#594 E6 측정 런그 · 급 비상속 · SCOPEFUEL_E6_ARM 표식 필요)"
+# The rung the spawner declares: ``SCOPEFUEL_E6_ARM=<profile>@<effort>``.
+E6_ARM_MARKER_ENV = "SCOPEFUEL_E6_ARM"
+
+
+def _e6_arm_profile(name: str, model: str, effort: str, reference: str, **kwargs) -> Profile:
+    """One unmeasured E6 rung row. ``reference`` cites AA data scopefuel stores."""
+
+    return Profile(
+        name,
+        model,
+        None,
+        launcher_effort=effort,
+        benchmark_effort=effort,
+        benchmark_annotation=f"{E6_ARM_ANNOTATION} · AA 참조 {reference}",
+        **kwargs,
+    )
+
+
+E6_ARM_RUNGS: tuple[Profile, ...] = (
+    _e6_arm_profile(
+        "sonnet",
+        "Sonnet 5 (max)",
+        "max",
+        "claude-sonnet-5 AA-model intelligence xhigh 34.4 저장(max 미저장)",
+        aa_model_id="claude-sonnet-5",
+    ),
+    _e6_arm_profile(
+        "codex-sol",
+        "GPT-6 Sol (high)",
+        "high",
+        "gpt-6-sol AA-model intelligence high 42.8",
+        aa_agent_model_id="gpt-6-sol",
+        aa_model_id="gpt-6-sol",
+    ),
+    _e6_arm_profile(
+        "kimi-k3",
+        "Kimi K3 (high)",
+        "high",
+        "kimi-k3 AA-agent agentic default 61.0",
+        aa_agent_model_id="kimi-k3",
+        aa_model_id="kimi-k3",
+    ),
+    _e6_arm_profile(
+        "kimi-k3",
+        "Kimi K3 (max)",
+        "max",
+        "kimi-k3 AA-agent agentic default 61.0",
+        aa_agent_model_id="kimi-k3",
+        aa_model_id="kimi-k3",
+    ),
+    _e6_arm_profile(
+        "grok-hi",
+        "Grok 4.7 (xhigh)",
+        "xhigh",
+        "grok-4-7 AA-model intelligence high 46.3 저장(xhigh 미저장)",
+        aa_agent_model_id="grok-4.7",
+        aa_model_id="grok-4-7",
+    ),
+)
+
+E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
+    (row.name, row.launcher_effort or "") for row in E6_ARM_RUNGS
+)
+
+
+def normalize_effort(effort: str | None) -> str | None:
+    """Fold an effort to the spelling the catalog is keyed on.
+
+    Rung names are a closed lowercase vocabulary, so ``HIGH`` and ``"high "``
+    name the same rung. Matching them raw let a caller miss an exact gated row
+    and land on the profile's default placement instead — a gate bypass spelled
+    with a capital letter. Shared by ``--effort``, the E6 marker and
+    ``policy launch`` so one spelling cannot mean different rungs in two places.
+    """
+
+    if effort is None:
+        return None
+    normalized = effort.strip().lower()
+    return normalized or None
+
+
+@dataclass(frozen=True)
+class E6ArmRequest:
+    """A parsed ``SCOPEFUEL_E6_ARM`` declaration: the rung being measured."""
+
+    profile: str
+    effort: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.profile}@{self.effort}"
+
+
+def parse_e6_arm_marker(raw: str | None) -> E6ArmRequest | None:
+    """Parse ``SCOPEFUEL_E6_ARM=<profile>@<effort>`` — the one E6 arm mechanism.
+
+    The spawner sets the marker on the spawn command (``SCOPEFUEL_E6_ARM=sonnet@max
+    wrk spawn …``); wrk forwards its environment to the ``scopefuel`` subprocesses
+    it calls, so the gate can judge *that rung* instead of the profile's default
+    placement. Rung names are the closed lowercase vocabulary, so the value is
+    normalized like ``--effort`` — a capital letter must not create a second
+    spelling that misses the rung.
+
+    A value that does not name a rung parses to ``None``: the marker can only ever
+    widen admission for the exact rung it names, so an unparsed value widens
+    nothing (fail-closed) and the E6 rung stays refused.
+    """
+
+    if raw is None:
+        return None
+    text = raw.strip().lower()
+    if not text:
+        return None
+    profile, separator, effort = text.partition("@")
+    profile, effort = profile.strip(), effort.strip()
+    if not separator or not profile or not effort:
+        return None
+    return E6ArmRequest(profile=PROFILE_ALIASES.get(profile, profile), effort=effort)
+
+
+def e6_arm_rung_for(profile: str, effort: str | None) -> Profile | None:
+    """The bundled E6 measurement row for a rung, or ``None`` when it is not one."""
+
+    normalized = normalize_effort(effort)
+    if normalized is None:
+        return None
+    canonical = PROFILE_ALIASES.get(profile, profile)
+    for row in E6_ARM_RUNGS:
+        if row.name == canonical and row.launcher_effort == normalized:
+            return row
+    return None
+
+
+def e6_arm_matches(marker: E6ArmRequest | None, profile: str, effort: str | None) -> bool:
+    """Whether the marker names exactly this rung (alias-resolved, normalized)."""
+
+    if marker is None:
+        return False
+    normalized = normalize_effort(effort)
+    if normalized is None:
+        return False
+    return marker.profile == PROFILE_ALIASES.get(profile, profile) and marker.effort == normalized
+
+
+def e6_arm_tag(rung: str) -> str:
+    """The visible admission marker the gate prints on its allow line."""
+
+    return f"[E6 arm, unmeasured C: {rung}]"
+
+
+def _e6_arm_suffix(e6_arm: str | None) -> str:
+    """The marker appended to an allow reason; empty for every ordinary rung."""
+
+    return f" {e6_arm_tag(e6_arm)}" if e6_arm else ""
+
+
 _GRADE_ORDER: tuple[Grade, ...] = ("S+", "S", "A+", "A", "B", "C")
 # Public alias: the launch catalog ranks grades with the same ladder and must
 # not keep a second copy of it.
@@ -2018,6 +2198,10 @@ class GateResult:
     # task #690 — REQUIRED_WINDOWS 중 유효 bucket 으로 커버되지 않은 창 이름
     # (스냅샷 부재·값 읽기 실패). 감사 필드 — reason 에도 같은 이름이 표기된다.
     missing_windows: tuple[str, ...] = ()
+    # task #692 — 이 판정이 연 E6 측정 런그 라벨("<profile>@<effort>"), 아니면 None.
+    # C 급 E6 런그는 이 표식이 있을 때만 열리므로, 통과 판정의 감사 필드이자
+    # allow 라인에 붙는 가시 표식의 원천이다.
+    e6_arm: str | None = None
 
 
 def _find_profile(
@@ -2028,6 +2212,29 @@ def _find_profile(
     for grade, profiles in table.items():
         for profile in profiles:
             if profile.name == profile_name:
+                return grade, profile
+    return None
+
+
+def _find_rung(
+    profile_name: str, effort: str | None, *, grade_table: dict[Grade, list[Profile]] | None = None
+) -> tuple[Grade, Profile] | None:
+    """The row the catalog places at exactly this (profile, effort) rung.
+
+    ``None`` means the table does not carry that rung — the caller keeps the
+    profile's default placement, the same fallback ``policy launch`` applies. A
+    row whose effort lives in a sibling profile spelling (``codex-terra-max``)
+    is not a row of this rung.
+    """
+
+    normalized = normalize_effort(effort)
+    if normalized is None:
+        return None
+    canonical = PROFILE_ALIASES.get(profile_name, profile_name)
+    table = GRADE_TABLE if grade_table is None else grade_table
+    for grade, profiles in table.items():
+        for profile in profiles:
+            if profile.name == canonical and (profile.launcher_effort or "") == normalized:
                 return grade, profile
     return None
 
@@ -2126,8 +2333,19 @@ def gate_check(
     operator_request: str | None = None,
     requested_by: str | None = None,
     purpose: str | None = None,
+    effort: str | None = None,
+    e6_arm: str | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
+
+    ``effort``(#692)는 요청한 *런그*다. 주어지면 그 런그의 행으로 판정하고(예:
+    ``gate -m opus --effort low`` 는 S 의 escalation 자격을 본다), 표가 그 런그를
+    모르면 프로필 기본 배치로 답한다 — ``policy launch`` 와 같은 폴백이다.
+
+    ``e6_arm``(#692)은 스포너가 설정한 ``SCOPEFUEL_E6_ARM=<profile>@<effort>``
+    표식의 원문이다. C 급 E6 측정 런그는 이 표식이 그 런그를 가리킬 때만 열리고,
+    없으면 런그 이름을 댄 사유와 함께 거부한다(rc 3). 표식은 그 런그 하나만
+    열 수 있다 — 다른 프로필/런그를 가리키면 아무것도 넓히지 못한다.
 
     escalation 프로필은 "같은 grade 정상 대안이 전부 비가용"이라는 자격을 먼저 확인한다.
     자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
@@ -2214,7 +2432,53 @@ def gate_check(
     # ``requested_by`` 미지정 시 자기신고 기본값. 신원 증명이 아니라 audit 라벨이다.
     audit_requested_by = ((requested_by or "").strip() or "unknown") if operator_request is not None else None
 
+    # #692: 어떤 런그를 판정하는가. --effort 가 런그를 지명하고, 없으면 E6 표식이
+    # 지명한다(스포너가 런그를 알려 주는 유일한 경로 — wrk 는 gate 에 --effort 를
+    # 넘기지 않는다). 둘 다 없으면 프로필 기본 배치로 답한다 — 기존 동작 그대로다.
+    canonical_profile = PROFILE_ALIASES.get(profile_name, profile_name)
+    e6_marker = parse_e6_arm_marker(e6_arm)
+    marker_rung = (
+        e6_marker.effort if e6_marker is not None and e6_marker.profile == canonical_profile else None
+    )
+    rung = normalize_effort(effort) or marker_rung
+    rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
+    # 캐논이 그 런그를 C 밖으로 배치했으면 E6 제한은 없다 — 제한은 "미측정 C" 동안만
+    # 유효하다(측정이 끝난 런그는 평범한 런그다).
+    e6_row = (
+        None
+        if rung_row is not None and rung_row[0] != E6_ARM_GRADE
+        else e6_arm_rung_for(canonical_profile, rung)
+    )
+    e6_admitted: str | None = None
+    if e6_row is not None:
+        # C 급 E6 측정 런그는 배치가 아니다 — 표식이 정확히 이 런그를 가리킬 때만
+        # 열린다. 없으면 런그 이름을 댄 사유로 거부한다(쿼타 판정 이전 — 배치 자체가
+        # 없는 런그를 쿼타로 판정하면 "쿼타 소진"으로 오독된다).
+        if not e6_arm_matches(e6_marker, canonical_profile, rung):
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=E6_ARM_GRADE,
+                reason=(
+                    f"e6_arm_required: {canonical_profile}@{rung} 은 미측정 E6 측정 런그다 "
+                    f"(#594) — SCOPEFUEL_E6_ARM={canonical_profile}@{rung} 표식이 있어야 연다"
+                ),
+                e6_arm=f"{canonical_profile}@{rung}",
+            )
+        e6_admitted = f"{canonical_profile}@{rung}"
+
     found = _find_profile(profile_name, grade_table=table)
+    if e6_admitted is not None:
+        # 열린 런그의 급은 C 다 — 프로필 기본 배치(A+ 등)를 보고하면 감사 기록이
+        # 실제 측정 런그보다 높은 급을 주장하게 된다.
+        assert e6_row is not None
+        found = (E6_ARM_GRADE, e6_row)
+    elif rung_row is not None:
+        # #692: 판정 대상은 요청한 런그의 행이다. 프로필의 최선 배치가 아니다 —
+        # `gate -m opus --effort low` 는 low 런그의 판정이다. 표가 모르는 런그는
+        # 프로필 기본 배치로 답한다(policy launch 와 같은 폴백).
+        found = rung_row
 
     # escalation 이 아닌 프로필에 operator-request 를 주면 조용히 무시하지 않고 거부한다 —
     # 범용 우회 플래그로 오인되는 것을 막기 위한 fail-closed. task #625: 단
@@ -2366,6 +2630,7 @@ def gate_check(
             reason += (
                 f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
             )
+        reason += _e6_arm_suffix(e6_admitted)
         return GateResult(
             ok=True,
             profile=profile_name,
@@ -2376,6 +2641,7 @@ def gate_check(
             pool_class=effective_class,
             stale_accepted=accepted is not None,
             missing_windows=missing,
+            e6_arm=e6_admitted,
             **audit,
         )
 
@@ -2444,6 +2710,7 @@ def gate_check(
                     operator_request, audit_requested_by or "unknown", escalation_override
                 )
                 reason += f" [{tag}]"
+            reason += _e6_arm_suffix(e6_admitted)
             return GateResult(
                 ok=True,
                 profile=profile_name,
@@ -2451,6 +2718,7 @@ def gate_check(
                 grade=grade,
                 reason=reason,
                 missing_windows=missing,
+                e6_arm=e6_admitted,
                 **audit,
             )
 
@@ -2551,6 +2819,7 @@ def gate_check(
                 operator_request, audit_requested_by or "unknown", escalation_override
             )
             reason += f" [{tag}]"
+        reason += _e6_arm_suffix(e6_admitted)
         return GateResult(
             ok=True,
             profile=profile_name,
@@ -2561,6 +2830,7 @@ def gate_check(
             pool_class=effective_class,
             stale_accepted=accepted is not None,
             missing_windows=missing,
+            e6_arm=e6_admitted,
             **audit,
         )
 
@@ -2571,6 +2841,7 @@ def gate_check(
         reason += f" [{_stale_tag(result, accepted)}]"
     if operator_request is not None:
         reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
+    reason += _e6_arm_suffix(e6_admitted)
     return GateResult(
         ok=True,
         profile=profile_name,
@@ -2581,6 +2852,7 @@ def gate_check(
         pool_class=effective_class,
         stale_accepted=accepted is not None,
         missing_windows=missing,
+        e6_arm=e6_admitted,
         **audit,
     )
 

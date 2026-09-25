@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import datetime as dt
 import json
+import os
 import pathlib
 import sys
 import time
@@ -333,6 +334,15 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     gate_parser.add_argument(
         "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
     )
+    gate_parser.add_argument(
+        "--effort",
+        choices=sorted(rung for rung in bench.CATALOG_EFFORT_RANKS if rung),
+        help=(
+            "#692: 판정할 런그(예: low/max). 주어지면 그 런그의 행으로 판정하고, "
+            "표가 모르는 런그는 프로필 기본 배치로 답한다. 미측정 E6 측정 런그는 "
+            f"{recommend.E6_ARM_MARKER_ENV}=<profile>@<effort> 표식이 있을 때만 열린다"
+        ),
+    )
 
     refresh_parser = subparsers.add_parser("refresh", help="한 pool만 이벤트 기반으로 캐시 갱신")
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
@@ -555,39 +565,47 @@ def _gate_record(
     account: str | None = None,
 ) -> dict:
     """gate 판정의 감사 레코드 (``--gate-output`` JSON 본체)."""
-    return {
-        "schema": "scopefuel.gate.v1",
-        "generated_at": now.isoformat(),
-        "profile": result.profile,
-        "grade": result.grade,
-        "provider_id": result.provider_id,
-        "ok": result.ok,
-        "exit_code": exit_code,
-        "unmeasurable": result.unmeasurable,
-        "stale_accepted": result.stale_accepted,
-        "used_pct": result.used_pct,
-        "pool_class": result.pool_class,
-        "reason": result.reason,
-        "alternatives": list(result.alternatives),
-        "escalation_override": result.escalation_override,
-        "operator_request_ref": result.operator_request_ref,
-        "requested_by": result.requested_by,
-        "ref_resolution": result.ref_resolution,
-        "role_denied": result.role_denied,
-        "purpose": purpose,
-        "source": result.source,
-        "source_verification": result.source_verification,
-        "source_label": result.source_label,
-        "manual_observation_ids": list(result.manual_observation_ids),
-        "manual_observations": list(result.manual_observations),
-        "measured_at": result.measured_at,
-        "expires_at": result.expires_at,
-        "observed_age_s": result.observed_age_s,
-        "remaining_effect_s": result.remaining_effect_s,
-        "last_auto_error": result.last_auto_error,
-        "exhaust_notice": result.exhaust_notice,
-        "missing_windows": list(result.missing_windows),
-    } | ({"account": account} if account else {})
+    return (
+        {
+            "schema": "scopefuel.gate.v1",
+            "generated_at": now.isoformat(),
+            "profile": result.profile,
+            "grade": result.grade,
+            "provider_id": result.provider_id,
+            "ok": result.ok,
+            "exit_code": exit_code,
+            "unmeasurable": result.unmeasurable,
+            "stale_accepted": result.stale_accepted,
+            "used_pct": result.used_pct,
+            "pool_class": result.pool_class,
+            "reason": result.reason,
+            "alternatives": list(result.alternatives),
+            "escalation_override": result.escalation_override,
+            "operator_request_ref": result.operator_request_ref,
+            "requested_by": result.requested_by,
+            "ref_resolution": result.ref_resolution,
+            "role_denied": result.role_denied,
+            "purpose": purpose,
+            "source": result.source,
+            "source_verification": result.source_verification,
+            "source_label": result.source_label,
+            "manual_observation_ids": list(result.manual_observation_ids),
+            "manual_observations": list(result.manual_observations),
+            "measured_at": result.measured_at,
+            "expires_at": result.expires_at,
+            "observed_age_s": result.observed_age_s,
+            "remaining_effect_s": result.remaining_effect_s,
+            "last_auto_error": result.last_auto_error,
+            "exhaust_notice": result.exhaust_notice,
+            "missing_windows": list(result.missing_windows),
+        }
+        | ({"account": account} if account else {})
+        | (
+            # #692: only an opened E6 measurement rung carries this — every other
+            # record stays byte-identical (the #635 golden compares whole records).
+            {"e6_arm": result.e6_arm} if result.e6_arm else {}
+        )
+    )
 
 
 def _gate_args(args: argparse.Namespace) -> dict:
@@ -596,6 +614,28 @@ def _gate_args(args: argparse.Namespace) -> dict:
         "requested_by": args.requested_by,
         "purpose": args.purpose,
     }
+
+
+def _e6_arm_marker() -> str | None:
+    """The spawner's E6 arm declaration, read from the environment (#692).
+
+    One mechanism, set by the spawner on the spawn command:
+    ``SCOPEFUEL_E6_ARM=<profile>@<effort>``. wrk forwards its environment to the
+    ``scopefuel`` subprocesses it calls, so both the catalog route and the quota
+    gate see the same declaration. Unset (the default) means no E6 arm.
+    """
+
+    return os.environ.get(recommend.E6_ARM_MARKER_ENV)
+
+
+def _gate_rung_args(args: argparse.Namespace) -> dict:
+    """#692: the rung context — the explicit ``--effort`` plus the E6 marker.
+
+    Kept apart from :func:`_gate_args` so the v2 shadow, which has no rung input
+    in its contract, is not handed keys it cannot consume.
+    """
+
+    return {"effort": getattr(args, "effort", None), "e6_arm": _e6_arm_marker()}
 
 
 def _manual_gate_audit(
@@ -687,6 +727,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         model_prices=model_prices,
         grade_table=grade_table,
         **_gate_args(args),
+        **_gate_rung_args(args),
     )
 
     # Manual observations are considered only after the automatic path is
@@ -719,6 +760,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                     model_prices=model_prices,
                     grade_table=grade_table,
                     **_gate_args(args),
+                    **_gate_rung_args(args),
                 )
                 if failure_kind != "auth"
                 and target.buckets
@@ -746,6 +788,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         model_prices=model_prices,
                         grade_table=grade_table,
                         **_gate_args(args),
+                        **_gate_rung_args(args),
                     )
                     result = _manual_gate_audit(result, resolution)
                 elif resolution is not None:
@@ -815,6 +858,10 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         )
         if tag:
             first_line += f' account="{tag}"'
+        # #692: an opened E6 measurement rung says so on the allow line itself —
+        # a C-graded rung admitted for an E6 arm must be visible, not implied.
+        if result.e6_arm:
+            first_line += f" {recommend.e6_arm_tag(result.e6_arm)}"
         if result.stale_accepted:
             first_line += " stale_accepted=true"
         if result.operator_request_ref is not None:
@@ -860,6 +907,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             "역할 거부 — 쿼타와 무관. 허용 용도로 --purpose 를 지정해야 쿼타 검사로 진행한다",
             file=sys.stderr,
         )
+    elif result.e6_arm and not result.ok:
+        # #692: an unmeasured E6 rung is refused on the rung, not on alternatives —
+        # the generic "no alternatives" line would misread as quota exhaustion.
+        print(
+            f"해결: {recommend.E6_ARM_MARKER_ENV}={result.e6_arm} 표식과 함께 스폰하라 (#594 E6 측정 런그)",
+            file=sys.stderr,
+        )
     elif result.alternatives:
         print(f"대안({result.grade}): {', '.join(result.alternatives)}", file=sys.stderr)
     else:
@@ -881,6 +935,7 @@ def _policy_launch_command(args: argparse.Namespace) -> int:
             effort=args.effort,
             operator_request=bool(args.operator_request),
             purpose=getattr(args, "purpose", None),
+            e6_arm=_e6_arm_marker(),
         )
     except launch.LaunchError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -909,6 +964,14 @@ def _seed_catalog_json(args: argparse.Namespace) -> int:
         row = entry.as_dict()
         row["decided_by"] = decided_by
         row["deviation_ref"] = deviation_ref
+        rows.append(row)
+    # #692: the E6 measurement rungs are catalog rows too — the canon has to carry
+    # them, or a server-backed host cannot resolve the arm. Each keeps its own
+    # deviation_ref (the E6 plan) rather than the generic seed provenance.
+    for entry in launch.e6_arm_entries():
+        row = entry.as_dict()
+        row["decided_by"] = decided_by
+        row["deviation_ref"] = entry.deviation_ref or deviation_ref
         rows.append(row)
     print(json.dumps({"catalog": rows}, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

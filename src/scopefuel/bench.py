@@ -2469,11 +2469,18 @@ def _read_catalog_uncached(backend: BenchBackend, *, path: pathlib.Path | str | 
 
 
 def catalog_snapshot() -> tuple[CatalogEntry, ...]:
-    """The bundled offline snapshot, derived from the reviewed code tables."""
+    """The bundled offline catalog, derived from the reviewed code tables.
 
-    from .launch import snapshot_entries
+    Placements plus the #692 E6 measurement rungs: the rungs are catalog rows
+    (grade C, unmeasured, marker-gated) but not placements, so they are kept out
+    of ``snapshot_entries()`` — that snapshot mirrors the placement canon and
+    keeps its invariants (Sol S+-only) — while the catalog view, ``bench catalog
+    list`` and the canon seed all carry them.
+    """
 
-    return snapshot_entries()
+    from .launch import e6_arm_entries, snapshot_entries
+
+    return snapshot_entries() + e6_arm_entries()
 
 
 def _catalog_sort_key(entry: CatalogEntry) -> tuple[int, str, int, str]:
@@ -2668,7 +2675,7 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
     one, because nothing downstream could tell which half it got.
     """
 
-    from .recommend import GRADE_TABLE, validate_grade_table
+    from .recommend import E6_ARM_GRADE, E6_ARM_KEYS, GRADE_TABLE, validate_grade_table
 
     if not view.entries:
         # Nothing seeded yet. A catalog that has said nothing cannot be the
@@ -2697,6 +2704,13 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
     proposed: dict[str, list] = {grade: [] for grade in GRADE_TABLE}
     for entry in sorted(live, key=_catalog_sort_key):
         if entry.gate == "consult_only":
+            continue
+        # #692: an unmeasured E6 measurement rung is a catalog row, not a
+        # candidate. A canon that carries the row (the seed emits them) must not
+        # turn it into a recommendation at C — `--recommend` never lists one, and
+        # only the E6 arm marker opens the rung at the gate. Once the canon
+        # measures it (grade above C) it is an ordinary row again.
+        if entry.key in E6_ARM_KEYS and entry.grade == E6_ARM_GRADE:
             continue
         if not entry.effort and entry.profile in enumerated:
             continue
