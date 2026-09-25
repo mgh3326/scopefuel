@@ -287,6 +287,25 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_compare.add_argument("--profile", help="프로필 필터")
     reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
 
+    reps_migrate = reps_sub.add_parser(
+        "migrate", help="로컬 bench.db reps를 handoffkeep reps 저장소로 1회 이관 (기본 dry-run)"
+    )
+    reps_migrate.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
+    reps_migrate.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정으로 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
+    reps_migrate.add_argument("--host", help="이관 행에 기록할 출처 호스트 (기본: 이 머신의 hostname)")
+    reps_migrate.add_argument(
+        "--sample", type=_nonnegative_int, default=5, help="dry-run 에서 보일 to-insert 샘플 수"
+    )
+    reps_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="원격이 같은 derived id 로 다른 rep 을 이미 갖고 있어도 덮어쓰기 진행",
+    )
+
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
         | set(recommend.PROFILE_ALIASES)
@@ -1147,6 +1166,47 @@ def _reps_command(args: argparse.Namespace) -> int:
             return 0
         for comparison in comparisons:
             print(bench.format_rep_comparison(comparison))
+        return 0
+    if args.reps_command == "migrate":
+        try:
+            result = bench.migrate_reps(
+                apply=args.apply,
+                host=args.host,
+                allow_plaintext_http=args.allow_plaintext_http,
+                force=args.force,
+            )
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not result.applied:
+            overwrite = f" would-overwrite={len(result.would_overwrite)}" if result.would_overwrite else ""
+            print(
+                f"reps migrate (dry-run) host={result.host} local={result.local_count} "
+                f"already-present={result.present_count} to-insert={len(result.pending)}{overwrite}"
+            )
+            for rep in result.pending[: args.sample]:
+                print(f"  {bench.format_rep(rep)}")
+            if result.would_overwrite:
+                print(
+                    "warning: --apply will refuse these rows without --force "
+                    "(derived id already taken by a different remote rep)"
+                )
+            print("pass --apply to write")
+            return 0
+        print(
+            f"reps migrate applied host={result.host} inserted={result.inserted_count} "
+            f"skipped={result.present_count}"
+        )
+        print(
+            f"reconcile: local={result.local_count} remote-this-host={result.remote_for_host} "
+            f"missing={len(result.missing)} extra-remote={result.extra_remote_count}"
+        )
+        for rep in result.missing[:10]:
+            print(f"  missing: {bench.format_rep(rep)}")
+        if len(result.missing) > 10:
+            print(f"  ... +{len(result.missing) - 10} more")
+        if result.missing:
+            return 2
         return 0
     return 2
 
