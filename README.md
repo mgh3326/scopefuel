@@ -210,6 +210,22 @@ catalog_ttl_s = 3600        # 카탈로그는 1시간 — 배치·모델 id의 �
 catalog_stale_max_s = 86400 # 이 나이를 넘겨 서버가 불가하면 번들 스냅샷(= stale)
 ```
 
+handoffkeep URL이 `http`이고 `localhost`가 아닐 때(예: 사설 터널 위 Tailscale
+엔드포인트) 베어러 토큰은 용도별 옵트인을 켠 경로로만 나갑니다 — 각각 기본값
+`false`이고, https는 이 플래그와 무관하게 항상 허용됩니다.
+
+```toml
+[bench]
+allow_plaintext_catalog = true      # scores/grades/catalog 정본 읽기·쓰기
+allow_plaintext_quota_share = true  # 쿼터 스냅샷 publish/read (/v1/documents)
+allow_plaintext_reps = true         # reps add/list
+```
+
+세 옵트인은 독립적입니다 — quota share·reps만 켜도 카탈로그 출처는 로컬에
+머뭅니다(서버 카탈로그로의 의도치 않은 전환, 즉 #667 회귀가 불가능). 예전 단일
+플래그 `allow_plaintext_url`은 세 용도 전부를 켜는 deprecated 별칭으로 계속
+동작하며, 켜져 있으면 경고 한 줄을 출력합니다.
+
 로컬 SQLite는 캐시가 되며, 읽기 실패는 캐시와 나이를 표시해 계속 동작하고, 쓰기 실패는
 종료코드 2로 끝납니다. `scopefuel bench push-local`은 기존 로컬 점수·reps를 지우지 않고 한 번
 이관할 때 사용합니다. 급 배치는 `scopefuel bench grades set`에서 deviation reference를 반드시

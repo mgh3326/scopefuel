@@ -107,7 +107,7 @@ localhost/127.0.0.1/::1 (CWE-319). As of 2026-09-23 the deployment is
 ```
 backend=local reason=auto-local-insecure-url
 blocked: handoffkeep credentials exist but the URL is plaintext http to a
-non-local host; serve it over https, or set [bench] allow_plaintext_url = true
+non-local host; serve it over https, or set [bench] allow_plaintext_catalog = true
 for a private WireGuard/Tailscale tunnel
 ```
 
@@ -121,8 +121,12 @@ claim only the operator can make. Two ways forward, in order of preference:
 
    ```toml
    [bench]
-   allow_plaintext_url = true   # only for a WireGuard-tunnelled tailnet address
+   allow_plaintext_catalog = true   # only for a WireGuard-tunnelled tailnet address
    ```
+
+   Since #697 the opt-in is per use (`allow_plaintext_catalog`,
+   `allow_plaintext_quota_share`, `allow_plaintext_reps`); the deprecated
+   `allow_plaintext_url` still works as an alias for all three, with a warning.
 
 ## Seeding the catalog (one time, operator token)
 

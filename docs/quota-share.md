@@ -126,11 +126,14 @@ as before. Results without an **account-bound** fingerprint are not published
 
 Prerequisites per host (#659 AC7):
 
-- **`[bench] allow_plaintext_url = true`** in the scopefuel config — the
-  deployed handoffkeep endpoint is a plaintext Tailscale URL
+- **`[bench] allow_plaintext_quota_share = true`** in the scopefuel config —
+  the deployed handoffkeep endpoint is a plaintext Tailscale URL
   (`http://100.122.100.56`); without the opt-in the bearer token is never sent
-  over plaintext and sharing silently stays off. Operator decision: enable on
-  Mac, Pi, desktop, NCP.
+  over plaintext and sharing silently stays off. Since #697 the opt-in is per
+  use — this flag does not move the bench catalog source (enable
+  `allow_plaintext_reps` separately for rep sharing); the deprecated
+  `allow_plaintext_url` alias still enables all three uses at once. Operator
+  decision: enable on Mac, Pi, desktop, NCP.
 - **`~/.claude.json` readable** (or `$CLAUDE_CONFIG_DIR/.claude.json` for custom
   contexts) — needed for `oauthAccount.accountUuid` so the fingerprint is
   account-bound; without it the host publishes/reads nothing remotely.

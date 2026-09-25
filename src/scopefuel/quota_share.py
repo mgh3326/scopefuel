@@ -95,15 +95,17 @@ def remote_eligible(result: ProviderResult) -> bool:
 def _endpoint() -> tuple[str, str] | None:
     """handoffkeep 엔드포인트 — bench(#593)와 같은 자격 해석을 공유한다.
 
-    평문 URL 은 명시적 opt-in([bench] allow_plaintext_url) 없이 쓰지 않는다 —
-    bearer 토큰을 평문으로 보내는 경로는 없다(CWE-319).
+    평문 URL 은 명시적 opt-in([bench] allow_plaintext_quota_share) 없이 쓰지
+    않는다 — bearer 토큰을 평문으로 보내는 경로는 없다(CWE-319). task #697:
+    quota share 는 catalog·reps 와 별도 opt-in 이므로 이 플래그 하나가 카탈로그
+    출처를 바꾸지 않는다.
     """
     url, token = bench._handoffkeep_credentials()
     if not url or not token:
         return None
     config = load_config()
     bench_cfg = config.get("bench") if isinstance(config, dict) else None
-    allow = isinstance(bench_cfg, dict) and bench_cfg.get("allow_plaintext_url") is True
+    allow = isinstance(bench_cfg, dict) and bench.plaintext_opt_in(bench_cfg, "quota_share")
     if not bench._plaintext_allowed(url, allow_plaintext=allow):
         return None
     return url.rstrip("/"), token
