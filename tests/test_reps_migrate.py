@@ -10,6 +10,7 @@ No test reaches the network — ``bench.request_json`` is replaced.
 from __future__ import annotations
 
 import sqlite3
+import urllib.parse
 from collections import Counter
 
 from scopefuel import bench, cli
@@ -36,10 +37,21 @@ class FakeRepStore:
         assert (headers or {}).get("Authorization") == f"Bearer {HK_TOKEN}"
         url = str(url)
         assert url.startswith(self.url), f"request left the configured endpoint: {url}"
-        assert url.rstrip("/").endswith("/v1/bench/reps"), f"unexpected path: {url}"
+        split = urllib.parse.urlsplit(url)
+        assert split.path == "/v1/bench/reps", f"unexpected path: {url}"
+        params = urllib.parse.parse_qs(split.query)
+        assert set(params) <= {"limit", "profile"}, f"unexpected query: {sorted(params)}"
+        # The deployed server: ORDER BY id DESC LIMIT min(limit, 5000),
+        # limit default 1000 — a bare GET sees only the newest 1000 rows.
+        limit = min(int(params.get("limit", ["1000"])[0]), 5000)
+        profile = params.get("profile", [""])[0]
         self.hits[method] += 1
         if method == "GET":
-            return {"reps": [dict(row) for row in self.reps]}
+            rows = self.reps
+            if profile:
+                rows = [row for row in rows if row["profile"] == profile]
+            rows = sorted(rows, key=lambda row: row["id"], reverse=True)[:limit]
+            return {"reps": [dict(row) for row in rows]}
         assert method == "PUT" and body is not None
         rows = body["reps"]
         assert 1 <= len(rows) <= 1000
@@ -279,17 +291,189 @@ def test_unstamped_identical_remote_row_counts_as_present(tmp_path, monkeypatch,
 
 
 def test_other_host_marker_does_not_dedup(tmp_path, monkeypatch, capsys):
-    """The dedup key includes the host: the same rep migrated from another
-    machine is a different row and must not block this host's copy."""
+    """The dedup key includes the host: a *different* rep (same content key,
+    different field values) migrated from another machine must not block this
+    host's copy."""
     _seed_local(tmp_path, [_rep("714-a")])
     fake = _remote_backend(tmp_path, monkeypatch)
-    fake.reps.append(_remote_from_record(_local_reps()[0], host="other-host"))
+    remote = _remote_from_record(_local_reps()[0], host="other-host")
+    remote["rounds"] = 99  # a genuinely different rep sharing the content key
+    fake.reps.append(remote)
 
     assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
     out = capsys.readouterr().out
     assert "inserted=1" in out
     assert len(fake.reps) == 2
     assert "remote-this-host=1" in out  # only this host's copy counts
+
+
+def test_identical_row_migrated_by_other_host_is_present(tmp_path, monkeypatch, capsys):
+    """A rep already migrated under a different host string (a drifted
+    gethostname(), or an identical copy on another machine) is the same rep —
+    it must not be duplicated."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_from_record(_local_reps()[0], host="old-hostname"))
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=0 skipped=1" in out
+    assert len(fake.reps) == 1
+    # the identical copy covers the local rep in reconcile
+    assert "local=1 remote-this-host=1 missing=0" in out
+
+
+def test_unstamped_remote_row_with_different_fields_reinserts(tmp_path, monkeypatch, capsys):
+    """An unstamped remote row matching only the content key is NOT the same
+    rep — e.g. the local row was edited after push-local (F3/M10 coverage)."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    remote = _remote_from_record(_local_reps()[0], host=None)
+    remote["rounds"] = 99
+    fake.reps.append(remote)
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=1 skipped=0" in out
+    assert len(fake.reps) == 2
+
+
+def _seed_local_bulk(tmp_path, n: int, *, task_prefix: str = "bulk") -> None:
+    """Insert n fixture reps in one connection — add_rep per row is too slow
+    at 1k+."""
+    _seed_local(tmp_path, [_rep(f"{task_prefix}-0")])
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.executemany(
+            "INSERT INTO reps (profile, model_id, task_ref, tier, role, rounds, "
+            "blockers_found, completed, input_tokens, output_tokens, notes, "
+            "recorded_at, effort, grade, table_grade) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "builder-devin",
+                    "swe-2",
+                    f"{task_prefix}-{i}",
+                    "T1",
+                    "impl",
+                    1,
+                    0,
+                    1,
+                    None,
+                    None,
+                    None,
+                    "2026-09-20T10:00:00Z",
+                    None,
+                    None,
+                    None,
+                )
+                for i in range(1, n)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _remote_row(
+    row_id: int, task_ref: str, *, profile: str = "builder-devin", host: str | None = HOST
+) -> dict:
+    notes = f"[src:{host}]" if host else None
+    return {
+        "id": row_id,
+        "origin_id": row_id + (1 << 40),
+        "created_by": CLIENT,
+        "created_at": "2026-09-25T00:00:00Z",
+        "profile": profile,
+        "model_id": "swe-2",
+        "task_ref": task_ref,
+        "tier": "T1",
+        "role": "impl",
+        "rounds": 1,
+        "blockers_found": 0,
+        "completed": 1,
+        "input_tokens": None,
+        "output_tokens": None,
+        "notes": notes,
+        "recorded_at": "2026-09-20T10:00:00Z",
+        "effort": None,
+        "grade": None,
+        "table_grade": None,
+    }
+
+
+def test_apply_beyond_the_default_remote_window(tmp_path, monkeypatch, capsys):
+    """The server's GET window defaults to the newest 1000 rows; at this
+    tool's scale (~1k+ local reps) migrate must request the 5000 cap or
+    dedup and reconcile see only a tail of the store."""
+    _seed_local_bulk(tmp_path, 1005)
+    fake = _remote_backend(tmp_path, monkeypatch)
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=1005" in out
+    assert "local=1005 remote-this-host=1005 missing=0" in out
+    assert len(fake.reps) == 1005
+
+    # Rerun: every row still visible through the windowed fetch — no re-PUT.
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=0 skipped=1005" in out
+    assert "missing=0" in out
+
+
+def test_full_unfiltered_window_still_migrates_local_profiles(tmp_path, monkeypatch, capsys):
+    """A store bigger than the read window under *other* profiles does not
+    block this host: the per-profile page is what must fit."""
+    _seed_local(tmp_path, [_rep("714-a"), _rep("714-b")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.extend(
+        _remote_row(i + 1, f"other-{i}", profile="other-prof", host="other-host") for i in range(5000)
+    )
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=2" in out
+    assert "missing=0" in out
+    assert len(fake.reps) == 5002
+
+
+def test_full_profile_window_fails_closed(tmp_path, monkeypatch, capsys):
+    """When a local profile's remote page comes back full, completeness is
+    unprovable — refuse rather than dedup/reconcile against a tail."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.extend(_remote_row(i + 1, f"other-{i}") for i in range(5000))
+
+    for argv in (
+        ["reps", "migrate", "--host", HOST],
+        ["reps", "migrate", "--apply", "--host", HOST],
+    ):
+        assert cli.main(argv) == 2
+        assert "read window" in capsys.readouterr().err
+    assert fake.hits["PUT"] == 0
+
+
+def test_naive_recorded_at_refuses_before_writing(tmp_path, monkeypatch, capsys):
+    """handoffkeep decodes RFC3339 — a naive recorded_at would die inside a
+    PUT batch. Refuse up front, naming the local row."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute("UPDATE reps SET recorded_at = '2026-09-20T10:00:00' WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+    fake = _remote_backend(tmp_path, monkeypatch)
+
+    for argv in (
+        ["reps", "migrate", "--host", HOST],
+        ["reps", "migrate", "--apply", "--host", HOST],
+    ):
+        assert cli.main(argv) == 2
+        err = capsys.readouterr().err
+        assert "recorded_at" in err and "ids: 1" in err
+    assert fake.hits["PUT"] == 0
 
 
 def test_reconcile_lists_missing_rows_and_fails(tmp_path, monkeypatch, capsys):

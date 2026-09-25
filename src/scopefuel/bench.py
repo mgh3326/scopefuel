@@ -1048,10 +1048,13 @@ def _handoffkeep_request(
     *,
     method: str = "GET",
     body: dict[str, object] | None = None,
+    query: dict[str, object] | None = None,
 ) -> dict:
     """Make one authenticated bench request without exposing response bodies."""
 
     url = _backend_url(backend, scope)
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
     headers = {"Authorization": f"Bearer {backend.token}"}
     if body is not None:
         headers["Content-Type"] = "application/json"
@@ -3074,8 +3077,8 @@ def _reps_from_payload(payload: dict) -> list[_RemoteRep]:
         raise BenchBackendError("handoffkeep returned invalid rep data") from exc
 
 
-def _fetch_reps(backend: BenchBackend) -> list[_RemoteRep]:
-    return _reps_from_payload(_handoffkeep_request(backend, "reps"))
+def _fetch_reps(backend: BenchBackend, *, query: dict[str, object] | None = None) -> list[_RemoteRep]:
+    return _reps_from_payload(_handoffkeep_request(backend, "reps", query=query))
 
 
 def _rep_to_wire(item: _RemoteRep) -> dict[str, object]:
@@ -3675,6 +3678,70 @@ def _stamp_rep_notes(notes: str | None, host: str) -> str:
     return f"{notes} {marker}" if notes else marker
 
 
+def _unstamp_rep_notes(notes: str | None) -> str | None:
+    """Strip the last [src:<host>] marker, restoring the pre-migration notes."""
+
+    if not notes:
+        return notes
+    marks = list(_MIGRATE_SRC_RE.finditer(notes))
+    if not marks:
+        return notes
+    last = marks[-1]
+    stripped = (notes[: last.start()] + notes[last.end() :]).strip()
+    return stripped or None
+
+
+def _rep_wire_timestamp(rep: RepRecord) -> bool:
+    """Whether rep.recorded_at is a timestamp handoffkeep can store — the Go
+    server decodes RFC3339, which requires an explicit timezone offset."""
+
+    try:
+        parsed = dt.datetime.fromisoformat(rep.recorded_at.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    return parsed.tzinfo is not None
+
+
+_MIGRATE_REP_WINDOW = 5000  # handoffkeep GET /v1/bench/reps limit cap (queryLimit)
+
+
+def _fetch_reps_for_migrate(backend: BenchBackend, profiles: set[str]) -> list[_RemoteRep]:
+    """Fetch remote reps for dedup and reconcile inside the server's GET window.
+
+    The server returns only the newest ``limit`` rows (``ORDER BY id DESC``,
+    default 1000, cap 5000). A bare GET therefore sees a tail of the store and
+    would silently mis-dedup and mis-reconcile at this tool's operating scale
+    (~1k local reps and growing): reconcile would list window-invisible rows
+    as missing forever, and reruns would re-PUT them.
+
+    Fetch the unfiltered window (a complete view whenever the whole store
+    fits) plus one windowed page per local profile — only remote rows whose
+    profile matches a local rep can dedup or reconcile against one anyway.
+    A *full* per-profile page means completeness cannot be proven for that
+    profile: refuse instead of writing on an unreadable remote.
+    """
+
+    seen: dict[int, _RemoteRep] = {}
+    for item in _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW}):
+        assert item.server_id is not None
+        seen[item.server_id] = item
+    for profile in sorted(profiles):
+        page = _fetch_reps(
+            backend,
+            query={"limit": _MIGRATE_REP_WINDOW, "profile": profile},
+        )
+        if len(page) >= _MIGRATE_REP_WINDOW:
+            raise BenchBackendError(
+                f"reps migrate: remote reps for profile {profile!r} fill the server's "
+                f"{_MIGRATE_REP_WINDOW}-row read window — dedup completeness cannot be "
+                "proven, refusing to write"
+            )
+        for item in page:
+            assert item.server_id is not None
+            seen[item.server_id] = item
+    return list(seen.values())
+
+
 def _recorded_at_key(value: str) -> object:
     """Normalize an ISO timestamp for comparison — the server may serialize the
     same instant differently (``Z`` vs ``+00:00``) than the local row."""
@@ -3724,20 +3791,25 @@ def _rep_present_remote(
 ) -> bool:
     """Whether ``rep`` is already on the server for this host.
 
-    A row stamped ``[src:<host>]`` counts only for that host — the same rep
-    migrated from another machine is a different keyed row. An unstamped remote
-    row (e.g. an earlier ``bench push-local`` copy) counts only when every rep
-    field is identical, which is what makes it the same rep rather than a
-    coincidence.
+    A row stamped ``[src:<host>]`` counts for that host directly. A row stamped
+    for a *different* host still counts when it is field-for-field identical
+    once its marker is stripped — the same rep migrated under a drifted
+    hostname (or on a host holding an identical copy) must not be duplicated.
+    An unstamped remote row (e.g. an earlier ``bench push-local`` copy) counts
+    only when every rep field is identical, which is what makes it the same
+    rep rather than a coincidence.
     """
 
     for item in index.get(_rep_content_key(rep), ()):
         remote_host = _remote_rep_host(item)
-        if remote_host is not None:
-            if remote_host == host:
-                return True
-            continue
-        if _same_rep_row(rep, item.record):
+        if remote_host == host:
+            return True
+        candidate = (
+            item.record
+            if remote_host is None
+            else replace(item.record, notes=_unstamp_rep_notes(item.record.notes))
+        )
+        if _same_rep_row(rep, candidate):
             return True
     return False
 
@@ -3771,7 +3843,7 @@ def migrate_reps(
     persistent plaintext reps writes.
     """
 
-    resolved_host = host or socket.gethostname()
+    resolved_host = host if host is not None else socket.gethostname()
     resolved_host = _optional_text(resolved_host, "host")
     if not resolved_host or "[" in resolved_host or "]" in resolved_host:
         raise BenchError("reps migrate: could not determine source host (pass --host)")
@@ -3797,9 +3869,17 @@ def migrate_reps(
         )
 
     local_reps = _read_local_reps_for_push(path=path)
-    remote = _fetch_reps(backend)
+    remote = _fetch_reps_for_migrate(backend, {rep.profile for rep in local_reps})
     index = _rep_content_index(remote)
     pending = [rep for rep in local_reps if not _rep_present_remote(rep, index, host)]
+    unwritable = [rep for rep in pending if not _rep_wire_timestamp(rep)]
+    if unwritable:
+        shown = ", ".join(str(rep.id) for rep in unwritable[:5])
+        raise BenchBackendError(
+            f"reps migrate: {len(unwritable)} local rep(s) have a recorded_at handoffkeep "
+            f"cannot store (RFC3339 needs a timezone offset; local ids: {shown}) — "
+            "fix or delete them, then re-run"
+        )
     if not apply:
         return RepMigration(
             host=host,
@@ -3830,26 +3910,42 @@ def migrate_reps(
         except (sqlite3.Error, OSError) as exc:
             raise BenchBackendError("local bench cache update failed") from exc
 
-    remote_after = _fetch_reps(backend)
+    remote_after = _fetch_reps_for_migrate(backend, {rep.profile for rep in local_reps})
     index_after = _rep_content_index(remote_after)
     missing = [rep for rep in local_reps if not _rep_present_remote(rep, index_after, host)]
     local_keys = {_rep_content_key(rep) for rep in local_reps}
-    local_rows = {_rep_row_key(rep) for rep in local_reps}
+    local_row_index: dict[tuple, list[int]] = {}
+    for rep in local_reps:
+        local_row_index.setdefault(_rep_row_key(rep), []).append(rep.id)
+    # remote-this-host = rows stamped for this host + local reps only visible
+    # through an identical non-host row (an earlier push-local copy, or the
+    # same rep migrated under a drifted hostname). Coverage is per local rep
+    # so a stamped row plus its push-local twin does not double count.
     remote_for_host = 0
     extra_remote_count = 0
+    stamped_keys: set[tuple] = set()
+    covered: set[int] = set()
     for item in remote_after:
         remote_host = _remote_rep_host(item)
-        if remote_host is not None:
-            if remote_host != host:
-                continue
+        if remote_host == host:
             remote_for_host += 1
+            stamped_keys.add(_rep_content_key(item.record))
             # A migrated row no longer matching any local rep on the content
             # key is an orphan (the local row was edited or deleted after an
             # earlier migrate) — surfaced, not silently counted as coverage.
             if _rep_content_key(item.record) not in local_keys:
                 extra_remote_count += 1
-        elif _rep_row_key(item.record) in local_rows:
-            remote_for_host += 1
+            continue
+        candidate = (
+            item.record
+            if remote_host is None
+            else replace(item.record, notes=_unstamp_rep_notes(item.record.notes))
+        )
+        for rep_id in local_row_index.get(_rep_row_key(candidate), ()):
+            covered.add(rep_id)
+    remote_for_host += sum(
+        1 for rep in local_reps if rep.id in covered and _rep_content_key(rep) not in stamped_keys
+    )
     return RepMigration(
         host=host,
         applied=True,
