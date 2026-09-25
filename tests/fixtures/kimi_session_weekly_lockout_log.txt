@@ -1,0 +1,1 @@
+2026-09-25T02:52:48.020Z WARN  llm request failed  turnStep=0.1 model=kimi-code/k3 errorName=APIStatusError errorMessage="403 You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota" statusCode=403
