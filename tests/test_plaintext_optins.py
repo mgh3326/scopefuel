@@ -13,7 +13,6 @@ hk is a dict-backed fake — ``bench.request_json`` and
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
 import json
 import urllib.parse
@@ -285,7 +284,7 @@ def test_reps_write_without_the_opt_in_fails_closed_and_sends_nothing(hk_plainte
     fake, config = hk_plaintext
     config.write_text('[bench]\nbackend = "handoffkeep"\n', encoding="utf-8")
 
-    with contextlib.suppress(bench.BenchBackendError):
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_reps"):
         _add_rep()
     assert fake.hits[("GET", "reps")] == 0
     assert fake.hits[("PUT", "reps")] == 0
@@ -385,7 +384,7 @@ def test_reps_write_under_the_catalog_only_opt_in_fails_closed(hk_plaintext):
     fake, config = hk_plaintext
     config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\n', encoding="utf-8")
 
-    with contextlib.suppress(bench.BenchBackendError):
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_reps"):
         _add_rep()
     assert fake.hits[("GET", "reps")] == 0
     assert fake.hits[("PUT", "reps")] == 0
