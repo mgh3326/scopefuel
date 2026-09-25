@@ -728,6 +728,48 @@ def test_alias_spelling_is_not_listed_as_its_own_alternative(monkeypatch, capsys
     assert "codex-sol" not in alt_lines[0]
 
 
+def test_the_escalation_refusal_never_offers_the_canonical_self():
+    """The exclusion-bug pin that quota tests cannot provide: driving the codex
+    pool over cutoff hides every codex-sol row from recommend() anyway, so those
+    tests cannot tell ``canonical_profile`` from ``profile_name`` in the
+    exclusion. On the escalation-refusal branch with healthy pools the codex
+    rows stay recommendable — pre-#716 ``gate -m codex-max`` listed codex-sol,
+    itself, as an alternative."""
+    result = gate_check(
+        _healthy_providers(),
+        "codex-max",
+        e6_arm="codex-sol@xhigh",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "escalation 후보" in result.reason
+    assert result.alternatives
+    assert "codex-sol" not in result.alternatives
+    assert "opus" in result.alternatives
+
+
+def test_an_unknown_rung_on_an_escalation_profile_keeps_the_ladder():
+    """explicit_rung requires a real catalog row: an effort the table does not
+    know (oc-omni has no @low row) still falls back to the default placement —
+    and that default is escalation-gated, so the alternatives-refusal applies.
+    A spelled rung must never waive escalation by not existing."""
+    result = gate_check(_healthy_providers(), "oc-omni", effort="low", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert "escalation 후보" in result.reason
+    assert result.alternatives
+
+
+def test_an_explicit_rung_allow_never_claims_escalation_qualification():
+    """Audit-text pin: with --effort the escalation ladder is skipped entirely,
+    so the allow reason must not claim 'escalation 자격 충족' — a check that
+    never ran. The tag still records that the judged row is escalation-gated."""
+    result = gate_check(_healthy_providers(), "codex-sol", effort="xhigh", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert "자격 충족" not in result.reason
+    assert "codex-sol@xhigh, escalation-gated" in result.reason
+
+
 def test_the_marker_alone_keeps_the_named_placed_rungs_own_gate():
     """#716 asymmetry, pinned: --effort is an explicit per-command nomination
     judged as a placement; the ambient SCOPEFUEL_E6_ARM only *selects* the rung —
