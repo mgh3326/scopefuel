@@ -36,8 +36,16 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "opus": ("opus", None),
     "builder-opus": ("opus", None),
     "captain-opus": ("opus", None),
+    # #704: the #594 E6 per-rung builder spellings pin the rung in the last
+    # name segment; wrk additionally requires SCOPEFUEL_E6_ARM=<profile>@<rung>
+    # (and --operator-request where the gate escalates the rung). The kimi
+    # pair is catalog-exempt (see WRK_CATALOG_EXEMPT).
+    "builder-opus-low": ("opus", "low"),
+    "builder-opus-medium": ("opus", "medium"),
     "sonnet": ("sonnet", None),
     "sonnet-med": ("sonnet", None),
+    "builder-sonnet-xhigh": ("sonnet", "xhigh"),
+    "builder-sonnet-max": ("sonnet", "max"),
     "haiku": ("haiku", None),
     "fable": ("fable", None),
     "codex": ("codex-sol", "high"),
@@ -45,11 +53,17 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "codex-max": ("codex-sol", None),
     "builder-sol": ("codex-sol", None),
     "captain-sol": ("codex-sol", None),
+    "builder-sol-high": ("codex-sol", "high"),
+    "builder-sol-max": ("codex-sol", "max"),
     # #633: builder-luna is codex-luna under --role builder, pinned to the
     # #594 E3 rung (xhigh) — same catalog profile as the worker spellings.
     "builder-luna": ("codex-luna", "xhigh"),
+    "builder-luna-max": ("codex-luna", "max"),
     "codex-terra": ("codex-terra", "medium"),
     "codex-med": ("codex-terra", "medium"),
+    "builder-terra-high": ("codex-terra", "high"),
+    "builder-terra-xhigh": ("codex-terra", "xhigh"),
+    "builder-terra-max": ("codex-terra", "max"),
     "codex-terra-max": ("codex-terra-max", None),
     "codex-luna": ("codex-luna", "medium"),
     "codex-luna-hi": ("codex-luna", "high"),
@@ -95,6 +109,8 @@ WRK_CATALOG_EXEMPT: dict[str, str] = {
     "kimi-k27-code": "ditto",
     "kimi-k3-low": "differentiated by KIMI_CODE_HOME, not by a model argument",
     "builder-kimi": "ditto",
+    "builder-kimi-high": "#704 E6 rung; pinned by the clone home's [thinking] effort, not argv",
+    "builder-kimi-max": "ditto",
     "devin-swe2": "fixed --model swe-2 argv; no effort flag",
     "builder-devin": "ditto",
     "devin-swe2-medium": "fixed argv; #635 effort rung inside the model id",
