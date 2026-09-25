@@ -2339,9 +2339,16 @@ def gate_check(
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
-    ``effort``(#692)는 요청한 *런그*다. 주어지면 그 런그의 행으로 판정하고(예:
-    ``gate -m opus --effort low`` 는 S 의 escalation 자격을 본다), 표가 그 런그를
-    모르면 프로필 기본 배치로 답한다 — ``policy launch`` 와 같은 폴백이다.
+    ``effort``(#692)는 요청한 *런그*다. 주어지면 그 런그의 행으로 판정하고, 표가
+    그 런그를 모르면 프로필 기본 배치로 답한다 — ``policy launch`` 와 같은
+    폴백이다. #716: 배치 행을 가리키는 ``--effort`` 는 명령마다 내리는 명시적
+    런그 지명이다 — 그 런그를 **배치로** 판정한다(측정불가·제외·cutoff 만).
+    escalation 의 "같은 grade 정상 대안 거부"는 기본 배치 해석(oc-omni 처럼
+    배치 행 자체가 escalation 인 프로필)과 ``--recommend`` 사다리의 개념이라,
+    호출자가 지명한 런그에는 적용하지 않는다 — "codex-sol@xhigh 를 판정해 달라"에
+    "opus 를 대신 써라"는 대답이 아니다. ambient 표식 ``SCOPEFUEL_E6_ARM`` 은
+    이 계약 밖이다 — 그 런그를 *고를* 뿐 그 행의 게이트(escalation 포함)를
+    면제하지 않는다. 환경 변수가 새어 나간 하위 문맥의 판정을 넓혀서는 안 된다.
 
     ``e6_arm``(#692)은 스포너가 설정한 ``SCOPEFUEL_E6_ARM=<profile>@<effort>``
     표식의 원문이다. C 급 E6 측정 런그는 이 표식이 그 런그를 가리킬 때만 열리고,
@@ -2446,6 +2453,10 @@ def gate_check(
     )
     rung = normalize_effort(effort) or marker_rung
     rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
+    # #716: --effort 는 명령 단위의 명시적 런그 지명이다 — 배치 행을 가리키면
+    # 그 런그를 배치로 판정한다(escalation 대안 거부 생략). 표식으로만 골라진
+    # 런그는 해당하지 않는다 — ambient env 는 새어 나간 문맥을 넓히지 못한다.
+    explicit_rung = normalize_effort(effort) is not None and rung_row is not None
     # 캐논이 그 런그를 C 밖으로 배치했으면 E6 제한은 없다 — 제한은 "미측정 C" 동안만
     # 유효하다(측정이 끝난 런그는 평범한 런그다).
     e6_row = (
@@ -2665,11 +2676,21 @@ def gate_check(
     result = by_id.get(provider_id)
     missing = _missing_required_windows(result, group_name)
 
+    # #716: 지명된 런그가 판정 대상이면 사유에 그 런그를 적는다 — 레코드와
+    # stdout 에 별칭 철자(codex-max)만 남아 실제 판정 런그가 지워지는 것을 막는다.
+    rung_suffix = ""
+    if rung_row is not None:
+        rung_suffix = f" [rung {canonical_profile}@{rung}]"
+        if profile.gate == "escalation":
+            rung_suffix = f" [rung {canonical_profile}@{rung}, escalation-gated]"
+
     def alternatives() -> tuple[str, ...]:
         return _alt_candidates(
             providers,
             grade,
-            profile_name,
+            # #716: 별칭 철자(codex-max)로 걸러도 canonical 행(codex-sol)은 걸리지
+            # 않아 자기 자신이 대안으로 나왔다 — canonical 이름으로 제외한다.
+            canonical_profile,
             today,
             now,
             urgency_hours,
@@ -2688,7 +2709,9 @@ def gate_check(
             "requested_by": audit_requested_by or "unknown",
             "ref_resolution": "unverified",
         }
-    if profile.gate == "escalation":
+    # #716: 명시적 런그 지명(--effort)에는 escalation 사다리를 적용하지 않는다 —
+    # 배치 행을 가리킨 지명은 그 런그의 배치 판정(아래 쿼타 검사)이 답이다.
+    if profile.gate == "escalation" and not explicit_rung:
         # 1) escalation 자격: 같은 grade 의 다른 정상 후보가 전부 소진·측정불가일 때만 진행.
         #    유효한 operator-request 가 있으면 이 "대안 가용 거부" 갈래 하나만 건너뛴다
         #    (task #461) — 아래 일반 검사(측정불가/exclude/cutoff)는 그대로 적용된다.
@@ -2702,7 +2725,7 @@ def gate_check(
                     grade=grade,
                     reason=(
                         f"{profile_name} 은 escalation 후보 — {profile.gate_reason or ''} "
-                        f"(다른 {grade} 후보가 아직 가용하므로 사용 불가)"
+                        f"(다른 {grade} 후보가 아직 가용하므로 사용 불가){rung_suffix}"
                     ),
                     alternatives=alts,
                     missing_windows=missing,
@@ -2745,7 +2768,7 @@ def gate_check(
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing),
+            reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing) + rung_suffix,
             unmeasurable=True,
             alternatives=alts,
             missing_windows=missing,
@@ -2762,6 +2785,7 @@ def gate_check(
             grade=grade,
             reason=(
                 f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음){_missing_windows_tag(missing)}"
+                f"{rung_suffix}"
             ),
             unmeasurable=True,
             alternatives=alts,
@@ -2790,7 +2814,7 @@ def gate_check(
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=", ".join(reason_parts) + ")",
+            reason=", ".join(reason_parts) + ")" + rung_suffix,
             used_pct=used_pct,
             pool_class=effective_class,
             alternatives=alts,
@@ -2810,7 +2834,7 @@ def gate_check(
             grade=grade,
             reason=(
                 f"{_exhaust_display(over, cutoff)} (class={effective_class})"
-                f"{_exhaust_suffix(cutoff_status, notify_status)}"
+                f"{_exhaust_suffix(cutoff_status, notify_status)}{rung_suffix}"
             ),
             used_pct=over.used_pct,
             pool_class=effective_class,
@@ -2820,7 +2844,7 @@ def gate_check(
             **audit,
         )
 
-    if profile.gate == "escalation":
+    if profile.gate == "escalation" and not explicit_rung:
         reason = (
             f"{profile_name} escalation 자격 충족 + pool={provider_id} 사용 {used_pct:g}% "
             f"class={effective_class} — {profile.gate_reason or ''}"
@@ -2835,6 +2859,7 @@ def gate_check(
             )
             reason += f" [{tag}]"
         reason += _e6_arm_suffix(e6_admitted)
+        reason += rung_suffix
         return GateResult(
             ok=True,
             profile=profile_name,
@@ -2857,6 +2882,7 @@ def gate_check(
     if operator_request is not None:
         reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     reason += _e6_arm_suffix(e6_admitted)
+    reason += rung_suffix
     return GateResult(
         ok=True,
         profile=profile_name,
