@@ -92,16 +92,17 @@ def plaintext_opt_in(bench_config: dict, use: str, *, stderr: TextIO | None = No
     """
 
     key = plaintext_opt_in_key(use)
-    if _PLAINTEXT_ALIAS_KEY in bench_config and _PLAINTEXT_ALIAS_KEY not in _WARNED_DEPRECATED_KEYS:
+    if bench_config.get(_PLAINTEXT_ALIAS_KEY) is True and _PLAINTEXT_ALIAS_KEY not in _WARNED_DEPRECATED_KEYS:
         print(
             f"warning: [bench] {_PLAINTEXT_ALIAS_KEY} is deprecated and enables plaintext http for "
             "all uses; prefer " + " / ".join(f"allow_plaintext_{name}" for name in PLAINTEXT_USES),
             file=stderr or sys.stderr,
         )
         _WARNED_DEPRECATED_KEYS.add(_PLAINTEXT_ALIAS_KEY)
-    specific = bench_config.get(key)
-    if isinstance(specific, bool):
-        return specific
+    if key in bench_config:
+        # A present key always wins over the alias; a non-bool value fails
+        # closed rather than widening the opt-in it was meant to narrow.
+        return bench_config.get(key) is True
     return bench_config.get(_PLAINTEXT_ALIAS_KEY) is True
 
 
@@ -262,6 +263,10 @@ class BenchBackend:
     # Whether this resolved backend may send the bearer token over plaintext
     # http — the resolved per-use opt-in (task #697), not the raw config key.
     allow_plaintext_url: bool = False
+    # The use this backend was resolved for (task #697). ``_backend_url``
+    # refuses a scope that maps to a different use, so a backend resolved under
+    # one opt-in can never serve another use even if a caller mixes them.
+    plaintext_use: str = "catalog"
 
 
 @dataclass(frozen=True)
@@ -420,6 +425,7 @@ def bench_backend(*, use: str, stderr: TextIO | None = None) -> BenchBackend:
             catalog_stale_max_s=catalog_stale_max,
             reason=reason,
             allow_plaintext_url=allow_plaintext,
+            plaintext_use=use,
         )
 
     endpoint_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16] if url else ""
@@ -433,6 +439,7 @@ def bench_backend(*, use: str, stderr: TextIO | None = None) -> BenchBackend:
         catalog_stale_max_s=catalog_stale_max,
         reason=reason,
         allow_plaintext_url=allow_plaintext,
+        plaintext_use=use,
     )
 
 
@@ -853,6 +860,16 @@ def _read_local_scores(
     normalized = _model_id(model_id) if model_id is not None else None
     conn = _readonly_connect(target)
     try:
+        # The file may exist with only bench_cache_* tables — a per-use opt-in
+        # mix (task #697) lets a reps/quota write create the cache while the
+        # source tables were never created.
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_scores'"
+            ).fetchone()
+            is None
+        ):
+            return []
         select_columns = _model_score_select_columns(conn)
         if normalized is None:
             rows = conn.execute(
@@ -1008,6 +1025,10 @@ def _backend_url(backend: BenchBackend, scope: str) -> str:
         raise BenchBackendError("invalid bench cache scope")
     if not backend.url or not backend.token:
         raise BenchBackendError("handoffkeep URL and token are required")
+    if _SCOPE_USE[scope] != backend.plaintext_use:
+        raise BenchBackendError(
+            f"bench backend resolved for use '{backend.plaintext_use}' cannot serve scope '{scope}'"
+        )
     _check_handoffkeep_scheme(backend.url, allow_plaintext=backend.allow_plaintext_url, use=_SCOPE_USE[scope])
     return f"{backend.url.rstrip('/')}/v1/bench/{scope}"
 
@@ -3551,12 +3572,14 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     if scores and catalog_backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchBackendError(
             "bench push-local: scores require the handoffkeep backend "
-            "(https, or [bench] allow_plaintext_catalog = true on a private tunnel)"
+            f"(resolved {catalog_backend.name}/{catalog_backend.reason}; needs https, or "
+            "[bench] allow_plaintext_catalog = true on a private tunnel)"
         )
     if remote_reps and reps_backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchBackendError(
             "bench push-local: reps require the handoffkeep backend "
-            "(https, or [bench] allow_plaintext_reps = true on a private tunnel)"
+            f"(resolved {reps_backend.name}/{reps_backend.reason}; needs https, or "
+            "[bench] allow_plaintext_reps = true on a private tunnel)"
         )
 
     # Fetch both scopes before the first PUT so a failed refresh or write leaves

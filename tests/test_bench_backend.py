@@ -460,7 +460,8 @@ def test_push_local_preserves_source_rows_and_rejects_local_backend(tmp_path, mo
     assert cli.main(["bench", "push-local"]) == 2
     assert capsys.readouterr().err.splitlines() == [
         "error: bench push-local: scores require the handoffkeep backend "
-        "(https, or [bench] allow_plaintext_catalog = true on a private tunnel)"
+        "(resolved local/configured; needs https, or "
+        "[bench] allow_plaintext_catalog = true on a private tunnel)"
     ]
 
     _set_backend(tmp_path, monkeypatch, "handoffkeep")

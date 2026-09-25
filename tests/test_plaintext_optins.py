@@ -25,9 +25,11 @@ from scopefuel import bench, quota_share, recommend
 from scopefuel.http import HttpError
 from scopefuel.model import Bucket, ProviderResult, Scope
 
-# A Tailscale-style endpoint: http to a non-local host — the deployment shape
-# that needs the opt-in at all.
-HK_URL = "http://100.122.100.56:8800"
+# A private-tunnel-style endpoint: http to a non-local host — the deployment
+# shape that needs the opt-in at all. Deliberately not the real tailnet
+# address: if a request path ever slips past the monkeypatch it must die on
+# DNS, not reach the deployed hk with a test token.
+HK_URL = "http://hk.invalid:8800"
 HK_TOKEN = "hk-test-token"
 
 NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
@@ -287,6 +289,137 @@ def test_reps_write_without_the_opt_in_fails_closed_and_sends_nothing(hk_plainte
         _add_rep()
     assert fake.hits[("GET", "reps")] == 0
     assert fake.hits[("PUT", "reps")] == 0
+
+
+def test_hk_reps_write_then_local_source_reads_on_a_cache_only_db(hk_plaintext):
+    """B1 regression (#697 round 2): the mixed target state creates bench.db
+    with only bench_cache_* tables — the reps write goes to handoffkeep while
+    scores stay local. Every local source-table reader must still work on a
+    file that has never had the source schema."""
+
+    fake, config = hk_plaintext
+    config.write_text(
+        "[bench]\nallow_plaintext_reps = true\nallow_plaintext_quota_share = true\n",
+        encoding="utf-8",
+    )
+
+    rep = _add_rep()  # remote write + cache stamp — creates a cache-only bench.db
+    assert rep.task_ref == "697"
+    assert fake.hits[("PUT", "reps")] == 1
+
+    # Local source reads on the cache-only file must not raise.
+    assert bench.read_scores() == []
+    assert isinstance(bench.read_prices(), dict)
+    assert isinstance(bench.read_reps(), list)  # remote read through the cache
+    assert bench.read_catalog().source == "snapshot"
+
+
+def _score_row() -> bench.ModelScore:
+    return bench.ModelScore(
+        model_id="t697-model",
+        effort=None,
+        harness=None,
+        source="AA-model",
+        metric="coding_index",
+        score=61.0,
+        rank=1,
+        captured_at="2026-09-25T00:00:00Z",
+    )
+
+
+_IMPORT_TOML = (
+    'source = "AA-agent"\n'
+    'metric = "agentic"\n'
+    'effort = "max"\n'
+    'harness = "codex"\n'
+    'captured_at = "2026-09-25T00:00:00Z"\n'
+    "[[scores]]\n"
+    'model_id = "t697-model"\n'
+    "score = 61.0\n"
+)
+
+_AA_PAYLOAD = {
+    "data": [
+        {
+            "slug": "t697-model",
+            "evaluations": {"artificial_analysis_coding_index": 61.0},
+        }
+    ]
+}
+
+
+def test_catalog_writers_fail_closed_under_the_reps_only_opt_in(hk_plaintext, tmp_path):
+    """Pin every catalog-use write path: with only the reps opt-in on, each
+    catalog-family writer must refuse before the wire and name its own key —
+    a writer resolving the wrong use turns this RED."""
+
+    fake, config = hk_plaintext
+    config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_reps = true\n', encoding="utf-8")
+
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
+        bench.upsert_scores([_score_row()])
+
+    imported = tmp_path / "scores.toml"
+    imported.write_text(_IMPORT_TOML, encoding="utf-8")
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
+        bench.import_scores(imported)
+
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
+        bench.sync_scores(api_key="k", request_fn=lambda *a, **k: _AA_PAYLOAD)
+
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
+        bench.set_grade(profile="opus", grade="S+", deviation_ref="hk:doc/test")
+
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"catalog": [CATALOG_ROW]}), encoding="utf-8")
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
+        bench.push_catalog(seed)
+
+    assert not fake.hits
+
+
+def test_reps_write_under_the_catalog_only_opt_in_fails_closed(hk_plaintext):
+    """The mirror: catalog on, reps off — a rep write must refuse naming the
+    reps key and send nothing."""
+
+    fake, config = hk_plaintext
+    config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\n', encoding="utf-8")
+
+    with contextlib.suppress(bench.BenchBackendError):
+        _add_rep()
+    assert fake.hits[("GET", "reps")] == 0
+    assert fake.hits[("PUT", "reps")] == 0
+    # And the catalog read does go through on its own opt-in.
+    assert bench.read_catalog().source == "server"
+    assert fake.hits[("GET", "catalog")] == 1
+
+
+def test_push_local_routes_each_scope_to_its_own_opt_in(hk_plaintext):
+    """push_local resolves catalog and reps backends separately: each scope's
+    rows go out only when that scope's opt-in is on."""
+
+    fake, config = hk_plaintext
+    config.write_text('[bench]\nbackend = "local"\n', encoding="utf-8")
+    bench.upsert_scores([_score_row()])
+    _add_rep()
+
+    config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_reps = true\n', encoding="utf-8")
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
+        bench.push_local()
+    assert fake.hits[("PUT", "scores")] == 0
+
+    config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\n', encoding="utf-8")
+    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_reps"):
+        bench.push_local()
+    assert fake.hits[("PUT", "reps")] == 0
+
+    config.write_text(
+        '[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\nallow_plaintext_reps = true\n',
+        encoding="utf-8",
+    )
+    assert bench.push_local() == (1, 1)
+    assert fake.hits[("PUT", "scores")] == 1
+    assert fake.hits[("PUT", "reps")] == 1
 
 
 # --- AC1/AC4: the alias and https -------------------------------------------
