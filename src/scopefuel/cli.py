@@ -628,6 +628,25 @@ def _e6_arm_marker() -> str | None:
     return os.environ.get(recommend.E6_ARM_MARKER_ENV)
 
 
+def _retired_e6_rungs() -> frozenset[tuple[str, str]]:
+    """#692: the E6 rungs the canon retired.
+
+    A marker must not revive a rung the operator closed, and the gate has no
+    catalog view of its own — the runtime grade table drops retired rows without
+    saying why. Read the view (memoised per process) and hand the keys over.
+    """
+
+    try:
+        view = bench.read_catalog()
+    except bench.BenchError:
+        return frozenset()
+    return frozenset(
+        (entry.profile, entry.effort)
+        for entry in view.entries
+        if entry.retired_at and (entry.profile, entry.effort) in recommend.E6_ARM_KEYS
+    )
+
+
 def _gate_rung_args(args: argparse.Namespace) -> dict:
     """#692: the rung context — the explicit ``--effort`` plus the E6 marker.
 
@@ -635,7 +654,11 @@ def _gate_rung_args(args: argparse.Namespace) -> dict:
     in its contract, is not handed keys it cannot consume.
     """
 
-    return {"effort": getattr(args, "effort", None), "e6_arm": _e6_arm_marker()}
+    return {
+        "effort": getattr(args, "effort", None),
+        "e6_arm": _e6_arm_marker(),
+        "retired_rungs": _retired_e6_rungs(),
+    }
 
 
 def _manual_gate_audit(
@@ -908,10 +931,12 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             file=sys.stderr,
         )
     elif result.e6_arm and not result.ok:
-        # #692: an unmeasured E6 rung is refused on the rung, not on alternatives —
-        # the generic "no alternatives" line would misread as quota exhaustion.
+        # #692: an E6 rung refusal is decided on the rung (the marker is missing,
+        # or the canon retired it), not on alternatives — the generic "no
+        # alternatives" line would misread as quota exhaustion. The reason line
+        # above carries the specific remedy.
         print(
-            f"해결: {recommend.E6_ARM_MARKER_ENV}={result.e6_arm} 표식과 함께 스폰하라 (#594 E6 측정 런그)",
+            f"E6 측정 런그 판정 — {recommend.E6_ARM_MARKER_ENV}={result.e6_arm} (#594, 사유 첫 줄 참조)",
             file=sys.stderr,
         )
     elif result.alternatives:

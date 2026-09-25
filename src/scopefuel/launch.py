@@ -35,6 +35,7 @@ from .recommend import (
     ASTRA_ALLOWED_PURPOSES,
     ASTRA_ROLE_PROFILES,
     E6_ARM_GRADE,
+    E6_ARM_KEYS,
     E6_ARM_RUNGS,
     GRADE_TABLE,
     PROFILE_ALIASES,
@@ -283,6 +284,17 @@ def _live_rows(view: CatalogView, profile: str) -> list[CatalogEntry]:
     return [e for e in view.entries if e.profile == profile and not e.retired_at]
 
 
+def _unmeasured_e6_row(row: CatalogEntry) -> bool:
+    """A C-graded E6 measurement row (#692) — a catalog row, never a placement.
+
+    Once the canon places the rung above C the row is an ordinary placement and
+    this returns False, which is what lets a measured rung become a candidate
+    again.
+    """
+
+    return (row.profile, row.effort) in E6_ARM_KEYS and row.grade == E6_ARM_GRADE
+
+
 def _default_effort(profile: str, rows: list[CatalogEntry]) -> tuple[str, str]:
     """Pick the rung a bare ``policy launch <profile>`` starts on.
 
@@ -395,12 +407,33 @@ def resolve_launch(
     view = read_catalog(path=path) if view is None else view
     canonical = PROFILE_ALIASES.get(profile, profile)
     rows = _live_rows(view, canonical)
+
+    requested = normalize_effort(effort)
+    marker = parse_e6_arm_marker(e6_arm)
+    e6_row = e6_arm_rung_for(canonical, requested)
+    e6_open = e6_row is not None and e6_arm_matches(marker, canonical, requested)
+    if not e6_open:
+        # #692: a C-graded E6 measurement rung is not a placement, so no unmarked
+        # request may be answered by one. Dropping the row (rather than refusing)
+        # keeps every existing spelling exactly as it was: ``wrk -m codex`` pins
+        # codex-sol@high and ``-m builder-grok`` pins grok-hi@xhigh, and a spawn
+        # that never asked for an E6 arm must not start failing. A row the canon
+        # placed above C is a placement and stays.
+        #
+        # The whole profile's unmeasured rows go, not just the requested rung:
+        # ``_default_effort`` walks the ordinary rows, so once the canon retires
+        # or gates the preferred rung a leftover C row became the "best-graded
+        # ordinary rung" — an unmarked ``policy launch grok-hi`` resolved the
+        # unmeasured xhigh rung and the canon's own retirement stopped refusing.
+        rows = [row for row in rows if not _unmeasured_e6_row(row)]
+
     from_snapshot = False
     if not rows:
         mentioned = any(entry.profile == canonical for entry in view.entries)
         if mentioned:
-            # The catalog carries this profile and every rung of it is retired.
-            # That is a statement, and the answer is no.
+            # The catalog carries this profile and every rung of it is retired —
+            # or (with the E6 rows dropped above) it carries no placement for it
+            # at all. Either way the canon has spoken and the answer is no.
             raise LaunchError(f"profile '{profile}' is retired in the catalog")
         snapshot_rows = [e for e in snapshot_entries() if e.profile == canonical]
         if not snapshot_rows or view.source == CATALOG_SOURCE_SNAPSHOT:
@@ -417,22 +450,6 @@ def resolve_launch(
         rows = snapshot_rows
         from_snapshot = True
 
-    requested = normalize_effort(effort)
-    marker = parse_e6_arm_marker(e6_arm)
-    e6_row = e6_arm_rung_for(canonical, requested)
-    e6_open = e6_row is not None and e6_arm_matches(marker, canonical, requested)
-    if e6_row is not None and not e6_open:
-        # #692: a C-graded E6 measurement rung is not a placement, so without the
-        # marker it must not answer for the request. Dropping the row (rather than
-        # refusing) keeps every existing spelling exactly as it was: ``wrk -m
-        # codex`` pins codex-sol@high and ``-m builder-grok`` pins grok-hi@xhigh,
-        # and a spawn that never asked for an E6 arm must not start failing. A row
-        # the canon placed above C is a placement and stays.
-        rows = [
-            row
-            for row in rows
-            if (row.profile, row.effort) != (canonical, requested) or row.grade != E6_ARM_GRADE
-        ]
     profile_entries = (
         rows if from_snapshot else [entry for entry in view.entries if entry.profile == canonical]
     )
@@ -451,11 +468,19 @@ def resolve_launch(
     # the profile-default row's permissive gate while the canon has gated the
     # high rung specifically.
     matched = [row for row in rows if row.effort == resolved_effort]
-    if not matched and e6_open:
+    if not matched and e6_open and not _retired_rung(view, canonical, resolved_effort):
         # The canon is silent about this rung (a server that has not been seeded
         # with the E6 rows yet). The bundled measurement row is the answer — the
-        # marker named it, and its grade C is the statement being made.
-        matched = [entry for entry in e6_arm_entries() if entry.effort == resolved_effort]
+        # marker named it, and its grade C is the statement being made. Keyed on
+        # the (profile, effort) pair, not the effort alone: two E6 rungs share an
+        # effort name (codex-sol@high and kimi-k3@high), and an effort-only match
+        # would hand a kimi arm the codex row. A rung the canon retired is *not*
+        # revived by the marker — retirement is the canon closing the rung.
+        matched = [
+            entry
+            for entry in e6_arm_entries()
+            if (entry.profile, entry.effort) == (canonical, resolved_effort)
+        ]
     if not matched:
         if _retired_rung(view, canonical, resolved_effort):
             raise LaunchError(f"profile '{profile}' rung '{resolved_effort}' is retired in the catalog")

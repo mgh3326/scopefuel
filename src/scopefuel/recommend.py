@@ -1119,7 +1119,7 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "sonnet",
         "Sonnet 5 (max)",
         "max",
-        "claude-sonnet-5 AA-model intelligence xhigh 34.4 저장(max 미저장)",
+        "claude-sonnet-5 AA-model intelligence max 38.2 · xhigh 34.4",
         aa_model_id="claude-sonnet-5",
     ),
     _e6_arm_profile(
@@ -1134,7 +1134,7 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "kimi-k3",
         "Kimi K3 (high)",
         "high",
-        "kimi-k3 AA-agent agentic default 61.0",
+        "kimi-k3 AA-agent agentic default 61.0(high 미저장)",
         aa_agent_model_id="kimi-k3",
         aa_model_id="kimi-k3",
     ),
@@ -1142,7 +1142,7 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "kimi-k3",
         "Kimi K3 (max)",
         "max",
-        "kimi-k3 AA-agent agentic default 61.0",
+        "kimi-k3 AA-agent agentic default 61.0 · AA-model intelligence max 43.6",
         aa_agent_model_id="kimi-k3",
         aa_model_id="kimi-k3",
     ),
@@ -1150,7 +1150,7 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "grok-hi",
         "Grok 4.7 (xhigh)",
         "xhigh",
-        "grok-4-7 AA-model intelligence high 46.3 저장(xhigh 미저장)",
+        "grok-4-7 AA-model intelligence high 46.3 · max 46.4(xhigh 미저장)",
         aa_agent_model_id="grok-4.7",
         aa_model_id="grok-4-7",
     ),
@@ -2335,6 +2335,7 @@ def gate_check(
     purpose: str | None = None,
     effort: str | None = None,
     e6_arm: str | None = None,
+    retired_rungs: frozenset[tuple[str, str]] | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -2346,6 +2347,9 @@ def gate_check(
     표식의 원문이다. C 급 E6 측정 런그는 이 표식이 그 런그를 가리킬 때만 열리고,
     없으면 런그 이름을 댄 사유와 함께 거부한다(rc 3). 표식은 그 런그 하나만
     열 수 있다 — 다른 프로필/런그를 가리키면 아무것도 넓히지 못한다.
+
+    ``retired_rungs``(#692)는 캐논이 retire 한 (profile, effort) 키다. 표식은
+    캐논이 닫은 런그를 되살리지 못한다 — retire 는 런그를 닫는 캐논의 수단이다.
 
     escalation 프로필은 "같은 grade 정상 대안이 전부 비가용"이라는 자격을 먼저 확인한다.
     자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
@@ -2451,6 +2455,17 @@ def gate_check(
     )
     e6_admitted: str | None = None
     if e6_row is not None:
+        if (canonical_profile, rung) in (retired_rungs or frozenset()):
+            # The canon closed the rung. A marker is not a way to reopen it —
+            # otherwise retiring an E6 rung would be a no-op for the arm path.
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=E6_ARM_GRADE,
+                reason=f"profile '{profile_name}' rung '{rung}' is retired in the catalog",
+                e6_arm=f"{canonical_profile}@{rung}",
+            )
         # C 급 E6 측정 런그는 배치가 아니다 — 표식이 정확히 이 런그를 가리킬 때만
         # 열린다. 없으면 런그 이름을 댄 사유로 거부한다(쿼타 판정 이전 — 배치 자체가
         # 없는 런그를 쿼타로 판정하면 "쿼타 소진"으로 오독된다).

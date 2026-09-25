@@ -175,15 +175,23 @@ SCOPEFUEL_E6_ARM=sonnet@max scopefuel gate -m sonnet --effort max  # → exit 0,
   정규화). 별칭도 받습니다(`codex-max@high` = `codex-sol@high`).
 - 표식이 그 런그를 가리키지 않으면 **아무것도 넓히지 못합니다** — 다른 프로필·다른 런그·
   형식 오류는 무시되고, C 급 E6 런그는 계속 거부됩니다(exit 3).
+- 표식은 C 급 런그의 admission key이면서 **게이트가 판정할 런그를 지명하는 스포너 경로**입니다
+  (wrk 는 `gate` 에 `--effort` 를 넘기지 않습니다). 그래서 arm B의 `opus@low` 같은 escalation
+  런그는 표식으로 런그를 지명한 뒤 기존 `--operator-request` 경로로 엽니다 — 표식 자체가
+  escalation 을 우회하지는 않습니다. 배치된 런그를 지명하면 판정이 그 런그로 **좁아질 뿐**
+  넓어지지는 않습니다(예: `SCOPEFUEL_E6_ARM=opus@low gate -m opus` 는 low 런그의 escalation
+  판정).
+- 캐논이 런그를 retire 하면 표식으로도 열리지 않습니다 — 닫는 수단은 retire 또는 C 밖 배치입니다.
 - 표식 없이 `policy launch`는 기존 폴백을 그대로 씁니다(`wrk -m codex`는 codex-sol@high를,
-  `-m builder-grok`은 grok-hi@xhigh를 pin하므로 이 스펠링들은 변하지 않습니다).
+  `-m builder-grok`은 grok-hi@xhigh를 pin하므로 이 스펠링들은 변하지 않습니다). 캐논이 E6
+  행을 싣고 있어도 표식 없는 기본값 계산은 C 행을 고르지 않습니다.
 - `--recommend`는 어느 급에서도 E6 런그를 나열하지 않습니다. 캐논이 그 런그를 C 밖으로
   측정하면 제한은 자동으로 풀립니다(그때는 평범한 런그).
 - 게이트의 `--effort`는 판정 대상을 런그로 좁힙니다 — `gate -m opus --effort low`는 low 런그
   (S, escalation)의 판정이고, 표가 모르는 런그는 프로필 기본 배치로 답합니다(기존 동작).
-- 아직 wrk에 effort 경로가 없는 런그(`kimi-k3`)는 카탈로그 행이 먼저 서 있고, arm B의
-  `opus@low`처럼 escalation gate가 걸린 런그는 E6 표식이 아니라 기존 `--operator-request`
-  경로가 연다는 점에 유의하세요(표식은 C 급 런그 전용).
+- 아직 wrk에 effort 경로가 없는 런그(`kimi-k3`)는 카탈로그 행이 먼저 서 있습니다. 표식은
+  ambient 환경변수이므로 자식 스폰에 상속되면 그 스폰의 게이트 태그도 표식 런그를 가리킵니다 —
+  arm 단위로만 설정하세요.
 
 ## Benchmark backend
 

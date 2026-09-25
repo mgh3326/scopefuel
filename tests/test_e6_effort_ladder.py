@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -39,11 +40,11 @@ NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
 
 # (profile, effort) -> (pool, catalog model id, the AA number scopefuel stores)
 NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
-    ("sonnet", "max"): ("claude", "claude-sonnet-5", "34.4"),
-    ("codex-sol", "high"): ("codex", "gpt-6-sol", "42.8"),
-    ("kimi-k3", "high"): ("kimi", "kimi-k3", "61.0"),
-    ("kimi-k3", "max"): ("kimi", "kimi-k3", "61.0"),
-    ("grok-hi", "xhigh"): ("grok", "grok-4.7", "46.3"),
+    ("sonnet", "max"): ("claude", "claude-sonnet-5", "max 38.2"),
+    ("codex-sol", "high"): ("codex", "gpt-6-sol", "high 42.8"),
+    ("kimi-k3", "high"): ("kimi", "kimi-k3", "default 61.0"),
+    ("kimi-k3", "max"): ("kimi", "kimi-k3", "max 43.6"),
+    ("grok-hi", "xhigh"): ("grok", "grok-4.7", "high 46.3"),
 }
 # The rungs the E6 arms use that the catalog already placed — no new row may
 # appear for these, or the existing spelling's resolution would change.
@@ -161,6 +162,112 @@ def test_each_new_rung_resolves_to_the_right_pool_and_effort_with_the_marker(key
     assert decision.model_id == model_id
     assert decision.grade == "C"
     assert decision.e6_arm == f"{profile}@{effort}"
+
+
+def test_a_canon_silent_about_the_rung_resolves_the_bundled_row_for_this_profile():
+    """Two E6 rungs share an effort name — the bundled fallback must key on the pair.
+
+    codex-sol@high and kimi-k3@high both exist; an effort-only lookup handed the
+    kimi arm the codex row (pool and model id included). The canon here is a
+    server view that does not carry the E6 rows yet.
+    """
+
+    view = bench.CatalogView(
+        entries=(
+            bench.CatalogEntry(
+                profile="kimi-k3", effort="", model_id="kimi-k3", pool="kimi", grade="S", score=61.0
+            ),
+            bench.CatalogEntry(
+                profile="codex-sol", effort="max", model_id="gpt-6-sol", pool="codex", grade="S+", score=67.0
+            ),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    decision = launch.resolve_launch("kimi-k3", effort="high", e6_arm="kimi-k3@high", view=view)
+    assert decision.pool == "kimi"
+    assert decision.model_id == "kimi-k3"
+    assert decision.grade == "C"
+    assert decision.e6_arm == "kimi-k3@high"
+
+
+def test_an_unmarked_default_never_falls_onto_a_c_row():
+    """The default walk must not pick an unmeasured E6 row.
+
+    With the canon carrying the E6 rows (the seed does), a bare
+    `policy launch grok-hi` would otherwise resolve the C xhigh row as the
+    "best-graded ordinary rung" as soon as the canon retires or gates the
+    preferred rung — and the canon's own retirement would stop refusing.
+    """
+
+    seeded = {
+        (entry.profile, entry.effort): entry
+        for entry in bench.catalog_snapshot()
+        if entry.profile == "grok-hi"
+    }
+    view = bench.CatalogView(
+        entries=tuple(seeded.values()),
+        source="cache",
+        backend="handoffkeep",
+    )
+    decision = launch.resolve_launch("grok-hi", view=view)
+    # grok-hi is keyed on its profile-default row: the reported effort is the
+    # launcher's flag, exactly as before #692.
+    assert decision.effort == "high"
+    assert decision.grade == "S"
+    assert decision.e6_arm is None
+
+    # The canon retires the profile-default row: the answer is the canon's
+    # statement, not the leftover C measurement row.
+    retired_view = bench.CatalogView(
+        entries=tuple(
+            replace(entry, retired_at="2026-09-25T00:00:00Z") if entry.effort == "" else entry
+            for entry in seeded.values()
+        ),
+        source="cache",
+        backend="handoffkeep",
+    )
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch("grok-hi", view=retired_view)
+
+
+def test_a_marker_does_not_revive_a_rung_the_canon_retired(monkeypatch, capsys):
+    seeded = {entry.key: entry for entry in bench.catalog_snapshot() if entry.profile == "sonnet"}
+    view = bench.CatalogView(
+        entries=tuple(
+            replace(entry, retired_at="2026-09-25T00:00:00Z") if entry.effort == "max" else entry
+            for entry in seeded.values()
+        ),
+        source="cache",
+        backend="handoffkeep",
+    )
+    monkeypatch.setattr(launch, "read_catalog", lambda **kwargs: view)
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "sonnet@max")
+    rc = cli.main(["policy", "launch", "sonnet", "--effort", "max"])
+    assert rc == 3
+    assert "retired" in capsys.readouterr().err
+
+
+def test_a_measured_canon_row_gets_no_e6_arm_label():
+    """A canon row placed above C is ordinary — the marker must not claim it."""
+
+    view = bench.CatalogView(
+        entries=(
+            bench.CatalogEntry(
+                profile="sonnet",
+                effort="max",
+                model_id="claude-sonnet-5",
+                pool="claude",
+                grade="B",
+                score=45.0,
+            ),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    decision = launch.resolve_launch("sonnet", effort="max", e6_arm="sonnet@max", view=view)
+    assert decision.grade == "B"
+    assert decision.e6_arm is None
 
 
 def test_recommend_never_lists_a_new_rung_at_any_grade():
@@ -327,6 +434,63 @@ def test_the_marker_parser_folds_spelling_and_rejects_a_value_that_names_no_rung
     assert parse_e6_arm_marker("@max") is None
     assert parse_e6_arm_marker(" Sonnet@MAX ").label == "sonnet@max"
     assert parse_e6_arm_marker("codex-max@high").label == "codex-sol@high"
+
+
+def test_the_marker_cannot_widen_across_profiles():
+    """A marker names one profile's rung — a cross-profile forgery opens nothing.
+
+    kimi-k3@max is a real E6 rung; naming it must not open sonnet@max (the
+    profile comparison is what stops it).
+    """
+
+    result = gate_check(
+        [_provider("claude", pool_class="spend")],
+        "sonnet",
+        effort="max",
+        e6_arm="kimi-k3@max",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "e6_arm_required" in result.reason
+    assert "sonnet@max" in result.reason
+
+
+def test_the_marker_selects_the_rung_it_names_for_a_placed_rung_too():
+    """The marker is also the gate's rung selector, and it only ever narrows.
+
+    wrk does not pass --effort to the gate, so for arm B's escalation-gated
+    opus@low the marker is what lets the gate see that rung at all (and then the
+    ordinary --operator-request path applies). It never widens: the default
+    judgement of opus is the S+ high rung.
+    """
+
+    plain = gate_check([_provider("claude", pool_class="spend")], "opus", today=TODAY, now=NOW)
+    assert plain.grade == "S+"
+    marked = gate_check(
+        [_provider("claude", pool_class="spend")], "opus", e6_arm="opus@low", today=TODAY, now=NOW
+    )
+    assert marked.grade == "S"
+    assert "escalation" in marked.reason
+    assert marked.e6_arm is None
+
+
+def test_a_retired_e6_rung_is_not_revived_by_the_marker():
+    """Retiring the rung is the canon closing it — the marker is not a way back."""
+
+    retired = frozenset({("sonnet", "max")})
+    result = gate_check(
+        [_provider("claude", pool_class="spend")],
+        "sonnet",
+        effort="max",
+        e6_arm="sonnet@max",
+        retired_rungs=retired,
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "retired" in result.reason
+    assert "rung 'max'" in result.reason
 
 
 def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
