@@ -76,7 +76,11 @@ def test_explicit_canon_escalation_rung_keeps_716_admission(spelling):
 
 def test_escalation_only_profile_still_uses_escalation_gate():
     profile = Profile("codex-sol", "Test", 60, gate="escalation", gate_reason="test")
-    table = {"S+": [profile, Profile("opus", "Ordinary", 60)]}
+    lower_grade = Profile("codex-sol", "Lower grade", 55, gate="escalation")
+    table = {
+        "S+": [profile, Profile("opus", "Ordinary", 60)],
+        "S": [lower_grade],
+    }
     assert _find_profile("codex-sol", grade_table=table) == ("S+", profile)
     result = gate_check(
         [_healthy_provider("codex"), _healthy_provider("claude")],
