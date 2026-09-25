@@ -87,8 +87,17 @@ _PERCENT_ANY = re.compile(r"\d+(?:\.\d+)?\s*%")
 # are only visible in the records the CLI itself writes per session.  Only
 # structured error records count — transcript/tool-output blobs in wire.jsonl
 # quote the same words and must never be mistaken for a lockout.
-KIMI_HOME = Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code")
-SESSIONS_DIR = KIMI_HOME / "sessions"
+SESSIONS_DIR: Path | None = None  # test override; None resolves env/home per call
+
+
+def _sessions_dir() -> Path:
+    if SESSIONS_DIR is not None:
+        return Path(SESSIONS_DIR)
+    # kimi honours KIMI_CODE_HOME for its data dir (#705 tester F6).
+    home = os.environ.get("KIMI_CODE_HOME") or str(Path.home() / ".kimi-code")
+    return Path(home).expanduser() / "sessions"
+
+
 _SESSION_LOG_MAX_AGE_S = 32 * 86400  # a lockout cannot outlive its 30d window
 _SESSION_LOG_TAIL_BYTES = 1_048_576
 _SESSION_LIMIT_ERR = re.compile(r"usage\s+limit", re.IGNORECASE)
@@ -96,7 +105,8 @@ _SESSION_LIMIT_ERR = re.compile(r"usage\s+limit", re.IGNORECASE)
 # lines with an errorMessage field — anchored, so quoted text cannot match.
 _SESSION_LOG_ERR = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z\s+(?:WARN|ERROR)\b")
 _SESSION_LOG_ERR_CTX = re.compile(r"errorName=APIStatusError|provider\.auth_error|statusCode=403")
-_SESSION_ERRMSG = re.compile(r'errorMessage="(?P<msg>[^"]*)"')
+# errorMessage may embed the JSON 403 body escaped — keep consuming escapes.
+_SESSION_ERRMSG = re.compile(r'errorMessage="(?P<msg>(?:[^"\\]|\\.)*)"')
 # Window names are taken only from the error message itself, word-bounded —
 # a bare "7d" substring appears in hex traceIds and classifies wrong.
 _LOCKOUT_MONTHLY = re.compile(r"\bmonth", re.IGNORECASE)
@@ -568,7 +578,7 @@ def _observed_lockouts(now: dt.datetime) -> dict[str | None, dt.datetime]:
     credentials or config).  Files untouched for longer than the longest
     lockout window cannot describe a current window and are skipped.
     """
-    root = Path(SESSIONS_DIR).expanduser()
+    root = _sessions_dir()
     if not root.is_dir():
         return {}
     min_mtime = now.timestamp() - _SESSION_LOG_MAX_AGE_S
