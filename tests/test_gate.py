@@ -898,3 +898,159 @@ def test_gate_kimi_zero_windows_without_monthly_is_the_known_shape():
     # 정상 회귀: 패널이 5h/주간만 렌더하고 0% 면 계측된 건강 상태로 통과한다.
     result = gate_check([_kimi_result(0.0, 0.0)], "kimi-k3", today=TODAY, now=NOW)
     assert result.ok is True
+
+
+# ------------------------------------------------- task #690: grok weekly-only + 미측정 창 가시성
+
+
+def _grok_weekly(used: float) -> ProviderResult:
+    """실 grok provider 출력 형태 — 주간(7d) 계정 bucket 하나뿐, 5h 는 원래 없다."""
+    return ProviderResult(
+        id="grok",
+        pool_class="spend",
+        buckets=[
+            Bucket(
+                label="7d",
+                window="7d",
+                used_pct=used,
+                resets_at=_reset_almost_full("7d"),
+                scope=Scope("account"),
+                horizon="week",
+            )
+        ],
+    )
+
+
+def test_grok_required_windows_are_weekly_only():
+    """#690: grok 은 5시간 한도 자체가 없다 — 필수 창 집합은 주간(7d) 하나뿐."""
+    from scopefuel import manual
+
+    assert manual.REQUIRED_WINDOWS["grok"] == frozenset({"7d"})
+
+
+def test_gate_grok_weekly_only_selectable():
+    """#690 AC: 5h 값이 없어도 주간 한도가 가용하면 요청 프로필 grok-hi 가 선택된다."""
+    result = gate_check([_grok_weekly(0.0)], "grok-hi", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.provider_id == "grok"
+    assert result.missing_windows == ()
+    assert "pool=grok" in result.reason
+
+
+def test_gate_grok_unreadable_5h_still_selectable():
+    """#690: 읽히지 않는 5h bucket(used_pct=None)이 섞여 있어도 grok 은 주간 값으로 통과.
+
+    5h 는 grok 의 필수 창이 아니므로 미측정 태그도 붙지 않는다 — grok 5h 칸의
+    '?' 는 결함이 아니라 provider 특성이다.
+    """
+    providers = [
+        ProviderResult(
+            id="grok",
+            pool_class="spend",
+            buckets=[
+                Bucket(
+                    label="5h",
+                    window="5h",
+                    used_pct=None,
+                    resets_at=None,
+                    scope=Scope("account"),
+                    horizon="now",
+                ),
+                Bucket(
+                    label="7d",
+                    window="7d",
+                    used_pct=12.0,
+                    resets_at=_reset_almost_full("7d"),
+                    scope=Scope("account"),
+                    horizon="week",
+                ),
+            ],
+        )
+    ]
+    result = gate_check(providers, "grok-hi", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.used_pct == 12.0
+    assert result.missing_windows == ()
+
+
+def test_gate_grok_weekly_exhausted_denied_with_reason():
+    """#690 AC: 주간 한도가 차단선을 넘으면 grok 는 거부 — 사유가 항상 출력된다."""
+    result = gate_check([_grok_weekly(99.9)], "grok-hi", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is False
+    assert "소진" in result.reason
+    assert "차단선 99%" in result.reason
+
+
+def test_gate_missing_required_window_named_on_admit():
+    """#690: 필수 창이 빠진 fresh 스냅샷은 측정된 창으로 판정하되 창 이름을 남긴다.
+
+    claude 는 5h+7d 가 필수 — 7d 만 있는 결과는 '5h 미측정' 을 표기한 채 통과.
+    """
+    providers = [_result("claude", 30.0, pool_class="preserve")]  # 7d 만 — 5h 없음
+    result = gate_check(providers, "opus", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.missing_windows == ("5h",)
+    assert "필수 창 미측정: 5h" in result.reason
+
+
+def test_gate_unreadable_required_window_named_on_admit():
+    """#690: bucket 은 있으나 값이 읽히지 않는(used_pct=None) 창도 미측정으로 표기."""
+    providers = [
+        ProviderResult(
+            id="claude",
+            pool_class="preserve",
+            buckets=[
+                Bucket(
+                    label="5h",
+                    window="5h",
+                    used_pct=None,
+                    resets_at=None,
+                    scope=Scope("account"),
+                    horizon="now",
+                ),
+                Bucket(
+                    label="7d",
+                    window="7d",
+                    used_pct=30.0,
+                    resets_at=_reset_almost_full("7d"),
+                    scope=Scope("account"),
+                    horizon="week",
+                ),
+            ],
+        )
+    ]
+    result = gate_check(providers, "opus", today=TODAY, now=NOW)
+    assert result.ok is True
+    assert result.missing_windows == ("5h",)
+    assert "필수 창 미측정: 5h" in result.reason
+
+
+def test_gate_stale_denial_names_missing_required_window():
+    """#690: 필수 창 부족으로 stale 수용이 거부될 때 어떤 창이 비었는지 사유에 남는다.
+
+    5h 만 있는 claude stale 스냅샷은 필수 7d 가 없어 수용 불가 — 사유가
+    '7d' 를 이름으로 지목한다.
+    """
+    stale = ProviderResult(
+        id="claude",
+        stale=True,
+        age_s=300.0,
+        error_kind="rate_limited",
+        account_fp_match=True,
+        buckets=[
+            Bucket(
+                label="5h",
+                window="5h",
+                used_pct=10.0,
+                resets_at=_reset_almost_full("5h"),
+                scope=Scope("account"),
+                horizon="now",
+            ),
+        ],
+    )
+    result = gate_check([stale], "opus", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.unmeasurable is True
+    assert result.missing_windows == ("7d",)
+    assert "필수 창 미측정: 7d" in result.reason

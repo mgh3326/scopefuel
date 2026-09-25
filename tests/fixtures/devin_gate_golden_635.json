@@ -12,6 +12,9 @@
       "manual_observation_ids": [],
       "manual_observations": [],
       "measured_at": null,
+      "missing_windows": [
+        "1d"
+      ],
       "observed_age_s": null,
       "ok": true,
       "operator_request_ref": null,
@@ -19,7 +22,7 @@
       "profile": "devin-ds41",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin-ds41 pool=devin 사용 0% class=spend",
+      "reason": "devin-ds41 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -33,7 +36,7 @@
       "used_pct": 0.0
     },
     "stderr": "",
-    "stdout": "profile=devin-ds41 pool=devin used_pct=0.0 class=spend\ndevin-ds41 pool=devin 사용 0% class=spend\n"
+    "stdout": "profile=devin-ds41 pool=devin used_pct=0.0 class=spend\ndevin-ds41 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]\n"
   },
   "devin-ds41/swe2_not_free": {
     "rc": 4,
@@ -48,6 +51,9 @@
       "manual_observation_ids": [],
       "manual_observations": [],
       "measured_at": null,
+      "missing_windows": [
+        "1d"
+      ],
       "observed_age_s": null,
       "ok": false,
       "operator_request_ref": null,
@@ -55,7 +61,7 @@
       "profile": "devin-ds41",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [manual fallback 불가: manual observation 없음]",
+      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -68,7 +74,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   },
   "devin-swe2/free": {
@@ -84,6 +90,9 @@
       "manual_observation_ids": [],
       "manual_observations": [],
       "measured_at": null,
+      "missing_windows": [
+        "1d"
+      ],
       "observed_age_s": null,
       "ok": true,
       "operator_request_ref": null,
@@ -91,7 +100,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin-swe2 pool=devin 사용 0% class=spend",
+      "reason": "devin-swe2 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -105,7 +114,7 @@
       "used_pct": 0.0
     },
     "stderr": "",
-    "stdout": "profile=devin-swe2 pool=devin used_pct=0.0 class=spend\ndevin-swe2 pool=devin 사용 0% class=spend\n"
+    "stdout": "profile=devin-swe2 pool=devin used_pct=0.0 class=spend\ndevin-swe2 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]\n"
   },
   "devin-swe2/swe2_not_free": {
     "rc": 4,
@@ -120,6 +129,9 @@
       "manual_observation_ids": [],
       "manual_observations": [],
       "measured_at": null,
+      "missing_windows": [
+        "1d"
+      ],
       "observed_age_s": null,
       "ok": false,
       "operator_request_ref": null,
@@ -127,7 +139,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [manual fallback 불가: manual observation 없음]",
+      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -140,7 +152,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   }
 }

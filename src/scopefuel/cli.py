@@ -586,6 +586,7 @@ def _gate_record(
         "remaining_effect_s": result.remaining_effect_s,
         "last_auto_error": result.last_auto_error,
         "exhaust_notice": result.exhaust_notice,
+        "missing_windows": list(result.missing_windows),
     } | ({"account": account} if account else {})
 
 

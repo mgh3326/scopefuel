@@ -134,6 +134,17 @@ scopefuel gate -m oc-omni --operator-request hk:task/461 --requested-by operator
   `escalation_override`·`operator_request_ref`·`requested_by`·`ref_resolution`이 남습니다.
   이 필드가 override로 통과한 스폰을 세는 근거입니다.
 
+### 필수 창과 미측정 (task #690)
+
+각 pool은 `manual.REQUIRED_WINDOWS`로 판정에 필요한 한도 창 집합을 정합니다. grok는 주간
+한도만 존재하므로 `{"7d"}`이 전부입니다 — 5h 칸의 `?`는 결함이 아니라 provider 특성입니다.
+규칙: (1) 스냅샷에 없거나 값이 읽히지 않는 필수 창은 부족으로도 소진으로도 간주하지 않습니다 —
+측정된 창만으로 판정하되, 통과·거부 사유에 `[필수 창 미측정: <창>]`로 이름을 남기고 감사
+레코드의 `missing_windows` 필드에도 기록됩니다(요청 프로필이 조용히 떨어지거나 조용히
+통과하지 않습니다). (2) 측정된 창 하나라도 cutoff를 넘으면 거부입니다 — 미측정 창이 있다고
+소진 판정이 완화되지 않습니다. (3) stale 폴백 수용은 계속 fail-closed입니다 — 필수 창 커버리지가
+갖춰지지 않은 stale 스냅샷은 수용되지 않으며, 거부 사유가 부족한 창을 지목합니다.
+
 ## Benchmark backend
 
 벤치 점수와 대표 실행 기록의 backend는 `auto`(기본)·`handoffkeep`·`local` 중 하나입니다.

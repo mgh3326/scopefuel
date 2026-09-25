@@ -1458,6 +1458,32 @@ def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str
     return f"{provider_id} 측정 불가 (provider error/degraded)"
 
 
+def _missing_required_windows(result: ProviderResult | None, group_name: str | None) -> tuple[str, ...]:
+    """``manual.REQUIRED_WINDOWS`` 중 유효한 매칭 bucket 이 커버하지 못한 창 (task #690).
+
+    창이 스냅샷에 아예 없거나 값이 읽히지 않는(``used_pct`` 무효) 경우 모두
+    "미측정"이다. 미측정 창은 부족으로도 소진으로도 간주하지 않는다 —
+    측정된 창만으로 판정하되 창 이름을 사유에 남겨 조용한 통과/탈락을 막는다.
+    grok 처럼 5h 한도가 원래 없는 풀은 ``REQUIRED_WINDOWS`` 자체가
+    ``{"7d"}`` 이므로 주간 bucket 하나로 완전 커버된다.
+    """
+    if result is None:
+        return ()
+    required = manual.REQUIRED_WINDOWS.get(result.id, frozenset())
+    if not required:
+        return ()
+    covered = {window for _used, window, _reset in _matching_buckets(result, group_name)}
+    return tuple(sorted(required - covered))
+
+
+def _missing_windows_tag(missing: tuple[str, ...], note: str = "") -> str:
+    """미측정 필수 창을 이름으로 적는 태그 — 요청 프로필의 조용한 탈락 금지 (task #690)."""
+    if not missing:
+        return ""
+    detail = f" — {note}" if note else ""
+    return f" [필수 창 미측정: {', '.join(missing)}{detail}]"
+
+
 def _reset_display(iso: str | None) -> str:
     if not iso:
         return "-"
@@ -1989,6 +2015,9 @@ class GateResult:
     stale_accepted: bool = False
     # task #638 — on_exhaust="operator-switch" 소진 알림 상태(발송/기통지/실패).
     exhaust_notice: str | None = None
+    # task #690 — REQUIRED_WINDOWS 중 유효 bucket 으로 커버되지 않은 창 이름
+    # (스냅샷 부재·값 읽기 실패). 감사 필드 — reason 에도 같은 이름이 표기된다.
+    missing_windows: tuple[str, ...] = ()
 
 
 def _find_profile(
@@ -2251,14 +2280,16 @@ def gate_check(
         by_id = {r.id: r for r in providers}
         result = by_id.get(provider_id)
         accepted = _stale_accepted(result, group_name, now)
+        missing = _missing_required_windows(result, group_name)
         if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
             return GateResult(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=None,
-                reason=_unmeasurable_reason(provider_id, result),
+                reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing),
                 unmeasurable=True,
+                missing_windows=missing,
                 **audit,
             )
         matches = _matching_buckets(result, group_name)
@@ -2268,8 +2299,12 @@ def gate_check(
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=None,
-                reason=f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)",
+                reason=(
+                    f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)"
+                    f"{_missing_windows_tag(missing)}"
+                ),
                 unmeasurable=True,
+                missing_windows=missing,
                 **audit,
             )
         states = _window_states(matches, now)
@@ -2298,6 +2333,7 @@ def gate_check(
                 reason=", ".join(reason_parts) + ")",
                 used_pct=used_pct,
                 pool_class=effective_class,
+                missing_windows=missing,
                 **audit,
             )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
@@ -2316,10 +2352,12 @@ def gate_check(
                 used_pct=over.used_pct,
                 pool_class=effective_class,
                 exhaust_notice=notify_status,
+                missing_windows=missing,
                 **audit,
             )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
         reason += _exhaust_suffix(cutoff_status, notify_status)
+        reason += _missing_windows_tag(missing, "측정된 창으로 판정")
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -2337,12 +2375,14 @@ def gate_check(
             used_pct=used_pct,
             pool_class=effective_class,
             stale_accepted=accepted is not None,
+            missing_windows=missing,
             **audit,
         )
 
     grade, profile = found
     by_id = {r.id: r for r in providers}
     result = by_id.get(provider_id)
+    missing = _missing_required_windows(result, group_name)
 
     def alternatives() -> tuple[str, ...]:
         return _alt_candidates(
@@ -2384,6 +2424,7 @@ def gate_check(
                         f"(다른 {grade} 후보가 아직 가용하므로 사용 불가)"
                     ),
                     alternatives=alts,
+                    missing_windows=missing,
                 )
             escalation_override = True
         if operator_request is not None:
@@ -2409,6 +2450,7 @@ def gate_check(
                 provider_id=provider_id,
                 grade=grade,
                 reason=reason,
+                missing_windows=missing,
                 **audit,
             )
 
@@ -2420,9 +2462,10 @@ def gate_check(
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=_unmeasurable_reason(provider_id, result),
+            reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing),
             unmeasurable=True,
             alternatives=alts,
+            missing_windows=missing,
             **audit,
         )
 
@@ -2434,9 +2477,12 @@ def gate_check(
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)",
+            reason=(
+                f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음){_missing_windows_tag(missing)}"
+            ),
             unmeasurable=True,
             alternatives=alts,
+            missing_windows=missing,
             **audit,
         )
 
@@ -2465,6 +2511,7 @@ def gate_check(
             used_pct=used_pct,
             pool_class=effective_class,
             alternatives=alts,
+            missing_windows=missing,
             **audit,
         )
 
@@ -2486,6 +2533,7 @@ def gate_check(
             pool_class=effective_class,
             alternatives=alts,
             exhaust_notice=notify_status,
+            missing_windows=missing,
             **audit,
         )
 
@@ -2495,6 +2543,7 @@ def gate_check(
             f"class={effective_class} — {profile.gate_reason or ''}"
         )
         reason += _exhaust_suffix(cutoff_status, notify_status)
+        reason += _missing_windows_tag(missing, "측정된 창으로 판정")
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -2511,11 +2560,13 @@ def gate_check(
             used_pct=used_pct,
             pool_class=effective_class,
             stale_accepted=accepted is not None,
+            missing_windows=missing,
             **audit,
         )
 
     reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
     reason += _exhaust_suffix(cutoff_status, notify_status)
+    reason += _missing_windows_tag(missing, "측정된 창으로 판정")
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
     if operator_request is not None:
@@ -2529,6 +2580,7 @@ def gate_check(
         used_pct=used_pct,
         pool_class=effective_class,
         stale_accepted=accepted is not None,
+        missing_windows=missing,
         **audit,
     )
 
