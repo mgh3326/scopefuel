@@ -682,9 +682,7 @@ def test_grok_hi_high_is_admitted_by_effort(monkeypatch, capsys, tmp_path):
     assert record["grade"] == "S"
 
 
-def test_codex_max_effort_high_is_the_c_rung_refusal_with_a_named_remedy(
-    monkeypatch, capsys, tmp_path
-):
+def test_codex_max_effort_high_is_the_c_rung_refusal_with_a_named_remedy(monkeypatch, capsys, tmp_path):
     """The pinned-alias conflict case: codex-max --effort high lands on
     codex-sol@high — an unmeasured C E6 rung — so the gate refuses, naming the
     rung and the exact remedy. Never a silent alternative list."""
@@ -698,9 +696,7 @@ def test_codex_max_effort_high_is_the_c_rung_refusal_with_a_named_remedy(
     assert "대안(" not in err  # refused on the rung, not folded into an alt list
 
 
-def test_an_explicit_rung_refusal_is_quota_based_and_drops_the_alias_self(
-    monkeypatch, capsys, tmp_path
-):
+def test_an_explicit_rung_refusal_is_quota_based_and_drops_the_alias_self(monkeypatch, capsys, tmp_path):
     """Placement judgement means quota rules: with the codex pool over cutoff
     the rung is refused on quota — and the alternatives never echo the alias's
     own canonical rows (pre-#716 `codex-max` listed `codex-sol` against itself)."""
