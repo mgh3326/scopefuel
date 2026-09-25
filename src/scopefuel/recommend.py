@@ -2207,13 +2207,23 @@ class GateResult:
 def _find_profile(
     profile_name: str, *, grade_table: dict[Grade, list[Profile]] | None = None
 ) -> tuple[Grade, Profile] | None:
+    """Pick the first ordinary placement; use escalation only if it is the sole kind.
+
+    Canon rows may be ordered by effort, while the local table has its own
+    reviewed grade order. Keeping that order among ordinary rows preserves
+    local defaults without letting an earlier escalation rung shadow one.
+    """
     profile_name = PROFILE_ALIASES.get(profile_name, profile_name)
     table = GRADE_TABLE if grade_table is None else grade_table
+    escalation = None
     for grade, profiles in table.items():
         for profile in profiles:
             if profile.name == profile_name:
-                return grade, profile
-    return None
+                if profile.gate == "default":
+                    return grade, profile
+                if escalation is None:
+                    escalation = (grade, profile)
+    return escalation
 
 
 def _find_rung(
