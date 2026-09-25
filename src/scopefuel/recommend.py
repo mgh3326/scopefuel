@@ -1449,9 +1449,7 @@ def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str
     return f"{provider_id} 측정 불가 (provider error/degraded)"
 
 
-def _missing_required_windows(
-    result: ProviderResult | None, group_name: str | None
-) -> tuple[str, ...]:
+def _missing_required_windows(result: ProviderResult | None, group_name: str | None) -> tuple[str, ...]:
     """``manual.REQUIRED_WINDOWS`` 중 유효한 매칭 bucket 이 커버하지 못한 창 (task #690).
 
     창이 스냅샷에 아예 없거나 값이 읽히지 않는(``used_pct`` 무효) 경우 모두
@@ -2471,8 +2469,7 @@ def gate_check(
             provider_id=provider_id,
             grade=grade,
             reason=(
-                f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음)"
-                f"{_missing_windows_tag(missing)}"
+                f"{provider_id} bucket 측정 불가 (scope 불일치 또는 값 없음){_missing_windows_tag(missing)}"
             ),
             unmeasurable=True,
             alternatives=alts,
