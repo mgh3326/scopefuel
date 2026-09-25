@@ -26,6 +26,7 @@ import contextlib
 import datetime as dt
 import errno
 import fcntl
+import json
 import os
 import pty
 import re
@@ -83,14 +84,24 @@ _PERCENT_ANY = re.compile(r"\d+(?:\.\d+)?\s*%")
 
 # task #705 — session-record lockout signal.  The /usage panel's used_ratio
 # reads 0 even while the provider is answering 403 "usage limit"; those errors
-# are only visible in the records the CLI itself writes per session.
-SESSIONS_DIR = Path.home() / ".kimi-code" / "sessions"
-_SESSION_LOG_MAX_AGE_S = 8 * 86400  # a lockout cannot outlive its 7d window
+# are only visible in the records the CLI itself writes per session.  Only
+# structured error records count — transcript/tool-output blobs in wire.jsonl
+# quote the same words and must never be mistaken for a lockout.
+KIMI_HOME = Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code")
+SESSIONS_DIR = KIMI_HOME / "sessions"
+_SESSION_LOG_MAX_AGE_S = 32 * 86400  # a lockout cannot outlive its 30d window
 _SESSION_LOG_TAIL_BYTES = 1_048_576
 _SESSION_LIMIT_ERR = re.compile(r"usage\s+limit", re.IGNORECASE)
-_SESSION_ERR_AUTH = re.compile(r"403|auth_error|apistatuserror", re.IGNORECASE)
-_SESSION_LOG_TS = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z")
-_WIRE_TS = re.compile(r'"time"\s*:\s*(?P<ms>\d{10,13})')
+# kimi-code.log records provider failures as ``<ISO>Z WARN llm request failed``
+# lines with an errorMessage field — anchored, so quoted text cannot match.
+_SESSION_LOG_ERR = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z\s+(?:WARN|ERROR)\b")
+_SESSION_LOG_ERR_CTX = re.compile(r"errorName=APIStatusError|provider\.auth_error|statusCode=403")
+_SESSION_ERRMSG = re.compile(r'errorMessage="(?P<msg>[^"]*)"')
+# Window names are taken only from the error message itself, word-bounded —
+# a bare "7d" substring appears in hex traceIds and classifies wrong.
+_LOCKOUT_MONTHLY = re.compile(r"\bmonth", re.IGNORECASE)
+_LOCKOUT_WEEKLY = re.compile(r"\bweek|7-day", re.IGNORECASE)
+_LOCKOUT_SESSION = re.compile(r"5-hour|(?<!\d)5h\b|hour", re.IGNORECASE)
 _LOCKOUT_WINDOW = {"session": "5h", "weekly": "7d", "monthly": "30d"}
 
 
@@ -462,33 +473,70 @@ def parse(text: str) -> ProviderResult:
     )
 
 
-def _line_timestamp(line: str) -> dt.datetime | None:
-    """Timestamp of one session-record line: ISO prefix (kimi-code.log) or a
-    wire.jsonl ``"time"`` epoch-ms field."""
-    log_match = _SESSION_LOG_TS.search(line)
-    if log_match:
+def _wire_lockout(line: str) -> tuple[str, dt.datetime | None] | None:
+    """Structured auth_error record from a wire.jsonl line, or None.
+
+    Transcript and tool-output records quote the same words — only the
+    protocol's error fields count: ``error.code == "provider.auth_error"`` or
+    a top-level message that starts with ``[provider.auth_error]``.  The
+    timestamp comes from the record's ``time`` field, never from ISO text
+    embedded mid-blob.
+    """
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict):
+        return None
+    message: object = None
+    error = record.get("error")
+    if isinstance(error, dict) and error.get("code") == "provider.auth_error":
+        message = error.get("message")
+    else:
+        candidate = record.get("message")
+        if isinstance(candidate, str) and candidate.startswith("[provider.auth_error]"):
+            message = candidate
+    if not isinstance(message, str) or not _SESSION_LIMIT_ERR.search(message):
+        return None
+    ts = None
+    raw_time = record.get("time")
+    if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
         try:
-            return dt.datetime.fromisoformat(log_match["ts"] + "+00:00")
-        except ValueError:
-            pass
-    wire_match = _WIRE_TS.search(line)
-    if wire_match:
-        try:
-            return dt.datetime.fromtimestamp(int(wire_match["ms"]) / 1000, dt.UTC)
+            ts = dt.datetime.fromtimestamp(raw_time / 1000, dt.UTC)
         except (OSError, OverflowError, ValueError):
-            return None
-    return None
+            ts = None
+    return message, ts
 
 
-def _lockout_window(line: str) -> str | None:
-    """Which quota window a 'usage limit' error names, or None when the line
+def _log_lockout(line: str) -> tuple[str, dt.datetime | None] | None:
+    """A provider quota failure from a kimi-code.log line, or None.
+
+    Requires the anchored ``<ISO>Z WARN/ERROR`` record shape plus an auth/403
+    context marker, and reads the window only from the ``errorMessage`` value —
+    text quoted elsewhere in the file cannot qualify.
+    """
+    head = _SESSION_LOG_ERR.match(line)
+    if head is None or not _SESSION_LOG_ERR_CTX.search(line):
+        return None
+    msg_match = _SESSION_ERRMSG.search(line)
+    message = msg_match["msg"] if msg_match else ""
+    if not _SESSION_LIMIT_ERR.search(message):
+        return None
+    try:
+        ts: dt.datetime | None = dt.datetime.fromisoformat(head["ts"] + "+00:00")
+    except ValueError:
+        ts = None
+    return message, ts
+
+
+def _lockout_window(message: str) -> str | None:
+    """Which quota window a 'usage limit' error message names, or None when it
     does not say — an unplaceable error is unmeasurable, not guesswork."""
-    lower = line.lower()
-    if "month" in lower:
+    if _LOCKOUT_MONTHLY.search(message):
         return "monthly"
-    if "week" in lower or "7-day" in lower or "7d" in lower:
+    if _LOCKOUT_WEEKLY.search(message):
         return "weekly"
-    if _SESSION_ROW.search(lower):
+    if _LOCKOUT_SESSION.search(message):
         return "session"
     return None
 
@@ -502,11 +550,14 @@ def _scan_quota_errors(path: Path, *, fallback_ts: dt.datetime) -> list[tuple[dt
             data = fh.read().decode("utf-8", errors="replace")
     except OSError:
         return []
+    extractor = _wire_lockout if path.name == "wire.jsonl" else _log_lockout
     hits = []
     for line in data.splitlines():
-        if not (_SESSION_LIMIT_ERR.search(line) and _SESSION_ERR_AUTH.search(line)):
+        hit = extractor(line)
+        if hit is None:
             continue
-        hits.append((_line_timestamp(line) or fallback_ts, _lockout_window(line)))
+        message, ts = hit
+        hits.append((ts or fallback_ts, _lockout_window(message)))
     return hits
 
 
