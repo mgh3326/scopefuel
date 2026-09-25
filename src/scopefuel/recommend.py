@@ -636,6 +636,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             61.0,
             **_aa_agent_benchmark(61.0, "kimi-k3", "default", harness="kimi-code-cli"),
             aa_agent_model_id="kimi-k3",
+            aa_model_id="kimi-k3",
         ),
         # operator decision 2026-09-09 doc1144: Grok 4.5와 4.6은 모두
         # input $2 / output $6 per 1M으로 동일하므로 성능이 높은 4.6을 유지한다.
@@ -705,6 +706,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_effort="high",
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
+            aa_model_id="claude-sonnet-5",
         ),
         Profile(
             "sonnet",
@@ -716,6 +718,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_effort="xhigh",
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
+            aa_model_id="claude-sonnet-5",
         ),
         Profile(
             "grok",
@@ -784,6 +787,10 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "DeepSeek V4.1 Flash (high)",
             None,
             benchmark_annotation=DEVIN_DS41_GRADE_ANNOTATION,
+            # #689: AA slug is the no-suffix row (AA labels it Max Effort); the
+            # Devin-side launch id deepseek-v4-1-flash-high is a different
+            # namespace (launch.LAUNCH_MODEL_IDS).
+            aa_model_id="deepseek-v4-1-flash",
         ),
     ],
     "A": [
@@ -841,6 +848,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_effort="medium",
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
+            aa_model_id="claude-sonnet-5",
         ),
         Profile(
             "sonnet",
@@ -850,6 +858,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_effort="low",
             benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
             estimate_reason=SONNET_ESTIMATE_REASON,
+            aa_model_id="claude-sonnet-5",
         ),
         # ROB-1212 follow-up: kimi-k3 low effort has no AA-agent measurement in
         # bench.db, only an AA-model coding_index=72.0 row.  Derived via the
