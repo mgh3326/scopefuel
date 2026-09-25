@@ -478,6 +478,110 @@ def test_content_key_collision_does_not_mask_a_missing_rep(tmp_path, monkeypatch
     assert "missing=1" in capsys.readouterr().out
 
 
+def test_derived_origin_collision_refuses_without_force(tmp_path, monkeypatch, capsys):
+    """N1: a pending rep whose derived origin_id is already held by a
+    *different* remote rep would silently overwrite it (a second machine on
+    the same --host string). Dry-run flags it; --apply refuses; --force is
+    the explicit override."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    foreign = _remote_row(900, "m1-0")  # stamped for this host, different rep
+    foreign["origin_id"] = bench._migrate_origin_id(HOST, 1)
+    fake.reps.append(foreign)
+
+    assert cli.main(["reps", "migrate", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "would-overwrite=1" in out and "--force" in out
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 2
+    err = capsys.readouterr().err
+    assert "would overwrite" in err and "--force" in err
+    assert fake.hits["PUT"] == 0
+    assert fake.reps[0]["task_ref"] == "m1-0"  # nothing was overwritten
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST, "--force"]) == 0
+    assert fake.reps[0]["task_ref"] == "714-a"  # deliberate overwrite
+    assert len(fake.reps) == 1
+
+
+def test_renumbered_local_rowid_heals_via_identical_match(tmp_path, monkeypatch, capsys):
+    """N4: a this-host stamped row whose origin_id no longer matches the
+    local rowid (ids renumbered) still counts as present by full-row match —
+    no duplicate copy."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_from_record(_local_reps()[0], host=HOST))
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute("UPDATE reps SET id = id + 100")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=0 skipped=1" in out
+    assert len(fake.reps) == 1
+
+
+def test_notes_marker_text_is_not_confused_with_stamp(tmp_path, monkeypatch, capsys):
+    """A local notes field that literally contains '[src:X]' text: the remote
+    stamp is the *last* marker — unstamp must restore 'a [src:X]' exactly."""
+    _seed_local(tmp_path, [_rep("714-a", notes="a [src:X]")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_from_record(_local_reps()[0], host="other-host"))
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    assert "inserted=0 skipped=1" in capsys.readouterr().out
+    assert len(fake.reps) == 1
+
+
+def test_stamped_plus_twins_do_not_double_count(tmp_path, monkeypatch, capsys):
+    """R12/F6: a stamped-for-host row plus an unstamped push-local twin plus
+    an other-host twin is one rep, counted once."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    rep = _local_reps()[0]
+    fake.reps.extend(
+        [
+            _remote_from_record(rep, host=HOST),
+            _remote_from_record(rep, host=None),
+            _remote_from_record(rep, host="other-host"),
+        ]
+    )
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=0 skipped=1" in out
+    assert "local=1 remote-this-host=1" in out
+    assert len(fake.reps) == 3
+
+
+def test_empty_host_is_rejected(tmp_path, monkeypatch, capsys):
+    """R14/F5: --host \"\" must not silently fall back to gethostname()."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    _remote_backend(tmp_path, monkeypatch)
+    assert cli.main(["reps", "migrate", "--host", ""]) == 2
+    assert "--host" in capsys.readouterr().err
+
+
+def test_non_rfc3339_offset_timestamp_refuses(tmp_path, monkeypatch, capsys):
+    """N2: an offset-bearing but non-RFC3339 recorded_at (space separator,
+    no seconds, colonless offset) parses in Python but fails the Go server."""
+    _seed_local(tmp_path, [_rep("714-a")])
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute("UPDATE reps SET recorded_at = '2026-09-20 10:00:00+00:00' WHERE id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+    fake = _remote_backend(tmp_path, monkeypatch)
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 2
+    assert "recorded_at" in capsys.readouterr().err
+    assert fake.hits["PUT"] == 0
+
+
 def test_naive_recorded_at_refuses_before_writing(tmp_path, monkeypatch, capsys):
     """handoffkeep decodes RFC3339 — a naive recorded_at would die inside a
     PUT batch. Refuse up front, naming the local row."""

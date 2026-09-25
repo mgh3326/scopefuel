@@ -3659,6 +3659,10 @@ class RepMigration:
     remote_for_host: int | None
     missing: list[RepRecord]
     extra_remote_count: int
+    # Pending reps whose derived origin_id is already taken on the server by a
+    # different rep — a PUT would silently overwrite that row (a second machine
+    # running under the same --host string is the realistic cause).
+    would_overwrite: list[RepRecord]
 
 
 def _migrate_src_host(notes: str | None) -> str | None:
@@ -3691,15 +3695,21 @@ def _unstamp_rep_notes(notes: str | None) -> str | None:
     return stripped or None
 
 
-def _rep_wire_timestamp(rep: RepRecord) -> bool:
-    """Whether rep.recorded_at is a timestamp handoffkeep can store — the Go
-    server decodes RFC3339, which requires an explicit timezone offset."""
+# What the Go server accepts for time.Time JSON decoding: RFC3339 is stricter
+# than fromisoformat (requires dashes, T, seconds, and a colon'd offset or Z).
+_MIGRATE_RFC3339_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
 
-    try:
-        parsed = dt.datetime.fromisoformat(rep.recorded_at.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
+
+def _rep_wire_timestamp(rep: RepRecord) -> bool:
+    """Whether rep.recorded_at is a timestamp handoffkeep can store."""
+
+    if not isinstance(rep.recorded_at, str) or not _MIGRATE_RFC3339_RE.fullmatch(rep.recorded_at):
         return False
-    return parsed.tzinfo is not None
+    try:
+        dt.datetime.fromisoformat(rep.recorded_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 _MIGRATE_REP_WINDOW = 5000  # handoffkeep GET /v1/bench/reps limit cap (queryLimit)
@@ -3733,8 +3743,8 @@ def _fetch_reps_for_migrate(backend: BenchBackend, profiles: set[str]) -> list[_
         if len(page) >= _MIGRATE_REP_WINDOW:
             raise BenchBackendError(
                 f"reps migrate: remote reps for profile {profile!r} fill the server's "
-                f"{_MIGRATE_REP_WINDOW}-row read window — dedup completeness cannot be "
-                "proven, refusing to write"
+                f"{_MIGRATE_REP_WINDOW}-row read window — remote completeness cannot be "
+                "proven, so dedup and reconcile are unreliable"
             )
         for item in page:
             assert item.server_id is not None
@@ -3804,14 +3814,12 @@ def _rep_present_remote(
 
     for item in index.get(_rep_content_key(rep), ()):
         remote_host = _remote_rep_host(item)
-        if remote_host == host:
+        if remote_host == host and item.origin_id == _migrate_origin_id(host, rep.id):
             # Identity, not just likeness: the stamped row must carry this
             # rep's derived origin_id. Two local reps can share a content key
             # (same profile/model/task/role/instant, different rounds) — a
             # key-only match would mask one of them missing on the server.
-            if item.origin_id == _migrate_origin_id(host, rep.id):
-                return True
-            continue
+            return True
         candidate = (
             item.record
             if remote_host is None
@@ -3835,6 +3843,7 @@ def migrate_reps(
     apply: bool = False,
     host: str | None = None,
     allow_plaintext_http: bool = False,
+    force: bool = False,
 ) -> RepMigration:
     """Upload local bench.db rep rows to the handoffkeep reps store, once.
 
@@ -3880,6 +3889,13 @@ def migrate_reps(
     remote = _fetch_reps_for_migrate(backend, {rep.profile for rep in local_reps})
     index = _rep_content_index(remote)
     pending = [rep for rep in local_reps if not _rep_present_remote(rep, index, host)]
+    # The derived origin_id is the server's upsert key — if a pending rep's
+    # target slot is already held by a different rep (another machine migrated
+    # under the same host string, or local rowids were renumbered), the PUT
+    # would silently overwrite it. Flagged in dry-run; refused under --apply
+    # unless the operator passes --force.
+    remote_by_origin = {item.origin_id: item for item in remote}
+    would_overwrite = [rep for rep in pending if _migrate_origin_id(host, rep.id) in remote_by_origin]
     unwritable = [rep for rep in pending if not _rep_wire_timestamp(rep)]
     if unwritable:
         shown = ", ".join(str(rep.id) for rep in unwritable[:5])
@@ -3899,6 +3915,15 @@ def migrate_reps(
             remote_for_host=None,
             missing=[],
             extra_remote_count=0,
+            would_overwrite=would_overwrite,
+        )
+    if would_overwrite and not force:
+        shown = ", ".join(str(rep.id) for rep in would_overwrite[:5])
+        raise BenchBackendError(
+            f"reps migrate: {len(would_overwrite)} pending rep(s) would overwrite remote rows "
+            f"already held under this host's derived ids (local ids: {shown}) — likely a "
+            "second machine migrated under the same --host string, or local rowids changed. "
+            "Inspect, then re-run with --force only if the overwrite is intended"
         )
 
     written = [
@@ -3964,6 +3989,7 @@ def migrate_reps(
         remote_for_host=remote_for_host,
         missing=missing,
         extra_remote_count=extra_remote_count,
+        would_overwrite=would_overwrite,
     )
 
 

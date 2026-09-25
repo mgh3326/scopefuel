@@ -300,6 +300,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_migrate.add_argument(
         "--sample", type=_nonnegative_int, default=5, help="dry-run 에서 보일 to-insert 샘플 수"
     )
+    reps_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="원격이 같은 derived id 로 다른 rep 을 이미 갖고 있어도 덮어쓰기 진행",
+    )
 
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
@@ -1167,17 +1172,24 @@ def _reps_command(args: argparse.Namespace) -> int:
                 apply=args.apply,
                 host=args.host,
                 allow_plaintext_http=args.allow_plaintext_http,
+                force=args.force,
             )
         except bench.BenchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         if not result.applied:
+            overwrite = f" would-overwrite={len(result.would_overwrite)}" if result.would_overwrite else ""
             print(
                 f"reps migrate (dry-run) host={result.host} local={result.local_count} "
-                f"already-present={result.present_count} to-insert={len(result.pending)}"
+                f"already-present={result.present_count} to-insert={len(result.pending)}{overwrite}"
             )
             for rep in result.pending[: args.sample]:
                 print(f"  {bench.format_rep(rep)}")
+            if result.would_overwrite:
+                print(
+                    "warning: --apply will refuse these rows without --force "
+                    "(derived id already taken by a different remote rep)"
+                )
             print("pass --apply to write")
             return 0
         print(
