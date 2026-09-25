@@ -454,6 +454,30 @@ def test_full_profile_window_fails_closed(tmp_path, monkeypatch, capsys):
     assert fake.hits["PUT"] == 0
 
 
+def test_content_key_collision_does_not_mask_a_missing_rep(tmp_path, monkeypatch, capsys):
+    """Two local reps can share (profile, model, task, role, recorded_at) —
+    only their fields differ. If the server holds just one stamped copy, the
+    other must still be pending/missing, not masked by the key."""
+    _seed_local(
+        tmp_path,
+        [_rep("714-a", rounds=1), _rep("714-a", rounds=2)],  # same key, different rows
+    )
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_from_record(_local_reps()[0], host=HOST))
+
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 0
+    out = capsys.readouterr().out
+    assert "inserted=1 skipped=1" in out
+    assert len(fake.reps) == 2
+    assert "missing=0" in out
+
+    # and if the server loses one twin, reconcile must see it
+    fake.drop_tasks.add("714-a")  # PUT-acked then dropped — but only one row exists per origin_id
+    fake.reps.pop()  # the rounds=2 copy is gone from the store
+    assert cli.main(["reps", "migrate", "--apply", "--host", HOST]) == 2
+    assert "missing=1" in capsys.readouterr().out
+
+
 def test_naive_recorded_at_refuses_before_writing(tmp_path, monkeypatch, capsys):
     """handoffkeep decodes RFC3339 — a naive recorded_at would die inside a
     PUT batch. Refuse up front, naming the local row."""

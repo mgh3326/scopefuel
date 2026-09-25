@@ -3791,10 +3791,12 @@ def _rep_present_remote(
 ) -> bool:
     """Whether ``rep`` is already on the server for this host.
 
-    A row stamped ``[src:<host>]`` counts for that host directly. A row stamped
-    for a *different* host still counts when it is field-for-field identical
-    once its marker is stripped — the same rep migrated under a drifted
-    hostname (or on a host holding an identical copy) must not be duplicated.
+    A row stamped ``[src:<host>]`` counts for that host only when it carries
+    this rep's derived ``origin_id`` — key-level likeness is not enough. A row
+    stamped for a *different* host still counts when it is field-for-field
+    identical once its marker is stripped — the same rep migrated under a
+    drifted hostname (or on a host holding an identical copy) must not be
+    duplicated.
     An unstamped remote row (e.g. an earlier ``bench push-local`` copy) counts
     only when every rep field is identical, which is what makes it the same
     rep rather than a coincidence.
@@ -3803,7 +3805,13 @@ def _rep_present_remote(
     for item in index.get(_rep_content_key(rep), ()):
         remote_host = _remote_rep_host(item)
         if remote_host == host:
-            return True
+            # Identity, not just likeness: the stamped row must carry this
+            # rep's derived origin_id. Two local reps can share a content key
+            # (same profile/model/task/role/instant, different rounds) — a
+            # key-only match would mask one of them missing on the server.
+            if item.origin_id == _migrate_origin_id(host, rep.id):
+                return True
+            continue
         candidate = (
             item.record
             if remote_host is None
