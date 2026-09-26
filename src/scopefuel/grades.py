@@ -122,6 +122,7 @@ _SPAWN_CATALOG: dict[str, tuple[str, str]] = {
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
+    "builder-sol-medium": ("codex-sol", "medium"),
     "builder-luna-max": ("codex-luna", "max"),
     "builder-terra-high": ("codex-terra", "high"),
     "builder-terra-xhigh": ("codex-terra", "xhigh"),
@@ -140,6 +141,10 @@ _SPAWN_CATALOG: dict[str, tuple[str, str]] = {
     "grok-hi": ("grok-hi", ""),
     "grok-med": ("grok", "medium"),
     "builder-grok": ("grok-hi", "xhigh"),
+    # #737 (decision 4088): the E6 grok rungs pin grok-hi@<suffix>.
+    "builder-grok-low": ("grok-hi", "low"),
+    "builder-grok-medium": ("grok-hi", "medium"),
+    "builder-grok-xhigh": ("grok-hi", "xhigh"),
     "cc-qwen38": ("cc-qwen38", ""),
     "cc-glm": ("cc-glm", ""),
     # kimi spellings are not in wrk's resolve_catalog_profile (the catalog once
