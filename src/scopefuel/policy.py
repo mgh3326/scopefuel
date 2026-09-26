@@ -9,6 +9,15 @@ values, not a bypass path — task #461's invariant stands: a request-time
 ``--operator-request`` can never skip quota/exclude/cutoff checks. The gate
 applies the configured cutoff to every profile path exactly as it applied the
 builtin one.
+
+``[pools.<p>] subscribed = false`` / ``[profiles.<name>] subscribed = <bool>``
+(task #742) mark a plan or profile as unsubscribed without deleting anything:
+catalog rows, reps and grade history stay; recommend and gate exclude them;
+list and catalog views keep showing the rows (marked). ``[profiles.<name>]``
+overrides ``[pools.<p>]`` — an explicit profile value wins over the pool flag
+in either direction, and the canonical profile name wins over alias spellings
+of the same entity. A missing key has no opinion; the shipped default flags
+nothing. Flipping the flag back to true restores eligibility.
 """
 
 from __future__ import annotations
@@ -128,11 +137,33 @@ def _write_config(config: dict) -> None:
                     lines.append(f"cutoff = {raw_cutoff!r}")
             if "on_exhaust" in entry and entry["on_exhaust"] is not None:
                 lines.append(f"on_exhaust = {_toml_string(str(entry['on_exhaust']))}")
+            _write_subscribed(lines, entry)
+            lines.append("")
+    profiles = config.get("profiles")
+    if isinstance(profiles, dict):
+        for name in sorted(profiles):
+            entry = profiles[name]
+            if not isinstance(entry, dict) or not entry:
+                continue
+            lines.append(f"[profiles.{_toml_string(str(name))}]")
+            _write_subscribed(lines, entry)
             lines.append("")
     text = "\n".join(lines).rstrip() + "\n" if lines else ""
     path.write_text(text, encoding="utf-8")
     if text:
         path.chmod(0o600)
+
+
+def _write_subscribed(lines: list[str], entry: dict) -> None:
+    """Serialize ``subscribed`` — bools as TOML bools, anything else as a string
+    so a bad value round-trips visibly instead of being silently dropped."""
+    raw = entry.get("subscribed")
+    if raw is None:
+        return
+    if isinstance(raw, bool):
+        lines.append(f"subscribed = {'true' if raw else 'false'}")
+    else:
+        lines.append(f"subscribed = {_toml_string(str(raw))}")
 
 
 @dataclass(frozen=True)
@@ -492,6 +523,96 @@ def get_on_exhaust(pool: str) -> tuple[str, str | None]:
     return raw, None
 
 
+# ---------------------------------------------------------------------------
+# task #742 — 구독 해지(unsubscribed) 플래그
+#
+# ``[pools.<p>] subscribed = false``  → 그 풀의 모든 프로필이 구독 해지.
+# ``[profiles.<name>] subscribed = <bool>`` → 프로필 수준 오버라이드(풀보다 우선).
+# 키가 없으면 의견 없음(구독 유지). bool 이 아닌 값은 무효 — 무시하고 한 수준
+# 아래로 폴백하면서 status 문자열을 남긴다(오타가 조용히 플래그를 켜거나 끄지
+# 않게 하는 이 레이어의 기존 fail-open 관례와 같다).
+
+
+def _pools_table(config: dict) -> dict:
+    pools = config.get("pools")
+    return pools if isinstance(pools, dict) else {}
+
+
+def _profiles_table(config: dict) -> dict:
+    profiles = config.get("profiles")
+    return profiles if isinstance(profiles, dict) else {}
+
+
+def get_subscribed(pool: str) -> tuple[bool, str | None]:
+    """``[pools.<pool>] subscribed`` — 풀 수준 구독 플래그 (기본 True)."""
+    entry = _pools_table(load_config()).get(pool)
+    if not isinstance(entry, dict) or "subscribed" not in entry:
+        return True, None
+    raw = entry["subscribed"]
+    if isinstance(raw, bool):
+        return raw, None
+    return True, f"invalid subscribed {raw!r} — bool 이 아니라 구독 유지로 폴백"
+
+
+def get_profile_subscribed(profile: str) -> tuple[bool | None, str | None]:
+    """``[profiles.<profile>] subscribed`` — 프로필 수준 오버라이드.
+
+    (True|False, None) 명시 값, (None, None) 미설정(풀 수준으로 폴백),
+    (None, status) bool 아닌 무효 값 — 호출자가 다음 수준으로 진행한다.
+    """
+    entry = _profiles_table(load_config()).get(profile)
+    if not isinstance(entry, dict) or "subscribed" not in entry:
+        return None, None
+    raw = entry["subscribed"]
+    if isinstance(raw, bool):
+        return raw, None
+    return None, f"invalid subscribed {raw!r} — pool 수준으로 폴백"
+
+
+def set_subscribed(pool: str, value: bool | None) -> None:
+    """Write ``[pools.<pool>] subscribed``. ``None`` removes just that key.
+
+    An entry left empty by the removal is dropped entirely — an orphan
+    ``[pools.<pool>]`` table would show in ``policy list`` as configured while
+    carrying nothing.
+    """
+    config = load_config()
+    pools = config.setdefault("pools", {})
+    entry = dict(pools.get(pool) or {})
+    if value is None:
+        entry.pop("subscribed", None)
+    else:
+        entry["subscribed"] = value
+    if entry:
+        pools[pool] = entry
+    else:
+        pools.pop(pool, None)
+        if not pools:
+            config.pop("pools", None)
+    _write_config(config)
+
+
+def set_profile_subscribed(profile: str, value: bool | None) -> None:
+    """Write ``[profiles.<profile>] subscribed``. ``None`` removes just that key
+    (the profile falls back to the pool level). An explicit ``true`` overrides
+    an unsubscribed pool; an explicit ``false`` overrides a subscribed pool —
+    the two are not interchangeable with removal."""
+    config = load_config()
+    profiles = config.setdefault("profiles", {})
+    entry = dict(profiles.get(profile) or {})
+    if value is None:
+        entry.pop("subscribed", None)
+    else:
+        entry["subscribed"] = value
+    if entry:
+        profiles[profile] = entry
+    else:
+        profiles.pop(profile, None)
+    if not profiles:
+        config.pop("profiles", None)
+    _write_config(config)
+
+
 def list_policies(
     known_pools: dict[str, PoolClass], today: dt.date | None = None
 ) -> list[tuple[str, PoolClass, str | None]]:
@@ -528,6 +649,8 @@ class PolicyRow:
     boost_status: str | None
     capacity_weight: float
     capacity_weight_configured: bool
+    subscribed: bool
+    subscribed_status: str | None
 
 
 def list_policy_rows(known_pools: dict[str, PoolClass], today: dt.date | None = None) -> list[PolicyRow]:
@@ -565,6 +688,7 @@ def list_policy_rows(known_pools: dict[str, PoolClass], today: dt.date | None = 
         merged_boost_status = boost_status
         if boost_configured and boost is None and boost_status is None:
             merged_boost_status = None
+        subscribed, subscribed_status = get_subscribed(name)
         rows.append(
             PolicyRow(
                 pool=name,
@@ -575,7 +699,32 @@ def list_policy_rows(known_pools: dict[str, PoolClass], today: dt.date | None = 
                 boost_status=merged_boost_status if boost_configured else None,
                 capacity_weight=weight,
                 capacity_weight_configured=weight_configured,
+                subscribed=subscribed,
+                subscribed_status=subscribed_status,
             )
         )
         _ = weight_status  # weight_status 는 get_capacity_weight 폴백 사유; 열 표시는 값만 사용.
+    return rows
+
+
+@dataclass(frozen=True)
+class ProfileSubscriptionRow:
+    """``policy list`` 프로필 행 — ``[profiles.<name>] subscribed`` 오버라이드."""
+
+    profile: str
+    subscribed: bool | None  # None = 키는 있으나 값이 bool 이 아님(무효)
+    status: str | None
+
+
+def list_profile_subscriptions(known_profiles: set[str]) -> list[ProfileSubscriptionRow]:
+    """Every ``[profiles.<name>]`` entry, marked when the name is not a known
+    profile or alias spelling — an override nothing resolves to is a config
+    bug worth surfacing, not a silent no-op."""
+    profiles = _profiles_table(load_config())
+    rows: list[ProfileSubscriptionRow] = []
+    for name in sorted(profiles):
+        value, status = get_profile_subscribed(name)
+        if name not in known_profiles:
+            status = f"unknown profile{'; ' + status if status else ''}"
+        rows.append(ProfileSubscriptionRow(profile=name, subscribed=value, status=status))
     return rows

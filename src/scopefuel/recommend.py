@@ -42,7 +42,9 @@ from .policy import (
     get_imminent_remaining_pct,
     get_imminent_reset_hours,
     get_policy,
+    get_profile_subscribed,
     get_reset_urgency_hours,
+    get_subscribed,
 )
 
 Grade = Literal["S+", "S", "A+", "A", "B", "C"]
@@ -1473,6 +1475,60 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     return "", None
 
 
+# ── task #742: 구독 해지(unsubscribed) 플래그 ────────────────────────────────
+# ``[pools.<p>] subscribed=false`` 는 그 풀의 모든 프로필을, ``[profiles.<name>]``
+# 은 프로필 하나를 덮어쓴다. 카탈로그·reps·급 이력은 지우지 않는다 — 추천과
+# 게이트만 닫고, true 로 되돌리면 그대로 복원된다. 구독이 없는 프로필의 판정은
+# 쿼타 답이 아니다 — 게이트는 전용 exit(6)으로 거부한다.
+
+
+@dataclass(frozen=True)
+class Subscription:
+    """Resolved subscription state for one profile spelling."""
+
+    subscribed: bool
+    source: str  # "profile" | "pool" — 어느 수준의 플래그가 결정했는지
+    key: str  # the deciding config key, e.g. "pools.kiro" / "profiles.kiro-opus"
+    pool: str
+    status: str | None = None  # 무효 값 폴백 사유 (있으면)
+
+    @property
+    def reason(self) -> str:
+        return f"[{self.key}] subscribed={'true' if self.subscribed else 'false'}"
+
+
+def profile_subscription(name: str, provider_id: str | None = None) -> Subscription:
+    """Effective subscription state of a profile spelling.
+
+    Precedence, highest first — the most specific statement wins:
+
+    1. ``[profiles.<canonical>]``           (canonical name)
+    2. ``[profiles.<requested>]``           (the spelling actually asked for)
+    3. ``[profiles.<alias>]``               (any other alias of the same entity,
+                                             deterministic order)
+    4. ``[pools.<pool>]``
+    5. default — subscribed (the shipped config flags nothing)
+
+    A non-bool value at any level is invalid: it is ignored and the next level
+    decides, with the status string carried for ``policy list`` to surface.
+    """
+    canonical = PROFILE_ALIASES.get(name, name)
+    pool = provider_id if provider_id is not None else profile_pool(canonical)[0]
+    alias_keys = sorted(alias for alias, target in PROFILE_ALIASES.items() if target == canonical)
+    status: str | None = None
+    for key in dict.fromkeys((canonical, name, *alias_keys)):
+        value, note = get_profile_subscribed(key)
+        if value is not None:
+            return Subscription(value, "profile", f"profiles.{key}", pool, note or status)
+        status = status or note
+    if pool:
+        value, note = get_subscribed(pool)
+        if not value:
+            return Subscription(False, "pool", f"pools.{pool}", pool, note or status)
+        status = status or note
+    return Subscription(True, "default", f"pools.{pool}", pool, status)
+
+
 @dataclass(frozen=True)
 class _WindowState:
     """Per-window usage snapshot used for multi-window cutoff + constraint selection."""
@@ -1537,6 +1593,20 @@ class _PolicyExcluded:
     provider_label: str
     until: dt.date | None
     note: str | None
+
+
+@dataclass
+class _Unsubscribed:
+    """#742 — a table row withheld from candidacy by the subscription flag.
+
+    Kept apart from ``_PolicyExcluded`` on purpose: the emergency-candidate
+    block renders ``policy_excluded`` rows as usable-when-nothing-else, and an
+    unsubscribed profile must never ride that path.
+    """
+
+    profile: Profile
+    provider_id: str
+    source: str  # "pool" | "profile" — which level's flag decided
 
 
 @dataclass
@@ -2153,6 +2223,9 @@ def _cross_grade_measured_alternatives(
             if profile.name in _SOL_PROFILES:
                 continue
             provider_id, _ = resolved_pool(profile)
+            # task #742 — 구독 해지는 측정된 상위급 대안으로도 나지 않는다.
+            if not profile_subscription(profile.name, provider_id).subscribed:
+                continue
             source_profile = estimated_by_provider.get(provider_id)
             if (
                 source_profile is None
@@ -2224,6 +2297,10 @@ class GateResult:
     # C 급 E6 런그는 이 표식이 있을 때만 열리므로, 통과 판정의 감사 필드이자
     # allow 라인에 붙는 가시 표식의 원천이다.
     e6_arm: str | None = None
+    # task #742 — 구독 해지 플래그 거부 (CLI exit 6). 쿼타(exit 3)·측정불가(exit 4)·
+    # 역할 거부(exit 5)와 다른 전용 코드다 — 구독 자체가 없는 판정을 "reset 을
+    # 기다리면 풀리는 quota 차단"으로 오독하지 않게 한다.
+    unsubscribed: bool = False
 
 
 def _find_profile(
@@ -2436,6 +2513,22 @@ def gate_check(
             )
 
     provider_id, group_name = profile_pool(profile_name)
+
+    # task #742 — 구독 해지 플래그는 요청 형식·측정·쿼타 어떤 검사보다 먼저 선다.
+    # 구독 자체가 없는 프로필을 쿼타로 판정하면 "reset 을 기다리면 풀린다"로
+    # 오독된다 — 쿼타 거부(exit 3)·측정불가(exit 4)·역할 거부(exit 5)와 다른 전용
+    # rc(exit 6)로 답하고, 어떤 alternatives 도 제안하지 않는다. 행·reps·급
+    # 이력은 남아 있으므로 subscribed=true 로 되돌리면 그대로 복원된다.
+    subscription = profile_subscription(profile_name, provider_id)
+    if not subscription.subscribed:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=f"unsubscribed: {subscription.reason}",
+            unsubscribed=True,
+        )
 
     # task #461 입력 검증 — REF 형식이 유효하지 않으면 프로필 판정 전에 거부한다.
     if requested_by is not None and operator_request is None:
@@ -2994,15 +3087,26 @@ def recommend(
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []
     policy_excluded: list[_PolicyExcluded] = []
+    unsubscribed: list[_Unsubscribed] = []
     escalation: list[_EscalationEntry] = []
 
     for profile in table[grade]:
+        provider_id, group_name = resolved_pool(profile)
+        # task #742 — 구독 해지(풀 또는 프로필 플래그)는 후보·승급·비상 후보 어떤
+        # 경로로도 추천되지 않는다. 행은 지우지 않고 후보 평가만 건너뛴다 —
+        # 정책 제외와 달리 자기 전용 fold 로 이름낸다.
+        subscription = profile_subscription(profile.name, provider_id)
+        if not subscription.subscribed:
+            unsubscribed.append(
+                _Unsubscribed(profile=profile, provider_id=provider_id, source=subscription.source)
+            )
+            continue
+
         # Escalation profiles → separate section, not in normal ranked candidates.
         if profile.gate == "escalation":
             escalation.append(_build_escalation_entry(profile, by_id, today, now=now))
             continue
 
-        provider_id, group_name = resolved_pool(profile)
         provider_label = _provider_label(provider_id, group_name)
 
         result = by_id.get(provider_id)
@@ -3449,6 +3553,21 @@ def recommend(
         """
         return bool(items)
 
+    def _fold_unsubscribed(items: list[_Unsubscribed]) -> list[str]:
+        """③ fold unsubscribed rows by the deciding level (pool or profile)."""
+        by_key: dict[str, list[_Unsubscribed]] = {}
+        for item in items:
+            key = (
+                f"{item.provider_id} 풀 구독 해지"
+                if item.source == "pool"
+                else f"프로필 {item.profile.name} 구독 해지"
+            )
+            by_key.setdefault(key, []).append(item)
+        return [
+            f"✗ {key} — 이 급에서 {len(group)}개({'·'.join(i.profile.name for i in group)})"
+            for key, group in by_key.items()
+        ]
+
     def _fold_excluded(items: list[_Excluded]) -> list[str]:
         """③ fold exhausted/unmeasurable by pool; keep kinds separate."""
         # Group key: (kind, provider_id, reason) so different cutoffs don't merge incorrectly.
@@ -3549,6 +3668,7 @@ def recommend(
             lines.extend(_fold_policy_excluded(policy_excluded))
 
     if not hide_excluded:
+        lines.extend(_fold_unsubscribed(unsubscribed))
         lines.extend(_fold_excluded(excluded))
 
     if escalation:

@@ -19,7 +19,14 @@ from dataclasses import replace
 from . import bench, grades, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
-from .policy import clear_policy, list_policy_rows, set_policy
+from .policy import (
+    clear_policy,
+    list_policy_rows,
+    list_profile_subscriptions,
+    set_policy,
+    set_profile_subscribed,
+    set_subscribed,
+)
 from .providers import default_order, registry
 from .recommend import grade_help_text
 from .refresh import REFRESH_POOLS, run_worker, spawn
@@ -120,7 +127,8 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-recommend-profiles",
         action="store_true",
-        help="GRADE_TABLE 의 모든 추천 프로필 이름(기계 판독 가능, 한 줄에 하나) — wrk 교차검증용",
+        help="GRADE_TABLE 의 모든 추천 프로필 이름(기계 판독 가능, 한 줄에 하나) — "
+        "wrk 교차검증용. 구독 해지 행은 이름 뒤에 [unsubscribed] 태그",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -148,9 +156,31 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         metavar="N|none",
         help="정수 boost (작을수록 먼저). 'none' 이면 boost만 해제. 숫자 설정 시 --until 필수",
     )
+    set_parser.add_argument(
+        "--subscribed",
+        choices=["on", "off", "none"],
+        default=None,
+        help=(
+            "#742 풀 수준 구독 플래그 — off 면 그 풀의 모든 프로필이 추천·게이트에서 "
+            "제외(행은 유지). 'none' 은 subscribed 키만 제거"
+        ),
+    )
 
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
     clear_parser.add_argument("pool", help="provider pool 이름")
+
+    profile_parser = policy_sub.add_parser(
+        "profile",
+        help="#742 프로필 수준 subscribed 플래그 ([profiles.<name>]) — 풀 플래그보다 우선",
+    )
+    profile_parser.add_argument(
+        "name", help="프로필 이름 (GRADE_TABLE·카탈로그 철자 — 별칭은 canonical 을 본다)"
+    )
+    profile_parser.add_argument(
+        "state",
+        choices=["on", "off", "clear"],
+        help="on/off=프로필 플래그 명시, clear=프로필 키 제거(풀 수준으로 폴백)",
+    )
 
     launch_parser = policy_sub.add_parser(
         "launch",
@@ -392,7 +422,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     gate_parser = subparsers.add_parser(
         "gate",
-        help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가/5=역할 거부)",
+        help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가/5=역할 거부/6=구독 해지)",
     )
     gate_parser.add_argument(
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
@@ -522,11 +552,26 @@ def _policy_command(
             class_tag = "[설정]" if row.class_configured else "[기본]"
             boost_s = str(row.boost) if row.boost is not None else "-"
             weight_s = f"{row.capacity_weight:g}" if row.capacity_weight_configured else "-"
-            status_s = f"  [{row.status}]" if row.status else ""
+            status_parts = [part for part in (row.status, row.subscribed_status) if part]
+            if not row.subscribed:
+                status_parts.append("unsubscribed")
+            status_s = f"  [{'; '.join(status_parts)}]" if status_parts else ""
             print(
                 f"{row.pool:<12} {row.effective_class:<9} {class_tag:<6} "
                 f"boost={boost_s:<4} capacity_weight={weight_s:<6}{status_s}"
             )
+        # #742 — profile-level overrides are a separate namespace from pools
+        # (a name like "agy" exists in both), so they list in their own section.
+        known_profiles = {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles} | set(
+            recommend.PROFILE_ALIASES
+        )
+        profile_rows = list_profile_subscriptions(known_profiles)
+        if profile_rows:
+            print("profiles:")
+            for row in profile_rows:
+                state = "-" if row.subscribed is None else str(row.subscribed).lower()
+                status_s = f"  [{row.status}]" if row.status else ""
+                print(f"  {row.profile:<24} subscribed={state}{status_s}")
         return 0
 
     if args.policy_command == "set":
@@ -540,8 +585,8 @@ def _policy_command(
                 boost_arg = args.boost
                 if args.until is None:
                     parser.error("--until 은 --boost 로 값을 지정할 때 필수입니다")
-        if args.pool_class is None and boost_arg == "__unset__":
-            parser.error("class 또는 --boost 중 하나는 지정해야 합니다")
+        if args.pool_class is None and boost_arg == "__unset__" and args.subscribed is None:
+            parser.error("class, --boost, --subscribed 중 하나는 지정해야 합니다")
 
         set_policy(
             args.pool,
@@ -556,7 +601,26 @@ def _policy_command(
             parts.append(f"{args.pool_class}{until_s}")
         if boost_arg != "__unset__":
             parts.append("boost cleared" if boost_arg is None else f"boost={boost_arg}")
+        if args.subscribed is not None:
+            # #742 — 'none' 은 subscribed 키만 제거한다(나머지 필드 보존).
+            set_subscribed(args.pool, None if args.subscribed == "none" else args.subscribed == "on")
+            parts.append(
+                "subscribed key removed"
+                if args.subscribed == "none"
+                else f"subscribed={args.subscribed == 'on'}"
+            )
         print(f"{args.pool} -> {', '.join(parts)}")
+        return 0
+
+    if args.policy_command == "profile":
+        # #742 — 프로필 수준 플래그는 풀 플래그를 양방향으로 덮어쓴다:
+        # on 은 unsubscribed 풀 위에서 이 프로필만, off 는 구독 풀 아래 이 프로필만 닫는다.
+        if args.state == "clear":
+            set_profile_subscribed(args.name, None)
+            print(f"profiles.{args.name} subscribed removed — 풀 수준으로 폴백")
+        else:
+            set_profile_subscribed(args.name, args.state == "on")
+            print(f"profiles.{args.name} subscribed={args.state == 'on'}")
         return 0
 
     if args.policy_command == "launch":
@@ -701,6 +765,11 @@ def _gate_record(
             # #692: only an opened E6 measurement rung carries this — every other
             # record stays byte-identical (the #635 golden compares whole records).
             {"e6_arm": result.e6_arm} if result.e6_arm else {}
+        )
+        | (
+            # #742: only an unsubscribed-flag refusal carries this — every other
+            # record stays byte-identical (same #635 golden contract as e6_arm).
+            {"unsubscribed": True} if result.unsubscribed else {}
         )
     )
 
@@ -943,7 +1012,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             ),
             observed_age_s=remote_used.age_s,
         )
-    exit_code = 0 if result.ok else (5 if result.role_denied else (4 if result.unmeasurable else 3))
+    # #742 — 구독 해지 거부는 전용 exit 6: 쿼타 차단(3)·측정불가(4)·역할 거부(5)와
+    # 다른 rc 로 "reset 을 기다리면 풀리는" quota 답과 섞이지 않는다.
+    exit_code = (
+        0
+        if result.ok
+        else (5 if result.role_denied else (4 if result.unmeasurable else (6 if result.unsubscribed else 3)))
+    )
 
     # task #578 1단계 — shadow 전용: v2(account-scoped) 판정을 계산해 비교 로그에만 남긴다.
     # result·exit_code·출력은 건드리지 않으며, 미등록 노드에서는 아무것도 하지 않는다.
@@ -1025,6 +1100,14 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         # what would actually change the answer.
         print(
             "역할 거부 — 쿼타와 무관. 허용 용도로 --purpose 를 지정해야 쿼타 검사로 진행한다",
+            file=sys.stderr,
+        )
+    elif result.unsubscribed:
+        # task #742: a subscription-flag refusal is not a quota refusal — the
+        # same-grade alternatives line would read as "wait for reset". The
+        # reason line names the deciding config key; flipping it restores.
+        print(
+            "구독 해지 — 쿼타와 무관. config 의 subscribed 를 true 로 되돌리면 다시 연다",
             file=sys.stderr,
         )
     elif result.e6_arm and not result.ok:
@@ -1520,8 +1603,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.list_recommend_profiles:
+        # #742 — 구독 해지 행도 지우지 않고 보인다: 이름 뒤에 [unsubscribed] 태그.
+        # 추천 후보가 아니라 "목록 표식"이며, 첫 토큰이 항상 프로필 이름이다.
         for name in sorted({p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}):
-            print(name)
+            subscription = recommend.profile_subscription(name)
+            print(name if subscription.subscribed else f"{name}  [unsubscribed]")
         return 0
 
     if args.recommend:

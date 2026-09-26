@@ -2663,6 +2663,19 @@ def push_catalog(source: pathlib.Path | str, *, path: pathlib.Path | str | None 
     return len(entries)
 
 
+def _entry_subscribed(entry: CatalogEntry) -> bool:
+    """#742 — config-level subscription state of this catalog row.
+
+    The flag lives in config, not in the canon: a row is never deleted for
+    being unsubscribed, only marked. Pool resolution mirrors the gate — the
+    name table wins where it has a mapping, the row's own pool otherwise.
+    """
+    from .recommend import profile_pool, profile_subscription
+
+    pool = profile_pool(entry.profile)[0] or entry.pool or None
+    return profile_subscription(entry.profile, pool).subscribed
+
+
 def catalog_report(*, path: pathlib.Path | str | None = None) -> str:
     """Render the catalog as one row per (profile, effort)."""
 
@@ -2670,12 +2683,13 @@ def catalog_report(*, path: pathlib.Path | str | None = None) -> str:
     lines = [view.label]
     for entry in sorted(view.entries, key=_catalog_sort_key):
         retired = " retired" if entry.retired_at else ""
+        unsubscribed = " unsubscribed" if not _entry_subscribed(entry) else ""
         score = "-" if entry.score is None else f"{entry.score:g}"
         lines.append(
             f"{entry.grade:<3} {entry.profile}"
             f"{'@' + entry.effort if entry.effort else ''} "
             f"model={entry.model_id or '-'} pool={entry.pool or '-'} "
-            f"gate={entry.gate} score={score}{retired}"
+            f"gate={entry.gate} score={score}{retired}{unsubscribed}"
         )
     return "\n".join(lines)
 

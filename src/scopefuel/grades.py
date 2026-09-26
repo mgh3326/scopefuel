@@ -60,6 +60,7 @@ import socket
 from dataclasses import dataclass, field
 
 from . import bench, launch
+from .recommend import profile_pool, profile_subscription
 
 # ---------------------------------------------------------------------------
 # The rule
@@ -1020,10 +1021,24 @@ def parse_rung_spec(spec: str) -> tuple[str, str]:
     return profile.strip(), effort.strip()
 
 
+def _unsubscribed_tag(profile: str, pool: str | None) -> str:
+    """#742 — " [unsubscribed]" marker for proposal lines.
+
+    The flag never suppresses evidence or history: propose keeps evaluating a
+    flagged rung and marks it, so flipping ``subscribed`` back to true restores
+    an untouched record rather than a gap.
+    """
+    resolved = profile_pool(profile)[0] or pool or None
+    return "" if profile_subscription(profile, resolved).subscribed else " [unsubscribed]"
+
+
 def render_rung_detail(result: RungResult) -> list[str]:
     """Every evidence row for one rung — the audit view a --rung query wants."""
 
-    lines = [f"rung {result.label()} current={result.row.grade}:"]
+    lines = [
+        f"rung {result.label()} current={result.row.grade}"
+        f"{_unsubscribed_tag(result.key[0], result.row.pool)}:"
+    ]
     for item in sorted(result.counted + result.excluded, key=lambda x: (x.ref.partition(":")[0], x.ref)):
         suffix = f"  [excluded: {item.excluded}]" if item.excluded else ""
         lines.append(f"  {_fmt_evidence(item)}{suffix}")
@@ -1082,7 +1097,10 @@ def render_proposal(
     if changes:
         lines.append("proposals:")
         for r in changes:
-            lines.append(f"  {r.action} {r.label()} {r.row.grade} -> {r.target}")
+            lines.append(
+                f"  {r.action} {r.label()} {r.row.grade} -> {r.target}"
+                f"{_unsubscribed_tag(r.key[0], r.row.pool)}"
+            )
             lines.append(f"    rule: {r.note}")
             for item in r.counted:
                 if item.ref in r.evidence_refs:
@@ -1095,7 +1113,10 @@ def render_proposal(
     if holds:
         lines.append("rungs with evidence but no change:")
         for r in holds:
-            lines.append(f"  {r.action:<12} {r.label()} current={r.row.grade} — {r.note}")
+            lines.append(
+                f"  {r.action:<12} {r.label()} current={r.row.grade} — {r.note}"
+                f"{_unsubscribed_tag(r.key[0], r.row.pool)}"
+            )
             summary = [f"{grade}:{len(refs)}" for grade, refs in r.passes_at.items()]
             if r.ungraded_passes:
                 summary.append(f"ungraded-pass:{len(r.ungraded_passes)}")
@@ -1113,6 +1134,7 @@ def render_proposal(
         retired = {key for key, entry in view.by_key().items() if entry.retired_at}
         for item in proposal.unrung:
             suffix = "  [rung retired]" if item.rung in retired else ""
+            suffix += _unsubscribed_tag(item.rung[0], None) if item.rung else ""
             lines.append(f"  {_fmt_evidence(item)}{suffix}")
 
     if focus is not None:

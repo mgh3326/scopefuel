@@ -15,6 +15,7 @@ from .model import (
     iso_to_local,
     overall_mark,
 )
+from .policy import get_subscribed
 
 MARK_TEXT = {"ok": "ok", "warn": "WARN", "crit": "CRIT", "degraded": "DEGRADED"}
 MARK_COLOR = {"ok": "\033[32m", "warn": "\033[33m", "crit": "\033[31m", "degraded": "\033[33m"}
@@ -97,8 +98,10 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
         # task #659 — 어느 계정의 측정인지 표에 항상 보인다 (지문 앞 8자 + 안전 라벨).
         acct = account_tag(result.account_fp, result.account_label, result.account_fp_kind)
         acct_s = f"  account {acct}" if acct else ""
+        # task #742 — 구독 해지 풀도 행을 지우지 않고 표식한다(추천·게이트만 닫힘).
+        unsub_s = " [unsubscribed]" if not get_subscribed(result.id)[0] else ""
         if result.error:
-            lines.append(f"{display_id:<7}{acct_s} -- {result.error}")
+            lines.append(f"{display_id:<7}{acct_s}{unsub_s} -- {result.error}")
             if result.hint:
                 lines.append(f"        힌트: {result.hint}")
             lines.append("")
@@ -124,7 +127,7 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
         else:
             mark_text = _mark(verdict.mark, color)
 
-        lines.append(f"{display_id}{plan}{acct_s}  [{mark_text}] {basis}{stamp}")
+        lines.append(f"{display_id}{plan}{acct_s}  [{mark_text}]{unsub_s} {basis}{stamp}")
 
         for bucket in result.buckets:
             tags = [t for t in (bucket.note,) if t]

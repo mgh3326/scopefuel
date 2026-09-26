@@ -205,6 +205,56 @@ SCOPEFUEL_E6_ARM=sonnet@max scopefuel gate -m sonnet --effort max  # → exit 0,
   ambient 환경변수이므로 자식 스폰에 상속되면 그 스폰의 게이트 태그도 표식 런그를 가리킵니다 —
   arm 단위로만 설정하세요.
 
+### 구독 해지 — subscribed 플래그 (task #742)
+
+구독이 끝난 플랜·프로필은 행을 지우지 않고 플래그로 표시합니다 — 카탈로그 행·reps·급
+이력은 그대로 남고, 추천과 게이트만 닫힙니다. 플래그를 되돌리면 남아 있던 이력 그대로
+복원됩니다. 플래그는 **config**(정본 카탈로그가 아님)에 둡니다:
+
+```toml
+[pools.kiro]
+subscribed = false        # 그 풀의 모든 프로필이 구독 해지
+
+[profiles.kiro-opus]
+subscribed = true         # 프로필 수준 오버라이드 — 풀 플래그보다 우선
+```
+
+우선순위(구체적인 문장이 이깁니다): `profiles.<canonical>` > `profiles.<요청 철자>` >
+같은 엔터티의 다른 별칭 키 > `pools.<pool>` > 기본값(구독). `true`/`false` 둘 다 명시
+오버라이드입니다 — 풀이 꺼진 상태에서 프로필을 `true`로 켜거나, 풀이 켜진 상태에서
+프로필을 `false`로 끌 수 있습니다. 키가 없으면 의견 없음(한 수준 아래로 폴백).
+bool이 아닌 값은 무효로 무시하고 다음 수준이 판정하며 `policy list`에 사유가 남습니다.
+설정을 아무것도 안 하면 기본값 그대로입니다 — 배포 기본값은 아무것도 플래그하지 않습니다.
+
+CLI 표면:
+
+```bash
+scopefuel policy set kiro --subscribed off          # [pools.kiro] subscribed=false
+scopefuel policy set kiro --subscribed on           # true
+scopefuel policy set kiro --subscribed none         # 키만 제거
+scopefuel policy profile kiro-opus off              # [profiles.kiro-opus] subscribed=false
+scopefuel policy profile kiro-opus on               # 풀이 꺼져도 이 프로필만 복원
+scopefuel policy profile kiro-opus clear            # 프로필 키 제거 → 풀 수준 폴백
+scopefuel policy list                               # 풀 행의 [unsubscribed] + profiles: 절
+```
+
+행동 계약:
+
+- `--recommend`는 구독 해지 프로필을 후보·승급 후보·비상 후보(policy_excluded)·교차급
+  실측 대안 어느 경로로도 나열하지 않습니다. 행 자체는 급표에 남아 있으므로
+  `✗ <pool> 풀 구독 해지 — 이 급에서 N개(...)` fold 줄로 표시합니다.
+- `scopefuel gate -m <p>`는 구독 해지를 **전용 exit 6**으로 거부합니다 — 쿼타 차단(3)·
+  측정불가(4)·역할 거부(5)와 다른 코드이며, 쿼타보다 먼저 판정하므로 "reset 을 기다리면
+  풀리는" 답으로 섞이지 않습니다. 사유는 결정한 config 키(`[pools.x]`/`[profiles.x]`)를
+  이름붙이고, `--gate-output` 레코드에 `"unsubscribed": true`가 남습니다.
+- `policy launch`는 같은 플래그로 거부합니다(rc 3, "canon says no" 경로) —
+  별칭·effort 런그·E6 arm·`--operator-request` 어떤 경로도 구독 해지를 열지 못합니다.
+- 상태 표·`--list-recommend-profiles`·`bench catalog list`는 행을 유지한 채
+  `[unsubscribed]`/`unsubscribed` 표식을 붙여 보입니다.
+- `grades propose`/`grades apply`·`reps`는 구독 해지 런그를 평소대로 평가·갱신합니다
+  (제안·보류·런그 상세 줄에 `[unsubscribed]` 태그만 추가). 플래그는 이력을 지우거나
+  평가를 건너뛰지 않습니다 — 되돌리면 끊기지 않은 기록으로 이어집니다.
+
 ## Benchmark backend
 
 벤치 점수와 대표 실행 기록의 backend는 `auto`(기본)·`handoffkeep`·`local` 중 하나입니다.
