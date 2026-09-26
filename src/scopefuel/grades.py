@@ -659,9 +659,7 @@ def backfill_rep_grades(
         backend=bench.BENCH_BACKEND_LOCAL,
         reason="reps backfill",
     )
-    evidence = gather_reps(
-        view=empty_view, host=host, allow_plaintext_http=allow_plaintext_http, path=path
-    )
+    evidence = gather_reps(view=empty_view, host=host, allow_plaintext_http=allow_plaintext_http, path=path)
     existing = bench.read_rep_grade_annotations(path=path)
     report = BackfillReport(mapping=clean)
     by_task: dict[str, list[EvidenceRep]] = {}
@@ -836,8 +834,7 @@ def _evaluate_row(
         parts = []
         if demote_fails:
             parts.append(
-                f"{len(demote_fails)} FAIL(s) at-or-below {current} "
-                "(demotion needs 2 or a post-merge marker)"
+                f"{len(demote_fails)} FAIL(s) at-or-below {current} (demotion needs 2 or a post-merge marker)"
             )
         if above:
             parts.append(f"{len(above)} FAIL(s) above the placement")

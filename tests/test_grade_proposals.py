@@ -1271,9 +1271,7 @@ def test_backfill_dry_run_writes_nothing(tmp_path, isolated_cache, capsys):
 def test_backfill_apply_annotates_without_mutating_originals(tmp_path, isolated_cache, capsys):
     _seed([_rep("743", effort="xhigh")])
     before = [rep.as_dict() for rep in bench.read_reps()]
-    rc = cli.main(
-        ["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"743": "A+"}), "--apply"]
-    )
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"743": "A+"}), "--apply"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "wrote 1 annotation row(s)" in out
