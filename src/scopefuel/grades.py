@@ -1079,12 +1079,96 @@ class Proposal:
         return [r for r in self.results if r.action in ("promote", "demote") and r.target != r.row.grade]
 
 
+def _same_run_key(rep: bench.RepRecord) -> tuple | None:
+    """Identity of one measured run, regardless of profile spelling.
+
+    The raw-content dedup key includes the recorded profile spelling, so the
+    same run stored as ``codex`` on one host and ``codex-sol`` on another
+    survives it. After rung resolution those rows are visibly one rep; this
+    key is everything about the run itself — notes and token counts stay out
+    (migration stamps and partial records legitimately differ between the
+    two recordings).
+    """
+
+    if not rep.task_ref or not rep.recorded_at:
+        return None
+    return (
+        rep.model_id,
+        rep.task_ref,
+        rep.tier,
+        rep.role,
+        rep.rounds,
+        rep.blockers_found,
+        rep.completed,
+        rep.grade,
+        bench._recorded_at_key(rep.recorded_at),
+    )
+
+
+def _collapse_preference(item: EvidenceRep) -> tuple:
+    """Which copy of a same-run duplicate is kept.
+
+    A rep whose effort was recorded — not inferred — measured the rung; the
+    server copy is authoritative over a local one; the lower id is the older
+    record.
+    """
+
+    return (
+        item.effort_inferred,
+        item.ref.startswith("local:"),
+        int(item.ref.rsplit(":", 1)[1]),
+    )
+
+
+def _collapse_alias_duplicates(evidence: RepsEvidence) -> None:
+    """One measured run under two spellings counts once.
+
+    Two rows with the same run identity resolve to the same rung only after
+    the spelling layer — raw dedup cannot see them. Collapse them here:
+    keep the preferred row and mark the rest excluded with a disclosed
+    reason, never silently dropped. Rows whose same-run duplicates resolved
+    to *different* rungs collapse the same way; the loser keeps its own
+    rung's excluded line naming the kept row's rung.
+
+    Only groups whose spellings differ collapse — two rows identical in
+    every field including the spelling are fleet-semantics separate reps
+    (the store has always counted each row once), not an alias artifact.
+    """
+
+    groups: dict[tuple, list[int]] = {}
+    for index, item in enumerate(evidence.rows):
+        if item.excluded or item.row_key is None:
+            continue
+        key = _same_run_key(item.rep)
+        if key is not None:
+            groups.setdefault(key, []).append(index)
+    for indexes in groups.values():
+        if len(indexes) < 2:
+            continue
+        if len({(evidence.rows[i].rep.profile, evidence.rows[i].rep.effort) for i in indexes}) < 2:
+            continue
+        keep = min((evidence.rows[i] for i in indexes), key=_collapse_preference)
+        for index in indexes:
+            item = evidence.rows[index]
+            if item is keep:
+                continue
+            if item.rung == keep.rung:
+                reason = f"alias-duplicate of {keep.ref} (same run resolved via different spellings)"
+            else:
+                reason = (
+                    f"duplicate rep under a different spelling (resolved {item.rung[0]}@{item.rung[1]}; "
+                    f"kept {keep.ref} resolved {keep.rung[0]}@{keep.rung[1]})"
+                )
+            evidence.rows[index] = dataclasses.replace(item, excluded=reason)
+
+
 def evaluate(
     evidence: RepsEvidence,
     view: bench.CatalogView,
     *,
     min_passes: int = MIN_PASSES,
 ) -> Proposal:
+    _collapse_alias_duplicates(evidence)
     grouped: dict[tuple[str, str], list[EvidenceRep]] = {}
     excluded_by_row: dict[tuple[str, str], list[EvidenceRep]] = {}
     unrung: list[EvidenceRep] = []
@@ -1312,9 +1396,10 @@ def render_proposal(
                 f"{' [snapshot-placement]' if r.snapshot_row else ''}"
             )
             lines.append(f"    rule: {r.note}")
+            # AC2: every counted rep prints its resolution basis, not only the
+            # refs that drove the proposed change.
             for item in r.counted:
-                if item.ref in r.evidence_refs:
-                    lines.append(f"    evidence {_fmt_evidence(item)}")
+                lines.append(f"    evidence {_fmt_evidence(item)}")
             for item in r.excluded:
                 lines.append(f"    excluded {item.ref} ({item.excluded})")
     else:

@@ -13,19 +13,33 @@ fails until ``grades._BUILDER_RUNGS`` gains the mapping.
 from __future__ import annotations
 
 import pytest
+from test_wrk_contract_guard import WRK_CATALOG_EXEMPT, WRK_CATALOG_SPELLINGS
 
 from scopefuel import bench, grades
 
 HOST = "test-host"
 
 # --- checked-in bin/wrk contract --------------------------------------------
-# Builder spelling -> (catalog profile, effort pin or ""). Mirrors the builder
-# rows of wrk's ``resolve_catalog_profile()`` (CATALOG_PROFILE /
-# CATALOG_EFFORT_PIN) plus the catalog-exempt builder spellings the launcher
-# carries no effort flag for (devin-*/kimi-k3 base spellings — their rung is
-# the profile's default row, so the pin is ""). When wrk adds a builder
-# spelling this fixture is refreshed with it; the equality guard below then
-# fails until ``grades._BUILDER_RUNGS`` maps it.
+# The complete rep-visible builder-spelling set, derived — not hand-maintained:
+# every builder/captain spelling wrk recognizes lives in the contract guard's
+# mirror tables, either as a ``resolve_catalog_profile()`` arm
+# (WRK_CATALOG_SPELLINGS) or as a catalog-exempt argv spelling
+# (WRK_CATALOG_EXEMPT — devin-*/kimi-* builder spellings take no effort flag,
+# so the catalog resolver has no arm for them, but a rep still records the
+# spelling). When wrk adds a builder spelling the mirror-side guard fails
+# first; refreshing those tables then fails the equality below until
+# ``grades._BUILDER_RUNGS`` maps it.
+WRK_RECOGNIZED_BUILDER_SPELLINGS: frozenset[str] = frozenset(
+    spelling
+    for spelling in (*WRK_CATALOG_SPELLINGS, *WRK_CATALOG_EXEMPT)
+    if spelling.startswith(("builder-", "captain-"))
+)
+
+# Expected (catalog profile, effort pin or "") per spelling — the value half
+# of the guard. Mirrors the builder rows of wrk's
+# ``resolve_catalog_profile()`` plus the catalog-exempt builder spellings the
+# launcher carries no effort flag for (devin-*/kimi-k3 base spellings — their
+# rung is the profile's default row, so the pin is "").
 #
 # Deliberately absent: ``builder-astra``/``captain-astra`` — wrk removed those
 # spellings (task #526); they die on use, and a rep spelled that way must not
@@ -133,9 +147,15 @@ def _keys(proposal: grades.Proposal) -> set[tuple[str, str]]:
 
 
 def test_every_wrk_builder_spelling_is_mapped():
-    """Guard: when wrk adds a builder spelling and this fixture is refreshed,
-    the equality fails until _BUILDER_RUNGS maps it — no silent drops, no
-    stale extras."""
+    """Guard: when wrk adds a builder spelling and the contract-guard tables
+    are refreshed, the equality fails until _BUILDER_RUNGS maps it — no
+    silent drops, no stale extras."""
+    assert set(grades._BUILDER_RUNGS) == WRK_RECOGNIZED_BUILDER_SPELLINGS
+
+
+def test_builder_mapping_values_match_wrk():
+    """The mapped (profile, effort pin) values mirror wrk's resolver/gate
+    tables — a drifted value silently lands reps on the wrong rung."""
     assert grades._BUILDER_RUNGS == WRK_BUILDER_SPELLINGS
 
 
@@ -536,3 +556,178 @@ def test_mutant_builder_map_kind_would_fail(tmp_path, isolated_cache):
     assert row.resolution != "direct"
     text = grades.render_proposal(proposal, view)
     assert "builder map=1" in text
+
+
+# ---------------------------------------------------------------------------
+# same-run collapse — one measured run under two spellings counts once
+# ---------------------------------------------------------------------------
+
+
+def _remote_rep_row(server_id: int, **fields) -> bench.RepRecord:
+    base = dict(
+        id=server_id,
+        profile="codex",
+        model_id="gpt-5-sol",
+        task_ref="dup-run",
+        tier="T1",
+        role="impl",
+        rounds=1,
+        blockers_found=0,
+        completed=1,
+        input_tokens=None,
+        output_tokens=None,
+        notes=None,
+        recorded_at="2026-09-20T10:00:00Z",
+        effort=None,
+        grade="A",
+        table_grade=None,
+    )
+    base.update(fields)
+    return bench.RepRecord(**base)
+
+
+def test_alias_canonical_same_run_counts_once(tmp_path, monkeypatch, isolated_cache):
+    """srv stored the run as 'codex', local stored it as 'codex-sol' — same
+    model, task, instant and outcome under two spellings. Raw dedup keys on
+    the recorded spelling, so only the resolved-rung layer can collapse them:
+    the server copy is kept, the local one is excluded with the reason."""
+    from test_grade_proposals import _remote_backend, _remote_row
+
+    local = bench.add_rep(
+        **_rep("dup-run", profile="codex-sol", model_id="gpt-5-sol", effort="high", grade="A")
+    )
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(_remote_rep_row(1200, profile="codex", effort=None), 1200, host=None),
+    ]
+    view = _view(_entry("codex-sol", "high", "C"))
+    proposal = _propose(view)
+    counted = proposal.evidence.counted
+    assert [r.ref for r in counted] == ["srv:1200"]
+    loser = next(r for r in proposal.evidence.rows if r.ref == f"local:{local.id}")
+    assert loser.excluded
+    assert "alias-duplicate" in loser.excluded and "srv:1200" in loser.excluded
+    # And the survivor cannot drive a promotion alone (min_passes=2).
+    from test_grade_proposals import _result
+
+    assert _result(proposal, "codex-sol", "high").action != "promote"
+
+
+def test_same_run_different_rung_keeps_recorded_effort(tmp_path, monkeypatch, isolated_cache):
+    """Same identity, conflicting rung claims: the row whose effort was
+    recorded — not inferred — is the one that measured the run."""
+    from test_grade_proposals import _remote_backend, _remote_row
+
+    local = bench.add_rep(
+        **_rep("dup-rung", profile="codex-sol", model_id="gpt-5-sol", effort="high", grade="A")
+    )
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(
+            _remote_rep_row(1201, profile="codex", effort="low", task_ref="dup-rung"),
+            1201,
+            host=None,
+        ),
+    ]
+    view = _view(
+        _entry("codex-sol", "high", "C"),
+        _entry("codex-sol", "low", "C"),
+    )
+    proposal = _propose(view)
+    counted = proposal.evidence.counted
+    assert [r.ref for r in counted] == ["srv:1201"]
+    assert counted[0].rung == ("codex-sol", "low")
+    loser = next(r for r in proposal.evidence.rows if r.ref == f"local:{local.id}")
+    assert "duplicate" in loser.excluded and "codex-sol@low" in loser.excluded
+
+
+def test_different_runs_same_task_not_collapsed(tmp_path, isolated_cache):
+    """Guard against over-merge: identical spelling+task but a different
+    recorded instant is a different run — both keep counting."""
+    _seed(
+        [
+            _rep("run-a", profile="codex-sol", effort="high", grade="A"),
+            _rep(
+                "run-a",
+                profile="codex-sol",
+                effort="high",
+                grade="A",
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
+        ]
+    )
+    view = _view(_entry("codex-sol", "high", "C"))
+    proposal = _propose(view)
+    assert len(proposal.evidence.counted) == 2
+
+
+def test_same_run_key_requires_task_ref():
+    """task_ref empty -> no same-run key; timestamp alone never merges.
+    (add_rep itself requires a task_ref — this guards remote rows, whose
+    schema tolerates the empty field.)"""
+    rep = _remote_rep_row(9, task_ref=None)
+    assert grades._same_run_key(rep) is None
+    assert grades._same_run_key(_remote_rep_row(9, task_ref="t")) is not None
+
+
+# ---------------------------------------------------------------------------
+# render: every counted rep prints its resolution basis (AC2, incl. changes)
+# ---------------------------------------------------------------------------
+
+
+def test_changed_rung_renders_every_counted_rep(tmp_path, isolated_cache):
+    """A promoted rung previously printed only the refs that drove the rule —
+    the other counted reps (e.g. a FAIL above the placement) went silent.
+    Every counted rep must print resolved=."""
+    _seed(
+        [
+            _rep("p1", profile="codex-sol", effort="high", grade="A"),
+            _rep("p2", profile="codex-sol", effort="high", grade="A"),
+            _rep("p3", profile="codex-sol", effort="high", grade="A"),
+            _rep("below-target", profile="codex-sol", effort="high", grade="B"),
+        ]
+    )
+    view = _view(_entry("codex-sol", "high", "C"))
+    proposal = _propose(view)
+    result = next(r for r in proposal.results if r.key == ("codex-sol", "high"))
+    assert result.action == "promote"
+    text = grades.render_proposal(proposal, view)
+    counted = proposal.evidence.counted
+    assert len(counted) == 4
+    assert text.count("resolved=") == len(counted)
+    assert "evidence local:" in text
+    for item in counted:
+        assert f"evidence {item.ref}" in text
+
+
+def test_mutant_evidence_refs_filter_would_fail(tmp_path, isolated_cache):
+    """assertion-RED: restoring the old evidence_refs filter leaves a counted
+    rep unprinted — this exact-count assertion goes red."""
+    _seed(
+        [
+            _rep("p1", profile="codex-sol", effort="high", grade="A"),
+            _rep("p2", profile="codex-sol", effort="high", grade="A"),
+            _rep("silent", profile="codex-sol", effort="high", grade="B"),
+        ]
+    )
+    view = _view(_entry("codex-sol", "high", "C"))
+    proposal = _propose(view)
+    text = grades.render_proposal(proposal, view)
+    silent = _counted(proposal, "silent")
+    assert f"evidence {silent.ref}" in text
+    assert text.count("resolved=") == len(proposal.evidence.counted)
+
+
+def test_mutant_alias_dedup_would_fail(tmp_path, monkeypatch, isolated_cache):
+    """assertion-RED: removing the collapse makes the same-run pair count
+    twice — len==1 fails."""
+    from test_grade_proposals import _remote_backend, _remote_row
+
+    bench.add_rep(**_rep("dup-run", profile="codex-sol", model_id="gpt-5-sol", effort="high", grade="A"))
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(_remote_rep_row(1202, profile="codex", effort=None), 1202, host=None),
+    ]
+    view = _view(_entry("codex-sol", "high", "C"))
+    proposal = _propose(view)
+    assert len(proposal.evidence.counted) == 1
