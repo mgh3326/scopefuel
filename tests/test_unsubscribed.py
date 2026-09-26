@@ -116,6 +116,19 @@ def test_profile_flag_roundtrip_and_clear():
     assert policy.get_profile_subscribed("kiro-sol") == (None, None)
 
 
+def test_profile_name_with_dot_roundtrips():
+    """A free-text name containing '.' must not serialize as a nested TOML
+    table — quote the key so the value reads back under the same name."""
+    policy.set_profile_subscribed("foo.bar", False)
+    assert policy.get_profile_subscribed("foo.bar") == (False, None)
+    sub = profile_subscription("foo.bar", "nowhere")
+    assert sub.subscribed is False
+    assert sub.key == "profiles.foo.bar"
+    rows = {r.profile: r for r in policy.list_profile_subscriptions(set())}
+    assert rows["foo.bar"].subscribed is False
+    assert "unknown profile" in rows["foo.bar"].status
+
+
 def test_profile_true_overrides_pool_false():
     policy.set_subscribed("kiro", False)
     policy.set_profile_subscribed("kiro-sol", True)

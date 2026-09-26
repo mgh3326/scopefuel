@@ -145,7 +145,7 @@ def _write_config(config: dict) -> None:
             entry = profiles[name]
             if not isinstance(entry, dict) or not entry:
                 continue
-            lines.append(f"[profiles.{name}]")
+            lines.append(f"[profiles.{_toml_string(str(name))}]")
             _write_subscribed(lines, entry)
             lines.append("")
     text = "\n".join(lines).rstrip() + "\n" if lines else ""
