@@ -62,6 +62,17 @@ def _view(*entries: bench.CatalogEntry) -> bench.CatalogView:
     )
 
 
+def _canon_view(*entries: bench.CatalogEntry, source: str = bench.CATALOG_SOURCE_SERVER) -> bench.CatalogView:
+    """A healthy canon read — the view apply accepts without an override."""
+    return bench.CatalogView(
+        entries=tuple(entries),
+        source=source,
+        backend=bench.BENCH_BACKEND_HANDOFFKEEP,
+        reason="configured",
+        age_s=0.0,
+    )
+
+
 def _propose(view, *, min_passes: int = 2, exclusions=(), host: str = HOST) -> grades.Proposal:
     evidence = grades.gather_reps(view=view, exclusions=list(exclusions), host=host)
     return grades.evaluate(evidence, view, min_passes=min_passes)
@@ -159,8 +170,9 @@ def test_promote_does_not_move_when_evidence_below_current(tmp_path, isolated_ca
 # ---------------------------------------------------------------------------
 
 
-def test_demote_on_fail_at_placement(tmp_path, isolated_cache):
-    """A completed=0 rep on an at-placement task demotes one step below it."""
+def test_single_capout_at_placement_blocks_not_demotes(tmp_path, isolated_cache):
+    """Rule v1: one cap-out FAIL at placement is one short of demotion —
+    it blocks promotion instead."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed(
         [
@@ -169,22 +181,44 @@ def test_demote_on_fail_at_placement(tmp_path, isolated_cache):
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert result.target == "A+"
+    assert "demotion needs 2" in result.note
+
+
+def test_demote_two_fails_at_placement(tmp_path, isolated_cache):
+    """Two FAIL reps at-or-below the placement demote one step below the
+    weakest failed grade."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+", completed=0),
+            _rep("t2", effort="xhigh", grade="A", completed=0),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
-    assert result.target == "A"  # one below the failed A+ claim
+    assert result.target == "B"  # one below the weakest failed claim (A)
 
 
 def test_demote_below_placement_drops_below_failed_grade(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "S"))
-    _seed([_rep("t1", effort="xhigh", grade="B", completed=0)])
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="B", completed=0),
+            _rep("t2", effort="xhigh", grade="A", completed=0),
+        ]
+    )
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "C"  # can't do B work -> below B
 
 
-def test_demote_ungraded_fail_steps_below_current(tmp_path, isolated_cache):
-    """An ungraded FAIL is fail-closed: treated as failing at the placement."""
+def test_demote_ungraded_fails_step_below_current(tmp_path, isolated_cache):
+    """Ungraded FAILs are fail-closed: they count at the placement, and two
+    of them demote one step below it."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
-    _seed([_rep("t1", effort="xhigh", completed=0)])
+    _seed([_rep("t1", effort="xhigh", completed=0), _rep("t2", effort="xhigh", completed=0)])
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "A"
@@ -192,7 +226,7 @@ def test_demote_ungraded_fail_steps_below_current(tmp_path, isolated_cache):
 
 def test_demote_floors_at_c(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "C"))
-    _seed([_rep("t1", effort="xhigh", grade="C", completed=0)])
+    _seed([_rep("t1", effort="xhigh", grade="C", completed=0), _rep("t2", effort="xhigh", completed=0)])
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "C"
@@ -224,6 +258,7 @@ def test_conflict_holds_when_at_grade_passes_exist(tmp_path, isolated_cache):
             _rep("t1", effort="xhigh", grade="A+"),
             _rep("t2", effort="xhigh", grade="A+"),
             _rep("t3", effort="xhigh", grade="A+", completed=0),
+            _rep("t4", effort="xhigh", grade="A", completed=0),  # 2nd demote-grade fail
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -232,8 +267,26 @@ def test_conflict_holds_when_at_grade_passes_exist(tmp_path, isolated_cache):
     assert _propose(view).changes() == []
 
 
+def test_single_marker_fail_still_conflicts(tmp_path, isolated_cache):
+    """One post-merge marker at-or-below is a full demote trigger on its own —
+    the conflict rule still applies against measured at-grade passes."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A"),
+            _rep("t2", effort="xhigh", grade="A"),
+            _rep("t3", effort="xhigh", grade="B", completed=0, notes="[rollback] merge"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "conflicted"
+    assert result.target == "A"
+    assert _propose(view).changes() == []
+
+
 def test_rollback_marker_is_fail_evidence(tmp_path, isolated_cache):
-    """A [rollback] notes marker is FAIL evidence even on a completed rep."""
+    """A [rollback] notes marker is FAIL evidence even on a completed rep —
+    and under rule v1 one marker at-or-below demotes alone."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed([_rep("t1", effort="xhigh", completed=1, notes="merged then reverted [rollback]")])
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -245,6 +298,37 @@ def test_post_merge_blocker_marker_is_fail(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed([_rep("t1", effort="xhigh", completed=1, notes="[post-merge-blocker] found by ops")])
     assert _result(_propose(view), "grok-hi", "xhigh").action == "demote"
+
+
+def test_marker_fail_above_placement_blocks_not_demotes(tmp_path, isolated_cache):
+    """Rule v1 scoping: a marker FAIL on a task *above* the placement is
+    overreach evidence — it blocks promotion but does not demote, because
+    the placement never claimed that level."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="B"),
+            _rep("t2", effort="xhigh", grade="S", completed=0, notes="[rollback]"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert result.target == "A"
+
+
+def test_one_at_below_plus_one_above_fail_not_demote(tmp_path, isolated_cache):
+    """Counting trap: one at-or-below FAIL plus one above-placement FAIL must
+    not add up to a two-FAIL demotion."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="B", completed=0),
+            _rep("t2", effort="xhigh", grade="S", completed=0),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert result.target == "A"
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +475,12 @@ def _cli_view(monkeypatch, entries) -> bench.CatalogView:
     return view
 
 
+def _cli_canon_view(monkeypatch, entries, *, source: str = bench.CATALOG_SOURCE_SERVER) -> bench.CatalogView:
+    view = _canon_view(*entries, source=source)
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: view)
+    return view
+
+
 def test_cli_propose_is_read_only(tmp_path, monkeypatch, capsys):
     _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
@@ -428,7 +518,7 @@ def test_cli_propose_json_artifact(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_apply_writes_catalog_and_stamps(tmp_path, monkeypatch, capsys):
-    _cli_view(
+    _cli_canon_view(
         monkeypatch,
         [_entry("grok-hi", "xhigh", "C"), _entry("opus", "", "S")],
     )
@@ -466,12 +556,13 @@ def test_cli_apply_writes_catalog_and_stamps(tmp_path, monkeypatch, capsys):
     assert snap[("opus", "")]["grade"] == "S"
     assert snap[("opus", "")]["decided_by"] is None
     assert snap[("grok-hi", "xhigh")]["grade"] == "A+"
+    assert "degraded_override" not in payload
 
 
 def test_cli_apply_refuses_stale_proposal(tmp_path, monkeypatch, capsys):
     """apply can never write without the matching propose evidence: a rep
     recorded after propose makes the artifact stale and apply refuses."""
-    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
     artifact = tmp_path / "proposal.json"
     out_file = tmp_path / "catalog.json"
@@ -499,7 +590,7 @@ def test_cli_apply_refuses_stale_proposal(tmp_path, monkeypatch, capsys):
 def test_cli_apply_refuses_forged_proposal(tmp_path, monkeypatch, capsys):
     """A hand-written proposal naming an evidence-less change fails the
     digest check — apply only ever writes evaluated changes."""
-    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A")])
     forged = tmp_path / "forged.json"
     forged.write_text(
@@ -538,7 +629,7 @@ def test_cli_apply_refuses_forged_proposal(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_apply_no_changes_writes_nothing(tmp_path, monkeypatch, capsys):
-    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A")])  # one pass — insufficient
     artifact = tmp_path / "proposal.json"
     out_file = tmp_path / "catalog.json"
@@ -571,6 +662,237 @@ def test_cli_propose_min_passes_zero_rejected(tmp_path, monkeypatch, capsys):
 def test_cli_propose_bad_exclude_rejected(tmp_path, monkeypatch, capsys):
     _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     assert cli.main(["grades", "propose", "--exclude", "bogus"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# task #741 — apply refuses degraded input unless --allow-degraded says why
+# ---------------------------------------------------------------------------
+
+
+def _apply_args(artifact, out_file, *extra) -> list[str]:
+    return [
+        "grades",
+        "apply",
+        "--proposal",
+        str(artifact),
+        "--out",
+        str(out_file),
+        "--decided-by",
+        "operator:test",
+        *extra,
+    ]
+
+
+def _insecure_url_reps_backend(monkeypatch) -> None:
+    """Per-use split: credentials exist but the reps use stays local."""
+    real = bench.bench_backend
+
+    def fake(*, use, stderr=None, allow_plaintext_http=False):
+        if use == "reps":
+            return bench.BenchBackend(
+                name=bench.BENCH_BACKEND_LOCAL,
+                cache_ttl_s=60.0,
+                url=None,
+                token=None,
+                endpoint_id="",
+                reason="auto-local-insecure-url",
+                plaintext_use=use,
+            )
+        return real(use=use, stderr=stderr, allow_plaintext_http=allow_plaintext_http)
+
+    monkeypatch.setattr(bench, "bench_backend", fake)
+
+
+def test_cli_apply_refuses_snapshot_catalog(tmp_path, monkeypatch, capsys):
+    """Mutant guard: a snapshot catalog must stop apply cold — a row stamped
+    from the bundled snapshot must never reach push-catalog."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])  # snapshot source
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    err = capsys.readouterr().err
+    assert "refuses degraded input" in err and "snapshot" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_refuses_unsupported_catalog(tmp_path, monkeypatch, capsys):
+    """Mutant guard: UNSUPPORTED also serves the bundled snapshot — a guard
+    that only names SNAPSHOT leaves a degraded path that still applies."""
+    _cli_canon_view(
+        monkeypatch,
+        [_entry("grok-hi", "xhigh", "C")],
+        source=bench.CATALOG_SOURCE_UNSUPPORTED,
+    )
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    assert "refuses degraded input" in capsys.readouterr().err
+    assert not out_file.exists()
+
+
+def test_cli_apply_allows_cache_catalog(tmp_path, monkeypatch, capsys):
+    """Mutant guard: a server cache inside the staleness budget is canon —
+    refusing every non-server source would brick normal applies."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")], source=bench.CATALOG_SOURCE_CACHE)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 0
+    assert out_file.exists()
+
+
+def test_cli_apply_refuses_insecure_url_reps(tmp_path, monkeypatch, capsys):
+    """The insecure-url fallback: the catalog is canon but the reps canon
+    exists and was never read — apply refuses even with a matching digest."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _insecure_url_reps_backend(monkeypatch)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    err = capsys.readouterr().err
+    assert "refuses degraded input" in err and "reps" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_refuses_partial_rep_window(tmp_path, monkeypatch, capsys):
+    """A full server rep window can hide older FAIL evidence — apply refuses."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    monkeypatch.setattr(bench, "_MIGRATE_REP_WINDOW", 1)
+    fake.reps = [
+        _remote_row(
+            bench.RepRecord(
+                id=900,
+                profile="builder-grok",
+                model_id="grok-4.7",
+                task_ref="srv-1",
+                tier="T1",
+                role="impl",
+                rounds=1,
+                blockers_found=0,
+                completed=1,
+                input_tokens=None,
+                output_tokens=None,
+                notes=None,
+                recorded_at="2026-09-25T00:00:00Z",
+                effort="xhigh",
+                grade="A+",
+                table_grade=None,
+            ),
+            601,
+            host=None,
+        )
+    ]
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    err = capsys.readouterr().err
+    assert "refuses degraded input" in err and "window" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_allow_degraded_records_reason(tmp_path, monkeypatch, capsys):
+    """The explicit override passes — and the reason lands in the artifact,
+    the console, and every changed row's deviation_ref."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])  # snapshot = degraded
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    reason = "canon unreachable; snapshot rows are the reviewed copy"
+    assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", reason)) == 0
+    payload = json.loads(out_file.read_text())
+    override_record = payload.get("degraded_override") or {}
+    assert override_record.get("reason") == reason
+    assert override_record.get("inputs")
+    changed = payload["catalog"][0]
+    assert f"degraded-override: {reason}" in changed["deviation_ref"]
+    out = capsys.readouterr().out
+    assert "degraded input applied" in out and reason in out
+
+
+def test_cli_apply_allow_degraded_no_changes_still_records_reason(tmp_path, monkeypatch, capsys):
+    """A degraded apply that changes nothing writes no artifact — the console
+    is the only trace, so the override reason must land there."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])  # snapshot = degraded
+    _seed([_rep("t1", effort="xhigh", grade="A")])  # one pass — insufficient
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    reason = "canon unreachable; reviewed the bundled snapshot"
+    assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", reason)) == 0
+    assert not out_file.exists()
+    out = capsys.readouterr().out
+    assert "proceeded over degraded input" in out and reason in out
+
+
+def test_cli_apply_allow_degraded_requires_a_reason(tmp_path, monkeypatch, capsys):
+    """A blank --allow-degraded is not an override — refuse before any write."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", "  ")) == 2
+    assert not out_file.exists()
+
+
+def test_cli_propose_marks_degraded_output(tmp_path, monkeypatch, capsys):
+    """Propose stays read-only but labels degraded input in both outputs."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert json.loads(artifact.read_text())["degraded"]
+    assert cli.main(["grades", "propose"]) == 0
+    assert "degraded input" in capsys.readouterr().out
+
+
+def test_cli_propose_clean_input_marks_nothing(tmp_path, monkeypatch, capsys):
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert json.loads(artifact.read_text())["degraded"] == []
+    assert cli.main(["grades", "propose"]) == 0
+    assert "degraded input" not in capsys.readouterr().out
+
+
+def test_cli_apply_malformed_artifact_is_a_clean_error(tmp_path, monkeypatch, capsys):
+    """CodeRabbit minor on #100: params/results of the wrong shape used to
+    crash with AttributeError/KeyError — now a BenchError with exit 2."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    bad_params = tmp_path / "bad-params.json"
+    bad_params.write_text(json.dumps({"min_passes": 2, "params": ["cli_exclusions"]}))
+    assert cli.main(_apply_args(bad_params, tmp_path / "o1.json")) == 2
+    assert "params" in capsys.readouterr().err
+    # A truthy non-array cli_exclusions or results used to TypeError before the
+    # comprehension — both are clean exit-2 errors now.
+    bad_collections = tmp_path / "bad-collections.json"
+    bad_collections.write_text(json.dumps({"min_passes": 2, "params": {"cli_exclusions": 42}}))
+    assert cli.main(_apply_args(bad_collections, tmp_path / "o1b.json")) == 2
+    assert "cli_exclusions" in capsys.readouterr().err
+    bad_collections.write_text(json.dumps({"min_passes": 2, "results": 42}))
+    assert cli.main(_apply_args(bad_collections, tmp_path / "o1c.json")) == 2
+    assert "results" in capsys.readouterr().err
+    # A results row missing profile/effort must not KeyError — it loses the
+    # recorded-changes comparison as a plain BenchError.
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    payload = json.loads(artifact.read_text())
+    del payload["results"][0]["profile"]
+    artifact.write_text(json.dumps(payload))
+    assert cli.main(_apply_args(artifact, tmp_path / "o2.json")) == 2
+    assert "disagrees" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -878,3 +1200,231 @@ def test_off_ladder_catalog_grade_raises_bench_error(tmp_path, isolated_cache):
     _seed([_rep("t1", effort="xhigh", grade="A+")])
     with pytest.raises(bench.BenchError, match="grok-hi@xhigh"):
         _propose(view)
+
+
+# ---------------------------------------------------------------------------
+# task #743 — rule v1 supplements: required --grade, non-mutating backfill
+# ---------------------------------------------------------------------------
+
+
+def _reps_add_argv(**extra) -> list[str]:
+    argv = [
+        "reps",
+        "add",
+        "--profile",
+        "builder-x",
+        "--model",
+        "model-x",
+        "--task",
+        "743",
+        "--tier",
+        "T2",
+        "--role",
+        "impl",
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    for flag, value in extra.items():
+        argv += [f"--{flag.replace('_', '-')}", str(value)]
+    return argv
+
+
+def test_reps_add_requires_grade(tmp_path, isolated_cache, capsys):
+    """Missing --grade refuses at the parser, writes nothing, names the flag."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(_reps_add_argv())
+    assert exc.value.code == 2
+    assert "--grade" in capsys.readouterr().err
+    assert bench.read_reps() == []
+
+
+def test_reps_add_with_grade_still_records(tmp_path, isolated_cache):
+    assert cli.main(_reps_add_argv(grade="A+")) == 0
+    reps = bench.read_reps()
+    assert len(reps) == 1 and reps[0].grade == "A+"
+
+
+def _mapping_file(tmp_path, payload) -> str:
+    path = tmp_path / "grade-map.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def _annotations() -> dict:
+    return bench.read_rep_grade_annotations()
+
+
+def test_backfill_dry_run_writes_nothing(tmp_path, isolated_cache, capsys):
+    _seed([_rep("743", effort="xhigh")])
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"743": "A+"})])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "dry-run" in out
+    assert "annotate local:1 grade=A+ task=743" in out
+    assert _annotations() == {}
+
+
+def test_backfill_apply_annotates_without_mutating_originals(tmp_path, isolated_cache, capsys):
+    _seed([_rep("743", effort="xhigh")])
+    before = [rep.as_dict() for rep in bench.read_reps()]
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"743": "A+"}), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "wrote 1 annotation row(s)" in out
+    after = [rep.as_dict() for rep in bench.read_reps()]
+    assert after == before  # the original row is byte-identical
+    annotations = _annotations()
+    assert list(annotations) == ["local:1"]
+    assert annotations["local:1"].grade == "A+"
+
+
+def test_backfill_proposal_consumes_annotated_grade(tmp_path, isolated_cache):
+    """After --apply, propose evaluates the annotated reps at their filled
+    grade — and discloses the overlay."""
+    view = _view(_entry("grok-hi", "xhigh", "B"))
+    _seed([_rep("743", effort="xhigh"), _rep("743", effort="xhigh")])
+    report = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    assert report.applied == 2
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert result.action == "promote"
+    assert result.target == "A+"
+    assert proposal.evidence.annotations_applied
+    text = grades.render_proposal(proposal, view)
+    assert "(backfilled)" in text
+    assert "backfilled grades applied" in text
+
+
+def test_backfill_without_apply_changes_no_proposal(tmp_path, isolated_cache):
+    """Dry-run plans but never persists — propose still sees ungraded reps."""
+    view = _view(_entry("grok-hi", "xhigh", "B"))
+    _seed([_rep("743", effort="xhigh"), _rep("743", effort="xhigh")])
+    report = grades.backfill_rep_grades(mapping={"743": "A+"})
+    assert len(report.planned) == 2 and report.applied == 0
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert len(result.ungraded_passes) == 2
+    assert result.action != "promote"
+
+
+def test_backfill_never_overwrites_existing_grade(tmp_path, isolated_cache):
+    """An already-graded rep keeps its recorded grade; the annotation is
+    reported as skipped, not written."""
+    _seed(
+        [
+            _rep("743", effort="xhigh", grade="B"),  # recorded grade wins
+            _rep("743", effort="xhigh"),  # the only annotatable row
+        ]
+    )
+    report = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    assert report.applied == 1
+    assert report.skipped_graded == [("local:1", "743", "B")]
+    annotations = _annotations()
+    assert "local:1" not in annotations
+    assert annotations["local:2"].grade == "A+"
+
+
+def test_backfill_rerun_is_idempotent(tmp_path, isolated_cache):
+    _seed([_rep("743", effort="xhigh")])
+    assert grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True).applied == 1
+    second = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    assert second.applied == 0
+    assert second.already_annotated == [("local:1", "A+")]
+    assert len(_annotations()) == 1
+
+
+def test_backfill_conflicting_annotation_keeps_original(tmp_path, isolated_cache):
+    """A second mapping that names a different grade for an annotated rep is a
+    conflict — reported, never rewritten."""
+    _seed([_rep("743", effort="xhigh")])
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    second = grades.backfill_rep_grades(mapping={"743": "S"}, apply=True)
+    assert second.applied == 0
+    assert second.conflicting_annotations == [("local:1", "A+", "S")]
+    assert _annotations()["local:1"].grade == "A+"
+
+
+def test_backfill_missing_task_reported(tmp_path, isolated_cache, capsys):
+    _seed([_rep("742", effort="xhigh")])
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"999": "A"})])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no counted reps for task 999" in out
+    assert _annotations() == {}
+
+
+def test_backfill_rejects_bad_mapping(tmp_path, isolated_cache, capsys):
+    _seed([_rep("743", effort="xhigh")])
+    for payload in (["743"], {"743": "Q"}, {"": "A+"}, {}):
+        rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, payload)])
+        assert rc == 2
+        assert "error:" in capsys.readouterr().err
+    assert _annotations() == {}
+
+
+def test_backfill_annotated_fail_counts_as_demote_evidence(tmp_path, isolated_cache):
+    """The overlay feeds every classifier, not just passes: a backfilled
+    post-merge marker FAIL demotes at-or-below alone."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed([_rep("743", effort="xhigh", completed=0, notes="[rollback]")])
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"
+    assert result.target == "A"
+
+
+def test_superseded_fail_never_double_counts_demote(tmp_path, isolated_cache):
+    """Directed surface: a superseded FAIL row and its replacement must not
+    add up to the two-FAIL demotion threshold."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed_at_id(11, effort="xhigh", grade="A+", completed=0)
+    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, notes="supersedes id=11")
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"  # only rep 12 counts — one FAIL short
+    assert result.target == "A+"
+
+
+def test_two_distinct_fails_still_demote_after_exclusion(tmp_path, isolated_cache):
+    """…but two genuinely distinct FAILs still reach the threshold."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed_at_id(11, effort="xhigh", grade="A+", completed=0)
+    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, notes="supersedes id=11")
+    _seed_at_id(13, effort="xhigh", grade="A", completed=0)
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"  # reps 12 + 13 count
+    assert result.target == "B"  # one step below the weaker fail (A)
+
+
+def test_backfill_conflict_follows_annotation_across_migration(tmp_path, monkeypatch):
+    """Round-1 BLOCKER: an annotation that reached a rep through migration
+    fan-out is still an existing annotation — re-backfilling the task at a
+    different grade is a reported conflict on the canonical ref, never a
+    second annotation that splits the rep's grade."""
+    migrated = bench.add_rep(**_rep("743", effort="xhigh"))  # local:1, ungraded
+    assert grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST).applied == 1
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]  # local:1 -> srv:501
+
+    second = grades.backfill_rep_grades(mapping={"743": "S"}, apply=True, host=HOST)
+    assert second.applied == 0
+    assert second.conflicting_annotations == [("srv:501", "A+", "S")]
+    annotations = _annotations()
+    assert list(annotations) == ["local:1"]
+    assert annotations["local:1"].grade == "A+"
+
+
+def test_backfill_same_grade_after_migration_is_idempotent(tmp_path, monkeypatch):
+    """Same-grade re-backfill against the migrated canonical ref reports
+    already-annotated and writes nothing."""
+    migrated = bench.add_rep(**_rep("743", effort="xhigh"))
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST)
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]
+
+    second = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST)
+    assert second.applied == 0
+    assert second.already_annotated == [("srv:501", "A+")]
+    assert len(_annotations()) == 1

@@ -561,6 +561,8 @@ def test_reps_add_and_list_round_trip(bench_home, capsys):
                 "0",
                 "--completed",
                 "1",
+                "--grade",
+                "A",
                 "--notes",
                 "fixture",
             ]
@@ -576,7 +578,7 @@ def test_reps_add_and_list_round_trip(bench_home, capsys):
     assert reps[0].output_tokens is None
     assert reps[0].notes == "fixture"
     assert reps[0].effort is None
-    assert reps[0].grade is None
+    assert reps[0].grade == "A"
 
     assert cli.main(["reps", "list"]) == 0
     assert "profile=codex-terra-max" in capsys.readouterr().out
@@ -597,6 +599,20 @@ def test_reps_help_and_filters_preserve_nullable_legacy_rows(bench_home, capsys)
         ("haiku", "high", "B"),
         ("codex-luna", "high", "A+"),
     ):
+        if grade is None:
+            # Pre-E6 rows: --grade is now required at the CLI, so legacy
+            # nullable rows only exist through the API/migration path.
+            bench.add_rep(
+                profile=profile,
+                model_id="model",
+                task_ref="ROB-1203",
+                tier="T1",
+                role="impl",
+                rounds=1,
+                blockers_found=0,
+                completed=1,
+            )
+            continue
         args = [
             "reps",
             "add",
@@ -616,11 +632,11 @@ def test_reps_help_and_filters_preserve_nullable_legacy_rows(bench_home, capsys)
             "0",
             "--completed",
             "1",
+            "--grade",
+            grade,
         ]
         if effort is not None:
             args.extend(["--effort", effort])
-        if grade is not None:
-            args.extend(["--grade", grade])
         assert cli.main(args) == 0
         capsys.readouterr()
 
@@ -726,6 +742,8 @@ def test_reps_tokens_round_trip_and_legacy_read_compat(bench_home, capsys, tmp_p
                 "0",
                 "--completed",
                 "1",
+                "--grade",
+                "A",
                 "--input-tokens",
                 "3975",
                 "--output-tokens",

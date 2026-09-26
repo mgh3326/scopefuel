@@ -287,6 +287,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     reps_add.add_argument(
         "--grade",
+        required=True,
         choices=bench.REP_GRADES,
         help="과제가 요구한 급 (S+/S/A+/A/B/C) — 프로필의 급표 배치가 아니라 과제 난이도",
     )
@@ -316,6 +317,25 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     reps_compare.add_argument("--profile", help="프로필 필터")
     reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
+
+    reps_backfill = reps_sub.add_parser(
+        "backfill",
+        help="task->grade 매핑 파일로 기존 rep의 과제 급을 주석 행으로 보충 (원행 불변, 기본 dry-run)",
+    )
+    reps_backfill.add_argument(
+        "--mapping",
+        required=True,
+        help="task-ref -> grade JSON 매핑 파일",
+    )
+    reps_backfill.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
+    reps_backfill.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
+    reps_backfill.add_argument(
+        "--host", help="migrated-local 매칭에 쓸 출처 호스트 (기본: 이 머신의 hostname)"
+    )
 
     reps_migrate = reps_sub.add_parser(
         "migrate", help="로컬 bench.db reps를 handoffkeep reps 저장소로 1회 이관 (기본 dry-run)"
@@ -385,6 +405,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--allow-plaintext-http",
         action="store_true",
         help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
+    grades_apply.add_argument(
+        "--allow-degraded",
+        metavar="REASON",
+        help="degraded 입력(스냅샷 카탈로그·불완전 rep 증거)에서도 적용 — 사유가 산출물과 "
+        "카탈로그 행 deviation_ref 에 기록된다",
     )
 
     all_profiles = sorted(
@@ -1301,6 +1327,36 @@ def _reps_command(args: argparse.Namespace) -> int:
         for comparison in comparisons:
             print(bench.format_rep_comparison(comparison))
         return 0
+    if args.reps_command == "backfill":
+        try:
+            raw = json.loads(pathlib.Path(args.mapping).read_text(encoding="utf-8"))
+            report = grades.backfill_rep_grades(
+                mapping=raw,
+                apply=args.apply,
+                source=args.mapping,
+                host=args.host,
+                allow_plaintext_http=args.allow_plaintext_http,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        mode = "applied" if args.apply else "dry-run"
+        print(f"reps backfill ({mode}): mapping {len(report.mapping)} task(s)")
+        for annotation in report.planned:
+            print(f"  annotate {annotation.rep_ref} grade={annotation.grade} task={annotation.task_ref}")
+        for ref, grade in report.already_annotated:
+            print(f"  already annotated {ref} grade={grade}")
+        for ref, task_ref, grade in report.skipped_graded:
+            print(f"  already graded {ref} task={task_ref} grade={grade} (kept)")
+        for ref, existing, mapped in report.conflicting_annotations:
+            print(f"  conflict {ref} annotation grade={existing} vs mapped {mapped} (kept)")
+        for task_ref in report.missing_tasks:
+            print(f"  no counted reps for task {task_ref}")
+        if args.apply:
+            print(f"reps backfill: wrote {report.applied} annotation row(s); original reps untouched")
+        else:
+            print("reps backfill: dry-run — rerun with --apply to write the annotations")
+        return 0
     if args.reps_command == "migrate":
         try:
             result = bench.migrate_reps(
@@ -1381,6 +1437,9 @@ def _grades_command(args: argparse.Namespace) -> int:
             print(grades.render_proposal(proposal, view, focus=focus))
         return 0
     if args.grades_command == "apply":
+        if args.allow_degraded is not None and not args.allow_degraded.strip():
+            print("error: --allow-degraded 는 비어 있지 않은 사유가 필요합니다", file=sys.stderr)
+            return 2
         try:
             proposal_file = json.loads(pathlib.Path(args.proposal).read_text(encoding="utf-8"))
             entries, live, _view = grades.apply_proposals(
@@ -1388,13 +1447,24 @@ def _grades_command(args: argparse.Namespace) -> int:
                 decided_by=args.decided_by,
                 deviation_ref=args.deviation_ref,
                 allow_plaintext_http=args.allow_plaintext_http,
+                allow_degraded=args.allow_degraded,
             )
-        except (OSError, ValueError) as exc:
+        # TypeError joins the clean-refusal set: a malformed artifact that
+        # slips past the shape checks dies inside a comprehension, and the
+        # operator still gets exit 2 instead of a traceback.
+        except (OSError, ValueError, TypeError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         changes = live.changes()
+        degraded = grades.degraded_reasons(_view, live.evidence)
+        override_reason = (args.allow_degraded or "").strip()
         if not changes:
             print("grades apply: proposal carries no grade changes — nothing written")
+            if degraded:
+                print(
+                    f"grades apply: proceeded over degraded input under --allow-degraded "
+                    f"({override_reason}) — {'; '.join(degraded)}"
+                )
             return 0
         # The "catalog" list carries only the stamped changed rows so the file
         # can go straight into `bench push-catalog` (which requires decided_by
@@ -1405,10 +1475,20 @@ def _grades_command(args: argparse.Namespace) -> int:
             "catalog": [e.as_dict() for e in entries if e.key in changed_rows],
             "snapshot": [e.as_dict() for e in entries],
         }
+        if degraded:
+            payload["degraded_override"] = {
+                "reason": override_reason,
+                "inputs": degraded,
+            }
         pathlib.Path(args.out).write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         print(f"grades apply: wrote {args.out} changed={len(changed_rows)} rows={len(entries)}")
+        if degraded:
+            print(
+                f"grades apply: degraded input applied under --allow-degraded "
+                f"({override_reason}) — {'; '.join(degraded)}"
+            )
         for result in changes:
             print(
                 f"  {result.action} {result.label()} "
