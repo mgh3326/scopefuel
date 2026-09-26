@@ -529,7 +529,7 @@ def _normalize_model_id(value: str | None) -> str:
 
 
 def _model_disposition(rep: bench.RepRecord, judging: bench.CatalogEntry) -> str:
-    """"" when the rep's model may count on this rung; a reason otherwise.
+    """ "" when the rep's model may count on this rung; a reason otherwise.
 
     Strict by construction (v1.1 AC1): the rung's catalog ``model_id`` is the
     only identity a rep can match, plus the declared ``MODEL_EQUIVALENCE``
@@ -1530,9 +1530,7 @@ def evaluate(
         excluded = excluded_by_row.get(key, [])
         if not counted and not excluded:
             continue
-        result = _evaluate_row(
-            row, counted, excluded, min_passes, demote_window, demote_fail_rate
-        )
+        result = _evaluate_row(row, counted, excluded, min_passes, demote_window, demote_fail_rate)
         if key[0] in snapshot_profiles:
             result.snapshot_row = True
         results.append(result)
@@ -1686,10 +1684,7 @@ def render_proposal(
         f"reps source={evidence.backend} (reason={evidence.backend_reason}) host={evidence.host} "
         f"rows: server={evidence.remote_count} local={evidence.local_count}",
     ]
-    lines.append(
-        "non-coding task patterns (excluded, reported): "
-        + ", ".join(evidence.non_coding_patterns)
-    )
+    lines.append("non-coding task patterns (excluded, reported): " + ", ".join(evidence.non_coding_patterns))
     if evidence.window_incomplete:
         lines.append(
             f"  warning: server rep window full ({bench._MIGRATE_REP_WINDOW}) — "
@@ -1734,9 +1729,7 @@ def render_proposal(
 
     anomalous = [row for row in evidence.rows if row.anomaly]
     if anomalous:
-        lines.append(
-            f"needs review — anomalous reps ({len(anomalous)}, excluded until reviewed):"
-        )
+        lines.append(f"needs review — anomalous reps ({len(anomalous)}, excluded until reviewed):")
         for row in anomalous:
             lines.append(f"  {_fmt_evidence(row)}  [{row.anomaly}]")
 
@@ -2030,11 +2023,7 @@ def apply_proposals(
     # artifact's claimed evidence).
     anomaly_refs = {row.ref for row in live.evidence.rows if row.anomaly}
     for key, item in recorded.items():
-        claimed = {
-            ref
-            for ref in _recorded_result_refs(item)
-            if isinstance(ref, str)
-        }
+        claimed = {ref for ref in _recorded_result_refs(item) if isinstance(ref, str)}
         bad = sorted(claimed & anomaly_refs)
         if bad:
             raise bench.BenchError(

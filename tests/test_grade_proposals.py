@@ -1571,14 +1571,10 @@ def test_model_disposition_unit_edges(tmp_path, isolated_cache):
         grade="A+",
     )
     assert grades._model_disposition(rep, entry) == ""
-    assert "mismatch" in grades._model_disposition(
-        dataclasses_replace_model(rep, "grok-4.6"), entry
-    )
+    assert "mismatch" in grades._model_disposition(dataclasses_replace_model(rep, "grok-4.6"), entry)
     equiv_entry = _entry("devin-swe2-max", "", "C", model_id="swe-2-max")
     assert grades._model_disposition(dataclasses_replace_model(rep, "devin-swe2-max"), equiv_entry) == ""
-    assert "mismatch" in grades._model_disposition(
-        dataclasses_replace_model(rep, "devin-swe2"), equiv_entry
-    )
+    assert "mismatch" in grades._model_disposition(dataclasses_replace_model(rep, "devin-swe2"), equiv_entry)
 
 
 def dataclasses_replace_model(rep: bench.RepRecord, model_id: str | None) -> bench.RepRecord:
@@ -1775,7 +1771,11 @@ def test_demotion_needs_fail_rate_in_recent_window(tmp_path, isolated_cache):
         [
             _rep("f1", effort="xhigh", grade="A+", completed=0, blockers_found=1),
             _rep(
-                "f2", effort="xhigh", grade="A", completed=0, blockers_found=1,
+                "f2",
+                effort="xhigh",
+                grade="A",
+                completed=0,
+                blockers_found=1,
                 recorded_at="2026-09-20T11:00:00Z",
             ),
             _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T12:00:00Z"),
@@ -1797,7 +1797,11 @@ def test_fail_rate_below_threshold_blocks(tmp_path, isolated_cache):
         [
             _rep("f1", effort="xhigh", grade="A+", completed=0, blockers_found=1),
             _rep(
-                "f2", effort="xhigh", grade="A+", completed=0, blockers_found=1,
+                "f2",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
                 recorded_at="2026-09-20T11:00:00Z",
             ),
             _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T12:00:00Z"),
@@ -1826,10 +1830,22 @@ def test_fails_older_than_window_never_demote(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed(
         [
-            _rep("old-fail", effort="xhigh", grade="A+", completed=0, blockers_found=1,
-                 recorded_at="2026-09-20T09:00:00Z"),
-            _rep("f2", effort="xhigh", grade="A+", completed=0, blockers_found=1,
-                 recorded_at="2026-09-20T11:00:00Z"),
+            _rep(
+                "old-fail",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
+                recorded_at="2026-09-20T09:00:00Z",
+            ),
+            _rep(
+                "f2",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
             _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T12:00:00Z"),
             _rep("p2", effort="xhigh", grade="A", recorded_at="2026-09-20T13:00:00Z"),
             _rep("p3", effort="xhigh", grade="A", recorded_at="2026-09-20T14:00:00Z"),
@@ -1849,8 +1865,14 @@ def test_marker_fail_outside_window_never_demotes(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "A"))
     _seed(
         [
-            _rep("old-rollback", effort="xhigh", grade="B", completed=0, notes="[rollback]",
-                 recorded_at="2026-09-20T08:00:00Z"),
+            _rep(
+                "old-rollback",
+                effort="xhigh",
+                grade="B",
+                completed=0,
+                notes="[rollback]",
+                recorded_at="2026-09-20T08:00:00Z",
+            ),
             *[
                 _rep(f"p{i}", effort="xhigh", grade="A", recorded_at=f"2026-09-20T1{i}:00:00Z")
                 for i in range(5)
@@ -1867,8 +1889,14 @@ def test_marker_fail_inside_window_demotes(tmp_path, isolated_cache):
     _seed(
         [
             _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T10:00:00Z"),
-            _rep("rollback", effort="xhigh", grade="B", completed=0, notes="[rollback]",
-                 recorded_at="2026-09-20T11:00:00Z"),
+            _rep(
+                "rollback",
+                effort="xhigh",
+                grade="B",
+                completed=0,
+                notes="[rollback]",
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -1891,10 +1919,22 @@ def test_cli_demote_window_flag_narrows_the_window(tmp_path, monkeypatch, capsys
     _seed(
         [
             _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T10:00:00Z"),
-            _rep("f1", effort="xhigh", grade="A+", completed=0, blockers_found=1,
-                 recorded_at="2026-09-20T11:00:00Z"),
-            _rep("f2", effort="xhigh", grade="A+", completed=0, blockers_found=1,
-                 recorded_at="2026-09-20T12:00:00Z"),
+            _rep(
+                "f1",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
+            _rep(
+                "f2",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
+                recorded_at="2026-09-20T12:00:00Z",
+            ),
         ]
     )
     assert cli.main(["grades", "propose", "--demote-window", "2"]) == 0
@@ -2047,9 +2087,7 @@ def test_json_carries_demote_params_and_anomalies(tmp_path, isolated_cache):
     assert payload["params"]["demote_window"] == grades.DEMOTE_WINDOW
     assert payload["params"]["demote_fail_rate"] == grades.DEMOTE_FAIL_RATE
     assert payload["params"]["cli_non_coding"] == ["^audit-"]
-    assert payload["anomalies"] == [
-        {"ref": "local:1", "rule": "zero-round-fail", "task_ref": "t1"}
-    ]
+    assert payload["anomalies"] == [{"ref": "local:1", "rule": "zero-round-fail", "task_ref": "t1"}]
     assert "^B0X-" in payload["non_coding_patterns"]
 
 
@@ -2063,9 +2101,7 @@ def test_apply_replays_artifact_non_coding_and_window(tmp_path, isolated_cache, 
     artifact = grades.proposal_to_json(
         grades.evaluate(evidence, canon, demote_window=3, demote_fail_rate=0.5), canon
     )
-    entries, live, _ = grades.apply_proposals(
-        artifact, decided_by="operator:test", deviation_ref="task-759"
-    )
+    entries, live, _ = grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-759")
     assert live.demote_window == 3 and live.demote_fail_rate == 0.5
     assert "audit-9" in live.evidence.rows[0].excluded or any(
         "non-coding" in r.excluded for r in live.evidence.rows

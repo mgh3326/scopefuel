@@ -389,8 +389,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--demote-rate",
         type=float,
         default=grades.DEMOTE_FAIL_RATE,
-        help="그 창 안 at-or-below FAIL 비율 강급 임계 (0 < r <= 1; 기본 "
-        f"{grades.DEMOTE_FAIL_RATE})",
+        help=f"그 창 안 at-or-below FAIL 비율 강급 임계 (0 < r <= 1; 기본 {grades.DEMOTE_FAIL_RATE})",
     )
     grades_propose.add_argument(
         "--non-coding-task",
