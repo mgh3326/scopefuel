@@ -20,12 +20,12 @@ from . import bench, grades, herdr, launch, manual, quota_share, quota_v2, recom
 from .cache import collect
 from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
 from .policy import (
+    ConfigEditError,
     clear_policy,
     list_policy_rows,
     list_profile_subscriptions,
     set_policy,
     set_profile_subscribed,
-    set_subscribed,
 )
 from .providers import default_order, registry
 from .recommend import grade_help_text
@@ -588,13 +588,25 @@ def _policy_command(
         if args.pool_class is None and boost_arg == "__unset__" and args.subscribed is None:
             parser.error("class, --boost, --subscribed 중 하나는 지정해야 합니다")
 
-        set_policy(
-            args.pool,
-            args.pool_class,
-            until=args.until,
-            note=args.note,
-            boost=boost_arg,
-        )
+        # #751 — class/boost/subscribed go through one locked edit so the
+        # combined command commits atomically instead of leaving a partial
+        # result when a second write fails.
+        # #742 — 'none' 은 subscribed 키만 제거한다(나머지 필드 보존).
+        subscribed_arg = "__unset__"
+        if args.subscribed is not None:
+            subscribed_arg = None if args.subscribed == "none" else args.subscribed == "on"
+        try:
+            set_policy(
+                args.pool,
+                args.pool_class,
+                until=args.until,
+                note=args.note,
+                boost=boost_arg,
+                subscribed=subscribed_arg,
+            )
+        except ConfigEditError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         parts = []
         if args.pool_class is not None:
             until_s = f" (until {args.until})" if args.until else ""
@@ -602,8 +614,6 @@ def _policy_command(
         if boost_arg != "__unset__":
             parts.append("boost cleared" if boost_arg is None else f"boost={boost_arg}")
         if args.subscribed is not None:
-            # #742 — 'none' 은 subscribed 키만 제거한다(나머지 필드 보존).
-            set_subscribed(args.pool, None if args.subscribed == "none" else args.subscribed == "on")
             parts.append(
                 "subscribed key removed"
                 if args.subscribed == "none"
@@ -615,19 +625,28 @@ def _policy_command(
     if args.policy_command == "profile":
         # #742 — 프로필 수준 플래그는 풀 플래그를 양방향으로 덮어쓴다:
         # on 은 unsubscribed 풀 위에서 이 프로필만, off 는 구독 풀 아래 이 프로필만 닫는다.
-        if args.state == "clear":
-            set_profile_subscribed(args.name, None)
-            print(f"profiles.{args.name} subscribed removed — 풀 수준으로 폴백")
-        else:
-            set_profile_subscribed(args.name, args.state == "on")
-            print(f"profiles.{args.name} subscribed={args.state == 'on'}")
+        try:
+            if args.state == "clear":
+                set_profile_subscribed(args.name, None)
+                print(f"profiles.{args.name} subscribed removed — 풀 수준으로 폴백")
+            else:
+                set_profile_subscribed(args.name, args.state == "on")
+                print(f"profiles.{args.name} subscribed={args.state == 'on'}")
+        except ConfigEditError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     if args.policy_command == "launch":
         return _policy_launch_command(args)
 
     if args.policy_command == "clear":
-        if clear_policy(args.pool):
+        try:
+            cleared = clear_policy(args.pool)
+        except ConfigEditError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if cleared:
             print(f"{args.pool} policy cleared")
             return 0
         print(f"error: {args.pool} 에 설정된 정책이 없습니다", file=sys.stderr)
