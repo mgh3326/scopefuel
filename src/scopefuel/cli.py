@@ -1320,10 +1320,15 @@ def _grades_command(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         changes = live.changes()
+        degraded = grades.degraded_reasons(_view, live.evidence)
         if not changes:
             print("grades apply: proposal carries no grade changes — nothing written")
+            if degraded:
+                print(
+                    f"grades apply: proceeded over degraded input under --allow-degraded "
+                    f"({args.allow_degraded.strip()}) — {'; '.join(degraded)}"
+                )
             return 0
-        degraded = grades.degraded_reasons(_view, live.evidence)
         # The "catalog" list carries only the stamped changed rows so the file
         # can go straight into `bench push-catalog` (which requires decided_by
         # on every row it PUTs). The full post-apply catalog rides along under
