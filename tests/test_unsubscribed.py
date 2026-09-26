@@ -567,7 +567,7 @@ def _entry(profile: str, effort: str, grade: str, **overrides) -> bench.CatalogE
     fields = {
         "profile": profile,
         "effort": effort,
-        "model_id": "model-x",
+        "model_id": "grok-4.7",
         "pool": "test",
         "grade": grade,
     }

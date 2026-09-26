@@ -101,7 +101,10 @@ def _entry(profile: str, effort: str, grade: str, **overrides) -> bench.CatalogE
     fields = {
         "profile": profile,
         "effort": effort,
-        "model_id": "model-x",
+        # Fixture reps record model_id="claude-opus-5-5" — the rung's catalog
+        # model defaults to the same so v1.1 model-match admits them; tests
+        # seeding other-model reps pass the entry model explicitly.
+        "model_id": "claude-opus-5-5",
         "pool": "test",
         "grade": grade,
     }
@@ -491,8 +494,10 @@ def test_apply_writes_promoted_snapshot_row(tmp_path, isolated_cache, monkeypatc
     monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
     _seed(
         [
-            _rep("t1", profile="sonnet", effort="low", grade="A+"),
-            _rep("t2", profile="sonnet", effort="low", grade="A+"),
+            # The snapshot's sonnet rows carry model claude-sonnet-5 — the reps
+            # must record that model to count (v1.1 model match).
+            _rep("t1", profile="sonnet", model_id="claude-sonnet-5", effort="low", grade="A+"),
+            _rep("t2", profile="sonnet", model_id="claude-sonnet-5", effort="low", grade="A+"),
         ]
     )
     proposal = _propose(canon)
@@ -601,7 +606,7 @@ def test_alias_canonical_same_run_counts_once(tmp_path, monkeypatch, isolated_ca
     fake.reps = [
         _remote_row(_remote_rep_row(1200, profile="codex", effort=None), 1200, host=None),
     ]
-    view = _view(_entry("codex-sol", "high", "C"))
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-5-sol"))
     proposal = _propose(view)
     counted = proposal.evidence.counted
     # The local row recorded effort=high — it measured the rung; the server
@@ -633,8 +638,8 @@ def test_same_run_different_rung_keeps_recorded_effort(tmp_path, monkeypatch, is
         ),
     ]
     view = _view(
-        _entry("codex-sol", "high", "C"),
-        _entry("codex-sol", "low", "C"),
+        _entry("codex-sol", "high", "C", model_id="gpt-5-sol"),
+        _entry("codex-sol", "low", "C", model_id="gpt-5-sol"),
     )
     proposal = _propose(view)
     counted = proposal.evidence.counted
@@ -663,8 +668,8 @@ def test_recorded_effort_beats_spelling_pin_in_collapse(tmp_path, monkeypatch, i
         ),
     ]
     view = _view(
-        _entry("codex-sol", "high", "C"),
-        _entry("codex-sol", "max", "C"),
+        _entry("codex-sol", "high", "C", model_id="gpt-5-sol"),
+        _entry("codex-sol", "max", "C", model_id="gpt-5-sol"),
     )
     proposal = _propose(view)
     counted = proposal.evidence.counted
@@ -678,7 +683,9 @@ def test_missing_model_id_never_collapses(tmp_path, monkeypatch, isolated_cache)
     """model_id is optional — None == None is not identity. Two rows with
     different spellings and no model must never merge on task+instant.
     (add_rep requires a model, so the pair arrives as server rows, whose
-    schema tolerates the empty field.)"""
+    schema tolerates the empty field.) Rule v1.1 adds the sharper check:
+    a rep with no recorded model can never prove it ran the rung's model —
+    both rows are excluded as unmatchable, still two distinct rows."""
     from test_grade_proposals import _remote_backend, _remote_row
 
     fake = _remote_backend(tmp_path, monkeypatch)
@@ -699,9 +706,11 @@ def test_missing_model_id_never_collapses(tmp_path, monkeypatch, isolated_cache)
         _entry("codex-sol", "high", "C"),
     )
     proposal = _propose(view)
-    counted = proposal.evidence.counted
-    assert len(counted) == 2
-    assert {r.rung for r in counted} == {("opus", "high"), ("codex-sol", "high")}
+    rows = [r for r in proposal.evidence.rows if r.rep.task_ref == "run-x"]
+    assert len(rows) == 2  # both tracked — never merged
+    assert proposal.evidence.counted == []
+    assert {r.rung for r in rows} == {("opus", "high"), ("codex-sol", "high")}
+    assert all("model not recorded" in r.excluded for r in rows)
 
 
 def test_same_run_key_requires_model_id():
@@ -710,9 +719,10 @@ def test_same_run_key_requires_model_id():
     assert grades._same_run_key(_remote_rep_row(9, model_id="m")) is not None
 
 
-def test_different_runs_same_task_not_collapsed(tmp_path, isolated_cache):
-    """Guard against over-merge: identical spelling+task but a different
-    recorded instant is a different run — both keep counting."""
+def test_different_runs_same_task_aggregate_on_a_rung(tmp_path, isolated_cache):
+    """v1.1 AC2: identical spelling+task on the same rung at different
+    instants are re-runs of one task — only the latest recorded rep counts;
+    the earlier one is excluded with the printed rule."""
     _seed(
         [
             _rep("run-a", profile="codex-sol", effort="high", grade="A"),
@@ -727,7 +737,33 @@ def test_different_runs_same_task_not_collapsed(tmp_path, isolated_cache):
     )
     view = _view(_entry("codex-sol", "high", "C"))
     proposal = _propose(view)
+    counted = proposal.evidence.counted
+    assert len(counted) == 1
+    assert counted[0].rep.recorded_at == "2026-09-20T11:00:00Z"
+    loser = next(r for r in proposal.evidence.rows if r.rep.recorded_at == "2026-09-20T10:00:00Z")
+    assert "same task 'run-a'" in loser.excluded and "final rep" in loser.excluded
+
+
+def test_same_task_different_rung_keeps_both(tmp_path, isolated_cache):
+    """Guard against over-merge: the same task measured on two different
+    rungs (two distinct runs) is two pieces of evidence — aggregation is
+    per (task, rung)."""
+    _seed(
+        [
+            _rep("run-a", profile="opus", effort="high", grade="A"),
+            _rep(
+                "run-a",
+                profile="opus",
+                effort="xhigh",
+                grade="A",
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
+        ]
+    )
+    view = _view(_entry("opus", "high", "C"), _entry("opus", "xhigh", "C"))
+    proposal = _propose(view)
     assert len(proposal.evidence.counted) == 2
+    assert {r.row_key for r in proposal.evidence.counted} == {("opus", "high"), ("opus", "xhigh")}
 
 
 def test_same_run_key_requires_task_ref():
@@ -797,6 +833,6 @@ def test_mutant_alias_dedup_would_fail(tmp_path, monkeypatch, isolated_cache):
     fake.reps = [
         _remote_row(_remote_rep_row(1202, profile="codex", effort=None), 1202, host=None),
     ]
-    view = _view(_entry("codex-sol", "high", "C"))
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-5-sol"))
     proposal = _propose(view)
     assert len(proposal.evidence.counted) == 1
