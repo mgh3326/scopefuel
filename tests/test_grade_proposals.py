@@ -432,12 +432,18 @@ def test_spelling_pin_used_when_effort_unrecorded(tmp_path, isolated_cache):
     assert all(r.key != ("grok-hi", "") for r in proposal.results)
 
 
-def test_launcher_default_effort_fills_unpinned(tmp_path, isolated_cache):
-    """builder-sol pins nothing — the launcher default (codex-sol@max) applies."""
+def test_builder_sol_pins_the_high_rung(tmp_path, isolated_cache):
+    """builder-sol consults codex-sol@high — wrk's catalog pin (decision
+    4088B), not the profile's max default. An effort the rep recorded would
+    still win over the pin."""
     view = _view(_entry("codex-sol", "max", "S+"), _entry("codex-sol", "high", "C"))
     _seed([_rep("t1", profile="builder-sol", grade="S")])
     proposal = _propose(view)
-    assert _result(proposal, "codex-sol", "max").counted
+    keys = {r.key for r in proposal.results}
+    assert ("codex-sol", "high") in keys
+    assert ("codex-sol", "max") not in keys
+    row = next(r for r in proposal.evidence.rows if r.rep.task_ref == "t1")
+    assert row.resolution == "builder map" and not row.effort_inferred
 
 
 def test_unrung_reps_are_reported_not_counted(tmp_path, isolated_cache):
