@@ -310,9 +310,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "grades", help="측정 rep 증거로 카탈로그 (profile, effort) 런그 급 제안/적용"
     )
     grades_sub = grades_parser.add_subparsers(dest="grades_command", required=True)
-    grades_propose = grades_sub.add_parser(
-        "propose", help="rep 증거 평가 → 런그별 급 변경 제안 (읽기 전용)"
-    )
+    grades_propose = grades_sub.add_parser("propose", help="rep 증거 평가 → 런그별 급 변경 제안 (읽기 전용)")
     grades_propose.add_argument(
         "--min-passes",
         type=_nonnegative_int,
@@ -1301,9 +1299,7 @@ def _grades_command(args: argparse.Namespace) -> int:
         return 0
     if args.grades_command == "apply":
         try:
-            proposal_file = json.loads(
-                pathlib.Path(args.proposal).read_text(encoding="utf-8")
-            )
+            proposal_file = json.loads(pathlib.Path(args.proposal).read_text(encoding="utf-8"))
             entries, live, _view = grades.apply_proposals(
                 proposal_file,
                 decided_by=args.decided_by,
