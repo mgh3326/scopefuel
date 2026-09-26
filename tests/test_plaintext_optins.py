@@ -69,7 +69,7 @@ class FakeHk:
         assert (headers or {}).get("Authorization") == f"Bearer {HK_TOKEN}"
         url = str(url)
         assert url.startswith(HK_URL), f"request left the configured endpoint: {url}"
-        path = url[len(HK_URL) :]
+        path = url[len(HK_URL) :].split("?", 1)[0]
         if path.startswith("/v1/bench/"):
             scope = path.rsplit("/", 1)[1]
             self.hits[(method, scope)] += 1

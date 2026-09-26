@@ -346,9 +346,28 @@ class RepRecord:
     effort: str | None
     grade: str | None
     table_grade: str | None = None
+    # Store-namespaced id for display (``srv:<pk>`` | ``origin:<key>`` |
+    # ``local:<rowid>``), set by the reader that knows which store the id
+    # belongs to. Display-only — never persisted and never part of the rep key.
+    ref: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _REP_COLUMNS}
+
+
+def rep_ref(rep: RepRecord) -> str:
+    """The rep's id with its store namespace — never a bare ambiguous number.
+
+    ``srv:<id>`` is the server primary key; ``origin:<id>`` is the client-side
+    idempotency key of a rep whose server copy exists but whose server pk was
+    never learned locally (a write-through echo, or a cache row predating the
+    refresh pass); ``local:<id>`` is a rowid of the local ``reps`` table, the
+    same namespace ``grades`` evidence and ``reps backfill`` refs already use.
+    """
+
+    if rep.ref:
+        return rep.ref
+    return f"local:{rep.id}"
 
 
 @dataclass(frozen=True)
@@ -3112,6 +3131,7 @@ def _remote_rep_from_wire(value: object) -> _RemoteRep:
         effort=_optional_text(value.get("effort"), "effort"),
         grade=_optional_text(value.get("grade"), "grade"),
         table_grade=_optional_text(value.get("table_grade"), "table_grade"),
+        ref=f"srv:{server_id}",
     )
     return _RemoteRep(
         record=record,
@@ -3183,6 +3203,11 @@ def _cached_reps(conn: sqlite3.Connection) -> list[_RemoteRep]:
                 effort=row["effort"],
                 grade=row["grade"],
                 table_grade=row["table_grade"],
+                ref=(
+                    f"srv:{row['server_id']}"
+                    if row["server_id"] is not None
+                    else f"origin:{row['origin_id']}"
+                ),
             ),
             origin_id=row["origin_id"],
             created_by=row["created_by"],
@@ -3201,16 +3226,17 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     cache row (see the client id column doc comment on ``_RemoteRep``).
 
     ``item.created_by`` is only ever ``None`` for an *anonymous* write-through
-    echo — a just-``push-local``'d or just-``add_rep``'d row, cached before the
-    next GET learns the server's identity for it. Such an echo is always this
-    process's own write for its own local ``origin_id``, never another
-    client's, so it may merge into whatever row already caches that
-    ``origin_id`` under any ``created_by`` (typically the very row this same
-    call's ``_replace_cached_reps`` pass just re-fetched) instead of piling up
-    a second, differently-keyed placeholder row for it. A cross-client
-    collision on one ``origin_id`` is only ever observed through *explicit*
-    (non-``None``) ``created_by`` values coming from a real GET, which always
-    take the exact-match branch below and so never merge with each other.
+    echo — a just-written rep cached before its server identity was proven.
+    The echo is this process's own write, but a *named* cache row sharing its
+    ``origin_id`` may be another client's same-content twin: folding the echo
+    into that row would pin a foreign pk onto our rep's display identity and
+    erase the local write marker. An echo therefore merges only into another
+    fully-unbound anonymous row for that ``origin_id`` (dedup of repeated
+    unbound writes) — never into a row carrying a ``server_id``, which it
+    cannot prove is its own server copy.
+    The server row for our own write is folded by the *bound* echo —
+    ``created_by`` + ``server_id`` copied from the post-write GET by
+    ``_bind_server_ids`` — through the exact-pair branch, never anonymously.
     """
     if item.created_by is not None:
         existing = conn.execute(
@@ -3223,8 +3249,8 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     else:
         existing = conn.execute(
             "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
-            "WHERE origin_id = ? "
-            "ORDER BY created_by IS NULL, server_id IS NULL, cache_key "
+            "WHERE origin_id = ? AND created_by IS NULL AND server_id IS NULL "
+            "ORDER BY cache_key "
             "LIMIT 1",
             (item.origin_id,),
         ).fetchone()
@@ -3326,21 +3352,107 @@ def _put_rep_batches(backend: BenchBackend, reps: list[_RemoteRep], *, batch_siz
             raise BenchBackendError("handoffkeep rejected a rep write")
 
 
+def _bind_server_ids(
+    written: list[_RemoteRep],
+    fetched: list[_RemoteRep],
+    *,
+    backend: BenchBackend,
+    window_complete: bool | None = None,
+) -> list[_RemoteRep]:
+    """Attach the server pk each written rep got, proven by the post-write GET.
+
+    A PUT response carries only an upsert count — the assigned ``id`` is only
+    observable through a read. The server's upsert key is ``(created_by,
+    origin_id)`` and it stamps ``created_by`` itself, so the client-side echo
+    cannot name its own row by key. The remote row that proves a write is the
+    *unique* holder of the rep's ``origin_id`` + content — but uniqueness is
+    only decidable inside a provably complete window: two clients may write
+    same-content reps under the same per-machine ``origin_id``, so when the
+    fetched page is full the just-written row may sit outside it while
+    another client's twin sits inside. ``fetched`` must therefore come from a
+    GET at ``_MIGRATE_REP_WINDOW``: a short page proves completeness. A full
+    page falls back to the rep's own profile page, which still contains every
+    possible twin (identical content implies identical profile); if that page
+    is full too the write stays unbound — ``origin:`` is honest, a foreign pk
+    is not.
+    """
+
+    by_origin: dict[int, list[_RemoteRep]] = {}
+    for item in fetched:
+        by_origin.setdefault(item.origin_id, []).append(item)
+    if window_complete is None:
+        window_complete = len(fetched) < _MIGRATE_REP_WINDOW
+    profile_pages: dict[str, tuple[list[_RemoteRep], bool]] = {}
+
+    def _profile_page(profile: str) -> tuple[list[_RemoteRep], bool]:
+        if profile not in profile_pages:
+            page = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW, "profile": profile})
+            profile_pages[profile] = (page, len(page) < _MIGRATE_REP_WINDOW)
+        return profile_pages[profile]
+
+    def _proven_match(item: _RemoteRep) -> _RemoteRep | None:
+        candidates = [
+            remote
+            for remote in by_origin.get(item.origin_id, ())
+            if _same_rep_row(item.record, remote.record)
+        ]
+        if len(candidates) > 1:
+            return None
+        if window_complete:
+            return candidates[0] if candidates else None
+        page, complete = _profile_page(item.record.profile)
+        if not complete:
+            return None
+        candidates = [
+            remote
+            for remote in page
+            if remote.origin_id == item.origin_id and _same_rep_row(item.record, remote.record)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    bound: list[_RemoteRep] = []
+    for item in written:
+        remote = _proven_match(item)
+        if remote is None:
+            bound.append(item)
+            continue
+        bound.append(
+            _RemoteRep(
+                record=item.record,
+                origin_id=item.origin_id,
+                created_by=remote.created_by,
+                server_id=remote.server_id,
+            )
+        )
+    return bound
+
+
 def _write_reps_handoffkeep(
     reps: list[_RemoteRep],
     *,
     path: pathlib.Path | str | None,
     backend: BenchBackend,
-) -> int:
+) -> list[_RemoteRep]:
+    """PUT the reps, then re-read so each written row's server pk is learned.
+
+    The GET follows the PUT: the fetched set is the freshest state (it already
+    carries the new rows' ``id``/``created_by``), so the commit lands them
+    with ``server_id`` filled instead of an anonymous echo. If the read fails
+    the error propagates without touching the cache — a retried add then
+    derives the same ``origin_id`` and the server upsert lands on the same
+    row, so the failure cannot leave a duplicate.
+    """
+
     if not reps:
-        return 0
-    fetched = _fetch_reps(backend)
+        return reps
     _put_rep_batches(backend, reps)
+    fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
+    written = _bind_server_ids(reps, fetched, backend=backend)
     try:
-        _commit_rep_cache(path=path, fetched=fetched, written=reps, backend=backend)
+        _commit_rep_cache(path=path, fetched=fetched, written=written, backend=backend)
     except (sqlite3.Error, OSError) as exc:
         raise BenchBackendError("local bench cache update failed") from exc
-    return len(reps)
+    return written
 
 
 def _filter_reps(
@@ -3476,8 +3588,13 @@ def add_rep(
             grade=grade,
             table_grade=table_grade,
         )
-        _write_reps_handoffkeep([_RemoteRep(record=record, origin_id=origin_id)], path=path, backend=backend)
-        return record
+        written = _write_reps_handoffkeep(
+            [_RemoteRep(record=record, origin_id=origin_id)], path=path, backend=backend
+        )
+        remote = written[0]
+        if remote.server_id is not None:
+            return replace(record, id=remote.server_id, ref=f"srv:{remote.server_id}")
+        return replace(record, ref=f"origin:{origin_id}")
 
     conn = connect(path)
     try:
@@ -3732,15 +3849,34 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
             f"(resolved {reps_backend.name}/{reps_backend.reason}; needs https, or "
             "[bench] allow_plaintext_reps = true on a private tunnel)"
         )
+    # The plaintext opt-in is otherwise enforced lazily inside the request
+    # layer — but the reps write now precedes its fetch, so a disallowed reps
+    # endpoint must be refused up front or the scores PUT would leak through
+    # before the check fires.
+    if scores:
+        _check_handoffkeep_scheme(
+            catalog_backend.url, allow_plaintext=catalog_backend.allow_plaintext_url, use="catalog"
+        )
+    if remote_reps:
+        _check_handoffkeep_scheme(
+            reps_backend.url, allow_plaintext=reps_backend.allow_plaintext_url, use="reps"
+        )
 
-    # Fetch both scopes before the first PUT so a failed refresh or write leaves
-    # all local cache tables and their timestamps untouched.
+    # Fetch scores before the first PUT so a failed refresh or write leaves
+    # all local cache tables and their timestamps untouched. Reps are read
+    # after their PUT instead: the post-write fetch both refreshes the cache
+    # and proves which server row each pushed rep became, so the committed
+    # echoes fold into their own srv rows instead of sitting anonymous beside
+    # them.
     fetched_scores = _fetch_scores(catalog_backend) if scores else []
-    fetched_reps = _fetch_reps(reps_backend) if remote_reps else []
     if scores:
         _put_score_batches(catalog_backend, scores)
     if remote_reps:
         _put_rep_batches(reps_backend, remote_reps)
+        fetched_reps = _fetch_reps(reps_backend, query={"limit": _MIGRATE_REP_WINDOW})
+        remote_reps = _bind_server_ids(remote_reps, fetched_reps, backend=reps_backend)
+    else:
+        fetched_reps = []
     try:
         _commit_push_cache(
             path=path,
@@ -4069,12 +4205,20 @@ def migrate_reps(
         raise BenchBackendError("reps migrate: derived origin_id collision — do not proceed")
     if written:
         _put_rep_batches(backend, written)
-        try:
-            _commit_rep_cache(path=path, fetched=remote, written=written, backend=backend)
-        except (sqlite3.Error, OSError) as exc:
-            raise BenchBackendError("local bench cache update failed") from exc
 
     remote_after = _fetch_reps_for_migrate(backend, {rep.profile for rep in local_reps})
+    if written:
+        # remote_after is provably complete for these profiles — a full
+        # per-profile page raises inside _fetch_reps_for_migrate — so a
+        # unique same-content match here is the migrated row itself.
+        bound = _bind_server_ids(written, remote_after, backend=backend, window_complete=True)
+        try:
+            # Commit the post-write read: the freshly migrated rows already
+            # carry their server id, so the cache shows srv: refs at once
+            # instead of waiting on the refresh pass.
+            _commit_rep_cache(path=path, fetched=remote_after, written=bound, backend=backend)
+        except (sqlite3.Error, OSError) as exc:
+            raise BenchBackendError("local bench cache update failed") from exc
     index_after = _rep_content_index(remote_after)
     missing = [rep for rep in local_reps if not _rep_present_remote(rep, index_after, host)]
     local_keys = {_rep_content_key(rep) for rep in local_reps}
@@ -4124,6 +4268,194 @@ def migrate_reps(
     )
 
 
+# --- task #755: one-time server_id repair for cached rep rows ----------------
+#
+# Cache rows written before the server pk was captured (write-through echoes
+# of ``reps add``/``push-local``, and rows cached by pre-#755 migrate runs)
+# show ``origin:<origin_id>`` — a host-derived key in a band far above any
+# server pk — where the server row is e.g. srv:1107. This pass binds the real
+# pk. A cached row may only take the id of a remote row that provably is the
+# same rep: ``origin_id`` alone collides across machines by default, so
+# matching on it could pin another client's pk onto this cache row.
+
+
+@dataclass(frozen=True)
+class RepIdRefresh:
+    """Outcome of ``reps refresh-ids`` — a dry-run plan or an applied result."""
+
+    applied: bool
+    candidates: int  # cache rows missing server_id
+    filled: list[tuple[str, int]]  # (cache_key, bound server_id)
+    unmatched: list[str]  # cache keys whose origin_id no remote row carries
+    conflicts: list[str]  # keys the server holds under a different rep's content
+    ambiguous: list[str]  # keys with more than one same-content server copy
+    window_blocked: list[str]  # NULL-created_by keys no fetched window can prove
+    window_incomplete: bool  # unfiltered remote window full — some proofs degraded
+
+
+def refresh_rep_server_ids(
+    *,
+    path: pathlib.Path | str | None = None,
+    apply: bool = False,
+    allow_plaintext_http: bool = False,
+) -> RepIdRefresh:
+    """Fill ``server_id`` for cached rep rows whose server copy exists.
+
+    Dry-run unless ``apply``. The match follows the server's own upsert key:
+    a cache row carrying ``created_by`` binds only the remote row under the
+    same ``(created_by, origin_id)`` pair — the pair is unique server-side, so
+    a visible pair row *is* that row, whatever else the window hides. An
+    anonymous echo row (``created_by`` NULL — this host's own write, cached
+    before its identity was known) binds only a *unique* same-content holder
+    of its ``origin_id``, and uniqueness is only decidable inside a provably
+    complete window: the unfiltered page, or the cache row's own profile page
+    (identical content implies identical profile, so every rival is in it).
+    Echoes no window can prove land in ``window_blocked`` rather than taking a
+    possibly-foreign pk. Either way the rep fields must be equal, so a pk is
+    never bound to a different rep — and a second run finds the rows it
+    filled already excluded from the candidate set, making the pass
+    idempotent.
+    """
+
+    backend = bench_backend(use="reps", allow_plaintext_http=allow_plaintext_http)
+    if backend.name != BENCH_BACKEND_HANDOFFKEEP:
+        raise BenchBackendError(
+            f"reps refresh-ids requires the handoffkeep backend (resolved {backend.name}/{backend.reason}; "
+            "needs HANDOFFKEEP_URL+HANDOFFKEEP_TOKEN, and https or the reps plaintext opt-in)"
+        )
+
+    conn = _cache_connect(path)
+    try:
+        candidates = conn.execute(
+            "SELECT cache_key, origin_id, created_by, profile, model_id, task_ref, tier, role, rounds, "
+            "blockers_found, completed, input_tokens, output_tokens, notes, recorded_at, effort, grade, "
+            "table_grade FROM bench_cache_reps WHERE server_id IS NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    remote = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
+    window_incomplete = len(remote) >= _MIGRATE_REP_WINDOW
+    by_origin: dict[int, list[_RemoteRep]] = {}
+    for item in remote:
+        by_origin.setdefault(item.origin_id, []).append(item)
+
+    profile_pages: dict[str, tuple[list[_RemoteRep], bool]] = {}
+
+    def _profile_page(profile: str) -> tuple[list[_RemoteRep], bool]:
+        """(rows, complete) for one profile — fetched lazily, only when the
+        unfiltered window cannot prove a candidate."""
+
+        if profile not in profile_pages:
+            page = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW, "profile": profile})
+            profile_pages[profile] = (page, len(page) < _MIGRATE_REP_WINDOW)
+        return profile_pages[profile]
+
+    def _echo_holders(row: sqlite3.Row) -> list[_RemoteRep] | None:
+        """Every remote row carrying this origin_id — or None when no fetched
+        window provably contains all of them."""
+
+        holders = by_origin.get(row["origin_id"], [])
+        if not window_incomplete:
+            return holders
+        page, complete = _profile_page(row["profile"])
+        if not complete:
+            return None
+        return [item for item in page if item.origin_id == row["origin_id"]]
+
+    filled: list[tuple[str, int, str | None]] = []
+    unmatched: list[str] = []
+    conflicts: list[str] = []
+    ambiguous: list[str] = []
+    window_blocked: list[str] = []
+    for row in candidates:
+        record = RepRecord(
+            id=row["origin_id"],
+            profile=row["profile"],
+            model_id=row["model_id"],
+            task_ref=row["task_ref"],
+            tier=row["tier"],
+            role=row["role"],
+            rounds=row["rounds"],
+            blockers_found=row["blockers_found"],
+            completed=row["completed"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            notes=row["notes"],
+            recorded_at=row["recorded_at"],
+            effort=row["effort"],
+            grade=row["grade"],
+            table_grade=row["table_grade"],
+        )
+        if row["created_by"] is not None:
+            # The server's upsert key is unique, so this can only ever be the
+            # one pair row — window-completeness cannot change that. When the
+            # unfiltered page misses it, the profile page may still hold it.
+            pair = [
+                item for item in by_origin.get(row["origin_id"], ()) if item.created_by == row["created_by"]
+            ]
+            if not pair and window_incomplete:
+                page, complete = _profile_page(row["profile"])
+                if complete:
+                    pair = [
+                        item
+                        for item in page
+                        if item.origin_id == row["origin_id"] and item.created_by == row["created_by"]
+                    ]
+            if not pair:
+                unmatched.append(row["cache_key"])
+            elif _same_rep_row(record, pair[0].record):
+                remote_row = pair[0]
+                assert remote_row.server_id is not None
+                filled.append((row["cache_key"], remote_row.server_id, remote_row.created_by))
+            else:
+                conflicts.append(row["cache_key"])
+            continue
+
+        holders = _echo_holders(row)
+        if holders is None:
+            window_blocked.append(row["cache_key"])
+            continue
+        content_matches = [item for item in holders if _same_rep_row(record, item.record)]
+        if len(content_matches) == 1:
+            remote_row = content_matches[0]
+            assert remote_row.server_id is not None  # wire rows always carry id
+            filled.append((row["cache_key"], remote_row.server_id, remote_row.created_by))
+        elif len(content_matches) > 1:
+            ambiguous.append(row["cache_key"])
+        elif holders:
+            conflicts.append(row["cache_key"])
+        else:
+            unmatched.append(row["cache_key"])
+
+    if apply and filled:
+        conn = _cache_connect(path)
+        try:
+            conn.execute("BEGIN")
+            for cache_key, server_id, created_by in filled:
+                conn.execute(
+                    "UPDATE bench_cache_reps SET server_id = ?, created_by = ? WHERE cache_key = ?",
+                    (server_id, created_by, cache_key),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    return RepIdRefresh(
+        applied=apply,
+        candidates=len(candidates),
+        filled=[(cache_key, server_id) for cache_key, server_id, _ in filled],
+        unmatched=unmatched,
+        conflicts=conflicts,
+        ambiguous=ambiguous,
+        window_blocked=window_blocked,
+        window_incomplete=window_incomplete,
+    )
+
+
 _REP_GRADE_ORDER: tuple[str, ...] = ("S+", "S", "A+", "A", "B", "C")
 
 
@@ -4150,7 +4482,7 @@ def _format_rep_grade(grade: str | None, table_grade: str | None) -> str:
 
 def format_rep(rep: RepRecord) -> str:
     fields = [
-        f"id={rep.id}",
+        f"id={rep_ref(rep)}",
         f"profile={rep.profile}",
         f"effort={rep.effort or '-'}",
         f"grade={_format_rep_grade(rep.grade, rep.table_grade)}",

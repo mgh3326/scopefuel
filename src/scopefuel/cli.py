@@ -356,6 +356,17 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help="원격이 같은 derived id 로 다른 rep 을 이미 갖고 있어도 덮어쓰기 진행",
     )
 
+    reps_refresh = reps_sub.add_parser(
+        "refresh-ids",
+        help="캐시된 rep 행의 server_id 를 서버 사본에서 채우는 1회 복구 (기본 dry-run)",
+    )
+    reps_refresh.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
+    reps_refresh.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정으로 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
+
     grades_parser = subparsers.add_parser(
         "grades", help="측정 rep 증거로 카탈로그 (profile, effort) 런그 급 제안/적용"
     )
@@ -1302,7 +1313,7 @@ def _reps_command(args: argparse.Namespace) -> int:
         except bench.BenchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        print(f"recorded rep id={rep.id}")
+        print(f"recorded rep id={bench.rep_ref(rep)}")
         return 0
     if args.reps_command == "list":
         try:
@@ -1416,6 +1427,36 @@ def _reps_command(args: argparse.Namespace) -> int:
             print(f"  ... +{len(result.missing) - 10} more")
         if result.missing:
             return 2
+        return 0
+    if args.reps_command == "refresh-ids":
+        try:
+            result = bench.refresh_rep_server_ids(
+                apply=args.apply,
+                allow_plaintext_http=args.allow_plaintext_http,
+            )
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        mode = "applied" if args.apply else "dry-run"
+        incomplete = " remote-window-incomplete" if result.window_incomplete else ""
+        print(
+            f"reps refresh-ids ({mode}): candidates={result.candidates} "
+            f"filled={len(result.filled)} unmatched={len(result.unmatched)} "
+            f"conflicts={len(result.conflicts)} ambiguous={len(result.ambiguous)} "
+            f"window-limited={len(result.window_blocked)}{incomplete}"
+        )
+        for cache_key, server_id in result.filled:
+            print(f"  fill {cache_key} -> srv:{server_id}")
+        for cache_key in result.unmatched:
+            print(f"  unmatched {cache_key}")
+        for cache_key in result.conflicts:
+            print(f"  conflict {cache_key} (server holds the id slot under a different rep)")
+        for cache_key in result.ambiguous:
+            print(f"  ambiguous {cache_key} (multiple same-content server rows)")
+        for cache_key in result.window_blocked:
+            print(f"  window-limited {cache_key} (remote window incomplete — cannot prove the server row)")
+        if not args.apply:
+            print("pass --apply to write")
         return 0
     return 2
 

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 from collections import Counter
 
 import pytest
@@ -111,8 +112,9 @@ class FakeHandoffkeep:
 
     @staticmethod
     def _scope(url: str) -> str:
+        path = urllib.parse.urlsplit(url).path
         for scope in ("scores", "reps", "grades", "catalog"):
-            if url.rstrip("/").endswith(f"/v1/bench/{scope}"):
+            if path.rstrip("/").endswith(f"/v1/bench/{scope}"):
                 return scope
         raise AssertionError(f"unexpected URL: {url}")
 
@@ -481,11 +483,10 @@ def test_push_local_preserves_source_rows_and_rejects_local_backend(tmp_path, mo
 
 def test_push_local_is_idempotent_in_the_rep_cache(tmp_path, monkeypatch, capsys):
     """B-3 (H1/H2, regression from round 1's B-1 fix): a second push-local must
-    not duplicate rep cache rows. push_local's write-through _RemoteRep is
-    always created_by=None (the client doesn't know its own authenticated id
-    until the next GET); _put_cached_rep must merge that anonymous echo into
-    the same-origin row _replace_cached_reps just re-fetched, not leave it
-    alongside as a second, differently-keyed placeholder row."""
+    not duplicate rep cache rows. push_local binds each pushed echo to its
+    server row via the post-write GET (_bind_server_ids), so the committed
+    row carries created_by+server_id and folds into the re-fetched pair row
+    instead of piling up a second, differently-keyed placeholder row."""
     _set_backend(tmp_path, monkeypatch, "local")
     for number in (1, 2):
         bench.add_rep(
