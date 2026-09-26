@@ -163,7 +163,9 @@ MODEL_EQUIVALENCE: dict[str, frozenset[str]] = {
 # prints in every proposal.
 # ---------------------------------------------------------------------------
 
-NON_CODING_TASK_PATTERNS: tuple[str, ...] = (r"^B0X-",)
+# The default matches case-insensitively — slot names are a generated class,
+# not an exact-case contract; configured/CLI regexes keep their own semantics.
+NON_CODING_TASK_PATTERNS: tuple[str, ...] = (r"(?i)^B0X-",)
 
 # ---------------------------------------------------------------------------
 # Anomalous reps (rule v1.1 AC5) — rows whose own fields contradict a real
@@ -910,6 +912,13 @@ def _finish_rows(
                 if mismatch:
                     reason = reason or mismatch
                     tags.append("model-mismatch")
+            if not (row.rep.task_ref or "").strip():
+                # AC2's one-task-one-count needs a task identity — a rep with
+                # none cannot prove it is a distinct measurement (the same
+                # cannot-prove rule as an unrecorded model), so it is reported
+                # rather than counted independently.
+                reason = reason or ("task ref not recorded — cannot prove the rep is a distinct measurement")
+                tags.append("no-task-ref")
         if judging is None:
             # Unrung — reported, never counted. The detail names the blockage:
             # an unknown spelling has no rows at all; an exact-effort row that

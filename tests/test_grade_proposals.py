@@ -1080,7 +1080,8 @@ def test_local_backend_discloses_server_unread(tmp_path, monkeypatch, capsys):
 
 def _seed_at_id(rep_id: int, **overrides) -> None:
     """Insert a rep at an explicit rowid — static pairs cite fixed ids."""
-    row = _rep(f"t{rep_id}", **overrides)
+    task_ref = overrides.pop("task_ref", f"t{rep_id}")
+    row = _rep(task_ref, **overrides)
     conn = bench.connect()
     try:
         conn.execute(
@@ -1709,7 +1710,7 @@ def test_b0x_trading_slot_excluded_and_reported(tmp_path, isolated_cache):
     assert not result.counted
     assert all("non-coding task" in r.excluded for r in result.excluded)
     text = grades.render_proposal(proposal, view)
-    assert "non-coding task patterns" in text and "^B0X-" in text
+    assert "non-coding task patterns" in text and "(?i)^B0X-" in text
     assert "non-coding=2" in text
 
 
@@ -1742,7 +1743,7 @@ def test_config_non_coding_patterns_honored(tmp_path, isolated_cache):
     proposal = _propose(view)
     result = _result(proposal, "grok-hi", "xhigh")
     assert [r.rep.task_ref for r in result.counted] == ["568"]
-    assert set(proposal.evidence.non_coding_patterns) >= {"^B0X-", "^analysis-", "^research-"}
+    assert set(proposal.evidence.non_coding_patterns) >= {"(?i)^B0X-", "^analysis-", "^research-"}
 
 
 def test_cli_non_coding_pattern_honored(tmp_path, isolated_cache):
@@ -2088,7 +2089,7 @@ def test_json_carries_demote_params_and_anomalies(tmp_path, isolated_cache):
     assert payload["params"]["demote_fail_rate"] == grades.DEMOTE_FAIL_RATE
     assert payload["params"]["cli_non_coding"] == ["^audit-"]
     assert payload["anomalies"] == [{"ref": "local:1", "rule": "zero-round-fail", "task_ref": "t1"}]
-    assert "^B0X-" in payload["non_coding_patterns"]
+    assert "(?i)^B0X-" in payload["non_coding_patterns"]
 
 
 def test_apply_replays_artifact_non_coding_and_window(tmp_path, isolated_cache, monkeypatch):
@@ -2198,3 +2199,29 @@ def test_alias_duplicate_exclusion_tagged(tmp_path, isolated_cache):
     proposal = _propose(view)
     dupes = [row for row in proposal.evidence.rows if "alias-duplicate" in row.exclusion_tags]
     assert len(dupes) == 1 and dupes[0].excluded
+
+
+def test_reps_without_task_ref_never_count_independently(tmp_path, isolated_cache):
+    """Tester BLOCKER: AC2's one-task-one-count needs a task identity — reps
+    with None/blank task_ref cannot prove they are distinct measurements, so
+    they are reported, never counted."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    for i, task in enumerate([None, "   ", None, None], start=700):
+        _seed_at_id(i, task_ref=task, effort="xhigh", grade="A+")
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert result.action == "insufficient"  # zero counted rows — four before the fix
+    assert not proposal.evidence.counted
+    for row in proposal.evidence.rows:
+        assert "task ref not recorded" in row.excluded
+        assert "no-task-ref" in row.exclusion_tags
+
+
+def test_default_non_coding_pattern_matches_lowercase_b0x(tmp_path, isolated_cache):
+    """Tester SHOULD: slot names are a generated class — the default regex
+    matches b0x- as well as B0X-."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed([_rep("b0x-live", effort="xhigh", grade="A+")])
+    proposal = _propose(view)
+    row = proposal.evidence.rows[0]
+    assert "non-coding" in row.exclusion_tags and row.excluded
