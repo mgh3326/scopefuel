@@ -801,6 +801,15 @@ def test_cli_apply_malformed_artifact_is_a_clean_error(tmp_path, monkeypatch, ca
     bad_params.write_text(json.dumps({"min_passes": 2, "params": ["cli_exclusions"]}))
     assert cli.main(_apply_args(bad_params, tmp_path / "o1.json")) == 2
     assert "params" in capsys.readouterr().err
+    # A truthy non-array cli_exclusions or results used to TypeError before the
+    # comprehension — both are clean exit-2 errors now.
+    bad_collections = tmp_path / "bad-collections.json"
+    bad_collections.write_text(json.dumps({"min_passes": 2, "params": {"cli_exclusions": 42}}))
+    assert cli.main(_apply_args(bad_collections, tmp_path / "o1b.json")) == 2
+    assert "cli_exclusions" in capsys.readouterr().err
+    bad_collections.write_text(json.dumps({"min_passes": 2, "results": 42}))
+    assert cli.main(_apply_args(bad_collections, tmp_path / "o1c.json")) == 2
+    assert "results" in capsys.readouterr().err
     # A results row missing profile/effort must not KeyError — it loses the
     # recorded-changes comparison as a plain BenchError.
     _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])

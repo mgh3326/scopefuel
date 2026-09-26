@@ -1037,9 +1037,19 @@ def apply_proposals(
     if params is not None and not isinstance(params, dict):
         raise bench.BenchError("proposal artifact params must be a JSON object")
     params = params or {}
+    raw_exclusions = params.get("cli_exclusions")
+    if raw_exclusions is None:
+        raw_exclusions = []
+    if not isinstance(raw_exclusions, list):
+        raise bench.BenchError("proposal artifact cli_exclusions must be a JSON array")
+    results = proposal_file.get("results")
+    if results is None:
+        results = []
+    if not isinstance(results, list):
+        raise bench.BenchError("proposal artifact results must be a JSON array")
     exclusions = [
         (str(pair[0]), str(pair[1]))
-        for pair in params.get("cli_exclusions") or []
+        for pair in raw_exclusions
         if isinstance(pair, list | tuple) and len(pair) == 2
     ]
     view = bench.read_catalog(path=path, commit_cache=False, allow_plaintext_http=allow_plaintext_http)
@@ -1065,7 +1075,7 @@ def apply_proposals(
         )
     recorded = {
         (item["profile"], item["effort"]): item
-        for item in proposal_file.get("results") or []
+        for item in results
         if isinstance(item, dict)
         and item.get("action") in ("promote", "demote")
         and isinstance(item.get("profile"), str)
