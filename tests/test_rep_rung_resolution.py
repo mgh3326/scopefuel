@@ -483,9 +483,7 @@ def test_apply_writes_promoted_snapshot_row(tmp_path, isolated_cache, monkeypatc
         "results": [r.as_dict() for r in proposal.results if r.action in ("promote", "demote")],
         "params": {"cli_exclusions": []},
     }
-    entries, live, _ = grades.apply_proposals(
-        artifact, decided_by="operator:test", deviation_ref="task-750"
-    )
+    entries, live, _ = grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-750")
     rows = {e.key: e for e in entries}
     # sonnet@low is a snapshot stand-in (canon covers only devin-ds41): its
     # promote A -> A+ must reach the artifact with the decision stamps.

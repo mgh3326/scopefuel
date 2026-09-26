@@ -231,9 +231,7 @@ class RungResolution:
     detail: str  # e.g. "builder-grok -> grok-hi@xhigh" — the printed basis
 
 
-def _catalog_default_effort(
-    profile: str, rows: list[bench.CatalogEntry] | None
-) -> str:
+def _catalog_default_effort(profile: str, rows: list[bench.CatalogEntry] | None) -> str:
     """The effort of the profile's catalog default rung (launch semantics).
 
     ``launch._default_effort`` over the profile's ordinary rows answers the
@@ -291,8 +289,11 @@ def _resolve_rep_rung(
         else f"{rung_label} (as recorded)"
     )
     return RungResolution(
-        profile=profile, effort=effort, kind=kind,
-        effort_inferred=effort_inferred, detail=detail,
+        profile=profile,
+        effort=effort,
+        kind=kind,
+        effort_inferred=effort_inferred,
+        detail=detail,
     )
 
 
@@ -311,9 +312,7 @@ def _grading_entries(view: bench.CatalogView) -> tuple[bench.CatalogEntry, ...]:
     """
 
     covered = {entry.profile for entry in view.entries}
-    return view.entries + tuple(
-        entry for entry in bench.catalog_snapshot() if entry.profile not in covered
-    )
+    return view.entries + tuple(entry for entry in bench.catalog_snapshot() if entry.profile not in covered)
 
 
 def _judging_row(rows: list[bench.CatalogEntry], effort: str) -> bench.CatalogEntry | None:
@@ -1151,10 +1150,7 @@ def _input_digest(proposal: Proposal) -> str:
         "rule_version": RULE_VERSION,
         "min_passes": proposal.min_passes,
         "backend": evidence.backend,
-        "catalog": [
-            entry.as_dict()
-            for entry in sorted(proposal.catalog_entries, key=lambda e: e.key)
-        ],
+        "catalog": [entry.as_dict() for entry in sorted(proposal.catalog_entries, key=lambda e: e.key)],
         "exclusions": [{"old": e.old_spec, "new": e.new_spec} for e in evidence.exclusions],
         "reps": [
             {
@@ -1201,9 +1197,7 @@ def _fmt_evidence(item: EvidenceRep) -> str:
         # The printed basis (AC2): which rule resolved the rung, and whether
         # the effort was measured on the rep or inferred from the profile's
         # catalog default. An inferred effort is never presented as measured.
-        detail = (
-            f"{item.resolution_detail}{' (effort inferred)' if item.effort_inferred else ''}"
-        )
+        detail = f"{item.resolution_detail}{' (effort inferred)' if item.effort_inferred else ''}"
         bits.append(f"resolved={item.resolution}:{detail}")
     elif item.resolution_detail:
         bits.append(f"unresolved:{item.resolution_detail}")
@@ -1297,8 +1291,7 @@ def render_proposal(
             if by_kind.get(kind, 0)
         )
         lines.append(
-            f"resolution basis ({len(counted)} counted reps): {kinds}"
-            f" — effort inferred on {inferred}"
+            f"resolution basis ({len(counted)} counted reps): {kinds} — effort inferred on {inferred}"
         )
 
     if evidence.exclusions:
