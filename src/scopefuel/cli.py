@@ -1321,12 +1321,13 @@ def _grades_command(args: argparse.Namespace) -> int:
             return 2
         changes = live.changes()
         degraded = grades.degraded_reasons(_view, live.evidence)
+        override_reason = (args.allow_degraded or "").strip()
         if not changes:
             print("grades apply: proposal carries no grade changes — nothing written")
             if degraded:
                 print(
                     f"grades apply: proceeded over degraded input under --allow-degraded "
-                    f"({args.allow_degraded.strip()}) — {'; '.join(degraded)}"
+                    f"({override_reason}) — {'; '.join(degraded)}"
                 )
             return 0
         # The "catalog" list carries only the stamped changed rows so the file
@@ -1340,7 +1341,7 @@ def _grades_command(args: argparse.Namespace) -> int:
         }
         if degraded:
             payload["degraded_override"] = {
-                "reason": args.allow_degraded.strip(),
+                "reason": override_reason,
                 "inputs": degraded,
             }
         pathlib.Path(args.out).write_text(
@@ -1350,7 +1351,7 @@ def _grades_command(args: argparse.Namespace) -> int:
         if degraded:
             print(
                 f"grades apply: degraded input applied under --allow-degraded "
-                f"({args.allow_degraded.strip()}) — {'; '.join(degraded)}"
+                f"({override_reason}) — {'; '.join(degraded)}"
             )
         for result in changes:
             print(

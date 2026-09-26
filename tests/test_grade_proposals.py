@@ -737,12 +737,28 @@ def test_cli_apply_allow_degraded_records_reason(tmp_path, monkeypatch, capsys):
     reason = "canon unreachable; snapshot rows are the reviewed copy"
     assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", reason)) == 0
     payload = json.loads(out_file.read_text())
-    assert payload["degraded_override"]["reason"] == reason
-    assert payload["degraded_override"]["inputs"]
+    override_record = payload.get("degraded_override") or {}
+    assert override_record.get("reason") == reason
+    assert override_record.get("inputs")
     changed = payload["catalog"][0]
     assert f"degraded-override: {reason}" in changed["deviation_ref"]
     out = capsys.readouterr().out
     assert "degraded input applied" in out and reason in out
+
+
+def test_cli_apply_allow_degraded_no_changes_still_records_reason(tmp_path, monkeypatch, capsys):
+    """A degraded apply that changes nothing writes no artifact — the console
+    is the only trace, so the override reason must land there."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])  # snapshot = degraded
+    _seed([_rep("t1", effort="xhigh", grade="A")])  # one pass — insufficient
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    reason = "canon unreachable; reviewed the bundled snapshot"
+    assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", reason)) == 0
+    assert not out_file.exists()
+    out = capsys.readouterr().out
+    assert "proceeded over degraded input" in out and reason in out
 
 
 def test_cli_apply_allow_degraded_requires_a_reason(tmp_path, monkeypatch, capsys):
