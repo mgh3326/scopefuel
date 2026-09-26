@@ -1129,6 +1129,14 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         aa_model_id="gpt-6-sol",
     ),
     _e6_arm_profile(
+        "codex-sol",
+        "GPT-6 Sol (medium)",
+        "medium",
+        "gpt-6-sol AA-model intelligence high 42.8(medium 미저장)",
+        aa_agent_model_id="gpt-6-sol",
+        aa_model_id="gpt-6-sol",
+    ),
+    _e6_arm_profile(
         "kimi-k3",
         "Kimi K3 (high)",
         "high",
@@ -1143,6 +1151,22 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "kimi-k3 AA-agent agentic default 61.0 · AA-model intelligence max 43.6",
         aa_agent_model_id="kimi-k3",
         aa_model_id="kimi-k3",
+    ),
+    _e6_arm_profile(
+        "grok-hi",
+        "Grok 4.7 (low)",
+        "low",
+        "grok-4-7 AA-model intelligence high 46.3 · max 46.4(low 미저장)",
+        aa_agent_model_id="grok-4.7",
+        aa_model_id="grok-4-7",
+    ),
+    _e6_arm_profile(
+        "grok-hi",
+        "Grok 4.7 (medium)",
+        "medium",
+        "grok-4-7 AA-model intelligence high 46.3 · max 46.4(medium 미저장)",
+        aa_agent_model_id="grok-4.7",
+        aa_model_id="grok-4-7",
     ),
     _e6_arm_profile(
         "grok-hi",

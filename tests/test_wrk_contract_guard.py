@@ -55,6 +55,8 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "captain-sol": ("codex-sol", None),
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
+    # #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.
+    "builder-sol-medium": ("codex-sol", "medium"),
     # #633: builder-luna is codex-luna under --role builder, pinned to the
     # #594 E3 rung (xhigh) — same catalog profile as the worker spellings.
     "builder-luna": ("codex-luna", "xhigh"),
@@ -82,6 +84,12 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "grok-hi": ("grok-hi", None),
     "grok-med": ("grok", "medium"),
     "builder-grok": ("grok-hi", "xhigh"),
+    # #737 (decision 4088): the grok E6 rungs — same grok-hi catalog profile,
+    # rung pinned in the last name segment; wrk additionally requires
+    # SCOPEFUEL_E6_ARM=grok-hi@<rung> (plain marker rungs, not escalation).
+    "builder-grok-low": ("grok-hi", "low"),
+    "builder-grok-medium": ("grok-hi", "medium"),
+    "builder-grok-xhigh": ("grok-hi", "xhigh"),
     "cc-qwen38": ("cc-qwen38", None),
     "cc-glm": ("cc-glm", None),
 }
