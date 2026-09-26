@@ -147,7 +147,7 @@ MODEL_EQUIVALENCE: dict[str, frozenset[str]] = {
     "deepseek-v4-1-flash-max": frozenset({"devin-ds41-max"}),
     # provider-namespaced / launcher spellings of the same model id.
     "solar-pro4": frozenset({"upstage/solar-pro4"}),
-    "kimi-k3": frozenset({"kimi-code", "kimi-code/k3"}),
+    "kimi-k3": frozenset({"kimi-code/k3"}),
     "gemini-3.7-flash": frozenset({"agy-flash", "agy-flash37"}),
     # profile spellings that pin one catalog model id.
     "gpt-6-luna": frozenset({"codex-luna-max"}),
@@ -1427,7 +1427,9 @@ def _collapse_alias_duplicates(evidence: RepsEvidence) -> None:
                     f"duplicate rep under a different spelling (resolved {item.rung[0]}@{item.rung[1]}; "
                     f"kept {keep.ref} resolved {keep.rung[0]}@{keep.rung[1]})"
                 )
-            evidence.rows[index] = dataclasses.replace(item, excluded=reason)
+            evidence.rows[index] = dataclasses.replace(
+                item, excluded=reason, exclusion_tags=item.exclusion_tags + ("alias-duplicate",)
+            )
 
 
 def _ref_id(ref: str) -> int:
@@ -1440,17 +1442,21 @@ def _ref_id(ref: str) -> int:
 
 
 def _recency_key(item: EvidenceRep) -> tuple:
-    """Chronological key for counted reps — normalized instant, then ref id.
+    """Chronological key for counted reps — true instant, then ref id.
 
-    ``bench._recorded_at_key`` can return a parsed datetime or a raw string;
-    both are normalized back to a comparable isoformat string so ``Z`` and
-    ``+00:00`` spellings of one instant order together. The ref id breaks the
-    remaining ties deterministically (a later store row is the later record).
+    ``bench._recorded_at_key`` can return a parsed datetime or a raw string.
+    Aware datetimes convert to the UTC epoch so ``+09:00`` wall-clock fields
+    never outrank an earlier ``Z`` instant; naive stamps are read as UTC
+    (the store's convention); unparseable stamps sort oldest by raw text.
+    The ref id breaks the remaining ties deterministically (a later store
+    row is the later record).
     """
 
     stamp = bench._recorded_at_key(item.rep.recorded_at or "")
-    normalized = stamp.isoformat() if isinstance(stamp, dt.datetime) else str(stamp)
-    return (normalized, _ref_id(item.ref))
+    if isinstance(stamp, dt.datetime):
+        aware = stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.UTC)
+        return (aware.timestamp(), "", _ref_id(item.ref))
+    return (float("-inf"), str(stamp), _ref_id(item.ref))
 
 
 def _collapse_task_repeats(evidence: RepsEvidence) -> None:

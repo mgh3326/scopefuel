@@ -2147,3 +2147,54 @@ def test_apply_refuses_artifact_naming_excluded_anomaly_twin(tmp_path, monkeypat
     monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
     with pytest.raises(bench.BenchError, match="anomalous rep"):
         grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-759")
+
+
+def test_kimi_code_floating_spelling_is_not_kimi_k3(tmp_path, isolated_cache):
+    """CR Major: bare 'kimi-code' is a floating launcher spelling (generation
+    ambiguous — same class as 'codex'), never equivalent to kimi-k3; only the
+    generation-namespaced 'kimi-code/k3' rename is declared."""
+    view = _view(_entry("kimi-k3", "high", "C", model_id="kimi-k3"))
+    _seed(
+        [
+            _rep("t1", profile="kimi-k3", model_id="kimi-code", effort="high", grade="A+"),
+            _rep("t2", profile="kimi-k3", model_id="kimi-code", effort="high", grade="A+"),
+            _rep("t3", profile="kimi-k3", model_id="kimi-code/k3", effort="high", grade="A+"),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "kimi-k3", "high")
+    assert result.action == "insufficient"  # one counted PASS, never three
+    rows = {row.rep.model_id: row for row in proposal.evidence.rows}
+    assert "model mismatch" in rows["kimi-code"].excluded
+    assert rows["kimi-code/k3"].excluded == ""
+
+
+def test_same_task_collapse_orders_by_true_instant_not_wall_clock(tmp_path, isolated_cache):
+    """CR Minor: recorded_at with a non-UTC offset must order by the instant,
+    not the local wall-clock fields — 10:00+09:00 (01:00Z) predates 02:00Z."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A", recorded_at="2026-09-20T10:00:00+09:00"),
+            _rep("t1", effort="xhigh", grade="A+", recorded_at="2026-09-20T02:00:00Z"),
+        ]
+    )
+    proposal = _propose(view)
+    rows = sorted(proposal.evidence.rows, key=lambda r: r.ref)
+    assert rows[0].rep.grade == "A" and "same task" in rows[0].excluded  # 01:00Z loses
+    assert rows[1].rep.grade == "A+" and rows[1].excluded == ""  # 02:00Z is the final rep
+
+
+def test_alias_duplicate_exclusion_tagged(tmp_path, isolated_cache):
+    """CR Minor: alias-collapse exclusions carry the alias-duplicate tag so the
+    evidence summary's per-tag breakdown adds up."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("t1", profile="grok", effort="xhigh", grade="A+"),
+            _rep("t1", profile="grok-hi", effort="xhigh", grade="A+"),
+        ]
+    )
+    proposal = _propose(view)
+    dupes = [row for row in proposal.evidence.rows if "alias-duplicate" in row.exclusion_tags]
+    assert len(dupes) == 1 and dupes[0].excluded
