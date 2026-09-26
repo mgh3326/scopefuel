@@ -527,7 +527,13 @@ def _rep_anomaly(rep: bench.RepRecord) -> str:
 
 
 def _normalize_model_id(value: str | None) -> str:
-    return (value or "").strip().lower()
+    """Exact-identity canonicalization: strip only. Case-fold is deliberately
+    NOT applied — folding is an undeclared equivalence (a rep 'vendor/model-a'
+    would count on a distinct 'vendor/Model-A' rung), the same class of
+    silent merge AC1 exists to prevent. Spelling variants must be declared in
+    MODEL_EQUIVALENCE to count."""
+
+    return (value or "").strip()
 
 
 def _model_disposition(rep: bench.RepRecord, judging: bench.CatalogEntry) -> str:
@@ -535,8 +541,9 @@ def _model_disposition(rep: bench.RepRecord, judging: bench.CatalogEntry) -> str
 
     Strict by construction (v1.1 AC1): the rung's catalog ``model_id`` is the
     only identity a rep can match, plus the declared ``MODEL_EQUIVALENCE``
-    renames. A rep with no recorded model, or a rung with no catalog model id,
-    can never be proven to match — fail-closed, reported, never counted.
+    renames — exact string identity after stripping, no case folding. A rep
+    with no recorded model, or a rung with no catalog model id, can never be
+    proven to match — fail-closed, reported, never counted.
     """
 
     rung_model = _normalize_model_id(judging.model_id)

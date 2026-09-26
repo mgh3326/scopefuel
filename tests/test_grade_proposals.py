@@ -2225,3 +2225,23 @@ def test_default_non_coding_pattern_matches_lowercase_b0x(tmp_path, isolated_cac
     proposal = _propose(view)
     row = proposal.evidence.rows[0]
     assert "non-coding" in row.exclusion_tags and row.excluded
+
+
+def test_model_match_is_exact_case_sensitive_identity(tmp_path, isolated_cache):
+    """Tester BLOCKER r2: case-fold is an undeclared equivalence — a rep
+    'vendor/model-a' must not count on a distinct 'vendor/Model-A' rung.
+    Only exact identity or a declared MODEL_EQUIVALENCE spelling counts."""
+    view = _view(_entry("grok-hi", "xhigh", "C", model_id="vendor/Model-A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", model_id="vendor/model-a", grade="A+"),
+            _rep("t2", effort="xhigh", model_id="vendor/model-a", grade="A+"),
+            _rep("t3", effort="xhigh", model_id="vendor/Model-A", grade="A+"),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert result.action == "insufficient"  # one counted PASS, never promote
+    rows = {row.rep.model_id: row for row in proposal.evidence.rows}
+    assert "model mismatch" in rows["vendor/model-a"].excluded
+    assert rows["vendor/Model-A"].excluded == ""

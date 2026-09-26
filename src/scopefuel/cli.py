@@ -396,7 +396,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="REGEX",
-        help="비코딩 task_ref 패턴 추가 (기본 ^B0X- + config.toml "
+        help="비코딩 task_ref 패턴 추가 (기본 (?i)^B0X- + config.toml "
         "[grades].non_coding_task_patterns). 반복 가능",
     )
     grades_propose.add_argument(
