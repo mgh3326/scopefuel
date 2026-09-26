@@ -571,8 +571,9 @@ def _evaluate_row(
 
     current = row.grade
     if current not in GRADE_STRENGTH:
+        rung = f"{row.profile}{'@' + row.effort if row.effort else ''}"
         raise bench.BenchError(
-            f"catalog row {row.label()} carries grade {current!r} outside the "
+            f"catalog row {rung} carries grade {current!r} outside the "
             f"ladder {GRADE_LADDER} — the catalog is corrupt, nothing is proposed"
         )
     cur_s = GRADE_STRENGTH[current]

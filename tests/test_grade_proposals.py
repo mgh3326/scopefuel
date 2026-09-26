@@ -13,6 +13,8 @@ import json
 import sqlite3
 import urllib.parse
 
+import pytest
+
 from scopefuel import bench, cli, grades
 
 HOST = "test-host"
@@ -867,3 +869,12 @@ def test_null_blockers_never_counts_as_clean(tmp_path, isolated_cache):
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "insufficient"
     assert len(result.unclean_passes) == 1
+
+
+def test_off_ladder_catalog_grade_raises_bench_error(tmp_path, isolated_cache):
+    """Tester SHOULD: a catalog row whose grade is off the ladder must fail
+    with a BenchError naming the rung — not an AttributeError on row.label."""
+    view = _view(_entry("grok-hi", "xhigh", "Q"))
+    _seed([_rep("t1", effort="xhigh", grade="A+")])
+    with pytest.raises(bench.BenchError, match="grok-hi@xhigh"):
+        _propose(view)
