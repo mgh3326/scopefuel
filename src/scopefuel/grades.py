@@ -1,0 +1,1026 @@
+"""task #735 — measured-rep grade proposals for catalog (profile, effort) rungs.
+
+``scopefuel grades propose`` reads the representative-run store, evaluates each
+catalog rung against the explicit rule below, and prints the proposed grade
+moves with the evidence rep ids behind each one. It is strictly read-only: it
+never writes the reps store, the catalog cache, or any other state.
+
+``scopefuel grades apply`` consumes a proposal artifact written by a matching
+``propose --json`` run, re-verifies the evidence fingerprint against the live
+stores, and writes the updated catalog as C1 JSON — the shape
+``bench push-catalog`` PUTs to the canon. Nothing here touches an installed
+host; the artifact is what an operator propagates.
+
+The rule (operator proposal, decision 4088 part A — draft, tunable via
+``--min-passes``):
+
+*   A **PASS** is a rep with ``completed=1``, ``blockers_found=0``, and no
+    post-merge failure marker in ``notes``. A rep that completed but the tester
+    found blockers is a pass-with-fixes: shown, never counted.
+*   A **FAIL** is a rep with ``completed=0`` (cap exhausted without completing)
+    or a ``[rollback]`` / ``[post-merge-blocker]`` marker in ``notes``. These
+    markers are the rep vocabulary's convention for a failure discovered *after*
+    the rep's merge; nothing today carries them, but the check is structural.
+*   **Promote** a rung to grade G — the highest such G — when it has at least
+    ``min_passes`` PASSes on tasks of grade G and the rung carries **no** FAIL
+    evidence at all (a rollback or cap-out undermines any pending promotion,
+    whatever grade the failed task asked for).
+*   **Demote** a rung when a FAIL rep's task grade is at or below the rung's
+    current placement — the rung demonstrably could not do work it was placed
+    to do. The target is one step below the weakest failed grade (a FAIL on an
+    ungraded task drops the rung one step below its placement). A FAIL on a
+    task *above* the placement is overreach evidence: it does not demote (the
+    placement never claimed that level) but it blocks promotion.
+*   **Conflicted**: when a demote trigger fires but the rung *also* holds
+    ``min_passes`` clean PASSes at its current grade, the evidence contradicts
+    itself — a single outlier fail does not outweigh a measured body of
+    at-placement passes. No move is proposed; both sides print for the
+    operator.
+*   Reps whose ``grade`` is empty are ungraded passes — shown, never counted:
+    the rule claims "can do grade-G work", and a pass on a task of unrecorded
+    difficulty cannot establish G.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import re
+import socket
+from dataclasses import dataclass, field
+
+from . import bench, launch
+
+# ---------------------------------------------------------------------------
+# The rule
+# ---------------------------------------------------------------------------
+
+RULE_VERSION = 1
+MIN_PASSES = 2
+
+# Weakest-to-strongest ladder; the index is the rung's strength rank.
+GRADE_LADDER = ("C", "B", "A", "A+", "S", "S+")
+GRADE_STRENGTH = {grade: index for index, grade in enumerate(GRADE_LADDER)}
+
+# Post-merge failure vocabulary, recorded in rep notes. Bracketed and explicit
+# so ordinary prose ("rolled back the lock", "no rollback") cannot trip it.
+FAIL_MARKERS = re.compile(r"\[(rollback|post-merge-blocker|postmerge-blocker)\]", re.IGNORECASE)
+
+# The existing notes convention for "this rep replaces that one" — e.g. rep 967
+# carries ``supersedes id=964``. The cited id is excluded in the same store
+# namespace as the rep carrying the note.
+SUPERSEDES_RE = re.compile(r"supersedes id=(\d+)", re.IGNORECASE)
+
+# Superseded duplicate reps the operator named for this first run, as
+# ``(superseded, surviving)`` ref specs. A bare id binds the rep known by that
+# id in *every* namespace the command can see — under the handoffkeep backend
+# that is both ``srv:<id>`` and this host's ``local:<id>``, so an unmigrated
+# local duplicate cannot slip past a server-scoped spec. ``local@<host>:<id>``
+# names a local row that exists only on that host: the desktop's rows 80/81
+# have never been migrated, so the pair binds only when the command runs on
+# the host named ``home-desktop`` — this host's own local row 80 is a
+# different rep and must not be excluded.
+STATIC_SUPERSEDES: tuple[tuple[str, str], ...] = (
+    ("993", "995"),
+    ("996", "997"),
+    ("local@home-desktop:80", "local@home-desktop:81"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Spawn-spelling -> catalog (profile, effort pin) — a mirror of wrk's
+# ``resolve_catalog_profile``. A rep records the launcher's spelling; the
+# catalog is keyed on the canonical profile, so evidence can only land on a
+# rung through this map. A spelling absent here is its own catalog profile
+# (the fail-safe direction, same as wrk).
+# ---------------------------------------------------------------------------
+
+_SPAWN_CATALOG: dict[str, tuple[str, str]] = {
+    "opus": ("opus", ""),
+    "builder-opus": ("opus", ""),
+    "captain-opus": ("opus", ""),
+    "builder-opus-low": ("opus", "low"),
+    "builder-opus-medium": ("opus", "medium"),
+    "sonnet": ("sonnet", ""),
+    "sonnet-med": ("sonnet", ""),
+    "builder-sonnet-xhigh": ("sonnet", "xhigh"),
+    "builder-sonnet-max": ("sonnet", "max"),
+    "haiku": ("haiku", ""),
+    "fable": ("fable", ""),
+    "codex": ("codex-sol", "high"),
+    "codex-sol": ("codex-sol", ""),
+    "codex-max": ("codex-sol", ""),
+    "builder-sol": ("codex-sol", ""),
+    "captain-sol": ("codex-sol", ""),
+    "codex-terra": ("codex-terra", "medium"),
+    "codex-med": ("codex-terra", "medium"),
+    "codex-terra-max": ("codex-terra-max", ""),
+    "codex-luna": ("codex-luna", "medium"),
+    "codex-luna-hi": ("codex-luna", "high"),
+    "codex-luna-max": ("codex-luna-max", ""),
+    "builder-luna": ("codex-luna", "xhigh"),
+    "builder-sol-high": ("codex-sol", "high"),
+    "builder-sol-max": ("codex-sol", "max"),
+    "builder-sol-medium": ("codex-sol", "medium"),
+    "builder-luna-max": ("codex-luna", "max"),
+    "builder-terra-high": ("codex-terra", "high"),
+    "builder-terra-xhigh": ("codex-terra", "xhigh"),
+    "builder-terra-max": ("codex-terra", "max"),
+    "codex-astra": ("codex-astra", ""),
+    "kiro-opus": ("kiro-opus", ""),
+    "kiro-opus-xhigh": ("kiro-opus", "xhigh"),
+    "kiro-opus-max": ("kiro-opus", "max"),
+    "kiro-sonnet": ("kiro-sonnet", ""),
+    "kiro-sol": ("kiro-sol", ""),
+    "kiro-sol-xhigh": ("kiro-sol", "xhigh"),
+    "kiro-sol-max": ("kiro-sol", "max"),
+    "kiro-cheap": ("kiro-cheap", ""),
+    "kiro-haiku": ("kiro-haiku", ""),
+    "grok": ("grok-hi", ""),
+    "grok-hi": ("grok-hi", ""),
+    "grok-med": ("grok", "medium"),
+    "builder-grok": ("grok-hi", "xhigh"),
+    # #737 (decision 4088): the E6 grok rungs pin grok-hi@<suffix>.
+    "builder-grok-low": ("grok-hi", "low"),
+    "builder-grok-medium": ("grok-hi", "medium"),
+    "builder-grok-xhigh": ("grok-hi", "xhigh"),
+    "cc-qwen38": ("cc-qwen38", ""),
+    "cc-glm": ("cc-glm", ""),
+    # kimi spellings are not in wrk's resolve_catalog_profile (the catalog once
+    # carried no kimi rows), but the #704 gate consults the catalog at the
+    # pinned rung: builder-kimi-<effort> measures kimi-k3@<effort>.
+    "kimi-k3": ("kimi-k3", ""),
+    "kimi-k3-low": ("kimi-k3", "low"),
+    "builder-kimi": ("kimi-k3", ""),
+    "builder-kimi-high": ("kimi-k3", "high"),
+    "builder-kimi-max": ("kimi-k3", "max"),
+    # E6 devin arms (task #594): the builder spellings name the catalog
+    # profile directly — devin-swe2-max/-medium are profiles, not rungs of
+    # devin-swe2 — and devin launchers carry no effort flag.
+    "builder-devin": ("devin-swe2", ""),
+    "builder-devin-max": ("devin-swe2-max", ""),
+    "builder-devin-medium": ("devin-swe2-medium", ""),
+    "builder-ds41": ("devin-ds41", ""),
+    "builder-ds41-max": ("devin-ds41-max", ""),
+}
+
+
+def _rep_rung(rep: bench.RepRecord) -> tuple[str, str]:
+    """The catalog rung this rep measured: (catalog profile, effective effort).
+
+    The effort is the one recorded on the rep, else the spelling's pin (the
+    rung wrk consulted for it), else the launcher's own default for profiles
+    that pin nothing (``builder-sol`` runs at codex-sol's launcher default,
+    max), else "" for launchers that carry no effort flag.
+    """
+
+    profile, pin = _SPAWN_CATALOG.get(rep.profile, (rep.profile, ""))
+    effort = rep.effort or pin or launch.DEFAULT_LAUNCH_EFFORTS.get(profile, "")
+    return profile, effort
+
+
+def _judging_row(rows: list[bench.CatalogEntry], effort: str) -> bench.CatalogEntry | None:
+    """The catalog row that governs a rung — the same row launch resolves.
+
+    An exact (profile, effort) row always judges its own rung, including an
+    unmeasured E6 row: a rep recorded on that rung is exactly the arm's
+    measurement. A rung the catalog never placed takes the profile's ordinary
+    default placement, which is what ``_default_effort`` computes over the
+    non-E6, non-retired rows the launch would actually see.
+    """
+
+    exact = [row for row in rows if row.effort == effort]
+    if exact:
+        # A retired row is a real placement record, not an absent one: the
+        # rung was placed and then withdrawn, so its evidence is unrung — it
+        # must not flow to a live sibling via the default fallback.
+        return exact[0] if not exact[0].retired_at else None
+    ordinary = [row for row in rows if not row.retired_at and not launch._unmeasured_e6_row(row)]
+    if not ordinary:
+        return None
+    fallback_effort, _ = launch._default_effort(rows[0].profile, ordinary)
+    matched = [row for row in ordinary if row.effort == fallback_effort]
+    return matched[0] if matched else None
+
+
+# ---------------------------------------------------------------------------
+# Evidence model
+# ---------------------------------------------------------------------------
+
+_KIND_PASS = "pass"  # completed, zero blockers, no marker
+_KIND_PASS_UNGRADED = "pass-ungraded"  # a pass whose task grade was not recorded
+_KIND_PASS_UNCLEAN = "pass-unclean"  # completed but blockers were found
+_KIND_FAIL = "fail"  # completed=0 or a post-merge marker
+_KIND_UNKNOWN = "unknown"  # rep row with no completed flag
+
+_KIND_LABELS = {
+    _KIND_PASS: "PASS",
+    _KIND_PASS_UNGRADED: "PASS(ungraded)",
+    _KIND_PASS_UNCLEAN: "PASS(blockers)",
+    _KIND_FAIL: "FAIL",
+    _KIND_UNKNOWN: "?",
+}
+
+
+@dataclass(frozen=True)
+class EvidenceRep:
+    """One rep inside the evaluation, with its store ref and disposition."""
+
+    ref: str  # srv:<id> | local:<id>
+    rep: bench.RepRecord
+    kind: str = ""
+    rung: tuple[str, str] = ()  # the measured rung (catalog spelling)
+    row_key: tuple[str, str] | None = None  # the catalog row governing the rung
+    excluded: str = ""  # non-empty reason when not counted
+
+
+def _classify(rep: bench.RepRecord) -> str:
+    notes = rep.notes or ""
+    if rep.completed == 0 or FAIL_MARKERS.search(notes):
+        return _KIND_FAIL
+    if rep.completed == 1:
+        # blockers_found=None means "not recorded", not "zero" — a pass whose
+        # blocker field was never measured cannot count as a clean PASS.
+        if rep.blockers_found != 0:
+            return _KIND_PASS_UNCLEAN
+        # A grade string outside the ladder (hand-edited store, a server row
+        # written by a newer rule) can establish no rung grade — the rep shows
+        # its raw task-grade in the evidence line but counts as ungraded.
+        return _KIND_PASS if rep.grade in GRADE_STRENGTH else _KIND_PASS_UNGRADED
+    return _KIND_UNKNOWN
+
+
+_REF_RE = re.compile(r"^(?:(srv|local)(?:@([^:]+))?:)?(\d+)$")
+
+
+def resolve_refs(spec: str, *, backend_name: str, host: str) -> tuple[str, ...]:
+    """Parse an exclusion ref spec to the concrete evidence refs it binds.
+
+    ``srv:N`` and ``local:N`` pin a namespace. ``local@<host>:N`` names a
+    local row only on that host — it binds nothing anywhere else, so a
+    host-scoped exclusion can never eat an unrelated rep that happens to
+    share the rowid. A bare ``N`` is the id the fleet cites the rep by:
+    under the handoffkeep backend it binds both ``srv:N`` and ``local:N`` so
+    an unmigrated local copy cannot double-count beside its server twin;
+    under the local backend only ``local:N`` exists.
+    """
+
+    match = _REF_RE.match(spec.strip())
+    if not match:
+        return ()
+    namespace, at_host, raw_id = match.groups()
+    if at_host is not None:
+        if namespace != "local" or at_host != host:
+            return ()
+        return (f"local:{raw_id}",)
+    if namespace is not None:
+        return (f"{namespace}:{raw_id}",)
+    if backend_name == bench.BENCH_BACKEND_HANDOFFKEEP:
+        return (f"srv:{raw_id}", f"local:{raw_id}")
+    return (f"local:{raw_id}",)
+
+
+@dataclass(frozen=True)
+class Exclusion:
+    old_spec: str
+    new_spec: str
+    old_refs: tuple[str, ...]  # every concrete ref the spec binds on this host
+    new_ref: str | None
+    origin: str  # "static" | "cli" | "notes:<carrier ref>"
+
+    def status(self, refs: set[str]) -> str:
+        if not self.old_refs:
+            return f"{self.old_spec} (superseded by {self.new_spec}) unresolvable on this host"
+        bound = [ref for ref in self.old_refs if ref in refs]
+        if not bound:
+            return (
+                f"{self.old_spec} (superseded by {self.new_spec}) not in evidence; survivor {self.new_spec}"
+            )
+        return f"{', '.join(bound)} superseded by {self.new_ref or self.new_spec}"
+
+
+# ---------------------------------------------------------------------------
+# Evidence collection — which store is read is disclosed, never assumed.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RepsEvidence:
+    backend: str
+    backend_reason: str
+    host: str
+    remote_count: int
+    local_count: int
+    window_incomplete: bool
+    rows: list[EvidenceRep]
+    exclusions: list[Exclusion] = field(default_factory=list)
+    # local_id -> server_id for this host's migrated rows, plus the fetched
+    # remote set. Both drive the exclusion pass: a ``supersedes id=N`` note
+    # written before migration names a *local* id, and the exclusion must
+    # follow the row onto its server copy.
+    migrated: dict[int, int] = field(default_factory=dict)
+    remote_items: list[bench._RemoteRep] = field(default_factory=list)
+
+    @property
+    def counted(self) -> list[EvidenceRep]:
+        return [row for row in self.rows if not row.excluded]
+
+
+def _matching_remote(rep: bench.RepRecord, index: dict, host: str) -> bench._RemoteRep | None:
+    """The remote row this local rep migrated to, mirroring _rep_present_remote."""
+
+    for item in index.get(bench._rep_content_key(rep), ()):
+        remote_host = bench._migrate_src_host(item.record.notes)
+        if remote_host == host and item.origin_id == bench._migrate_origin_id(host, rep.profile, rep.id):
+            return item
+        candidate = (
+            item.record
+            if remote_host is None
+            else dataclasses.replace(item.record, notes=bench._unstamp_rep_notes(item.record.notes))
+        )
+        if bench._same_rep_row(rep, candidate):
+            return item
+    return None
+
+
+def gather_reps(
+    *,
+    view: bench.CatalogView,
+    exclusions: list[tuple[str, str]] | None = None,
+    allow_plaintext_http: bool = False,
+    path=None,
+    host: str | None = None,
+) -> RepsEvidence:
+    """Read every evidence row the rule consumes, each tagged by store.
+
+    The reps source is the resolved bench backend — the handoffkeep canon when
+    configured (server rows, refs ``srv:<id>``) merged with this host's local
+    rows not yet migrated (refs ``local:<id>``); a local row already present on
+    the server is the same rep and counts once via the server's ref. On a
+    local backend the local table is the whole source and the backend's reason
+    string says why the canon was not read (e.g. an insecure-url auto-fallback)
+    — that reason is printed in every proposal so a partial read is never
+    silent.
+    """
+
+    resolved_host = host or socket.gethostname()
+    backend = bench.bench_backend(use="reps", allow_plaintext_http=allow_plaintext_http)
+
+    rows: list[EvidenceRep] = []
+    remote_items: list[bench._RemoteRep] = []
+    migrated: dict[int, int] = {}
+    remote_count = 0
+    local_count = 0
+    window_incomplete = False
+
+    if backend.name == bench.BENCH_BACKEND_HANDOFFKEEP:
+        remote_items = bench._fetch_reps(backend, query={"limit": bench._MIGRATE_REP_WINDOW})
+        remote_count = len(remote_items)
+        window_incomplete = remote_count >= bench._MIGRATE_REP_WINDOW
+        local_reps = bench._read_local_reps_for_push(path=path)
+        local_count = len(local_reps)
+        index = bench._rep_content_index(remote_items)
+        for rep in local_reps:
+            match = _matching_remote(rep, index, resolved_host)
+            if match is not None:
+                migrated[rep.id] = match.server_id or 0
+        for item in remote_items:
+            rows.append(EvidenceRep(ref=f"srv:{item.server_id}", rep=item.record))
+        for rep in local_reps:
+            if rep.id in migrated:
+                # Already migrated — the server's row is the rep; the local
+                # copy is a duplicate and is recorded as excluded evidence.
+                rows.append(
+                    EvidenceRep(
+                        ref=f"local:{rep.id}",
+                        rep=rep,
+                        excluded=f"already migrated (srv:{migrated[rep.id]})",
+                    )
+                )
+            else:
+                rows.append(EvidenceRep(ref=f"local:{rep.id}", rep=rep))
+    else:
+        for rep in bench._read_local_reps_for_push(path=path):
+            local_count += 1
+            rows.append(EvidenceRep(ref=f"local:{rep.id}", rep=rep))
+
+    evidence = RepsEvidence(
+        backend=backend.name,
+        backend_reason=backend.reason,
+        host=resolved_host,
+        remote_count=remote_count,
+        local_count=local_count,
+        window_incomplete=window_incomplete,
+        rows=rows,
+        migrated=migrated,
+        remote_items=remote_items,
+    )
+    _finish_rows(evidence, view, exclusions or [])
+    return evidence
+
+
+def _notes_spec(row: EvidenceRep, cited: str, evidence: RepsEvidence) -> tuple[str, str, str, list[str]]:
+    """The exclusion spec a ``supersedes id=N`` note binds for one carrier.
+
+    The cited id is always a rowid — but in which store depends on where the
+    note was written. A local carrier cites a local id. A server row carrying
+    a ``[src:<host>]`` migration stamp wrote the note *before* migration, so
+    id=N is a local id on that host: the spec binds ``local@<host>:N`` plus
+    the migrated server copy (found through the deterministic origin id).
+    A server-native carrier cites a server id. And when this host's cited
+    local row has already migrated, its live server copy is bound too —
+    otherwise the supersede intent dies at the migration boundary and the
+    duplicate counts.
+    """
+
+    origin = f"notes:{row.ref}"
+    namespace = row.ref.partition(":")[0]
+    if namespace == "local":
+        extra = [f"srv:{srv}"] if (srv := evidence.migrated.get(int(cited))) else []
+        return f"local:{cited}", row.ref, origin, extra
+    src = bench._migrate_src_host(row.rep.notes)
+    if src is None:
+        return f"srv:{cited}", row.ref, origin, []
+    # The cited row lived on host ``src``; its migrated copy — if any —
+    # carries the deterministic origin id of (src, its own profile, N).
+    extra = [
+        f"srv:{item.server_id}"
+        for item in evidence.remote_items
+        if item.server_id
+        and bench._migrate_src_host(item.record.notes) == src
+        and item.origin_id == bench._migrate_origin_id(src, item.record.profile, int(cited))
+    ]
+    return f"local@{src}:{cited}", row.ref, origin, extra
+
+
+def _finish_rows(
+    evidence: RepsEvidence,
+    view: bench.CatalogView,
+    exclusions: list[tuple[str, str]],
+) -> None:
+    """Kind, rung, judging row, and exclusion disposition for every row."""
+
+    catalog_rows: dict[str, list[bench.CatalogEntry]] = {}
+    for entry in view.entries:
+        catalog_rows.setdefault(entry.profile, []).append(entry)
+
+    specs: list[tuple[str, str, str, list[str]]] = [
+        (old, new, "static", []) for old, new in STATIC_SUPERSEDES
+    ]
+    specs += [(old, new, "cli", []) for old, new in exclusions]
+    # Notes-declared supersedes are part of the store itself — a rep carrying
+    # ``supersedes id=N`` excludes the cited id, following it across the
+    # migration boundary when the note predates the move.
+    for row in evidence.rows:
+        if row.excluded:
+            continue
+        for cited in SUPERSEDES_RE.findall(row.rep.notes or ""):
+            specs.append(_notes_spec(row, cited, evidence))
+
+    by_ref = {row.ref for row in evidence.rows}
+    excluded: dict[str, str] = {}
+    for old_spec, new_spec, origin, extra in specs:
+        old_refs = tuple(
+            dict.fromkeys(
+                resolve_refs(old_spec, backend_name=evidence.backend, host=evidence.host) + tuple(extra)
+            )
+        )
+        new_refs = resolve_refs(new_spec, backend_name=evidence.backend, host=evidence.host)
+        new_ref = next((ref for ref in new_refs if ref in by_ref), new_refs[0] if new_refs else None)
+        item = Exclusion(old_spec, new_spec, old_refs, new_ref, origin)
+        evidence.exclusions.append(item)
+        for ref in old_refs:
+            if ref in by_ref and ref not in excluded:
+                excluded[ref] = f"superseded by {item.new_ref or new_spec}"
+
+    for index, row in enumerate(evidence.rows):
+        kind = _classify(row.rep)
+        rung = _rep_rung(row.rep)
+        candidates = catalog_rows.get(rung[0])
+        judging = _judging_row(candidates, rung[1]) if candidates else None
+        reason = row.excluded or excluded.get(row.ref, "")
+        evidence.rows[index] = dataclasses.replace(
+            row,
+            kind=kind,
+            rung=rung,
+            row_key=judging.key if judging else None,
+            excluded=reason,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RungResult:
+    key: tuple[str, str]  # the catalog row key being evaluated
+    row: bench.CatalogEntry
+    counted: list[EvidenceRep]
+    excluded: list[EvidenceRep]
+    action: str  # promote | demote | blocked | hold | insufficient
+    target: str
+    passes_at: dict[str, list[str]]
+    ungraded_passes: list[str]
+    unclean_passes: list[str]
+    fails: list[tuple[str, str | None]]
+    evidence_refs: list[str]
+    note: str
+
+    def label(self) -> str:
+        return f"{self.key[0]}{'@' + self.key[1] if self.key[1] else ''}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "profile": self.key[0],
+            "effort": self.key[1],
+            "current": self.row.grade,
+            "action": self.action,
+            "target": self.target,
+            "passes_at": {grade: list(refs) for grade, refs in self.passes_at.items()},
+            "ungraded_passes": list(self.ungraded_passes),
+            "unclean_passes": list(self.unclean_passes),
+            "fails": [list(item) for item in self.fails],
+            "evidence": list(self.evidence_refs),
+            "note": self.note,
+        }
+
+
+def _evaluate_row(
+    row: bench.CatalogEntry,
+    counted: list[EvidenceRep],
+    excluded: list[EvidenceRep],
+    min_passes: int,
+) -> RungResult:
+    passes_at: dict[str, list[str]] = {}
+    ungraded: list[str] = []
+    unclean: list[str] = []
+    fails: list[tuple[str, str | None]] = []
+    for item in counted:
+        if item.kind == _KIND_PASS:
+            assert item.rep.grade  # _classify only returns PASS for graded reps
+            passes_at.setdefault(item.rep.grade, []).append(item.ref)
+        elif item.kind == _KIND_PASS_UNGRADED:
+            ungraded.append(item.ref)
+        elif item.kind == _KIND_FAIL:
+            fails.append((item.ref, item.rep.grade))
+        else:
+            unclean.append(item.ref)
+
+    current = row.grade
+    if current not in GRADE_STRENGTH:
+        rung = f"{row.profile}{'@' + row.effort if row.effort else ''}"
+        raise bench.BenchError(
+            f"catalog row {rung} carries grade {current!r} outside the "
+            f"ladder {GRADE_LADDER} — the catalog is corrupt, nothing is proposed"
+        )
+    cur_s = GRADE_STRENGTH[current]
+
+    # A FAIL whose task grade sits outside the ladder cannot establish "the
+    # rung failed at G" — fail-closed: it counts like an ungraded FAIL.
+    demote_fails = [(ref, g) for ref, g in fails if g is None or GRADE_STRENGTH.get(g, -1) <= cur_s]
+    if demote_fails:
+        if len(passes_at.get(current, ())) >= min_passes:
+            # Contradictory evidence: the rung fails at-or-below its grade yet
+            # still measures clean passes at it. Not a silent hold — both sides
+            # print so the operator judges the outlier.
+            return RungResult(
+                key=row.key,
+                row=row,
+                counted=counted,
+                excluded=excluded,
+                action="conflicted",
+                target=current,
+                passes_at=passes_at,
+                ungraded_passes=ungraded,
+                unclean_passes=unclean,
+                fails=fails,
+                evidence_refs=sorted(ref for ref, _ in fails),
+                note=(
+                    f"FAIL at-or-below {current} but {len(passes_at[current])} "
+                    f"clean PASSes at {current} — evidence conflicts"
+                ),
+            )
+        # The rung could not do work at or below the grade it claims. Target:
+        # one step below the weakest failed claim — an ungraded FAIL is treated
+        # as a failure at the placement itself (fail-closed).
+        target_idx = min(GRADE_STRENGTH[g] - 1 if g in GRADE_STRENGTH else cur_s - 1 for _, g in demote_fails)
+        target_idx = max(target_idx, 0)
+        target = GRADE_LADDER[target_idx]
+        note = "FAIL evidence at-or-below placement"
+        if target == current:
+            note += "; already at floor C"
+        return RungResult(
+            key=row.key,
+            row=row,
+            counted=counted,
+            excluded=excluded,
+            action="demote",
+            target=target,
+            passes_at=passes_at,
+            ungraded_passes=ungraded,
+            unclean_passes=unclean,
+            fails=fails,
+            evidence_refs=sorted(ref for ref, _ in demote_fails),
+            note=note,
+        )
+
+    if fails:
+        return RungResult(
+            key=row.key,
+            row=row,
+            counted=counted,
+            excluded=excluded,
+            action="blocked",
+            target=current,
+            passes_at=passes_at,
+            ungraded_passes=ungraded,
+            unclean_passes=unclean,
+            fails=fails,
+            evidence_refs=sorted(ref for ref, _ in fails),
+            note="promotion blocked by FAIL evidence above the placement",
+        )
+
+    qualifying = [g for g, refs in passes_at.items() if len(refs) >= min_passes]
+    if qualifying:
+        best = max(qualifying, key=lambda g: GRADE_STRENGTH[g])
+        refs = sorted(passes_at[best])
+        if GRADE_STRENGTH[best] > cur_s:
+            return RungResult(
+                key=row.key,
+                row=row,
+                counted=counted,
+                excluded=excluded,
+                action="promote",
+                target=best,
+                passes_at=passes_at,
+                ungraded_passes=ungraded,
+                unclean_passes=unclean,
+                fails=fails,
+                evidence_refs=refs,
+                note=f">={min_passes} clean PASSes at grade {best}",
+            )
+        return RungResult(
+            key=row.key,
+            row=row,
+            counted=counted,
+            excluded=excluded,
+            action="hold",
+            target=current,
+            passes_at=passes_at,
+            ungraded_passes=ungraded,
+            unclean_passes=unclean,
+            fails=fails,
+            evidence_refs=refs,
+            note=f"evidence confirms placement (best qualifying grade {best} <= {current})",
+        )
+
+    return RungResult(
+        key=row.key,
+        row=row,
+        counted=counted,
+        excluded=excluded,
+        action="insufficient",
+        target=current,
+        passes_at=passes_at,
+        ungraded_passes=ungraded,
+        unclean_passes=unclean,
+        fails=fails,
+        evidence_refs=[],
+        note="no grade reaches the PASS threshold",
+    )
+
+
+@dataclass
+class Proposal:
+    results: list[RungResult]  # every catalog row that had any evidence
+    unrung: list[EvidenceRep]  # counted reps whose rung has no catalog row
+    evidence: RepsEvidence
+    min_passes: int
+    digest: str = ""
+
+    def changes(self) -> list[RungResult]:
+        return [r for r in self.results if r.action in ("promote", "demote") and r.target != r.row.grade]
+
+
+def evaluate(
+    evidence: RepsEvidence,
+    view: bench.CatalogView,
+    *,
+    min_passes: int = MIN_PASSES,
+) -> Proposal:
+    grouped: dict[tuple[str, str], list[EvidenceRep]] = {}
+    excluded_by_row: dict[tuple[str, str], list[EvidenceRep]] = {}
+    unrung: list[EvidenceRep] = []
+    for item in evidence.rows:
+        if item.excluded:
+            if item.row_key is not None:
+                excluded_by_row.setdefault(item.row_key, []).append(item)
+            continue
+        if item.row_key is None:
+            unrung.append(item)
+            continue
+        grouped.setdefault(item.row_key, []).append(item)
+
+    results: list[RungResult] = []
+    for key in sorted(view.by_key()):
+        row = view.by_key()[key]
+        if row.retired_at:
+            continue
+        counted = grouped.get(key, [])
+        excluded = excluded_by_row.get(key, [])
+        if not counted and not excluded:
+            continue
+        results.append(_evaluate_row(row, counted, excluded, min_passes))
+
+    proposal = Proposal(results=results, unrung=unrung, evidence=evidence, min_passes=min_passes)
+    proposal.digest = _input_digest(proposal, view)
+    return proposal
+
+
+def _input_digest(proposal: Proposal, view: bench.CatalogView) -> str:
+    """Fingerprint the full evaluation input — reps, exclusions, rules, catalog.
+
+    ``apply`` recomputes this digest against live stores and refuses to write
+    when it differs: a proposal can only be applied to exactly the evidence it
+    was computed from, so a stale artifact or a changed rep store fails loud
+    instead of writing an unproven change.
+    """
+
+    evidence = proposal.evidence
+    payload = {
+        "rule_version": RULE_VERSION,
+        "min_passes": proposal.min_passes,
+        "backend": evidence.backend,
+        "catalog": [entry.as_dict() for entry in sorted(view.entries, key=lambda e: e.key)],
+        "exclusions": [{"old": e.old_spec, "new": e.new_spec} for e in evidence.exclusions],
+        "reps": [
+            {
+                "ref": row.ref,
+                "rep": row.rep.as_dict(),
+                "kind": row.kind,
+                "rung": list(row.rung),
+                "row_key": list(row.row_key) if row.row_key else None,
+                "excluded": row.excluded or None,
+            }
+            for row in evidence.rows
+        ],
+        "results": [r.as_dict() for r in proposal.results],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def _fmt_evidence(item: EvidenceRep) -> str:
+    rep = item.rep
+    bits = [
+        item.ref,
+        f"task={rep.task_ref or '-'}",
+        f"tier={rep.tier or '-'}",
+        _KIND_LABELS.get(item.kind, item.kind),
+    ]
+    if rep.grade:
+        bits.append(f"task-grade={rep.grade}")
+    bits.append(f"rounds={rep.rounds if rep.rounds is not None else '-'}")
+    bits.append(f"blockers={rep.blockers_found if rep.blockers_found is not None else '-'}")
+    if item.row_key and item.rung != item.row_key:
+        rung_effort = item.rung[1] or "(none)"
+        row_effort = item.row_key[1] or "(default)"
+        bits.append(f"rung-effort={rung_effort}->judged-by-{row_effort}")
+    return " ".join(bits)
+
+
+def parse_rung_spec(spec: str) -> tuple[str, str]:
+    """``profile[@effort]`` in catalog spelling -> a rung key."""
+
+    profile, _, effort = spec.strip().partition("@")
+    return profile.strip(), effort.strip()
+
+
+def render_rung_detail(result: RungResult) -> list[str]:
+    """Every evidence row for one rung — the audit view a --rung query wants."""
+
+    lines = [f"rung {result.label()} current={result.row.grade}:"]
+    for item in sorted(result.counted + result.excluded, key=lambda x: (x.ref.partition(":")[0], x.ref)):
+        suffix = f"  [excluded: {item.excluded}]" if item.excluded else ""
+        lines.append(f"  {_fmt_evidence(item)}{suffix}")
+    summary = [f"{grade}:{len(refs)}" for grade, refs in result.passes_at.items()]
+    if result.ungraded_passes:
+        summary.append(f"ungraded-pass:{len(result.ungraded_passes)}")
+    if result.unclean_passes:
+        summary.append(f"pass-with-blockers:{len(result.unclean_passes)}")
+    if result.fails:
+        summary.append(f"fails:{len(result.fails)}")
+    if summary:
+        lines.append(f"  counts: {' '.join(summary)}")
+    lines.append(f"  => {result.action} {result.row.grade} -> {result.target} ({result.note})")
+    return lines
+
+
+def render_proposal(
+    proposal: Proposal, view: bench.CatalogView, *, focus: tuple[str, str] | None = None
+) -> str:
+    evidence = proposal.evidence
+    lines = [
+        "scopefuel grades propose — measured-rep grade proposals (read-only)",
+        f"rule v{RULE_VERSION}: promote needs >= {proposal.min_passes} clean PASSes on "
+        "tasks of grade G with zero FAIL evidence; demote on FAIL at-or-below the "
+        "placement; any unresolved FAIL blocks promotion",
+        f"reps source={evidence.backend} (reason={evidence.backend_reason}) host={evidence.host} "
+        f"rows: server={evidence.remote_count} local={evidence.local_count}",
+    ]
+    if evidence.window_incomplete:
+        lines.append(
+            f"  warning: server rep window full ({bench._MIGRATE_REP_WINDOW}) — "
+            "remote completeness not proven; treat proposal as partial"
+        )
+    if evidence.backend == bench.BENCH_BACKEND_LOCAL:
+        lines.append("  note: local backend — server reps were not read on this host")
+    lines.append(view.label)
+
+    if evidence.exclusions:
+        lines.append("exclusions:")
+        refs = {row.ref for row in evidence.rows}
+        for item in evidence.exclusions:
+            lines.append(f"  {item.status(refs)}")
+
+    changes = proposal.changes()
+    changed_keys = {r.key for r in changes}
+    holds = [r for r in proposal.results if r.key not in changed_keys]
+    if changes:
+        lines.append("proposals:")
+        for r in changes:
+            lines.append(f"  {r.action} {r.label()} {r.row.grade} -> {r.target}")
+            lines.append(f"    rule: {r.note}")
+            for item in r.counted:
+                if item.ref in r.evidence_refs:
+                    lines.append(f"    evidence {_fmt_evidence(item)}")
+            for item in r.excluded:
+                lines.append(f"    excluded {item.ref} ({item.excluded})")
+    else:
+        lines.append("proposals: none")
+
+    if holds:
+        lines.append("rungs with evidence but no change:")
+        for r in holds:
+            lines.append(f"  {r.action:<12} {r.label()} current={r.row.grade} — {r.note}")
+            summary = [f"{grade}:{len(refs)}" for grade, refs in r.passes_at.items()]
+            if r.ungraded_passes:
+                summary.append(f"ungraded-pass:{len(r.ungraded_passes)}")
+            if r.unclean_passes:
+                summary.append(f"pass-with-blockers:{len(r.unclean_passes)}")
+            if r.fails:
+                summary.append(f"fails:{len(r.fails)}")
+            if summary:
+                lines.append(f"    counts: {' '.join(summary)}")
+            for item in r.excluded:
+                lines.append(f"    excluded {item.ref} ({item.excluded})")
+
+    if proposal.unrung:
+        lines.append("unrung evidence (rep rung has no live catalog row — reported, not counted):")
+        retired = {key for key, entry in view.by_key().items() if entry.retired_at}
+        for item in proposal.unrung:
+            suffix = "  [rung retired]" if item.rung in retired else ""
+            lines.append(f"  {_fmt_evidence(item)}{suffix}")
+
+    if focus is not None:
+        focused = [r for r in proposal.results if r.key == focus]
+        if focused:
+            lines.append("focused rung:")
+            lines.extend(render_rung_detail(focused[0]))
+        else:
+            lines.append(
+                f"focused rung: {focus[0]}{'@' + focus[1] if focus[1] else ''} "
+                "has no catalog row or no evidence"
+            )
+
+    refs = {row.ref for row in evidence.rows}
+    missing = [
+        item.status(refs) for item in evidence.exclusions if not any(ref in refs for ref in item.old_refs)
+    ]
+    if missing:
+        lines.append("missing exclusion targets (never silently ignored):")
+        lines.extend(f"  {line}" for line in missing)
+
+    lines.append(f"proposal-digest={proposal.digest}")
+    return "\n".join(lines)
+
+
+def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
+    return {
+        "rule_version": RULE_VERSION,
+        "min_passes": proposal.min_passes,
+        "digest": proposal.digest,
+        # The inputs apply must re-derive the evaluation with — only
+        # operator-supplied pairs; static pairs come from the code and
+        # notes-declared supersedes from the store itself.
+        "params": {
+            "cli_exclusions": [
+                [item.old_spec, item.new_spec]
+                for item in proposal.evidence.exclusions
+                if item.origin == "cli"
+            ],
+        },
+        "reps": {
+            "backend": proposal.evidence.backend,
+            "backend_reason": proposal.evidence.backend_reason,
+            "host": proposal.evidence.host,
+            "remote_count": proposal.evidence.remote_count,
+            "local_count": proposal.evidence.local_count,
+            "window_incomplete": proposal.evidence.window_incomplete,
+        },
+        "catalog_source": view.source,
+        "exclusions": [
+            {
+                "old": item.old_spec,
+                "new": item.new_spec,
+                "old_refs": list(item.old_refs),
+                "new_ref": item.new_ref,
+                "origin": item.origin,
+            }
+            for item in proposal.evidence.exclusions
+        ],
+        "results": [r.as_dict() for r in proposal.results],
+        "unrung": [_fmt_evidence(item) for item in proposal.unrung],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Apply — writes the updated catalog artifact; never touches a host.
+# ---------------------------------------------------------------------------
+
+
+def apply_proposals(
+    proposal_file: dict,
+    *,
+    decided_by: str,
+    deviation_ref: str,
+    allow_plaintext_http: bool = False,
+    path=None,
+) -> tuple[list[bench.CatalogEntry], Proposal, bench.CatalogView]:
+    """Verify a proposal artifact against live stores, then stamp the catalog.
+
+    The proposal's params (rules + exclusions) drive a fresh evaluation; the
+    resulting digest must equal the artifact's, or the evidence changed since
+    it was computed and nothing is written. Returns the full updated catalog,
+    the live proposal, and the catalog view it was computed against.
+    """
+
+    if not isinstance(proposal_file, dict):
+        raise bench.BenchError("proposal artifact must be a JSON object")
+    min_passes = proposal_file.get("min_passes")
+    if not isinstance(min_passes, int) or min_passes < 1:
+        raise bench.BenchError("proposal artifact has no valid min_passes")
+    params = proposal_file.get("params") or {}
+    exclusions = [
+        (str(pair[0]), str(pair[1]))
+        for pair in params.get("cli_exclusions") or []
+        if isinstance(pair, list | tuple) and len(pair) == 2
+    ]
+    view = bench.read_catalog(path=path, commit_cache=False, allow_plaintext_http=allow_plaintext_http)
+    evidence = gather_reps(
+        view=view, exclusions=exclusions, allow_plaintext_http=allow_plaintext_http, path=path
+    )
+    live = evaluate(evidence, view, min_passes=min_passes)
+    if proposal_file.get("digest") != live.digest:
+        raise bench.BenchError(
+            "proposal digest does not match the live evidence — rerun `grades propose` "
+            "(the reps store, exclusions, or catalog changed since the artifact was written)"
+        )
+    recorded = {
+        (item["profile"], item["effort"]): item
+        for item in proposal_file.get("results") or []
+        if isinstance(item, dict) and item.get("action") in ("promote", "demote")
+    }
+    for result in live.changes():
+        want = recorded.get(result.key)
+        if want is None or want.get("target") != result.target:
+            raise bench.BenchError(
+                f"proposal artifact disagrees with live evaluation for {result.label()} — "
+                "rerun `grades propose`"
+            )
+
+    changed = {r.key: r for r in live.changes()}
+    now = bench._utc_now()
+    entries: list[bench.CatalogEntry] = []
+    for entry in view.entries:
+        result = changed.get(entry.key)
+        if result is None:
+            entries.append(entry)
+            continue
+        entries.append(
+            dataclasses.replace(
+                entry,
+                grade=result.target,
+                decided_by=decided_by,
+                decided_at=now,
+                deviation_ref=(f"{deviation_ref}; {result.action} evidence {','.join(result.evidence_refs)}"),
+            )
+        )
+    return entries, live, view
