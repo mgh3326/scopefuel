@@ -512,3 +512,67 @@ def test_cli_profile_on_at_crlf_eof(policy_config, monkeypatch):
     after = policy_config.read_bytes()
     assert after.count(b"\n") == after.count(b"\r\n")
     assert b'[profiles."new name"]\r\nsubscribed = true\r\n' in after
+
+
+# ------------------------- round-2 blocker part 2: deletion at end of file
+#
+# Deleting the last table/key must keep the surviving last line's terminator —
+# the survivor was mid-file and owned a newline; a CRLF file may never end on
+# a lone \r, and an LF file must not lose its final \n.
+
+BENCH_KEEP_CRLF = b'[bench]\r\nbackend = "keep" # untouched\r\n'
+BENCH_KEEP_LF = b'[bench]\nbackend = "keep" # untouched\n'
+POOL_CRLF = b'[pools.codex]\r\nclass = "spend"\r\nuntil = 2026-12-31\r\n'
+POOL_LF = b'[pools.codex]\nclass = "spend"\nuntil = 2026-12-31\n'
+POOL_SUB_CRLF = b"[pools.codex]\r\nsubscribed = false\r\n"
+POOL_SUB_LF = b"[pools.codex]\nsubscribed = false\n"
+
+
+@pytest.mark.parametrize(
+    ("prefix", "pool"),
+    [
+        (BENCH_KEEP_CRLF, POOL_CRLF),
+        (BENCH_KEEP_CRLF, POOL_CRLF[:-2]),
+        (BENCH_KEEP_LF, POOL_LF),
+        (BENCH_KEEP_LF, POOL_LF[:-1]),
+        (BENCH_KEEP_CRLF, POOL_SUB_CRLF),
+        (BENCH_KEEP_CRLF, POOL_SUB_CRLF[:-2]),
+        (BENCH_KEEP_LF, POOL_SUB_LF),
+        (BENCH_KEEP_LF, POOL_SUB_LF[:-1]),
+    ],
+)
+def test_delete_table_at_eof(policy_config, prefix, pool):
+    policy_config.write_bytes(prefix + pool)
+    if b"subscribed" in pool:
+        policy.set_subscribed("codex", None)
+    else:
+        assert policy.clear_policy("codex")
+    assert policy_config.read_bytes() == prefix
+
+
+def test_remove_key_at_eof_no_final_newline(policy_config):
+    """Removing the file's last line keeps the survivor's terminator."""
+    policy_config.write_bytes(b'[pools.codex]\r\nclass = "spend"\r\nuntil = 2026-12-31')
+    policy.clear_policy("codex")
+    assert policy_config.read_bytes() == b""
+
+
+def test_replace_value_last_line_no_final_newline(policy_config):
+    """Replacing the file's last line keeps its unterminated shape."""
+    until = str(STILL_ACTIVE).encode()
+    policy_config.write_bytes(b'[pools.codex]\r\nclass = "hold"\r\nuntil = ' + until)
+    policy.set_policy("codex", "spend", until=STILL_ACTIVE)
+    assert policy_config.read_bytes() == b'[pools.codex]\r\nclass = "spend"\r\nuntil = ' + until
+    policy_config.write_bytes(b'[pools.codex]\nclass = "hold"\nuntil = ' + until)
+    policy.set_policy("codex", "spend", until=STILL_ACTIVE)
+    assert policy_config.read_bytes() == b'[pools.codex]\nclass = "spend"\nuntil = ' + until
+
+
+def test_clear_at_eof_set_clear_restores(policy_config):
+    """set then clear at EOF still restores the original bytes."""
+    policy_config.write_bytes(BENCH_KEEP_LF)
+    policy.set_policy("codex", "spend", until=STILL_ACTIVE)
+    after_set = policy_config.read_bytes()
+    assert after_set.startswith(BENCH_KEEP_LF)
+    policy.clear_policy("codex")
+    assert policy_config.read_bytes() == BENCH_KEEP_LF

@@ -472,6 +472,15 @@ class _Doc:
             idx = self._eof_insert_index()
         self.lines[idx:idx] = new_lines
 
+    def _delete_lines(self, start: int, end: int) -> None:
+        reached_eof = end >= len(self.lines)
+        del self.lines[start:end]
+        if reached_eof and self.lines and self.lines[-1] != "":
+            # the deleted span consumed the file end; the line now last was
+            # mid-file and owned a newline — keep a phantom tail so it
+            # terminates (a CRLF file can never end on a lone '\r').
+            self.lines.append("")
+
     def _rescan(self) -> None:
         self.regions, self.stmts = _scan_doc(self.lines)
 
@@ -556,7 +565,7 @@ class _Doc:
         stmt = self._find_stmt(path)
         if stmt is None:
             return False
-        del self.lines[stmt.start : stmt.end]
+        self._delete_lines(stmt.start, stmt.end)
         self._rescan()
         return True
 
@@ -571,14 +580,14 @@ class _Doc:
             )
             if region is None:
                 break
-            del self.lines[region.start : region.end]
+            self._delete_lines(region.start, region.end)
             self._rescan()
             found = True
         while True:
             victim = next((s for s in self.stmts if s.path[: len(path)] == path), None)
             if victim is None:
                 break
-            del self.lines[victim.start : victim.end]
+            self._delete_lines(victim.start, victim.end)
             self._rescan()
             found = True
         return found
