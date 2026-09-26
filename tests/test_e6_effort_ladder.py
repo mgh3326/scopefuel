@@ -459,10 +459,12 @@ def test_the_marker_cannot_widen_across_profiles():
 def test_the_marker_selects_the_rung_it_names_for_a_placed_rung_too():
     """The marker is also the gate's rung selector, and it only ever narrows.
 
-    wrk does not pass --effort to the gate, so for arm B's escalation-gated
-    opus@low the marker is what lets the gate see that rung at all (and then the
-    ordinary --operator-request path applies). It never widens: the default
-    judgement of opus is the S+ high rung.
+    wrk does not pass --effort to the gate, so for arm B's opus@low the marker
+    is what lets the gate see that rung at all. #738 made opus@low an ordinary
+    placement row (operator decision hk:doc note/2026-09-26/grade-cost-table,
+    id 4098), so the marker-selected judgement is a plain quota pass — no
+    --operator-request needed. It never widens: the default judgement of opus
+    is the S+ high rung.
     """
 
     plain = gate_check([_provider("claude", pool_class="spend")], "opus", today=TODAY, now=NOW)
@@ -470,8 +472,9 @@ def test_the_marker_selects_the_rung_it_names_for_a_placed_rung_too():
     marked = gate_check(
         [_provider("claude", pool_class="spend")], "opus", e6_arm="opus@low", today=TODAY, now=NOW
     )
+    assert marked.ok is True
     assert marked.grade == "S"
-    assert "escalation" in marked.reason
+    assert "escalation" not in marked.reason
     assert marked.e6_arm is None
 
 
@@ -511,11 +514,16 @@ def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
 
 
 def test_the_gate_judges_the_rung_that_was_requested():
-    """`gate -m opus --effort low` is the low rung's judgement, not the profile's best."""
+    """`gate -m opus --effort low` is the low rung's judgement, not the profile's best.
+
+    #738: opus@low is an ordinary placement row — admitted on quota alone, no
+    --operator-request and no escalation-gated tag (hk:doc id 4098)."""
 
     result = gate_check([_provider("claude", pool_class="spend")], "opus", effort="low", today=TODAY, now=NOW)
+    assert result.ok is True
     assert result.grade == "S"
-    assert "escalation" in result.reason
+    assert "opus@low" in result.reason
+    assert "escalation" not in result.reason
     plain = gate_check([_provider("claude", pool_class="spend")], "opus", today=TODAY, now=NOW)
     assert plain.grade == "S+"
 

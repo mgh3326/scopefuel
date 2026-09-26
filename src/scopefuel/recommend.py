@@ -654,15 +654,13 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         # ROB-591: moved from A+ (was Opus 5 (low), escalation, score 57) —
         # Opus 5.5 refresh raises the low-effort score into S range.
+        # #738 (operator decision, hk:doc note/2026-09-26/grade-cost-table,
+        # id 4098): Opus low dominates every Sonnet effort on cost and score —
+        # an ordinary S placement row, no escalation gate.
         Profile(
             "opus",
             "Opus 5.5 (low)",
             62.0,
-            gate="escalation",
-            # CodeRabbit #68: the old A+ reason ("Sonnet high 우선") named a
-            # Sonnet-grade alternative that doesn't exist at S — point at the
-            # real S-grade normal candidates instead.
-            gate_reason="비용효율 — Terra max/Kimi K3/Grok 4.7 우선; 쿼타 여유 시",
             benchmark_effort="low",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
             estimate_reason=OPUS_5_5_ESTIMATE_REASON,

@@ -120,3 +120,31 @@ def test_selection_skips_an_escalation_row_for_each_family(family):
         "S+",
         ordinary,
     )
+
+
+def test_opus_low_is_an_ordinary_s_rung_and_the_bare_default_is_still_high():
+    """#738 (operator decision hk:doc note/2026-09-26/grade-cost-table, id 4098):
+    opus@low is an ordinary placement row at grade S — `gate -m opus --effort
+    low` is admitted without --operator-request — while the bare `gate -m opus`
+    default stays the S+ high row and sonnet@xhigh keeps its escalation gate.
+    """
+    s_low = next(p for p in GRADE_TABLE["S"] if p.name == "opus")
+    assert (s_low.launcher_effort, s_low.gate, s_low.gate_reason) == ("low", "default", None)
+
+    sonnet_xhigh = next(p for p in GRADE_TABLE["A+"] if p.name == "sonnet" and p.launcher_effort == "xhigh")
+    assert sonnet_xhigh.gate == "escalation"
+
+    providers = [_healthy_provider("claude")]
+    today = dt.date(2026, 9, 26)
+    admitted = gate_check(providers, "opus", effort="low", today=today)
+    assert admitted.ok is True
+    assert admitted.grade == "S"
+    assert "escalation" not in admitted.reason
+    grade, profile = _find_profile("opus", grade_table=GRADE_TABLE)
+    assert (grade, profile.launcher_effort) == ("S+", "high")
+
+    # the ordinary gate rides the bundled snapshot installs propagate
+    row = next(e for e in bench.catalog_snapshot() if e.profile == "opus" and e.effort == "low")
+    assert (row.grade, row.gate) == ("S", "default")
+    sonnet_row = next(e for e in bench.catalog_snapshot() if e.profile == "sonnet" and e.effort == "xhigh")
+    assert sonnet_row.gate == "escalation"
