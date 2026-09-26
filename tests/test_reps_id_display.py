@@ -685,3 +685,43 @@ def test_refresh_echo_window_blocked_when_no_window_proves(tmp_path, monkeypatch
     finally:
         conn.close()
     assert row["server_id"] is None
+
+
+def test_anonymous_echo_never_inherits_an_anonymous_server_binding(tmp_path, monkeypatch):
+    """_put_cached_rep: an unbound echo may not merge into an anonymous row
+    that already carries a server_id — a defensive cache shape it cannot
+    prove is its own server copy."""
+
+    _local_backend(tmp_path, monkeypatch)
+    _seed_cache_row(tmp_path, cache_key="server:60000", origin_id=1, server_id=60000, created_by=None)
+    record = bench.RepRecord(
+        id=1,
+        profile="builder-devin-max",
+        model_id="swe-2-max",
+        task_ref="755",
+        tier="T1",
+        role="impl",
+        rounds=1,
+        blockers_found=0,
+        completed=1,
+        input_tokens=None,
+        output_tokens=None,
+        notes="tokens unknown",
+        recorded_at="2026-09-26T12:00:00+00:00",
+        effort=None,
+        grade="A",
+        table_grade="A",
+    )
+    conn = _cache_db(tmp_path)
+    try:
+        bench._put_cached_rep(conn, bench._RemoteRep(record=record, origin_id=1))
+        conn.commit()
+        rows = {
+            row["cache_key"]: row["server_id"]
+            for row in conn.execute(
+                "SELECT cache_key, server_id FROM bench_cache_reps WHERE origin_id = 1"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert rows == {"server:60000": 60000, "origin:1": None}

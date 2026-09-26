@@ -3231,7 +3231,9 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     ``origin_id`` may be another client's same-content twin: folding the echo
     into that row would pin a foreign pk onto our rep's display identity and
     erase the local write marker. An echo therefore merges only into another
-    anonymous row for that ``origin_id`` (dedup of repeated unbound writes).
+    fully-unbound anonymous row for that ``origin_id`` (dedup of repeated
+    unbound writes) — never into a row carrying a ``server_id``, which it
+    cannot prove is its own server copy.
     The server row for our own write is folded by the *bound* echo —
     ``created_by`` + ``server_id`` copied from the post-write GET by
     ``_bind_server_ids`` — through the exact-pair branch, never anonymously.
@@ -3247,8 +3249,8 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     else:
         existing = conn.execute(
             "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
-            "WHERE origin_id = ? AND created_by IS NULL "
-            "ORDER BY server_id IS NULL, cache_key "
+            "WHERE origin_id = ? AND created_by IS NULL AND server_id IS NULL "
+            "ORDER BY cache_key "
             "LIMIT 1",
             (item.origin_id,),
         ).fetchone()
@@ -3846,6 +3848,18 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
             "bench push-local: reps require the handoffkeep backend "
             f"(resolved {reps_backend.name}/{reps_backend.reason}; needs https, or "
             "[bench] allow_plaintext_reps = true on a private tunnel)"
+        )
+    # The plaintext opt-in is otherwise enforced lazily inside the request
+    # layer — but the reps write now precedes its fetch, so a disallowed reps
+    # endpoint must be refused up front or the scores PUT would leak through
+    # before the check fires.
+    if scores:
+        _check_handoffkeep_scheme(
+            catalog_backend.url, allow_plaintext=catalog_backend.allow_plaintext_url, use="catalog"
+        )
+    if remote_reps:
+        _check_handoffkeep_scheme(
+            reps_backend.url, allow_plaintext=reps_backend.allow_plaintext_url, use="reps"
         )
 
     # Fetch scores before the first PUT so a failed refresh or write leaves
