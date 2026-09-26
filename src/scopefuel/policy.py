@@ -448,6 +448,30 @@ class _Doc:
     def _eol(self, line: str) -> str:
         return line + "\r" if self.crlf else line
 
+    def _eof_insert_index(self) -> int:
+        """Splice index for appending past the last real line.
+
+        The element list is line content — the join supplies every newline,
+        so a text ending with a newline has a phantom ``""`` tail that must
+        stay last. A file without a final newline gets its tail terminated
+        (with ``\\r`` on CRLF files) and a fresh phantom appended — a CRLF
+        file can never end on a lone ``\\r``, which is invalid TOML.
+        """
+        if not self.lines:
+            self.lines.append("")
+            return 0
+        if self.lines[-1] == "":
+            return len(self.lines) - 1
+        if self.crlf:
+            self.lines[-1] += "\r"
+        self.lines.append("")
+        return len(self.lines) - 1
+
+    def _insert(self, idx: int, new_lines: list[str]) -> None:
+        if idx >= len(self.lines):
+            idx = self._eof_insert_index()
+        self.lines[idx:idx] = new_lines
+
     def _rescan(self) -> None:
         self.regions, self.stmts = _scan_doc(self.lines)
 
@@ -497,14 +521,14 @@ class _Doc:
                 indent = raw[: len(raw) - len(raw.lstrip())]
                 break
             idx = max((member.end for member in members), default=region.start + 1)
-            self.lines[idx:idx] = [self._eol(f"{indent}{_key_seg_text(key)} = {text_value}")]
+            self._insert(idx, [self._eol(f"{indent}{_key_seg_text(key)} = {text_value}")])
             self._rescan()
             return
         siblings = [s for s in self.stmts if s.path[:-1] == parent]
         if siblings:
             last = siblings[-1]
             dotted = ".".join(_key_seg_text(seg) for seg in last.rel[:-1] + (key,))
-            self.lines[last.end : last.end] = [self._eol(f"{dotted} = {text_value}")]
+            self._insert(last.end, [self._eol(f"{dotted} = {text_value}")])
             self._rescan()
             return
         if _get_path(self.config, parent) is not _MISSING:
@@ -515,6 +539,8 @@ class _Doc:
             if other.path and other.path[0] == parent[0]:
                 idx = other.end
                 break
+        if idx >= len(self.lines):
+            idx = self._eof_insert_index()
         segs = [_key_seg_text(s) for s in parent]
         if quote_table:
             segs[-1] = _toml_string(parent[-1])

@@ -457,3 +457,58 @@ def test_pool_subscribed_none_via_set_policy(policy_config):
     # kiro had plan = "team" — table survives, only the key is gone
     assert "subscribed" not in _region(text, KIRO)
     assert 'plan = "team"' in _region(text, KIRO)
+
+
+# ----------------------------------------- round-2 blocker: EOF line endings
+
+CRLF_BENCH_ONLY = b"[bench]\r\nkeep = true\r\n"
+
+
+def test_new_table_at_crlf_eof(policy_config):
+    """Appending a new table must leave a real \\r\\n, not a lone \\r."""
+    policy_config.write_bytes(CRLF_BENCH_ONLY)
+    policy.set_profile_subscribed("new name", True)
+    after = policy_config.read_bytes()
+    assert after.endswith(b"subscribed = true\r\n")
+    assert after.count(b"\n") == after.count(b"\r\n")
+    import tomllib
+
+    assert tomllib.loads(after.decode("utf-8"))["profiles"]["new name"]["subscribed"] is True
+    policy.set_policy("grok", "spend", until=STILL_ACTIVE)
+    after = policy_config.read_bytes()
+    assert after.count(b"\n") == after.count(b"\r\n")
+    assert b'[profiles."new name"]\r\nsubscribed = true\r\n' in after
+
+
+def test_new_table_at_crlf_eof_no_final_newline(policy_config):
+    policy_config.write_bytes(b"[bench]\r\nkeep = true")
+    policy.set_profile_subscribed("new name", True)
+    after = policy_config.read_bytes()
+    assert after.count(b"\n") == after.count(b"\r\n")
+    assert after.startswith(b"[bench]\r\nkeep = true\r\n")
+    import tomllib
+
+    assert tomllib.loads(after.decode("utf-8"))["profiles"]["new name"]["subscribed"] is True
+
+
+def test_new_key_in_last_table_crlf_no_final_newline(policy_config):
+    policy_config.write_bytes(b"[pools.codex]\r\nplan = 5")
+    policy.set_subscribed("codex", True)
+    after = policy_config.read_bytes()
+    assert after == b"[pools.codex]\r\nplan = 5\r\nsubscribed = true\r\n"
+
+
+def test_new_key_in_last_table_lf_no_final_newline(policy_config):
+    policy_config.write_bytes(b"[pools.codex]\nplan = 5")
+    policy.set_subscribed("codex", True)
+    assert policy_config.read_bytes() == b"[pools.codex]\nplan = 5\nsubscribed = true\n"
+
+
+def test_cli_profile_on_at_crlf_eof(policy_config, monkeypatch):
+    policy_config.write_bytes(CRLF_BENCH_ONLY)
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    rc = cli.main(["policy", "profile", "new name", "on"])
+    assert rc == 0
+    after = policy_config.read_bytes()
+    assert after.count(b"\n") == after.count(b"\r\n")
+    assert b'[profiles."new name"]\r\nsubscribed = true\r\n' in after
