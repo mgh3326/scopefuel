@@ -589,8 +589,9 @@ def _remote_rep_row(server_id: int, **fields) -> bench.RepRecord:
 def test_alias_canonical_same_run_counts_once(tmp_path, monkeypatch, isolated_cache):
     """srv stored the run as 'codex', local stored it as 'codex-sol' — same
     model, task, instant and outcome under two spellings. Raw dedup keys on
-    the recorded spelling, so only the resolved-rung layer can collapse them:
-    the server copy is kept, the local one is excluded with the reason."""
+    the recorded spelling, so only the resolved-rung layer can collapse
+    them: the row carrying the recorded effort is kept, the derived one is
+    excluded with the reason."""
     from test_grade_proposals import _remote_backend, _remote_row
 
     local = bench.add_rep(
@@ -603,10 +604,12 @@ def test_alias_canonical_same_run_counts_once(tmp_path, monkeypatch, isolated_ca
     view = _view(_entry("codex-sol", "high", "C"))
     proposal = _propose(view)
     counted = proposal.evidence.counted
-    assert [r.ref for r in counted] == ["srv:1200"]
-    loser = next(r for r in proposal.evidence.rows if r.ref == f"local:{local.id}")
+    # The local row recorded effort=high — it measured the rung; the server
+    # row only reached it through the 'codex' spelling pin.
+    assert [r.ref for r in counted] == [f"local:{local.id}"]
+    loser = next(r for r in proposal.evidence.rows if r.ref == "srv:1200")
     assert loser.excluded
-    assert "alias-duplicate" in loser.excluded and "srv:1200" in loser.excluded
+    assert "alias-duplicate" in loser.excluded and f"local:{local.id}" in loser.excluded
     # And the survivor cannot drive a promotion alone (min_passes=2).
     from test_grade_proposals import _result
 
@@ -639,6 +642,72 @@ def test_same_run_different_rung_keeps_recorded_effort(tmp_path, monkeypatch, is
     assert counted[0].rung == ("codex-sol", "low")
     loser = next(r for r in proposal.evidence.rows if r.ref == f"local:{local.id}")
     assert "duplicate" in loser.excluded and "codex-sol@low" in loser.excluded
+
+
+def test_recorded_effort_beats_spelling_pin_in_collapse(tmp_path, monkeypatch, isolated_cache):
+    """Tester r2: a rep-recorded effort measured the rung; a spelling pin only
+    says which rung the launcher consulted. srv 'codex' effort=- pins to high;
+    local 'codex-sol@max' recorded max — the recorded row wins even though the
+    pin lands on the server."""
+    from test_grade_proposals import _remote_backend, _remote_row
+
+    local = bench.add_rep(
+        **_rep("dup-pin", profile="codex-sol", model_id="gpt-5-sol", effort="max", grade="A")
+    )
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(
+            _remote_rep_row(1600, profile="codex", effort=None, task_ref="dup-pin"),
+            1600,
+            host=None,
+        ),
+    ]
+    view = _view(
+        _entry("codex-sol", "high", "C"),
+        _entry("codex-sol", "max", "C"),
+    )
+    proposal = _propose(view)
+    counted = proposal.evidence.counted
+    assert [r.ref for r in counted] == [f"local:{local.id}"]
+    assert counted[0].rung == ("codex-sol", "max")
+    loser = next(r for r in proposal.evidence.rows if r.ref == "srv:1600")
+    assert "duplicate" in loser.excluded and "codex-sol@max" in loser.excluded
+
+
+def test_missing_model_id_never_collapses(tmp_path, monkeypatch, isolated_cache):
+    """model_id is optional — None == None is not identity. Two rows with
+    different spellings and no model must never merge on task+instant.
+    (add_rep requires a model, so the pair arrives as server rows, whose
+    schema tolerates the empty field.)"""
+    from test_grade_proposals import _remote_backend, _remote_row
+
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(
+            _remote_rep_row(1701, profile="opus", model_id=None, effort="high", task_ref="run-x"),
+            1701,
+            host=None,
+        ),
+        _remote_row(
+            _remote_rep_row(1702, profile="codex-sol", model_id=None, effort="high", task_ref="run-x"),
+            1702,
+            host=None,
+        ),
+    ]
+    view = _view(
+        _entry("opus", "high", "C"),
+        _entry("codex-sol", "high", "C"),
+    )
+    proposal = _propose(view)
+    counted = proposal.evidence.counted
+    assert len(counted) == 2
+    assert {r.rung for r in counted} == {("opus", "high"), ("codex-sol", "high")}
+
+
+def test_same_run_key_requires_model_id():
+    """None == None is not model identity — never collapse on it."""
+    assert grades._same_run_key(_remote_rep_row(9, model_id=None)) is None
+    assert grades._same_run_key(_remote_rep_row(9, model_id="m")) is not None
 
 
 def test_different_runs_same_task_not_collapsed(tmp_path, isolated_cache):

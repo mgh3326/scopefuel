@@ -1087,10 +1087,12 @@ def _same_run_key(rep: bench.RepRecord) -> tuple | None:
     survives it. After rung resolution those rows are visibly one rep; this
     key is everything about the run itself — notes and token counts stay out
     (migration stamps and partial records legitimately differ between the
-    two recordings).
+    two recordings). ``model_id`` is required because it is optional in the
+    store — None == None would let unrelated profiles merge on task and
+    timestamp alone.
     """
 
-    if not rep.task_ref or not rep.recorded_at:
+    if not rep.task_ref or not rep.recorded_at or not rep.model_id:
         return None
     return (
         rep.model_id,
@@ -1106,14 +1108,15 @@ def _same_run_key(rep: bench.RepRecord) -> tuple | None:
 
 
 def _collapse_preference(item: EvidenceRep) -> tuple:
-    """Which copy of a same-run duplicate is kept.
-
-    A rep whose effort was recorded — not inferred — measured the rung; the
-    server copy is authoritative over a local one; the lower id is the older
-    record.
+    """Which copy of a same-run duplicate is kept — the documented
+    precedence: a rep-recorded effort measured the rung, a spelling pin is
+    the rung the launcher consulted, a catalog default is inference only;
+    the server copy is authoritative over a local one; the lower id is the
+    older record.
     """
 
     return (
+        not item.rep.effort,
         item.effort_inferred,
         item.ref.startswith("local:"),
         int(item.ref.rsplit(":", 1)[1]),
