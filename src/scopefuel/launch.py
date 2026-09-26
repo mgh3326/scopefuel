@@ -45,6 +45,7 @@ from .recommend import (
     normalize_effort,
     parse_e6_arm_marker,
     profile_pool,
+    profile_subscription,
 )
 
 GATE_DEFAULT = "default"
@@ -504,6 +505,14 @@ def resolve_launch(
         if e6_open and row.grade == E6_ARM_GRADE and (row.profile, row.effort) == (canonical, resolved_effort)
         else None
     )
+
+    # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라
+    # 카탈로그·snapshot·arm 어떤 경로로도 동일하게 닫히고 --operator-request 가
+    # 열지 못한다. 행 자체는 지우지 않는다 — pool 판정은 gate 와 같은 축
+    # (profile_pool 이름표 우선, 없으면 카탈로그 행의 pool)으로 본다.
+    subscription = profile_subscription(canonical, profile_pool(canonical)[0] or row.pool)
+    if not subscription.subscribed:
+        raise LaunchError(f"profile '{profile}' is unsubscribed ({subscription.reason})")
 
     # The gate rules. consult_only always needs an explicit operator request.
     # A non-default gate under a stale catalog needs one too: the snapshot saying
