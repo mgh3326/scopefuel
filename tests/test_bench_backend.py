@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 from collections import Counter
 
 import pytest
@@ -111,8 +112,9 @@ class FakeHandoffkeep:
 
     @staticmethod
     def _scope(url: str) -> str:
+        path = urllib.parse.urlsplit(url).path
         for scope in ("scores", "reps", "grades", "catalog"):
-            if url.rstrip("/").endswith(f"/v1/bench/{scope}"):
+            if path.rstrip("/").endswith(f"/v1/bench/{scope}"):
                 return scope
         raise AssertionError(f"unexpected URL: {url}")
 
