@@ -569,7 +569,7 @@ def test_reps_add_and_list_round_trip(bench_home, capsys):
         )
         == 0
     )
-    assert "recorded rep id=1" in capsys.readouterr().out
+    assert "recorded rep id=local:1" in capsys.readouterr().out
     reps = bench.read_reps()
     assert len(reps) == 1
     assert reps[0].task_ref == "ROB-1187"
@@ -662,7 +662,7 @@ def test_reps_help_and_filters_preserve_nullable_legacy_rows(bench_home, capsys)
 
     assert cli.main(["reps", "list", "--grade", "B", "--profile", "codex-luna", "--effort", "medium"]) == 0
     combined = capsys.readouterr().out
-    assert "id=3" in combined and "id=4" not in combined and "id=5" not in combined
+    assert "id=local:3" in combined and "id=local:4" not in combined and "id=local:5" not in combined
 
     assert cli.main(["reps", "list", "--grade", "C"]) == 0
     empty = capsys.readouterr().out
