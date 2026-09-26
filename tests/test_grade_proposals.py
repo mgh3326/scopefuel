@@ -264,7 +264,7 @@ def test_static_supersede_pair_excludes_old_rep(tmp_path, isolated_cache):
     result = _result(proposal, "codex-sol", "high")
     assert result.action == "insufficient"  # one pass left — never double-counted
     cli_ex = next(e for e in proposal.evidence.exclusions if e.origin == "cli")
-    assert cli_ex.old_ref == "local:1" and cli_ex.new_ref == "local:2"
+    assert cli_ex.old_refs == ("local:1",) and cli_ex.new_ref == "local:2"
 
 
 def test_notes_supersede_excludes_cited_id(tmp_path, isolated_cache):
@@ -320,7 +320,7 @@ def test_known_static_pairs_present_in_output(tmp_path, isolated_cache):
     text = grades.render_proposal(_propose(view), view)
     assert "993" in text and "995" in text
     assert "996" in text and "997" in text
-    assert "desktop:80" in text
+    assert "home-desktop:80" in text
 
 
 # ---------------------------------------------------------------------------
@@ -675,19 +675,49 @@ def test_server_and_local_merge_dedups_migrated(tmp_path, monkeypatch):
     assert _result(proposal, "grok-hi", "xhigh").action == "promote"
 
 
-def test_server_ref_syntax_in_exclusions(tmp_path, monkeypatch):
-    rep = bench.add_rep(**_rep("t1", effort="xhigh", grade="A+"))
-    _remote_backend(tmp_path, monkeypatch)
-    # Nothing remote; the bare id under a handoffkeep backend names the server
-    # side, so a local row needs an explicit local: prefix to be excluded.
+def test_bare_exclusion_id_binds_both_namespaces(tmp_path, monkeypatch):
+    """Tester blocker: under handoffkeep a bare exclusion id is the fleet-cited
+    rep id — it must bind the server row AND an unmigrated local duplicate
+    sharing the rowid, so the pair cannot double-count."""
+    rep = bench.add_rep(**_rep("dup", effort="xhigh", grade="A+"))  # local:1
+    bench.add_rep(**_rep("survivor", effort="xhigh", grade="A+"))  # local:2
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(
+            bench.RepRecord(
+                id=1,
+                profile="builder-grok",
+                model_id="grok-4.7",
+                task_ref="srv-dup",
+                tier="T1",
+                role="impl",
+                rounds=1,
+                blockers_found=0,
+                completed=1,
+                input_tokens=None,
+                output_tokens=None,
+                notes=None,
+                recorded_at="2026-09-25T00:00:00Z",
+                effort="xhigh",
+                grade="A+",
+                table_grade=None,
+            ),
+            1,  # srv:1 — same rowid as local:1, a different rep
+            host=None,
+        ),
+    ]
     view = _view(_entry("grok-hi", "xhigh", "C"))
     evidence = grades.gather_reps(view=view, exclusions=[("1", "2")], host=HOST)
     cli_ex = next(e for e in evidence.exclusions if e.origin == "cli")
-    assert cli_ex.old_ref == "srv:1"  # bare -> shared store
-    counted = {r.ref for r in evidence.rows if not r.excluded}
-    assert f"local:{rep.id}" in counted
-    evidence2 = grades.gather_reps(view=view, exclusions=[("local:1", "local:2")], host=HOST)
-    assert f"local:{rep.id}" not in {r.ref for r in evidence2.rows if not r.excluded}
+    assert set(cli_ex.old_refs) == {"srv:1", "local:1"}
+    excluded = {r.ref for r in evidence.rows if r.excluded}
+    assert {"srv:1", "local:1"} <= excluded
+    assert "local:2" in {r.ref for r in evidence.rows if not r.excluded}
+    # A namespace-pinned spec does not reach across: srv:1 leaves local:1 alone.
+    evidence2 = grades.gather_reps(view=view, exclusions=[("srv:1", "srv:2")], host=HOST)
+    pinned = next(e for e in evidence2.exclusions if e.origin == "cli")
+    assert pinned.old_refs == ("srv:1",)
+    assert f"local:{rep.id}" in {r.ref for r in evidence2.rows if not r.excluded}
 
 
 def test_local_backend_discloses_server_unread(tmp_path, monkeypatch, capsys):
@@ -698,3 +728,142 @@ def test_local_backend_discloses_server_unread(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "source=local" in out
     assert "server reps were not read" in out
+
+
+# ---------------------------------------------------------------------------
+# Tester round-1 blocker regressions
+# ---------------------------------------------------------------------------
+
+
+def _seed_at_id(rep_id: int, **overrides) -> None:
+    """Insert a rep at an explicit rowid — static pairs cite fixed ids."""
+    row = _rep(f"t{rep_id}", **overrides)
+    conn = bench.connect()
+    try:
+        conn.execute(
+            "INSERT INTO reps "
+            "(id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
+            "input_tokens, output_tokens, notes, recorded_at, effort, grade, table_grade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rep_id,
+                row["profile"],
+                row["model_id"],
+                row["task_ref"],
+                row["tier"],
+                row["role"],
+                row["rounds"],
+                row["blockers_found"],
+                row["completed"],
+                None,
+                None,
+                row.get("notes"),
+                row["recorded_at"],
+                row.get("effort"),
+                row.get("grade"),
+                bench.derive_table_grade(row["profile"], row.get("effort")),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_static_desktop_pair_binds_home_desktop(tmp_path, isolated_cache):
+    """Tester blocker: the desktop pair is local@home-desktop — the earlier
+    'desktop' hostname bound nothing anywhere."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed_at_id(80, effort="xhigh", grade="A+")
+    _seed_at_id(81, effort="xhigh", grade="A+")
+    evidence = grades.gather_reps(view=view, host="home-desktop")
+    ex = next(e for e in evidence.exclusions if e.old_spec == "local@home-desktop:80")
+    assert ex.old_refs == ("local:80",) and ex.new_ref == "local:81"
+    excluded = {r.ref for r in evidence.rows if r.excluded}
+    assert "local:80" in excluded and "local:81" not in excluded
+    proposal = grades.evaluate(evidence, view)
+    assert _result(proposal, "grok-hi", "xhigh").action == "insufficient"
+    # Anywhere else the pair binds nothing — an unrelated local:80 still counts.
+    proposal2 = _propose(view, host="mbp")
+    assert _result(proposal2, "grok-hi", "xhigh").action == "promote"
+
+
+def test_retired_rung_evidence_never_flows_to_live_sibling(tmp_path, isolated_cache):
+    """Tester blocker: reps on retired grok-hi@xhigh must not judge the live
+    grok-hi default row through the effort fallback."""
+    view = _view(
+        _entry("grok-hi", "xhigh", "C", retired_at="2026-09-01T00:00:00Z"),
+        _entry("grok-hi", "", "S"),
+    )
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    proposal = _propose(view)
+    assert all(r.key != ("grok-hi", "") for r in proposal.results)
+    assert {r.rep.task_ref for r in proposal.unrung} == {"t1", "t2"}
+    text = grades.render_proposal(proposal, view)
+    assert "rung retired" in text
+
+
+def test_notes_supersede_follows_cited_id_across_migration(tmp_path, monkeypatch):
+    """Tester blocker: a migrated carrier's ``supersedes id=N`` cites a local
+    id on the source host — the exclusion must bind the cited row's migrated
+    server copy, not an unrelated server row N."""
+    cited = bench.add_rep(**_rep("old", effort="xhigh", grade="A+"))  # local:1
+    carrier = bench.add_rep(**_rep("new", effort="xhigh", grade="A+", notes="supersedes id=1"))  # local:2
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [
+        _remote_row(cited, 501, host=HOST),  # srv:501 = migrated local:1
+        _remote_row(carrier, 502, host=HOST),  # srv:502 carries the note
+    ]
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    evidence = grades.gather_reps(view=view, host=HOST)
+    excluded = {r.ref: r.excluded for r in evidence.rows if r.excluded}
+    assert "superseded" in excluded.get("srv:501", "")
+    proposal = grades.evaluate(evidence, view)
+    # Only the carrier's server copy counts — 1 pass < 2.
+    assert _result(proposal, "grok-hi", "xhigh").action == "insufficient"
+
+
+def test_notes_supersede_binds_migrated_copy_for_local_carrier(tmp_path, monkeypatch):
+    """The mirror case: a still-local carrier cites a local id that has
+    already migrated — its live server copy is bound too."""
+    cited = bench.add_rep(**_rep("old", effort="xhigh", grade="A+"))  # local:1
+    bench.add_rep(**_rep("new", effort="xhigh", grade="A+", notes="supersedes id=1"))  # local:2, unmigrated
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(cited, 501, host=HOST)]  # only the cited row migrated
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    evidence = grades.gather_reps(view=view, host=HOST)
+    excluded = {r.ref: r.excluded for r in evidence.rows if r.excluded}
+    assert "superseded" in excluded.get("srv:501", "")
+    proposal = grades.evaluate(evidence, view)
+    assert _result(proposal, "grok-hi", "xhigh").action == "insufficient"
+
+
+def test_read_catalog_commit_cache_false_never_writes(tmp_path, monkeypatch):
+    """Tester blocker: the strictly read-only catalog path must neither
+    persist the server response nor create the cache DB/schema."""
+    _remote_backend(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        bench,
+        "request_json",
+        lambda url, **kw: {
+            "catalog": [{"profile": "grok-hi", "effort": "xhigh", "grade": "A", "gate": "default"}]
+        },
+    )
+    target = bench.db_path()
+    assert not target.exists()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == bench.CATALOG_SOURCE_SERVER
+    assert not target.exists()  # nothing created, nothing written
+    bench.reset_catalog_memo()
+    view2 = bench.read_catalog()
+    assert view2.source == bench.CATALOG_SOURCE_SERVER
+    assert target.exists()  # the default path still maintains the cache
+
+
+def test_null_blockers_never_counts_as_clean(tmp_path, isolated_cache):
+    """Tester SHOULD: blockers_found=None is 'not recorded', not zero — an
+    unmeasured pass cannot establish a clean PASS."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed_at_id(1, effort="xhigh", grade="A+", blockers_found=None)
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "insufficient"
+    assert len(result.unclean_passes) == 1

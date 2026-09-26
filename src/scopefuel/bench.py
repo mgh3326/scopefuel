@@ -2440,7 +2440,12 @@ def reset_catalog_memo() -> None:
     _CATALOG_MEMO.clear()
 
 
-def read_catalog(*, path: pathlib.Path | str | None = None) -> CatalogView:
+def read_catalog(
+    *,
+    path: pathlib.Path | str | None = None,
+    commit_cache: bool = True,
+    allow_plaintext_http: bool = False,
+) -> CatalogView:
     """Read the canonical catalog, disclosing which of the three states served it.
 
     Never raises for an unreachable server: the bundled snapshot is a reviewed
@@ -2448,20 +2453,26 @@ def read_catalog(*, path: pathlib.Path | str | None = None) -> CatalogView:
     than stopping it. What the outage must not do is widen anything — that rule
     lives with the consumers (``scopefuel.launch``), which refuse to relax a
     non-default gate while this view is stale.
+
+    ``commit_cache=False`` serves the same view without persisting the server
+    response into the local cache — the strictly read-only path ``grades
+    propose``/``apply`` take.
     """
 
-    backend = bench_backend(use="catalog")
+    backend = bench_backend(use="catalog", allow_plaintext_http=allow_plaintext_http)
     memo_key = (str(path or ""), backend.name, backend.endpoint_id)
     memoized = _CATALOG_MEMO.get(memo_key)
     if memoized is not None:
         return memoized
 
-    view = _read_catalog_uncached(backend, path=path)
+    view = _read_catalog_uncached(backend, path=path, commit_cache=commit_cache)
     _CATALOG_MEMO[memo_key] = view
     return view
 
 
-def _read_catalog_uncached(backend: BenchBackend, *, path: pathlib.Path | str | None) -> CatalogView:
+def _read_catalog_uncached(
+    backend: BenchBackend, *, path: pathlib.Path | str | None, commit_cache: bool = True
+) -> CatalogView:
     if backend.name == BENCH_BACKEND_LOCAL:
         return CatalogView(
             entries=catalog_snapshot(),
@@ -2471,17 +2482,37 @@ def _read_catalog_uncached(backend: BenchBackend, *, path: pathlib.Path | str | 
             reason=backend.reason,
         )
 
-    conn = _cache_connect(path)
-    try:
-        now = _cache_now()
-        cached = _cached_catalog(conn)
-        row = conn.execute(
-            "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = 'catalog'"
-        ).fetchone()
-    except sqlite3.Error:
-        cached, row = [], None
-    finally:
-        conn.close()
+    now = _cache_now()
+    cached: list[CatalogEntry] = []
+    row = None
+    if commit_cache:
+        conn = _cache_connect(path)
+        try:
+            cached = _cached_catalog(conn)
+            row = conn.execute(
+                "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = 'catalog'"
+            ).fetchone()
+        except sqlite3.Error:
+            cached, row = [], None
+        finally:
+            conn.close()
+    else:
+        # The read-only path (grades propose/apply): probe the cache without
+        # creating the DB or its schema. A missing/unreadable cache is simply
+        # "no cache" — the server fetch below still happens.
+        target = pathlib.Path(path) if path is not None else db_path()
+        if str(target) != ":memory:" and target.expanduser().exists():
+            try:
+                conn = _readonly_connect(target)
+                try:
+                    cached = _cached_catalog(conn)
+                    row = conn.execute(
+                        "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = 'catalog'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                cached, row = [], None
 
     age_s: float | None = None
     if row is not None and row["endpoint_id"] == backend.endpoint_id:
@@ -2512,7 +2543,8 @@ def _read_catalog_uncached(backend: BenchBackend, *, path: pathlib.Path | str | 
 
     try:
         entries = _fetch_catalog(backend)
-        _commit_catalog_cache(path=path, entries=entries, backend=backend)
+        if commit_cache:
+            _commit_catalog_cache(path=path, entries=entries, backend=backend)
         return CatalogView(
             entries=tuple(entries),
             source=CATALOG_SOURCE_SERVER,

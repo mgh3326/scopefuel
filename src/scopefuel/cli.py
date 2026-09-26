@@ -1275,7 +1275,7 @@ def _grades_command(args: argparse.Namespace) -> int:
                 return 2
             exclusions.append((old.strip(), new.strip()))
         try:
-            view = bench.read_catalog()
+            view = bench.read_catalog(commit_cache=False, allow_plaintext_http=args.allow_plaintext_http)
             evidence = grades.gather_reps(
                 view=view,
                 exclusions=exclusions,

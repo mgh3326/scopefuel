@@ -73,16 +73,18 @@ FAIL_MARKERS = re.compile(r"\[(rollback|post-merge-blocker|postmerge-blocker)\]"
 SUPERSEDES_RE = re.compile(r"supersedes id=(\d+)", re.IGNORECASE)
 
 # Superseded duplicate reps the operator named for this first run, as
-# ``(superseded, surviving)`` ref specs. A bare id names the shared store's id
-# (server ids under the handoffkeep backend, this host's local ids under the
-# local backend — the id the fleet cites the rep by). ``local@<host>:<id>``
+# ``(superseded, surviving)`` ref specs. A bare id binds the rep known by that
+# id in *every* namespace the command can see — under the handoffkeep backend
+# that is both ``srv:<id>`` and this host's ``local:<id>``, so an unmigrated
+# local duplicate cannot slip past a server-scoped spec. ``local@<host>:<id>``
 # names a local row that exists only on that host: the desktop's rows 80/81
-# have never been migrated, so the pair binds only when the command runs there
-# — this host's own local row 80 is a different rep and must not be excluded.
+# have never been migrated, so the pair binds only when the command runs on
+# the host named ``home-desktop`` — this host's own local row 80 is a
+# different rep and must not be excluded.
 STATIC_SUPERSEDES: tuple[tuple[str, str], ...] = (
     ("993", "995"),
     ("996", "997"),
-    ("local@desktop:80", "local@desktop:81"),
+    ("local@home-desktop:80", "local@home-desktop:81"),
 )
 
 
@@ -185,8 +187,11 @@ def _judging_row(rows: list[bench.CatalogEntry], effort: str) -> bench.CatalogEn
 
     exact = [row for row in rows if row.effort == effort]
     if exact:
-        return exact[0]
-    ordinary = [row for row in rows if not launch._unmeasured_e6_row(row)]
+        # A retired row is a real placement record, not an absent one: the
+        # rung was placed and then withdrawn, so its evidence is unrung — it
+        # must not flow to a live sibling via the default fallback.
+        return exact[0] if not exact[0].retired_at else None
+    ordinary = [row for row in rows if not row.retired_at and not launch._unmeasured_e6_row(row)]
     if not ordinary:
         return None
     fallback_effort, _ = launch._default_effort(rows[0].profile, ordinary)
@@ -230,53 +235,64 @@ def _classify(rep: bench.RepRecord) -> str:
     if rep.completed == 0 or FAIL_MARKERS.search(notes):
         return _KIND_FAIL
     if rep.completed == 1:
-        if (rep.blockers_found or 0) > 0:
+        # blockers_found=None means "not recorded", not "zero" — a pass whose
+        # blocker field was never measured cannot count as a clean PASS.
+        if rep.blockers_found != 0:
             return _KIND_PASS_UNCLEAN
-        return _KIND_PASS if rep.grade else _KIND_PASS_UNGRADED
+        # A grade string outside the ladder (hand-edited store, a server row
+        # written by a newer rule) can establish no rung grade — the rep shows
+        # its raw task-grade in the evidence line but counts as ungraded.
+        return _KIND_PASS if rep.grade in GRADE_STRENGTH else _KIND_PASS_UNGRADED
     return _KIND_UNKNOWN
 
 
 _REF_RE = re.compile(r"^(?:(srv|local)(?:@([^:]+))?:)?(\d+)$")
 
 
-def resolve_ref(spec: str, *, backend_name: str, host: str) -> str | None:
-    """Parse an exclusion ref spec to a concrete evidence ref, or None.
+def resolve_refs(spec: str, *, backend_name: str, host: str) -> tuple[str, ...]:
+    """Parse an exclusion ref spec to the concrete evidence refs it binds.
 
-    ``N`` names the shared store's id N (server ids under the handoffkeep
-    backend, this host's local ids under local — the id the fleet cites the
-    rep by). ``srv:N`` and ``local:N`` pin a namespace. ``local@<host>:N``
-    names a local row only on that host — it resolves to None anywhere else,
-    so a host-scoped exclusion can never eat an unrelated rep that happens to
-    share the rowid.
+    ``srv:N`` and ``local:N`` pin a namespace. ``local@<host>:N`` names a
+    local row only on that host — it binds nothing anywhere else, so a
+    host-scoped exclusion can never eat an unrelated rep that happens to
+    share the rowid. A bare ``N`` is the id the fleet cites the rep by:
+    under the handoffkeep backend it binds both ``srv:N`` and ``local:N`` so
+    an unmigrated local copy cannot double-count beside its server twin;
+    under the local backend only ``local:N`` exists.
     """
 
     match = _REF_RE.match(spec.strip())
     if not match:
-        return None
+        return ()
     namespace, at_host, raw_id = match.groups()
     if at_host is not None:
         if namespace != "local" or at_host != host:
-            return None
-        return f"local:{raw_id}"
-    if namespace is None:
-        namespace = "srv" if backend_name == bench.BENCH_BACKEND_HANDOFFKEEP else "local"
-    return f"{namespace}:{raw_id}"
+            return ()
+        return (f"local:{raw_id}",)
+    if namespace is not None:
+        return (f"{namespace}:{raw_id}",)
+    if backend_name == bench.BENCH_BACKEND_HANDOFFKEEP:
+        return (f"srv:{raw_id}", f"local:{raw_id}")
+    return (f"local:{raw_id}",)
 
 
 @dataclass(frozen=True)
 class Exclusion:
     old_spec: str
     new_spec: str
-    old_ref: str | None
+    old_refs: tuple[str, ...]  # every concrete ref the spec binds on this host
     new_ref: str | None
     origin: str  # "static" | "cli" | "notes:<carrier ref>"
 
     def status(self, refs: set[str]) -> str:
-        if self.old_ref is None:
+        if not self.old_refs:
             return f"{self.old_spec} (superseded by {self.new_spec}) unresolvable on this host"
-        if self.old_ref not in refs:
-            return f"{self.old_ref} (from {self.old_spec}) not in evidence; survivor {self.new_spec}"
-        return f"{self.old_ref} superseded by {self.new_ref or self.new_spec}"
+        bound = [ref for ref in self.old_refs if ref in refs]
+        if not bound:
+            return (
+                f"{self.old_spec} (superseded by {self.new_spec}) not in evidence; survivor {self.new_spec}"
+            )
+        return f"{', '.join(bound)} superseded by {self.new_ref or self.new_spec}"
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +310,12 @@ class RepsEvidence:
     window_incomplete: bool
     rows: list[EvidenceRep]
     exclusions: list[Exclusion] = field(default_factory=list)
+    # local_id -> server_id for this host's migrated rows, plus the fetched
+    # remote set. Both drive the exclusion pass: a ``supersedes id=N`` note
+    # written before migration names a *local* id, and the exclusion must
+    # follow the row onto its server copy.
+    migrated: dict[int, int] = field(default_factory=dict)
+    remote_items: list[bench._RemoteRep] = field(default_factory=list)
 
     @property
     def counted(self) -> list[EvidenceRep]:
@@ -341,6 +363,8 @@ def gather_reps(
     backend = bench.bench_backend(use="reps", allow_plaintext_http=allow_plaintext_http)
 
     rows: list[EvidenceRep] = []
+    remote_items: list[bench._RemoteRep] = []
+    migrated: dict[int, int] = {}
     remote_count = 0
     local_count = 0
     window_incomplete = False
@@ -352,7 +376,6 @@ def gather_reps(
         local_reps = bench._read_local_reps_for_push(path=path)
         local_count = len(local_reps)
         index = bench._rep_content_index(remote_items)
-        migrated: dict[int, int] = {}
         for rep in local_reps:
             match = _matching_remote(rep, index, resolved_host)
             if match is not None:
@@ -385,9 +408,45 @@ def gather_reps(
         local_count=local_count,
         window_incomplete=window_incomplete,
         rows=rows,
+        migrated=migrated,
+        remote_items=remote_items,
     )
     _finish_rows(evidence, view, exclusions or [])
     return evidence
+
+
+def _notes_spec(row: EvidenceRep, cited: str, evidence: RepsEvidence) -> tuple[str, str, str, list[str]]:
+    """The exclusion spec a ``supersedes id=N`` note binds for one carrier.
+
+    The cited id is always a rowid — but in which store depends on where the
+    note was written. A local carrier cites a local id. A server row carrying
+    a ``[src:<host>]`` migration stamp wrote the note *before* migration, so
+    id=N is a local id on that host: the spec binds ``local@<host>:N`` plus
+    the migrated server copy (found through the deterministic origin id).
+    A server-native carrier cites a server id. And when this host's cited
+    local row has already migrated, its live server copy is bound too —
+    otherwise the supersede intent dies at the migration boundary and the
+    duplicate counts.
+    """
+
+    origin = f"notes:{row.ref}"
+    namespace = row.ref.partition(":")[0]
+    if namespace == "local":
+        extra = [f"srv:{srv}"] if (srv := evidence.migrated.get(int(cited))) else []
+        return f"local:{cited}", row.ref, origin, extra
+    src = bench._migrate_src_host(row.rep.notes)
+    if src is None:
+        return f"srv:{cited}", row.ref, origin, []
+    # The cited row lived on host ``src``; its migrated copy — if any —
+    # carries the deterministic origin id of (src, its own profile, N).
+    extra = [
+        f"srv:{item.server_id}"
+        for item in evidence.remote_items
+        if item.server_id
+        and bench._migrate_src_host(item.record.notes) == src
+        and item.origin_id == bench._migrate_origin_id(src, item.record.profile, int(cited))
+    ]
+    return f"local@{src}:{cited}", row.ref, origin, extra
 
 
 def _finish_rows(
@@ -399,30 +458,36 @@ def _finish_rows(
 
     catalog_rows: dict[str, list[bench.CatalogEntry]] = {}
     for entry in view.entries:
-        if entry.retired_at:
-            continue
         catalog_rows.setdefault(entry.profile, []).append(entry)
 
-    specs: list[tuple[str, str, str]] = [(old, new, "static") for old, new in STATIC_SUPERSEDES]
-    specs += [(old, new, "cli") for old, new in exclusions]
+    specs: list[tuple[str, str, str, list[str]]] = [
+        (old, new, "static", []) for old, new in STATIC_SUPERSEDES
+    ]
+    specs += [(old, new, "cli", []) for old, new in exclusions]
     # Notes-declared supersedes are part of the store itself — a rep carrying
-    # ``supersedes id=N`` excludes the cited id in its own namespace.
+    # ``supersedes id=N`` excludes the cited id, following it across the
+    # migration boundary when the note predates the move.
     for row in evidence.rows:
         if row.excluded:
             continue
         for cited in SUPERSEDES_RE.findall(row.rep.notes or ""):
-            namespace = row.ref.partition(":")[0]
-            specs.append((f"{namespace}:{cited}", row.ref, f"notes:{row.ref}"))
+            specs.append(_notes_spec(row, cited, evidence))
 
     by_ref = {row.ref for row in evidence.rows}
     excluded: dict[str, str] = {}
-    for old_spec, new_spec, origin in specs:
-        old_ref = resolve_ref(old_spec, backend_name=evidence.backend, host=evidence.host)
-        new_ref = resolve_ref(new_spec, backend_name=evidence.backend, host=evidence.host)
-        item = Exclusion(old_spec, new_spec, old_ref, new_ref, origin)
+    for old_spec, new_spec, origin, extra in specs:
+        old_refs = tuple(
+            dict.fromkeys(
+                resolve_refs(old_spec, backend_name=evidence.backend, host=evidence.host) + tuple(extra)
+            )
+        )
+        new_refs = resolve_refs(new_spec, backend_name=evidence.backend, host=evidence.host)
+        new_ref = next((ref for ref in new_refs if ref in by_ref), new_refs[0] if new_refs else None)
+        item = Exclusion(old_spec, new_spec, old_refs, new_ref, origin)
         evidence.exclusions.append(item)
-        if old_ref is not None and old_ref in by_ref and old_ref not in excluded:
-            excluded[old_ref] = f"superseded by {new_ref or new_spec}"
+        for ref in old_refs:
+            if ref in by_ref and ref not in excluded:
+                excluded[ref] = f"superseded by {item.new_ref or new_spec}"
 
     for index, row in enumerate(evidence.rows):
         kind = _classify(row.rep)
@@ -500,9 +565,16 @@ def _evaluate_row(
             unclean.append(item.ref)
 
     current = row.grade
+    if current not in GRADE_STRENGTH:
+        raise bench.BenchError(
+            f"catalog row {row.label()} carries grade {current!r} outside the "
+            f"ladder {GRADE_LADDER} — the catalog is corrupt, nothing is proposed"
+        )
     cur_s = GRADE_STRENGTH[current]
 
-    demote_fails = [(ref, g) for ref, g in fails if g is None or GRADE_STRENGTH[g] <= cur_s]
+    # A FAIL whose task grade sits outside the ladder cannot establish "the
+    # rung failed at G" — fail-closed: it counts like an ungraded FAIL.
+    demote_fails = [(ref, g) for ref, g in fails if g is None or GRADE_STRENGTH.get(g, -1) <= cur_s]
     if demote_fails:
         if len(passes_at.get(current, ())) >= min_passes:
             # Contradictory evidence: the rung fails at-or-below its grade yet
@@ -528,7 +600,7 @@ def _evaluate_row(
         # The rung could not do work at or below the grade it claims. Target:
         # one step below the weakest failed claim — an ungraded FAIL is treated
         # as a failure at the placement itself (fail-closed).
-        target_idx = min(GRADE_STRENGTH[g] - 1 if g else cur_s - 1 for _, g in demote_fails)
+        target_idx = min(GRADE_STRENGTH[g] - 1 if g in GRADE_STRENGTH else cur_s - 1 for _, g in demote_fails)
         target_idx = max(target_idx, 0)
         target = GRADE_LADDER[target_idx]
         note = "FAIL evidence at-or-below placement"
@@ -805,9 +877,11 @@ def render_proposal(
                 lines.append(f"    excluded {item.ref} ({item.excluded})")
 
     if proposal.unrung:
-        lines.append("unrung evidence (rep rung has no catalog row — reported, not counted):")
+        lines.append("unrung evidence (rep rung has no live catalog row — reported, not counted):")
+        retired = {key for key, entry in view.by_key().items() if entry.retired_at}
         for item in proposal.unrung:
-            lines.append(f"  {_fmt_evidence(item)}")
+            suffix = "  [rung retired]" if item.rung in retired else ""
+            lines.append(f"  {_fmt_evidence(item)}{suffix}")
 
     if focus is not None:
         focused = [r for r in proposal.results if r.key == focus]
@@ -821,7 +895,9 @@ def render_proposal(
             )
 
     refs = {row.ref for row in evidence.rows}
-    missing = [item.status(refs) for item in evidence.exclusions if item.old_ref not in refs]
+    missing = [
+        item.status(refs) for item in evidence.exclusions if not any(ref in refs for ref in item.old_refs)
+    ]
     if missing:
         lines.append("missing exclusion targets (never silently ignored):")
         lines.extend(f"  {line}" for line in missing)
@@ -858,7 +934,7 @@ def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
             {
                 "old": item.old_spec,
                 "new": item.new_spec,
-                "old_ref": item.old_ref,
+                "old_refs": list(item.old_refs),
                 "new_ref": item.new_ref,
                 "origin": item.origin,
             }
@@ -901,7 +977,7 @@ def apply_proposals(
         for pair in params.get("cli_exclusions") or []
         if isinstance(pair, list | tuple) and len(pair) == 2
     ]
-    view = bench.read_catalog(path=path)
+    view = bench.read_catalog(path=path, commit_cache=False, allow_plaintext_http=allow_plaintext_http)
     evidence = gather_reps(
         view=view, exclusions=exclusions, allow_plaintext_http=allow_plaintext_http, path=path
     )
