@@ -26,7 +26,6 @@ from .policy import (
     list_profile_subscriptions,
     set_policy,
     set_profile_subscribed,
-    set_subscribed,
 )
 from .providers import default_order, registry
 from .recommend import grade_help_text
@@ -589,6 +588,13 @@ def _policy_command(
         if args.pool_class is None and boost_arg == "__unset__" and args.subscribed is None:
             parser.error("class, --boost, --subscribed 중 하나는 지정해야 합니다")
 
+        # #751 — class/boost/subscribed go through one locked edit so the
+        # combined command commits atomically instead of leaving a partial
+        # result when a second write fails.
+        # #742 — 'none' 은 subscribed 키만 제거한다(나머지 필드 보존).
+        subscribed_arg = "__unset__"
+        if args.subscribed is not None:
+            subscribed_arg = None if args.subscribed == "none" else args.subscribed == "on"
         try:
             set_policy(
                 args.pool,
@@ -596,6 +602,7 @@ def _policy_command(
                 until=args.until,
                 note=args.note,
                 boost=boost_arg,
+                subscribed=subscribed_arg,
             )
         except ConfigEditError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -607,12 +614,6 @@ def _policy_command(
         if boost_arg != "__unset__":
             parts.append("boost cleared" if boost_arg is None else f"boost={boost_arg}")
         if args.subscribed is not None:
-            # #742 — 'none' 은 subscribed 키만 제거한다(나머지 필드 보존).
-            try:
-                set_subscribed(args.pool, None if args.subscribed == "none" else args.subscribed == "on")
-            except ConfigEditError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 2
             parts.append(
                 "subscribed key removed"
                 if args.subscribed == "none"

@@ -220,7 +220,7 @@ def _scan_value_rest(line: str, pos: int, st: dict) -> tuple[str, object]:
     ve = pos  # position just past the last non-whitespace value char
     while pos < n:
         c = line[pos]
-        if c in " \t":
+        if c in " \t\r":
             pos += 1
             continue
         if c == "#":
@@ -440,7 +440,13 @@ class _Doc:
         self.lines = text.split("\n")
         self.config = config
         self.touched: set[tuple[str, ...]] = set()
+        # dominant line ending — new lines must carry the same terminator so
+        # a CRLF file stays CRLF byte-for-byte (#751 B1).
+        self.crlf = sum(1 for line in self.lines if line.endswith("\r")) * 2 > max(1, len(self.lines) - 1)
         self._rescan()
+
+    def _eol(self, line: str) -> str:
+        return line + "\r" if self.crlf else line
 
     def _rescan(self) -> None:
         self.regions, self.stmts = _scan_doc(self.lines)
@@ -491,14 +497,14 @@ class _Doc:
                 indent = raw[: len(raw) - len(raw.lstrip())]
                 break
             idx = max((member.end for member in members), default=region.start + 1)
-            self.lines[idx:idx] = [f"{indent}{_key_seg_text(key)} = {text_value}"]
+            self.lines[idx:idx] = [self._eol(f"{indent}{_key_seg_text(key)} = {text_value}")]
             self._rescan()
             return
         siblings = [s for s in self.stmts if s.path[:-1] == parent]
         if siblings:
             last = siblings[-1]
             dotted = ".".join(_key_seg_text(seg) for seg in last.rel[:-1] + (key,))
-            self.lines[last.end : last.end] = [f"{dotted} = {text_value}"]
+            self.lines[last.end : last.end] = [self._eol(f"{dotted} = {text_value}")]
             self._rescan()
             return
         if _get_path(self.config, parent) is not _MISSING:
@@ -516,7 +522,7 @@ class _Doc:
         block = [header, f"{_key_seg_text(key)} = {text_value}"]
         before = [""] if idx > 0 and self.lines[idx - 1].strip() else []
         after = [""] if idx < len(self.lines) and self.lines[idx].strip() else []
-        self.lines[idx:idx] = before + block + after
+        self.lines[idx:idx] = [self._eol(line) for line in before + block + after]
         self._rescan()
 
     def remove_key(self, path: tuple[str, ...]) -> bool:
@@ -577,7 +583,7 @@ def _locked(path: pathlib.Path):
 def _atomic_write(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_bytes(text.encode("utf-8"))
     if text:
         tmp.chmod(0o600)
     os.replace(tmp, path)
@@ -596,7 +602,7 @@ def _edit_config(edit_fn):
         path = path.resolve()
     with _locked(path):
         try:
-            text = path.read_text(encoding="utf-8")
+            text = path.read_bytes().decode("utf-8")
         except FileNotFoundError:
             text = ""
         if text:
@@ -608,8 +614,23 @@ def _edit_config(edit_fn):
             config0 = {}
         doc = _Doc(text, config0)
         result, expect = edit_fn(doc)
+
+        def check_expect(tree: dict, label: str) -> None:
+            for want_path, want in expect.items():
+                got = _get_path(tree, want_path)
+                if want is None:
+                    if got is not _MISSING:
+                        raise ConfigEditError(f"{label}: {'.'.join(want_path)} still present")
+                elif _norm(got if got is not _MISSING else None) != _norm(want):
+                    raise ConfigEditError(f"{label}: {'.'.join(want_path)} did not land as intended")
+
         new_text = doc.text()
         if new_text == text:
+            # No lines changed — legitimate only when the expectation already
+            # holds in the file. Otherwise the target sits inside a shape the
+            # editor cannot splice (e.g. an inline table) and returning success
+            # would silently lie about the write (#751 B2).
+            check_expect(config0, "refusing no-op edit")
             return result
         try:
             config1 = tomllib.loads(new_text)
@@ -621,13 +642,7 @@ def _edit_config(edit_fn):
             _strip_path(after, touched)
         if _norm(before) != _norm(after):
             raise ConfigEditError("internal: edit modified non-target content")
-        for want_path, want in expect.items():
-            got = _get_path(config1, want_path)
-            if want is None:
-                if got is not _MISSING:
-                    raise ConfigEditError(f"internal: {'.'.join(want_path)} still present")
-            elif _norm(got if got is not _MISSING else None) != _norm(want):
-                raise ConfigEditError(f"internal: {'.'.join(want_path)} did not land as intended")
+        check_expect(config1, "internal")
         _atomic_write(path, new_text)
         return result
 
@@ -786,17 +801,21 @@ def set_policy(
     until: dt.date | None = None,
     note: str | None = None,
     boost: int | None | Literal["__unset__"] = "__unset__",
+    subscribed: bool | None | Literal["__unset__"] = "__unset__",
 ) -> None:
-    """Set pool class and/or numeric boost.
+    """Set pool class and/or numeric boost and/or the subscribed flag.
 
     ``pool_class`` may be None when the call only touches boost (``policy set
     <pool> --boost N``/``--boost none`` without a class positional). ``boost``
     left at the sentinel default leaves any existing boost untouched; pass an
     explicit ``int`` to set it (requires ``until``, shared with the pool-level
     class expiry — there is no separate boost-until field) or ``None`` to
-    clear it. ``plan``/``price_usd``/``capacity_weight`` are read-only from
-    this module's perspective — they are config.toml-only fields with no CLI
-    setter (operator-edited).
+    clear it. ``subscribed`` follows the same rule: the sentinel leaves the
+    key alone, ``True``/``False`` writes it, ``None`` removes just that key —
+    merged into the same locked edit so a combined ``policy set`` applies as
+    one atomic transaction (#751 B3). ``plan``/``price_usd``/
+    ``capacity_weight`` are read-only from this module's perspective — they
+    are config.toml-only fields with no CLI setter (operator-edited).
     """
     if pool_class is not None and until is None:
         raise ValueError("until(만료일)은 필수입니다")
@@ -815,6 +834,8 @@ def set_policy(
         else:
             ops["boost"] = boost
             ops["until"] = until
+    if subscribed != "__unset__":
+        ops["subscribed"] = _DELETE if subscribed is None else subscribed
     if not ops:
         return
     base = ("pools", pool)
@@ -825,7 +846,6 @@ def set_policy(
                 doc.remove_key(base + (key,))
             else:
                 doc.set_value(base + (key,), value)
-        doc.touched.add(base)
         # semantic expectation: same result the old dict-level write produced
         entry: dict[str, object] = dict((doc.config.get("pools") or {}).get(pool) or {})
         for key, value in ops.items():
@@ -833,7 +853,12 @@ def set_policy(
                 entry.pop(key, None)
             else:
                 entry[key] = value
-        return None, {base: entry}
+        if not entry:
+            # an entry left empty by the removal is dropped entirely — the
+            # same rule _set_subscribed_impl applies.
+            doc.delete_table(base)
+        doc.touched.add(base)
+        return None, {base: entry or None}
 
     _edit_config(edit)
 

@@ -334,3 +334,126 @@ def test_noop_write_leaves_file_untouched(policy_config):
     """subscribed none on a pool without the key is a no-op — file not even written."""
     policy.set_subscribed("kiro", None)
     assert policy_config.read_text(encoding="utf-8") == FIXTURE
+
+
+# ------------------------------------------------- tester blockers (B1/B2/B3)
+
+CRLF_FIXTURE = FIXTURE.replace("\n", "\r\n")
+
+
+def _crlf_file(policy_config):
+    policy_config.write_bytes(CRLF_FIXTURE.encode("utf-8"))
+
+
+def test_crlf_file_stays_byte_identical(policy_config):
+    """B1: universal-newline read/write flattened CRLF on every write."""
+    _crlf_file(policy_config)
+    before = policy_config.read_bytes()
+    policy.set_policy("grok", "spend", until=STILL_ACTIVE)
+    mid = policy_config.read_bytes()
+    assert mid.count(b"\n") == mid.count(b"\r\n")  # no bare LF anywhere
+    assert b'backend = "handoffkeep"   # \xec\xa0\x95\xeb\xb3\xb8' in mid
+    policy.clear_policy("grok")
+    assert policy_config.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "writer,header",
+    [
+        (lambda: policy.set_policy("codex", "exclude", until=STILL_ACTIVE), CODEX),
+        (lambda: policy.clear_policy("claude"), CLAUDE),
+        (lambda: policy.set_subscribed("kiro", False), KIRO),
+        (lambda: policy.set_profile_subscribed("codex-max", True), PROF_CODEX_MAX),
+    ],
+    ids=["set_policy", "clear_policy", "set_subscribed", "set_profile_subscribed"],
+)
+def test_crlf_preserved_for_all_writers(policy_config, writer, header):
+    _crlf_file(policy_config)
+    before = policy_config.read_bytes()
+    writer()
+    after = policy_config.read_bytes()
+    assert after.count(b"\n") == after.count(b"\r\n")
+    for marker in (
+        'backend = "handoffkeep"   # 정본 저장소',
+        "allow_plaintext_quota_share = true   # ssh 터널이라 평문 허용",
+        'other = "모르는 섹션도 그대로"   # unknown section survives',
+    ):
+        assert (marker + "\r").encode("utf-8") in after
+    # every non-target line, line endings included, is unchanged
+    assert _mask_region(after.decode("utf-8"), header) == _mask_region(before.decode("utf-8"), header)
+
+
+def test_inline_table_subscribed_remove_refuses_not_noop(policy_config):
+    """B2: removal inside an inline table used to silently report success."""
+    policy_config.write_text(
+        '[pools]\ncodex = { subscribed = true, plan = "team", price_usd = 200 }\n'
+        '\n[bench]\nbackend = "keep"\n',
+        encoding="utf-8",
+    )
+    before = policy_config.read_bytes()
+    with pytest.raises(policy.ConfigEditError):
+        policy.set_subscribed("codex", None)
+    assert policy_config.read_bytes() == before
+
+
+def test_inline_table_profile_subscribed_remove_refuses(policy_config):
+    policy_config.write_text(
+        '[profiles]\n"codex-max" = { subscribed = true, label = "x" }\n',
+        encoding="utf-8",
+    )
+    before = policy_config.read_bytes()
+    with pytest.raises(policy.ConfigEditError):
+        policy.set_profile_subscribed("codex-max", None)
+    assert policy_config.read_bytes() == before
+
+
+def test_cli_subscribed_none_on_inline_table_is_refusal(policy_config, capsys, monkeypatch):
+    policy_config.write_text('[pools]\ncodex = { subscribed = true, plan = "team" }\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    before = policy_config.read_bytes()
+    rc = cli.main(["policy", "set", "codex", "--subscribed", "none"])
+    assert rc == 2
+    assert policy_config.read_bytes() == before
+
+
+def test_cli_combined_set_is_single_atomic_write(policy_config, monkeypatch):
+    """B3: class+subscribed used to commit in two separate writes."""
+    calls = []
+    original = policy._atomic_write
+
+    def spy(path, text):
+        calls.append(path)
+        original(path, text)
+
+    monkeypatch.setattr(policy, "_atomic_write", spy)
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    rc = cli.main(["policy", "set", "codex", "exclude", "--until", str(STILL_ACTIVE), "--subscribed", "off"])
+    assert rc == 0
+    assert len(calls) == 1
+    import tomllib
+
+    parsed = tomllib.loads(policy_config.read_text(encoding="utf-8"))
+    assert parsed["pools"]["codex"]["class"] == "exclude"
+    assert parsed["pools"]["codex"]["subscribed"] is False
+
+
+def test_cli_combined_set_failure_persists_nothing(policy_config, monkeypatch):
+    def boom(path, text):
+        raise OSError("injected failure")
+
+    monkeypatch.setattr(policy, "_atomic_write", boom)
+    monkeypatch.setattr(cli, "registry", lambda: dict(BUILTIN))
+    with pytest.raises(OSError):
+        cli.main(["policy", "set", "codex", "exclude", "--until", str(STILL_ACTIVE), "--subscribed", "off"])
+    assert policy_config.read_text(encoding="utf-8") == FIXTURE
+
+
+def test_pool_subscribed_none_via_set_policy(policy_config):
+    """The merged --subscribed none path drops an emptied pool table."""
+    policy.set_policy("kiro", None, subscribed=False)
+    assert "subscribed = false" in _region(policy_config.read_text(), KIRO)
+    policy.set_policy("kiro", None, subscribed=None)
+    text = policy_config.read_text(encoding="utf-8")
+    # kiro had plan = "team" — table survives, only the key is gone
+    assert "subscribed" not in _region(text, KIRO)
+    assert 'plan = "team"' in _region(text, KIRO)
