@@ -570,12 +570,27 @@ def test_add_retry_never_binds_a_foreign_twin(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "recorded rep id=origin:1" in out
     assert "srv:60000" not in out
+
+    # The unbound echo must not be absorbed into the twin's cache row: ours
+    # stays a separate origin: marker, the twin stays its own srv row.
     conn = _cache_db(tmp_path)
     try:
-        ours = conn.execute("SELECT server_id FROM bench_cache_reps WHERE cache_key = 'origin:1'").fetchall()
+        rows = {
+            row["cache_key"]: row["server_id"]
+            for row in conn.execute(
+                "SELECT cache_key, server_id FROM bench_cache_reps WHERE origin_id = 1"
+            ).fetchall()
+        }
     finally:
         conn.close()
-    assert ours == [] or all(row["server_id"] is None for row in ours)
+    assert rows == {"other-client:1": 60000, "origin:1": None}
+
+    _stamp_reps_cache_fresh()
+    assert cli.main(["reps", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "id=origin:1" in out
+    assert "id=srv:60000" in out  # the twin is real remote state — labeled as such
+    assert not _BARE_ID.search(out), out
 
 
 def test_refresh_echo_needs_a_proven_window(tmp_path, monkeypatch, capsys):

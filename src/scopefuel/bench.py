@@ -3226,16 +3226,15 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     cache row (see the client id column doc comment on ``_RemoteRep``).
 
     ``item.created_by`` is only ever ``None`` for an *anonymous* write-through
-    echo — a just-``push-local``'d or just-``add_rep``'d row, cached before the
-    next GET learns the server's identity for it. Such an echo is always this
-    process's own write for its own local ``origin_id``, never another
-    client's, so it may merge into whatever row already caches that
-    ``origin_id`` under any ``created_by`` (typically the very row this same
-    call's ``_replace_cached_reps`` pass just re-fetched) instead of piling up
-    a second, differently-keyed placeholder row for it. A cross-client
-    collision on one ``origin_id`` is only ever observed through *explicit*
-    (non-``None``) ``created_by`` values coming from a real GET, which always
-    take the exact-match branch below and so never merge with each other.
+    echo — a just-written rep cached before its server identity was proven.
+    The echo is this process's own write, but a *named* cache row sharing its
+    ``origin_id`` may be another client's same-content twin: folding the echo
+    into that row would pin a foreign pk onto our rep's display identity and
+    erase the local write marker. An echo therefore merges only into another
+    anonymous row for that ``origin_id`` (dedup of repeated unbound writes).
+    The server row for our own write is folded by the *bound* echo —
+    ``created_by`` + ``server_id`` copied from the post-write GET by
+    ``_bind_server_ids`` — through the exact-pair branch, never anonymously.
     """
     if item.created_by is not None:
         existing = conn.execute(
@@ -3248,8 +3247,8 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     else:
         existing = conn.execute(
             "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
-            "WHERE origin_id = ? "
-            "ORDER BY created_by IS NULL, server_id IS NULL, cache_key "
+            "WHERE origin_id = ? AND created_by IS NULL "
+            "ORDER BY server_id IS NULL, cache_key "
             "LIMIT 1",
             (item.origin_id,),
         ).fetchone()
@@ -3356,6 +3355,7 @@ def _bind_server_ids(
     fetched: list[_RemoteRep],
     *,
     backend: BenchBackend,
+    window_complete: bool | None = None,
 ) -> list[_RemoteRep]:
     """Attach the server pk each written rep got, proven by the post-write GET.
 
@@ -3378,7 +3378,8 @@ def _bind_server_ids(
     by_origin: dict[int, list[_RemoteRep]] = {}
     for item in fetched:
         by_origin.setdefault(item.origin_id, []).append(item)
-    window_complete = len(fetched) < _MIGRATE_REP_WINDOW
+    if window_complete is None:
+        window_complete = len(fetched) < _MIGRATE_REP_WINDOW
     profile_pages: dict[str, tuple[list[_RemoteRep], bool]] = {}
 
     def _profile_page(profile: str) -> tuple[list[_RemoteRep], bool]:
@@ -3847,14 +3848,21 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
             "[bench] allow_plaintext_reps = true on a private tunnel)"
         )
 
-    # Fetch both scopes before the first PUT so a failed refresh or write leaves
-    # all local cache tables and their timestamps untouched.
+    # Fetch scores before the first PUT so a failed refresh or write leaves
+    # all local cache tables and their timestamps untouched. Reps are read
+    # after their PUT instead: the post-write fetch both refreshes the cache
+    # and proves which server row each pushed rep became, so the committed
+    # echoes fold into their own srv rows instead of sitting anonymous beside
+    # them.
     fetched_scores = _fetch_scores(catalog_backend) if scores else []
-    fetched_reps = _fetch_reps(reps_backend) if remote_reps else []
     if scores:
         _put_score_batches(catalog_backend, scores)
     if remote_reps:
         _put_rep_batches(reps_backend, remote_reps)
+        fetched_reps = _fetch_reps(reps_backend, query={"limit": _MIGRATE_REP_WINDOW})
+        remote_reps = _bind_server_ids(remote_reps, fetched_reps, backend=reps_backend)
+    else:
+        fetched_reps = []
     try:
         _commit_push_cache(
             path=path,
@@ -4186,11 +4194,15 @@ def migrate_reps(
 
     remote_after = _fetch_reps_for_migrate(backend, {rep.profile for rep in local_reps})
     if written:
+        # remote_after is provably complete for these profiles — a full
+        # per-profile page raises inside _fetch_reps_for_migrate — so a
+        # unique same-content match here is the migrated row itself.
+        bound = _bind_server_ids(written, remote_after, backend=backend, window_complete=True)
         try:
             # Commit the post-write read: the freshly migrated rows already
             # carry their server id, so the cache shows srv: refs at once
             # instead of waiting on the refresh pass.
-            _commit_rep_cache(path=path, fetched=remote_after, written=written, backend=backend)
+            _commit_rep_cache(path=path, fetched=remote_after, written=bound, backend=backend)
         except (sqlite3.Error, OSError) as exc:
             raise BenchBackendError("local bench cache update failed") from exc
     index_after = _rep_content_index(remote_after)
