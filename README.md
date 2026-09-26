@@ -145,7 +145,7 @@ scopefuel gate -m oc-omni --operator-request hk:task/461 --requested-by operator
 소진 판정이 완화되지 않습니다. (3) stale 폴백 수용은 계속 fail-closed입니다 — 필수 창 커버리지가
 갖춰지지 않은 stale 스냅샷은 수용되지 않으며, 거부 사유가 부족한 창을 지목합니다.
 
-### E6 측정 런그와 arm 표식 (task #692)
+### E6 측정 런그와 arm 표식 (task #692, grok·sol-medium 런그 #737)
 
 E6(#594, `hk:doc plan/2026-09-25/e6-effort-ladder`)는 한 모델을 여러 effort로 실과제에서
 비교합니다. 그 런그 중 표가 몰랐던 것은 이제 **카탈로그 행**으로 존재합니다 — 급 C·점수 없음
@@ -157,8 +157,11 @@ E6(#594, `hk:doc plan/2026-09-25/e6-effort-ladder`)는 한 모델을 여러 effo
 |---|---|---|---|---|
 | `sonnet` | claude-sonnet-5 | max | claude | C |
 | `codex-sol` | gpt-6-sol | high | codex | C |
+| `codex-sol` | gpt-6-sol | medium | codex | C |
 | `kimi-k3` | kimi-k3 | high | kimi | C |
 | `kimi-k3` | kimi-k3 | max | kimi | C |
+| `grok-hi` | grok-4.7 | low | grok | C |
+| `grok-hi` | grok-4.7 | medium | grok | C |
 | `grok-hi` | grok-4.7 | xhigh | grok | C |
 
 이 런그는 **명시적 arm 표식** 하나로만 열립니다 — 스포너가 스폰 명령에 붙이는 환경변수입니다.

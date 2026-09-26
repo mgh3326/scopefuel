@@ -42,8 +42,12 @@ NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
 NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
     ("sonnet", "max"): ("claude", "claude-sonnet-5", "max 38.2"),
     ("codex-sol", "high"): ("codex", "gpt-6-sol", "high 42.8"),
+    ("codex-sol", "medium"): ("codex", "gpt-6-sol", "medium 미저장"),
     ("kimi-k3", "high"): ("kimi", "kimi-k3", "default 61.0"),
     ("kimi-k3", "max"): ("kimi", "kimi-k3", "max 43.6"),
+    # #737 (decision 4088): the grok E6 arms — builder-grok-low/-medium/-xhigh.
+    ("grok-hi", "low"): ("grok", "grok-4.7", "high 46.3"),
+    ("grok-hi", "medium"): ("grok", "grok-4.7", "high 46.3"),
     ("grok-hi", "xhigh"): ("grok", "grok-4.7", "high 46.3"),
 }
 # The rungs the E6 arms use that the catalog already placed — no new row may
@@ -806,8 +810,9 @@ def test_an_explicit_effort_wins_over_a_marker_naming_a_different_rung():
 
 def test_an_effort_the_table_does_not_know_still_falls_back_to_the_default():
     """Unchanged #692 fallback: a spelled rung with no row answers the profile's
-    default placement (grok-hi has no @medium row — only the C E6 rung at xhigh)."""
-    result = gate_check(_healthy_providers(), "grok-hi", effort="medium", today=TODAY, now=NOW)
+    default placement (grok-hi has no @ultra row — the E6 rungs are low/medium/
+    xhigh and none of them is 'ultra')."""
+    result = gate_check(_healthy_providers(), "grok-hi", effort="ultra", today=TODAY, now=NOW)
     assert result.ok is True
     assert result.grade == "S"
 
