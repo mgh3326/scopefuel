@@ -539,6 +539,10 @@ POOL_SUB_LF = b"[pools.codex]\nsubscribed = false\n"
         (BENCH_KEEP_CRLF, POOL_SUB_CRLF[:-2]),
         (BENCH_KEEP_LF, POOL_SUB_LF),
         (BENCH_KEEP_LF, POOL_SUB_LF[:-1]),
+        # a pre-existing blank before the deleted region is non-target content
+        (BENCH_KEEP_CRLF + b"\r\n", POOL_SUB_CRLF),
+        (BENCH_KEEP_LF + b"\n", POOL_SUB_LF),
+        (BENCH_KEEP_LF + b"\n", POOL_SUB_LF[:-1]),
     ],
 )
 def test_delete_table_at_eof(policy_config, prefix, pool):

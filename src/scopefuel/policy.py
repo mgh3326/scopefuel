@@ -475,10 +475,11 @@ class _Doc:
     def _delete_lines(self, start: int, end: int) -> None:
         reached_eof = end >= len(self.lines)
         del self.lines[start:end]
-        if reached_eof and self.lines and self.lines[-1] != "":
-            # the deleted span consumed the file end; the line now last was
-            # mid-file and owned a newline — keep a phantom tail so it
-            # terminates (a CRLF file can never end on a lone '\r').
+        if reached_eof and self.lines:
+            # the deleted span consumed the file end; every surviving line
+            # was mid-file and owned a newline — keep a phantom tail so it
+            # terminates (a CRLF file can never end on a lone '\r', and a
+            # surviving blank line keeps its own newline too).
             self.lines.append("")
 
     def _rescan(self) -> None:
@@ -548,14 +549,18 @@ class _Doc:
             if other.path and other.path[0] == parent[0]:
                 idx = other.end
                 break
-        if idx >= len(self.lines):
+        at_eof = idx >= len(self.lines)
+        if at_eof:
             idx = self._eof_insert_index()
         segs = [_key_seg_text(s) for s in parent]
         if quote_table:
             segs[-1] = _toml_string(parent[-1])
         header = "[" + ".".join(segs) + "]"
         block = [header, f"{_key_seg_text(key)} = {text_value}"]
-        before = [""] if idx > 0 and self.lines[idx - 1].strip() else []
+        # no separator blank on an EOF append — inserts stay byte-minimal so a
+        # later delete can restore the pre-insert tail exactly (a blank added
+        # here is indistinguishable from one the user wrote before the table).
+        before = [""] if not at_eof and idx > 0 and self.lines[idx - 1].strip() else []
         after = [""] if idx < len(self.lines) and self.lines[idx].strip() else []
         self.lines[idx:idx] = [self._eol(line) for line in before + block + after]
         self._rescan()
