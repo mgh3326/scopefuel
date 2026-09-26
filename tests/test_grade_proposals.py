@@ -2245,3 +2245,18 @@ def test_model_match_is_exact_case_sensitive_identity(tmp_path, isolated_cache):
     rows = {row.rep.model_id: row for row in proposal.evidence.rows}
     assert "model mismatch" in rows["vendor/model-a"].excluded
     assert rows["vendor/Model-A"].excluded == ""
+
+
+def test_apply_refuses_artifact_naming_ghost_ref(tmp_path, isolated_cache, monkeypatch):
+    """Tester BLOCKER r3: the stored digest binds live evidence, not the
+    artifact's claimed refs — a result forged to cite a rep that never existed
+    (local:999) or a ref the live result does not rest on is refused."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    proposal = _propose(canon)
+    artifact = grades.proposal_to_json(proposal, canon)
+    promote = next(r for r in artifact["results"] if r["action"] == "promote")
+    promote["evidence"].append("local:999")
+    with pytest.raises(bench.BenchError, match="absent from its live evidence"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-759")

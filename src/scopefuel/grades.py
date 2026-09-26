@@ -2048,6 +2048,7 @@ def apply_proposals(
     # and apply refuses it outright (the digest check alone cannot see the
     # artifact's claimed evidence).
     anomaly_refs = {row.ref for row in live.evidence.rows if row.anomaly}
+    live_by_key = {result.key: result for result in live.results}
     for key, item in recorded.items():
         claimed = {ref for ref in _recorded_result_refs(item) if isinstance(ref, str)}
         bad = sorted(claimed & anomaly_refs)
@@ -2056,6 +2057,24 @@ def apply_proposals(
                 f"proposal for {key[0]}@{key[1]} rests on anomalous rep(s) "
                 f"{', '.join(bad)} — excluded pending review; rerun `grades propose` "
                 "after the operator reviews the anomaly"
+            )
+        # The stored digest binds live evidence, not the artifact's claimed
+        # refs: every ref the artifact names must be a ref the live result for
+        # this rung actually rests on. A ghost (a ref absent from the store) or
+        # a borrowed ref from another rung means the artifact was forged after
+        # recording — fail closed.
+        live_result = live_by_key.get(key)
+        live_refs = (
+            {ref for ref in _recorded_result_refs(live_result.as_dict())}
+            if live_result is not None
+            else set()
+        )
+        ghosts = sorted(ref for ref in claimed if ref not in live_refs)
+        if ghosts:
+            raise bench.BenchError(
+                f"proposal for {key[0]}@{key[1]} names rep(s) "
+                f"{', '.join(ghosts)} absent from its live evidence — the artifact "
+                "was forged or built on a different store; rerun `grades propose`"
             )
     for result in live.changes():
         want = recorded.get(result.key)
