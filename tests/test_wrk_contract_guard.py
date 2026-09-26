@@ -51,8 +51,10 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "codex": ("codex-sol", "high"),
     "codex-sol": ("codex-sol", None),
     "codex-max": ("codex-sol", None),
-    "builder-sol": ("codex-sol", None),
-    "captain-sol": ("codex-sol", None),
+    # decision 4088B: a builder seat never takes the max rung — wrk's
+    # resolve_catalog_profile pins high for both sol builder spellings.
+    "builder-sol": ("codex-sol", "high"),
+    "captain-sol": ("codex-sol", "high"),
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     # #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.

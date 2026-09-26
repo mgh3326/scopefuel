@@ -57,10 +57,11 @@ import hashlib
 import json
 import re
 import socket
+from collections import Counter
 from dataclasses import dataclass, field
 
 from . import bench, launch
-from .recommend import profile_pool, profile_subscription
+from .recommend import PROFILE_ALIASES, profile_pool, profile_subscription
 
 # ---------------------------------------------------------------------------
 # The rule
@@ -99,95 +100,220 @@ STATIC_SUPERSEDES: tuple[tuple[str, str], ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Spawn-spelling -> catalog (profile, effort pin) — a mirror of wrk's
-# ``resolve_catalog_profile``. A rep records the launcher's spelling; the
-# catalog is keyed on the canonical profile, so evidence can only land on a
-# rung through this map. A spelling absent here is its own catalog profile
-# (the fail-safe direction, same as wrk).
+# Rep -> rung resolution (task #750)
+#
+# A rep records the *launcher spelling* it was spawned with; the catalog is
+# keyed on (profile, effort) rungs, so evidence can only land through the maps
+# below. Resolution has two halves — the profile basis and the effort basis —
+# and both are disclosed per counted rep (``resolved=...`` in the output):
+#
+# * ``builder map`` — a wrk builder spelling (``_BUILDER_RUNGS``) carries its
+#   base catalog profile and, where the spelling pins one, the pinned effort.
+#   The table mirrors wrk's ``resolve_catalog_profile``/gate tables; the
+#   fixture guard in tests/test_rep_rung_resolution.py fails when wrk adds a
+#   builder spelling that is not mapped.
+# * ``alias`` — a non-builder spelling names a catalog profile by another
+#   name: wrk worker spellings (``_SPELLING_ALIASES``), legacy rep spellings
+#   recorded by older tooling, and ``recommend.PROFILE_ALIASES`` entries such
+#   as ``codex-max -> codex-sol``.
+# * ``default effort`` — a rep on a catalog profile with no recorded effort
+#   lands on the profile's catalog default rung (``launch._default_effort``)
+#   and is marked ``effort inferred``: the rung was derived, never measured.
+# * ``direct`` — the rep's own profile and recorded effort name the rung.
+#
+# Two precedence rules keep the derivation honest:
+#
+# * the recorded rep effort always wins over a spelling pin — the rep is the
+#   record of what actually ran;
+# * a spelling pin wins over the profile default — it is the rung the launch
+#   consulted (``builder-sol`` consults codex-sol@high, not the max default).
+#
+# A rep that still cannot be resolved — an unknown spelling, or a rung no live
+# catalog row governs — is reported as unrung, never silently counted.
 # ---------------------------------------------------------------------------
 
-_SPAWN_CATALOG: dict[str, tuple[str, str]] = {
-    "opus": ("opus", ""),
+# wrk builder spellings -> (catalog profile, effort pin or ""). Mirror of
+# bin/wrk resolve_catalog_profile()'s CATALOG_PROFILE/CATALOG_EFFORT_PIN plus
+# the catalog-exempt builder spellings (devin-*/kimi-* take the same-named
+# catalog profile; their launchers pass no effort flag, so the pin is "").
+# decision 4088 B: builder-sol/captain-sol pin high — a builder seat never
+# takes the max rung.
+_BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-opus": ("opus", ""),
     "captain-opus": ("opus", ""),
     "builder-opus-low": ("opus", "low"),
     "builder-opus-medium": ("opus", "medium"),
-    "sonnet": ("sonnet", ""),
-    "sonnet-med": ("sonnet", ""),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
-    "haiku": ("haiku", ""),
-    "fable": ("fable", ""),
-    "codex": ("codex-sol", "high"),
-    "codex-sol": ("codex-sol", ""),
-    "codex-max": ("codex-sol", ""),
-    "builder-sol": ("codex-sol", ""),
-    "captain-sol": ("codex-sol", ""),
-    "codex-terra": ("codex-terra", "medium"),
-    "codex-med": ("codex-terra", "medium"),
-    "codex-terra-max": ("codex-terra-max", ""),
-    "codex-luna": ("codex-luna", "medium"),
-    "codex-luna-hi": ("codex-luna", "high"),
-    "codex-luna-max": ("codex-luna-max", ""),
-    "builder-luna": ("codex-luna", "xhigh"),
+    "builder-sol": ("codex-sol", "high"),
+    "captain-sol": ("codex-sol", "high"),
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     "builder-sol-medium": ("codex-sol", "medium"),
+    # #633: builder-luna is codex-luna admitted under --role builder at the
+    # #594 E3 rung (xhigh).
+    "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
     "builder-terra-high": ("codex-terra", "high"),
     "builder-terra-xhigh": ("codex-terra", "xhigh"),
     "builder-terra-max": ("codex-terra", "max"),
-    "codex-astra": ("codex-astra", ""),
-    "kiro-opus": ("kiro-opus", ""),
-    "kiro-opus-xhigh": ("kiro-opus", "xhigh"),
-    "kiro-opus-max": ("kiro-opus", "max"),
-    "kiro-sonnet": ("kiro-sonnet", ""),
-    "kiro-sol": ("kiro-sol", ""),
-    "kiro-sol-xhigh": ("kiro-sol", "xhigh"),
-    "kiro-sol-max": ("kiro-sol", "max"),
-    "kiro-cheap": ("kiro-cheap", ""),
-    "kiro-haiku": ("kiro-haiku", ""),
-    "grok": ("grok-hi", ""),
-    "grok-hi": ("grok-hi", ""),
-    "grok-med": ("grok", "medium"),
+    # Task-240 pilot + #737 E6 rungs: grok-hi@<rung>.
     "builder-grok": ("grok-hi", "xhigh"),
-    # #737 (decision 4088): the E6 grok rungs pin grok-hi@<suffix>.
     "builder-grok-low": ("grok-hi", "low"),
     "builder-grok-medium": ("grok-hi", "medium"),
     "builder-grok-xhigh": ("grok-hi", "xhigh"),
-    "cc-qwen38": ("cc-qwen38", ""),
-    "cc-glm": ("cc-glm", ""),
-    # kimi spellings are not in wrk's resolve_catalog_profile (the catalog once
-    # carried no kimi rows), but the #704 gate consults the catalog at the
-    # pinned rung: builder-kimi-<effort> measures kimi-k3@<effort>.
-    "kimi-k3": ("kimi-k3", ""),
-    "kimi-k3-low": ("kimi-k3", "low"),
+    # #666 devin builders: the builder spellings name the catalog profile
+    # directly — devin-swe2-max/-medium are profiles, not rungs of devin-swe2 —
+    # and devin launchers carry no effort flag.
+    "builder-devin": ("devin-swe2", ""),
+    "builder-devin-medium": ("devin-swe2-medium", ""),
+    "builder-devin-max": ("devin-swe2-max", ""),
+    "builder-ds41": ("devin-ds41", ""),
+    "builder-ds41-max": ("devin-ds41-max", ""),
+    # kimi spellings are not in wrk's resolve_catalog_profile (catalog-exempt),
+    # but the #704 gate consults the catalog at the pinned rung:
+    # builder-kimi-<effort> measures kimi-k3@<effort>.
     "builder-kimi": ("kimi-k3", ""),
     "builder-kimi-high": ("kimi-k3", "high"),
     "builder-kimi-max": ("kimi-k3", "max"),
-    # E6 devin arms (task #594): the builder spellings name the catalog
-    # profile directly — devin-swe2-max/-medium are profiles, not rungs of
-    # devin-swe2 — and devin launchers carry no effort flag.
-    "builder-devin": ("devin-swe2", ""),
-    "builder-devin-max": ("devin-swe2-max", ""),
-    "builder-devin-medium": ("devin-swe2-medium", ""),
-    "builder-ds41": ("devin-ds41", ""),
-    "builder-ds41-max": ("devin-ds41-max", ""),
 }
 
+# Non-builder spelling -> (catalog profile, effort pin or ""). Two sources:
+#
+# * wrk worker spellings whose name is not the catalog profile's (``grok``
+#   launches grok-hi, ``codex`` pins codex-sol@high, ``sonnet-med`` is sonnet);
+# * legacy rep spellings recorded before the canonical names settled
+#   (``claude-opus`` and the model-id spellings are the opus profile).
+#
+# Spellings that are already catalog profile names resolve directly and are
+# deliberately absent — a bare ``opus``/``sonnet``/``kimi-k3-low`` rep needs
+# no map. Ambiguous legacy spellings stay unmapped on purpose: ``claude``
+# alone names no model, so those reps report as unrung rather than guess.
+_SPELLING_ALIASES: dict[str, tuple[str, str]] = {
+    # wrk worker spellings (resolve_catalog_profile)
+    "codex": ("codex-sol", "high"),
+    "codex-med": ("codex-terra", "medium"),
+    "codex-luna-hi": ("codex-luna", "high"),
+    "sonnet-med": ("sonnet", ""),
+    "grok": ("grok-hi", ""),
+    "grok-med": ("grok", "medium"),
+    # kiro rung spellings
+    "kiro-opus-xhigh": ("kiro-opus", "xhigh"),
+    "kiro-opus-max": ("kiro-opus", "max"),
+    "kiro-sol-xhigh": ("kiro-sol", "xhigh"),
+    "kiro-sol-max": ("kiro-sol", "max"),
+    # legacy rep spellings (pre-canonical names and model ids in old rows)
+    "claude-opus": ("opus", ""),
+    "claude-opus-5": ("opus", ""),
+    "claude-opus5-verify": ("opus", ""),
+    "sonnet-medium": ("sonnet", ""),
+    "kimi-code": ("kimi-k3", ""),
+    "agy-flash37": ("agy-flash", ""),
+}
 
-def _rep_rung(rep: bench.RepRecord) -> tuple[str, str]:
-    """The catalog rung this rep measured: (catalog profile, effective effort).
+# Resolution kinds, printed per counted rep (AC2). Kind precedence: the
+# profile basis wins — a builder-map or alias rep keeps that kind even when
+# its effort was inferred (the ``effort inferred`` flag still prints).
+_KIND_DIRECT = "direct"
+_KIND_BUILDER_MAP = "builder map"
+_KIND_ALIAS = "alias"
+_KIND_DEFAULT_EFFORT = "default effort"
 
-    The effort is the one recorded on the rep, else the spelling's pin (the
-    rung wrk consulted for it), else the launcher's own default for profiles
-    that pin nothing (``builder-sol`` runs at codex-sol's launcher default,
-    max), else "" for launchers that carry no effort flag.
+
+@dataclass(frozen=True)
+class RungResolution:
+    """How one rep's (profile, effort) rung was derived."""
+
+    profile: str
+    effort: str
+    kind: str  # _KIND_*
+    effort_inferred: bool  # effort came from the catalog default, not the rep or a pin
+    detail: str  # e.g. "builder-grok -> grok-hi@xhigh" — the printed basis
+
+
+def _catalog_default_effort(
+    profile: str, rows: list[bench.CatalogEntry] | None
+) -> str:
+    """The effort of the profile's catalog default rung (launch semantics).
+
+    ``launch._default_effort`` over the profile's ordinary rows answers the
+    rung a bare ``policy launch <profile>`` starts on; "" is returned when the
+    profile has no ordinary placement to infer from.
     """
 
-    profile, pin = _SPAWN_CATALOG.get(rep.profile, (rep.profile, ""))
-    effort = rep.effort or pin or launch.DEFAULT_LAUNCH_EFFORTS.get(profile, "")
-    return profile, effort
+    ordinary = [row for row in rows or () if not row.retired_at and not launch._unmeasured_e6_row(row)]
+    if not ordinary:
+        return ""
+    catalog_effort, _ = launch._default_effort(profile, ordinary)
+    return catalog_effort
+
+
+def _resolve_rep_rung(
+    rep: bench.RepRecord, catalog_rows: dict[str, list[bench.CatalogEntry]]
+) -> RungResolution:
+    """Resolve a rep to its catalog rung, recording the basis used.
+
+    Profile basis order: builder map, then non-builder aliases, then
+    ``recommend.PROFILE_ALIASES``, then the spelling taken literally (direct).
+    Effort basis order: the rep's recorded effort, then the spelling's pin,
+    then the profile's catalog default (marked ``effort inferred``).
+    """
+
+    spelling = rep.profile
+    effort_inferred = False
+    if spelling in _BUILDER_RUNGS:
+        profile, pin = _BUILDER_RUNGS[spelling]
+        kind = _KIND_BUILDER_MAP
+    elif spelling in _SPELLING_ALIASES:
+        profile, pin = _SPELLING_ALIASES[spelling]
+        kind = _KIND_ALIAS
+    elif spelling in PROFILE_ALIASES:
+        profile, pin = PROFILE_ALIASES[spelling], ""
+        kind = _KIND_ALIAS
+    else:
+        profile, pin = spelling, ""
+        kind = _KIND_DIRECT
+
+    if rep.effort:
+        effort = rep.effort
+    elif pin:
+        effort = pin
+    else:
+        effort = _catalog_default_effort(profile, catalog_rows.get(profile))
+        effort_inferred = True
+        if kind == _KIND_DIRECT:
+            kind = _KIND_DEFAULT_EFFORT
+
+    rung_label = f"{profile}{'@' + effort if effort else ''}"
+    detail = (
+        f"{spelling} -> {rung_label}"
+        if spelling != profile or effort_inferred
+        else f"{rung_label} (as recorded)"
+    )
+    return RungResolution(
+        profile=profile, effort=effort, kind=kind,
+        effort_inferred=effort_inferred, detail=detail,
+    )
+
+
+def _grading_entries(view: bench.CatalogView) -> tuple[bench.CatalogEntry, ...]:
+    """The rung universe propose/apply evaluate.
+
+    The canon can be only partially seeded — today a profile joins it when the
+    operator pushes a decided row. For a profile the canon never mentions (a
+    retired row still counts as mentioned — the canon has spoken), the bundled
+    snapshot carries the reviewed placement, exactly the coverage rule
+    ``bench._catalog_grade_table`` applies for recommend/policy. Evidence on
+    those profiles resolves to the snapshot's rungs — labelled, so a snapshot
+    placement is never indistinguishable from a canon row. The snapshot's
+    unmeasured E6 rungs are part of it: builder-spelling reps measuring an E6
+    arm land on those rows and grade them.
+    """
+
+    covered = {entry.profile for entry in view.entries}
+    return view.entries + tuple(
+        entry for entry in bench.catalog_snapshot() if entry.profile not in covered
+    )
 
 
 def _judging_row(rows: list[bench.CatalogEntry], effort: str) -> bench.CatalogEntry | None:
@@ -246,6 +372,9 @@ class EvidenceRep:
     row_key: tuple[str, str] | None = None  # the catalog row governing the rung
     excluded: str = ""  # non-empty reason when not counted
     grade_backfilled: bool = False  # rep.grade came from a rep_grade_annotations row
+    resolution: str = ""  # direct | builder map | alias | default effort ("" when unrung)
+    effort_inferred: bool = False  # rung effort came from the catalog default
+    resolution_detail: str = ""  # the printed basis; the unrung reason when row_key is None
 
 
 def _classify(rep: bench.RepRecord) -> str:
@@ -514,7 +643,7 @@ def _finish_rows(
     """Kind, rung, judging row, and exclusion disposition for every row."""
 
     catalog_rows: dict[str, list[bench.CatalogEntry]] = {}
-    for entry in view.entries:
+    for entry in _grading_entries(view):
         catalog_rows.setdefault(entry.profile, []).append(entry)
 
     specs: list[tuple[str, str, str, list[str]]] = [
@@ -548,16 +677,35 @@ def _finish_rows(
 
     for index, row in enumerate(evidence.rows):
         kind = _classify(row.rep)
-        rung = _rep_rung(row.rep)
+        resolution = _resolve_rep_rung(row.rep, catalog_rows)
+        rung = (resolution.profile, resolution.effort)
         candidates = catalog_rows.get(rung[0])
         judging = _judging_row(candidates, rung[1]) if candidates else None
         reason = row.excluded or excluded.get(row.ref, "")
+        if judging is None:
+            # Unrung — reported, never counted. The detail names the blockage:
+            # an unknown spelling has no rows at all; an exact-effort row that
+            # is retired, or a profile left with only unmeasured E6/retired
+            # rows, has no live row to judge it.
+            if not candidates:
+                detail = f"no catalog profile for '{resolution.profile}'"
+            elif any(e.effort == rung[1] and e.retired_at for e in candidates):
+                detail = f"rung retired: {resolution.detail}"
+            else:
+                detail = f"no live catalog row for {resolution.detail}"
+            resolved_kind, inferred = "", False
+        else:
+            detail = resolution.detail
+            resolved_kind, inferred = resolution.kind, resolution.effort_inferred
         evidence.rows[index] = dataclasses.replace(
             row,
             kind=kind,
             rung=rung,
             row_key=judging.key if judging else None,
             excluded=reason,
+            resolution=resolved_kind,
+            effort_inferred=inferred,
+            resolution_detail=detail,
         )
 
 
@@ -720,6 +868,10 @@ class RungResult:
     fails: list[tuple[str, str | None]]
     evidence_refs: list[str]
     note: str
+    # True when the row being evaluated is a bundled-snapshot stand-in for a
+    # profile the canon never mentions — labelled so a snapshot placement is
+    # never indistinguishable from a canon row.
+    snapshot_row: bool = False
 
     def label(self) -> str:
         return f"{self.key[0]}{'@' + self.key[1] if self.key[1] else ''}"
@@ -731,6 +883,7 @@ class RungResult:
             "current": self.row.grade,
             "action": self.action,
             "target": self.target,
+            "row_source": "snapshot" if self.snapshot_row else "canon",
             "passes_at": {grade: list(refs) for grade, refs in self.passes_at.items()},
             "ungraded_passes": list(self.ungraded_passes),
             "unclean_passes": list(self.unclean_passes),
@@ -916,6 +1069,12 @@ class Proposal:
     evidence: RepsEvidence
     min_passes: int
     digest: str = ""
+    # The rung universe actually evaluated: canon rows plus bundled snapshot
+    # rows for profiles the canon never mentions (see _grading_entries).
+    catalog_entries: tuple[bench.CatalogEntry, ...] = ()
+    # Profiles whose rungs stand in from the snapshot — disclosed, since a
+    # snapshot placement is a reviewed default, not a canon decision.
+    snapshot_profiles: frozenset[str] = frozenset()
 
     def changes(self) -> list[RungResult]:
         return [r for r in self.results if r.action in ("promote", "demote") and r.target != r.row.grade]
@@ -940,29 +1099,51 @@ def evaluate(
             continue
         grouped.setdefault(item.row_key, []).append(item)
 
+    entries = _grading_entries(view)
+    covered = {entry.profile for entry in view.entries}
+    # "Stand-in" is only meaningful against a real canon read: under a
+    # snapshot/unsupported view every row is already the fallback universe.
+    snapshot_profiles = (
+        frozenset(entry.profile for entry in entries if entry.profile not in covered)
+        if view.source in (bench.CATALOG_SOURCE_SERVER, bench.CATALOG_SOURCE_CACHE)
+        else frozenset()
+    )
+    by_key = {entry.key: entry for entry in entries}
     results: list[RungResult] = []
-    for key in sorted(view.by_key()):
-        row = view.by_key()[key]
+    for key in sorted(by_key):
+        row = by_key[key]
         if row.retired_at:
             continue
         counted = grouped.get(key, [])
         excluded = excluded_by_row.get(key, [])
         if not counted and not excluded:
             continue
-        results.append(_evaluate_row(row, counted, excluded, min_passes))
+        result = _evaluate_row(row, counted, excluded, min_passes)
+        if key[0] in snapshot_profiles:
+            result.snapshot_row = True
+        results.append(result)
 
-    proposal = Proposal(results=results, unrung=unrung, evidence=evidence, min_passes=min_passes)
-    proposal.digest = _input_digest(proposal, view)
+    proposal = Proposal(
+        results=results,
+        unrung=unrung,
+        evidence=evidence,
+        min_passes=min_passes,
+        catalog_entries=entries,
+        snapshot_profiles=snapshot_profiles,
+    )
+    proposal.digest = _input_digest(proposal)
     return proposal
 
 
-def _input_digest(proposal: Proposal, view: bench.CatalogView) -> str:
+def _input_digest(proposal: Proposal) -> str:
     """Fingerprint the full evaluation input — reps, exclusions, rules, catalog.
 
     ``apply`` recomputes this digest against live stores and refuses to write
     when it differs: a proposal can only be applied to exactly the evidence it
     was computed from, so a stale artifact or a changed rep store fails loud
-    instead of writing an unproven change.
+    instead of writing an unproven change. The catalog serialized here is the
+    evaluated rung universe (canon plus snapshot stand-ins), not only what the
+    backend returned.
     """
 
     evidence = proposal.evidence
@@ -970,7 +1151,10 @@ def _input_digest(proposal: Proposal, view: bench.CatalogView) -> str:
         "rule_version": RULE_VERSION,
         "min_passes": proposal.min_passes,
         "backend": evidence.backend,
-        "catalog": [entry.as_dict() for entry in sorted(view.entries, key=lambda e: e.key)],
+        "catalog": [
+            entry.as_dict()
+            for entry in sorted(proposal.catalog_entries, key=lambda e: e.key)
+        ],
         "exclusions": [{"old": e.old_spec, "new": e.new_spec} for e in evidence.exclusions],
         "reps": [
             {
@@ -981,6 +1165,8 @@ def _input_digest(proposal: Proposal, view: bench.CatalogView) -> str:
                 "row_key": list(row.row_key) if row.row_key else None,
                 "excluded": row.excluded or None,
                 "grade_backfilled": row.grade_backfilled,
+                "resolution": row.resolution or None,
+                "effort_inferred": row.effort_inferred or None,
             }
             for row in evidence.rows
         ],
@@ -1011,6 +1197,16 @@ def _fmt_evidence(item: EvidenceRep) -> str:
         rung_effort = item.rung[1] or "(none)"
         row_effort = item.row_key[1] or "(default)"
         bits.append(f"rung-effort={rung_effort}->judged-by-{row_effort}")
+    if item.resolution:
+        # The printed basis (AC2): which rule resolved the rung, and whether
+        # the effort was measured on the rep or inferred from the profile's
+        # catalog default. An inferred effort is never presented as measured.
+        detail = (
+            f"{item.resolution_detail}{' (effort inferred)' if item.effort_inferred else ''}"
+        )
+        bits.append(f"resolved={item.resolution}:{detail}")
+    elif item.resolution_detail:
+        bits.append(f"unresolved:{item.resolution_detail}")
     return " ".join(bits)
 
 
@@ -1084,6 +1280,26 @@ def render_proposal(
             "  degraded input — apply refuses this proposal without --allow-degraded: " + "; ".join(degraded)
         )
     lines.append(view.label)
+    if proposal.snapshot_profiles:
+        lines.append(
+            "  note: canon covers no row for these profiles — bundled snapshot "
+            "placements stand in (results marked [snapshot-placement]): "
+            + ", ".join(sorted(proposal.snapshot_profiles))
+        )
+
+    counted = [row for row in evidence.rows if not row.excluded and row.row_key is not None]
+    if counted:
+        by_kind = Counter(row.resolution for row in counted)
+        inferred = sum(1 for row in counted if row.effort_inferred)
+        kinds = " ".join(
+            f"{kind}={by_kind.get(kind, 0)}"
+            for kind in (_KIND_DIRECT, _KIND_BUILDER_MAP, _KIND_DEFAULT_EFFORT, _KIND_ALIAS)
+            if by_kind.get(kind, 0)
+        )
+        lines.append(
+            f"resolution basis ({len(counted)} counted reps): {kinds}"
+            f" — effort inferred on {inferred}"
+        )
 
     if evidence.exclusions:
         lines.append("exclusions:")
@@ -1100,6 +1316,7 @@ def render_proposal(
             lines.append(
                 f"  {r.action} {r.label()} {r.row.grade} -> {r.target}"
                 f"{_unsubscribed_tag(r.key[0], r.row.pool)}"
+                f"{' [snapshot-placement]' if r.snapshot_row else ''}"
             )
             lines.append(f"    rule: {r.note}")
             for item in r.counted:
@@ -1116,6 +1333,7 @@ def render_proposal(
             lines.append(
                 f"  {r.action:<12} {r.label()} current={r.row.grade} — {r.note}"
                 f"{_unsubscribed_tag(r.key[0], r.row.pool)}"
+                f"{' [snapshot-placement]' if r.snapshot_row else ''}"
             )
             summary = [f"{grade}:{len(refs)}" for grade, refs in r.passes_at.items()]
             if r.ungraded_passes:
@@ -1126,15 +1344,17 @@ def render_proposal(
                 summary.append(f"fails:{len(r.fails)}")
             if summary:
                 lines.append(f"    counts: {' '.join(summary)}")
+            # AC2: every counted rep prints how its rung was resolved, not
+            # only the refs that drove a proposed change.
+            for item in r.counted:
+                lines.append(f"    evidence {_fmt_evidence(item)}")
             for item in r.excluded:
                 lines.append(f"    excluded {item.ref} ({item.excluded})")
 
     if proposal.unrung:
-        lines.append("unrung evidence (rep rung has no live catalog row — reported, not counted):")
-        retired = {key for key, entry in view.by_key().items() if entry.retired_at}
+        lines.append("unrung evidence (rep rung could not be resolved — reported, not counted):")
         for item in proposal.unrung:
-            suffix = "  [rung retired]" if item.rung in retired else ""
-            suffix += _unsubscribed_tag(item.rung[0], None) if item.rung else ""
+            suffix = _unsubscribed_tag(item.rung[0], None) if item.rung else ""
             lines.append(f"  {_fmt_evidence(item)}{suffix}")
 
     if focus is not None:
@@ -1184,6 +1404,19 @@ def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
             "window_incomplete": proposal.evidence.window_incomplete,
         },
         "catalog_source": view.source,
+        "snapshot_fill_profiles": sorted(proposal.snapshot_profiles),
+        "resolution_counts": dict(
+            Counter(
+                row.resolution
+                for row in proposal.evidence.rows
+                if not row.excluded and row.row_key is not None
+            )
+        ),
+        "effort_inferred": sum(
+            1
+            for row in proposal.evidence.rows
+            if not row.excluded and row.row_key is not None and row.effort_inferred
+        ),
         "degraded": degraded_reasons(view, proposal.evidence),
         "exclusions": [
             {
@@ -1291,7 +1524,10 @@ def apply_proposals(
     changed = {r.key: r for r in live.changes()}
     now = bench._utc_now()
     entries: list[bench.CatalogEntry] = []
-    for entry in view.entries:
+    # The evaluated universe, not only the backend's rows: a promote/demote on
+    # a snapshot stand-in rung must land in the artifact so push-catalog can
+    # write the row into the canon.
+    for entry in live.catalog_entries:
         result = changed.get(entry.key)
         if result is None:
             entries.append(entry)
