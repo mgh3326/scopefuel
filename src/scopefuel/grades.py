@@ -660,7 +660,6 @@ def backfill_rep_grades(
         reason="reps backfill",
     )
     evidence = gather_reps(view=empty_view, host=host, allow_plaintext_http=allow_plaintext_http, path=path)
-    existing = bench.read_rep_grade_annotations(path=path)
     report = BackfillReport(mapping=clean)
     by_task: dict[str, list[EvidenceRep]] = {}
     for row in evidence.counted:
@@ -675,11 +674,17 @@ def backfill_rep_grades(
         for row in rows:
             if row.rep.grade and not row.grade_backfilled:
                 report.skipped_graded.append((row.ref, task_ref, row.rep.grade))
-            elif row.ref in existing:
-                if existing[row.ref].grade == grade:
+            elif row.grade_backfilled:
+                # An effective annotation already governs this row — including
+                # one that reached it through migration fan-out (local:<id> ->
+                # srv:<id>). Judging by the row's post-overlay grade keeps a
+                # re-backfill at a different grade a reported conflict on the
+                # canonical ref instead of a second annotation that splits the
+                # rep's grade across the migration boundary.
+                if row.rep.grade == grade:
                     report.already_annotated.append((row.ref, grade))
                 else:
-                    report.conflicting_annotations.append((row.ref, existing[row.ref].grade, grade))
+                    report.conflicting_annotations.append((row.ref, row.rep.grade, grade))
             else:
                 report.planned.append(
                     bench.RepGradeAnnotation(

@@ -1396,3 +1396,35 @@ def test_two_distinct_fails_still_demote_after_exclusion(tmp_path, isolated_cach
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"  # reps 12 + 13 count
     assert result.target == "B"  # one step below the weaker fail (A)
+
+
+def test_backfill_conflict_follows_annotation_across_migration(tmp_path, monkeypatch):
+    """Round-1 BLOCKER: an annotation that reached a rep through migration
+    fan-out is still an existing annotation — re-backfilling the task at a
+    different grade is a reported conflict on the canonical ref, never a
+    second annotation that splits the rep's grade."""
+    migrated = bench.add_rep(**_rep("743", effort="xhigh"))  # local:1, ungraded
+    assert grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST).applied == 1
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]  # local:1 -> srv:501
+
+    second = grades.backfill_rep_grades(mapping={"743": "S"}, apply=True, host=HOST)
+    assert second.applied == 0
+    assert second.conflicting_annotations == [("srv:501", "A+", "S")]
+    annotations = _annotations()
+    assert list(annotations) == ["local:1"]
+    assert annotations["local:1"].grade == "A+"
+
+
+def test_backfill_same_grade_after_migration_is_idempotent(tmp_path, monkeypatch):
+    """Same-grade re-backfill against the migrated canonical ref reports
+    already-annotated and writes nothing."""
+    migrated = bench.add_rep(**_rep("743", effort="xhigh"))
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST)
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]
+
+    second = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST)
+    assert second.applied == 0
+    assert second.already_annotated == [("srv:501", "A+")]
+    assert len(_annotations()) == 1
