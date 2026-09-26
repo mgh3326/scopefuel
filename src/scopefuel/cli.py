@@ -16,7 +16,7 @@ import sys
 import time
 from dataclasses import replace
 
-from . import bench, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
+from . import bench, grades, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
 from .cache import collect
 from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
 from .policy import clear_policy, list_policy_rows, set_policy
@@ -304,6 +304,59 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="원격이 같은 derived id 로 다른 rep 을 이미 갖고 있어도 덮어쓰기 진행",
+    )
+
+    grades_parser = subparsers.add_parser(
+        "grades", help="측정 rep 증거로 카탈로그 (profile, effort) 런그 급 제안/적용"
+    )
+    grades_sub = grades_parser.add_subparsers(dest="grades_command", required=True)
+    grades_propose = grades_sub.add_parser(
+        "propose", help="rep 증거 평가 → 런그별 급 변경 제안 (읽기 전용)"
+    )
+    grades_propose.add_argument(
+        "--min-passes",
+        type=_nonnegative_int,
+        default=grades.MIN_PASSES,
+        help=f"승급에 필요한 같은-급 PASS 수 (기본 {grades.MIN_PASSES}; decision 4088 draft N=2)",
+    )
+    grades_propose.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="OLD=NEW",
+        help="대표 실행 중복 제외 — OLD 는 NEW 에 의해 superseded 된 ref "
+        "(N | srv:N | local:N | local@host:N). 반복 가능",
+    )
+    grades_propose.add_argument(
+        "--rung",
+        metavar="PROFILE[@EFFORT]",
+        help="한 런그의 증거 전체를 detail 출력 (카탈로그 스펠링)",
+    )
+    grades_propose.add_argument("--json", action="store_true", help="proposal artifact JSON 출력")
+    grades_propose.add_argument("--out", help="--json 결과를 이 파일에 기록")
+    grades_propose.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
+
+    grades_apply = grades_sub.add_parser(
+        "apply", help="propose artifact 를 재검증하고 갱신된 카탈로그 JSON 생성"
+    )
+    grades_apply.add_argument(
+        "--proposal", required=True, help="grades propose --json --out 으로 만든 artifact 파일"
+    )
+    grades_apply.add_argument("--out", required=True, help="갱신된 카탈로그 JSON 출력 경로 (C1)")
+    grades_apply.add_argument("--decided-by", required=True, help="카탈로그 행 provenance (필수)")
+    grades_apply.add_argument(
+        "--deviation-ref",
+        default="hk:decision/2026-09-26/effort-efficiency",
+        help="변경 근거 참조 (기본: decision 4088)",
+    )
+    grades_apply.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
     )
 
     all_profiles = sorted(
@@ -1211,6 +1264,83 @@ def _reps_command(args: argparse.Namespace) -> int:
     return 2
 
 
+def _grades_command(args: argparse.Namespace) -> int:
+    if args.grades_command == "propose":
+        if args.min_passes < 1:
+            print("error: --min-passes 는 1 이상이어야 합니다", file=sys.stderr)
+            return 2
+        exclusions: list[tuple[str, str]] = []
+        for spec in args.exclude:
+            old, sep, new = spec.partition("=")
+            if not sep or not old.strip() or not new.strip():
+                print(f"error: --exclude 는 OLD=NEW 형식이어야 합니다: {spec!r}", file=sys.stderr)
+                return 2
+            exclusions.append((old.strip(), new.strip()))
+        try:
+            view = bench.read_catalog()
+            evidence = grades.gather_reps(
+                view=view,
+                exclusions=exclusions,
+                allow_plaintext_http=args.allow_plaintext_http,
+            )
+            proposal = grades.evaluate(evidence, view, min_passes=args.min_passes)
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            payload = grades.proposal_to_json(proposal, view)
+            text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+            if args.out:
+                pathlib.Path(args.out).write_text(text, encoding="utf-8")
+                print(f"proposal artifact written: {args.out} digest={proposal.digest}")
+            else:
+                print(text, end="")
+        else:
+            focus = grades.parse_rung_spec(args.rung) if args.rung else None
+            print(grades.render_proposal(proposal, view, focus=focus))
+        return 0
+    if args.grades_command == "apply":
+        try:
+            proposal_file = json.loads(
+                pathlib.Path(args.proposal).read_text(encoding="utf-8")
+            )
+            entries, live, _view = grades.apply_proposals(
+                proposal_file,
+                decided_by=args.decided_by,
+                deviation_ref=args.deviation_ref,
+                allow_plaintext_http=args.allow_plaintext_http,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        changes = live.changes()
+        if not changes:
+            print("grades apply: proposal carries no grade changes — nothing written")
+            return 0
+        # The "catalog" list carries only the stamped changed rows so the file
+        # can go straight into `bench push-catalog` (which requires decided_by
+        # on every row it PUTs). The full post-apply catalog rides along under
+        # "snapshot" for the audit record.
+        changed_rows = {r.key for r in changes}
+        payload = {
+            "catalog": [e.as_dict() for e in entries if e.key in changed_rows],
+            "snapshot": [e.as_dict() for e in entries],
+        }
+        pathlib.Path(args.out).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        print(f"grades apply: wrote {args.out} changed={len(changed_rows)} rows={len(entries)}")
+        for result in changes:
+            print(
+                f"  {result.action} {result.label()} "
+                f"{result.row.grade} -> {result.target} "
+                f"(evidence: {', '.join(result.evidence_refs)})"
+            )
+        print("propagate with: scopefuel bench push-catalog <out> (operator token)")
+        return 0
+    return 2
+
+
 def _read_json_arg(path: str) -> object:
     text = sys.stdin.read() if path == "-" else pathlib.Path(path).read_text()
     return json.loads(text)
@@ -1281,6 +1411,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "reps":
         return _reps_command(args)
+
+    if args.command == "grades":
+        return _grades_command(args)
 
     if args.command == "policy":
         return _policy_command(args, fetchers, parser)
