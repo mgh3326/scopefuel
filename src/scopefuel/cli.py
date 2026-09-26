@@ -1316,7 +1316,10 @@ def _grades_command(args: argparse.Namespace) -> int:
                 allow_plaintext_http=args.allow_plaintext_http,
                 allow_degraded=args.allow_degraded,
             )
-        except (OSError, ValueError) as exc:
+        # TypeError joins the clean-refusal set: a malformed artifact that
+        # slips past the shape checks dies inside a comprehension, and the
+        # operator still gets exit 2 instead of a traceback.
+        except (OSError, ValueError, TypeError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         changes = live.changes()
