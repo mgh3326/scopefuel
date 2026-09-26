@@ -62,6 +62,17 @@ def _view(*entries: bench.CatalogEntry) -> bench.CatalogView:
     )
 
 
+def _canon_view(*entries: bench.CatalogEntry, source: str = bench.CATALOG_SOURCE_SERVER) -> bench.CatalogView:
+    """A healthy canon read — the view apply accepts without an override."""
+    return bench.CatalogView(
+        entries=tuple(entries),
+        source=source,
+        backend=bench.BENCH_BACKEND_HANDOFFKEEP,
+        reason="configured",
+        age_s=0.0,
+    )
+
+
 def _propose(view, *, min_passes: int = 2, exclusions=(), host: str = HOST) -> grades.Proposal:
     evidence = grades.gather_reps(view=view, exclusions=list(exclusions), host=host)
     return grades.evaluate(evidence, view, min_passes=min_passes)
@@ -391,6 +402,12 @@ def _cli_view(monkeypatch, entries) -> bench.CatalogView:
     return view
 
 
+def _cli_canon_view(monkeypatch, entries, *, source: str = bench.CATALOG_SOURCE_SERVER) -> bench.CatalogView:
+    view = _canon_view(*entries, source=source)
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: view)
+    return view
+
+
 def test_cli_propose_is_read_only(tmp_path, monkeypatch, capsys):
     _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
@@ -428,7 +445,7 @@ def test_cli_propose_json_artifact(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_apply_writes_catalog_and_stamps(tmp_path, monkeypatch, capsys):
-    _cli_view(
+    _cli_canon_view(
         monkeypatch,
         [_entry("grok-hi", "xhigh", "C"), _entry("opus", "", "S")],
     )
@@ -466,12 +483,13 @@ def test_cli_apply_writes_catalog_and_stamps(tmp_path, monkeypatch, capsys):
     assert snap[("opus", "")]["grade"] == "S"
     assert snap[("opus", "")]["decided_by"] is None
     assert snap[("grok-hi", "xhigh")]["grade"] == "A+"
+    assert "degraded_override" not in payload
 
 
 def test_cli_apply_refuses_stale_proposal(tmp_path, monkeypatch, capsys):
     """apply can never write without the matching propose evidence: a rep
     recorded after propose makes the artifact stale and apply refuses."""
-    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
     artifact = tmp_path / "proposal.json"
     out_file = tmp_path / "catalog.json"
@@ -499,7 +517,7 @@ def test_cli_apply_refuses_stale_proposal(tmp_path, monkeypatch, capsys):
 def test_cli_apply_refuses_forged_proposal(tmp_path, monkeypatch, capsys):
     """A hand-written proposal naming an evidence-less change fails the
     digest check — apply only ever writes evaluated changes."""
-    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A")])
     forged = tmp_path / "forged.json"
     forged.write_text(
@@ -538,7 +556,7 @@ def test_cli_apply_refuses_forged_proposal(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_apply_no_changes_writes_nothing(tmp_path, monkeypatch, capsys):
-    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     _seed([_rep("t1", effort="xhigh", grade="A")])  # one pass — insufficient
     artifact = tmp_path / "proposal.json"
     out_file = tmp_path / "catalog.json"
@@ -571,6 +589,212 @@ def test_cli_propose_min_passes_zero_rejected(tmp_path, monkeypatch, capsys):
 def test_cli_propose_bad_exclude_rejected(tmp_path, monkeypatch, capsys):
     _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     assert cli.main(["grades", "propose", "--exclude", "bogus"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# task #741 — apply refuses degraded input unless --allow-degraded says why
+# ---------------------------------------------------------------------------
+
+
+def _apply_args(artifact, out_file, *extra) -> list[str]:
+    return [
+        "grades",
+        "apply",
+        "--proposal",
+        str(artifact),
+        "--out",
+        str(out_file),
+        "--decided-by",
+        "operator:test",
+        *extra,
+    ]
+
+
+def _insecure_url_reps_backend(monkeypatch) -> None:
+    """Per-use split: credentials exist but the reps use stays local."""
+    real = bench.bench_backend
+
+    def fake(*, use, stderr=None, allow_plaintext_http=False):
+        if use == "reps":
+            return bench.BenchBackend(
+                name=bench.BENCH_BACKEND_LOCAL,
+                cache_ttl_s=60.0,
+                url=None,
+                token=None,
+                endpoint_id="",
+                reason="auto-local-insecure-url",
+                plaintext_use=use,
+            )
+        return real(use=use, stderr=stderr, allow_plaintext_http=allow_plaintext_http)
+
+    monkeypatch.setattr(bench, "bench_backend", fake)
+
+
+def test_cli_apply_refuses_snapshot_catalog(tmp_path, monkeypatch, capsys):
+    """Mutant guard: a snapshot catalog must stop apply cold — a row stamped
+    from the bundled snapshot must never reach push-catalog."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])  # snapshot source
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    err = capsys.readouterr().err
+    assert "refuses degraded input" in err and "snapshot" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_refuses_unsupported_catalog(tmp_path, monkeypatch, capsys):
+    """Mutant guard: UNSUPPORTED also serves the bundled snapshot — a guard
+    that only names SNAPSHOT leaves a degraded path that still applies."""
+    _cli_canon_view(
+        monkeypatch,
+        [_entry("grok-hi", "xhigh", "C")],
+        source=bench.CATALOG_SOURCE_UNSUPPORTED,
+    )
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    assert "refuses degraded input" in capsys.readouterr().err
+    assert not out_file.exists()
+
+
+def test_cli_apply_allows_cache_catalog(tmp_path, monkeypatch, capsys):
+    """Mutant guard: a server cache inside the staleness budget is canon —
+    refusing every non-server source would brick normal applies."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")], source=bench.CATALOG_SOURCE_CACHE)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 0
+    assert out_file.exists()
+
+
+def test_cli_apply_refuses_insecure_url_reps(tmp_path, monkeypatch, capsys):
+    """The insecure-url fallback: the catalog is canon but the reps canon
+    exists and was never read — apply refuses even with a matching digest."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _insecure_url_reps_backend(monkeypatch)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    err = capsys.readouterr().err
+    assert "refuses degraded input" in err and "reps" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_refuses_partial_rep_window(tmp_path, monkeypatch, capsys):
+    """A full server rep window can hide older FAIL evidence — apply refuses."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    fake = _remote_backend(tmp_path, monkeypatch)
+    monkeypatch.setattr(bench, "_MIGRATE_REP_WINDOW", 1)
+    fake.reps = [
+        _remote_row(
+            bench.RepRecord(
+                id=900,
+                profile="builder-grok",
+                model_id="grok-4.7",
+                task_ref="srv-1",
+                tier="T1",
+                role="impl",
+                rounds=1,
+                blockers_found=0,
+                completed=1,
+                input_tokens=None,
+                output_tokens=None,
+                notes=None,
+                recorded_at="2026-09-25T00:00:00Z",
+                effort="xhigh",
+                grade="A+",
+                table_grade=None,
+            ),
+            601,
+            host=None,
+        )
+    ]
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file)) == 2
+    err = capsys.readouterr().err
+    assert "refuses degraded input" in err and "window" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_allow_degraded_records_reason(tmp_path, monkeypatch, capsys):
+    """The explicit override passes — and the reason lands in the artifact,
+    the console, and every changed row's deviation_ref."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])  # snapshot = degraded
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    reason = "canon unreachable; snapshot rows are the reviewed copy"
+    assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", reason)) == 0
+    payload = json.loads(out_file.read_text())
+    assert payload["degraded_override"]["reason"] == reason
+    assert payload["degraded_override"]["inputs"]
+    changed = payload["catalog"][0]
+    assert f"degraded-override: {reason}" in changed["deviation_ref"]
+    out = capsys.readouterr().out
+    assert "degraded input applied" in out and reason in out
+
+
+def test_cli_apply_allow_degraded_requires_a_reason(tmp_path, monkeypatch, capsys):
+    """A blank --allow-degraded is not an override — refuse before any write."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert cli.main(_apply_args(artifact, out_file, "--allow-degraded", "  ")) == 2
+    assert not out_file.exists()
+
+
+def test_cli_propose_marks_degraded_output(tmp_path, monkeypatch, capsys):
+    """Propose stays read-only but labels degraded input in both outputs."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert json.loads(artifact.read_text())["degraded"]
+    assert cli.main(["grades", "propose"]) == 0
+    assert "degraded input" in capsys.readouterr().out
+
+
+def test_cli_propose_clean_input_marks_nothing(tmp_path, monkeypatch, capsys):
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert json.loads(artifact.read_text())["degraded"] == []
+    assert cli.main(["grades", "propose"]) == 0
+    assert "degraded input" not in capsys.readouterr().out
+
+
+def test_cli_apply_malformed_artifact_is_a_clean_error(tmp_path, monkeypatch, capsys):
+    """CodeRabbit minor on #100: params/results of the wrong shape used to
+    crash with AttributeError/KeyError — now a BenchError with exit 2."""
+    _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    bad_params = tmp_path / "bad-params.json"
+    bad_params.write_text(json.dumps({"min_passes": 2, "params": ["cli_exclusions"]}))
+    assert cli.main(_apply_args(bad_params, tmp_path / "o1.json")) == 2
+    assert "params" in capsys.readouterr().err
+    # A results row missing profile/effort must not KeyError — it loses the
+    # recorded-changes comparison as a plain BenchError.
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    payload = json.loads(artifact.read_text())
+    del payload["results"][0]["profile"]
+    artifact.write_text(json.dumps(payload))
+    assert cli.main(_apply_args(artifact, tmp_path / "o2.json")) == 2
+    assert "disagrees" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
