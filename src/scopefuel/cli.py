@@ -257,6 +257,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     reps_add.add_argument(
         "--grade",
+        required=True,
         choices=bench.REP_GRADES,
         help="과제가 요구한 급 (S+/S/A+/A/B/C) — 프로필의 급표 배치가 아니라 과제 난이도",
     )
@@ -286,6 +287,25 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     reps_compare.add_argument("--profile", help="프로필 필터")
     reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
+
+    reps_backfill = reps_sub.add_parser(
+        "backfill",
+        help="task->grade 매핑 파일로 기존 rep의 과제 급을 주석 행으로 보충 (원행 불변, 기본 dry-run)",
+    )
+    reps_backfill.add_argument(
+        "--mapping",
+        required=True,
+        help="task-ref -> grade JSON 매핑 파일",
+    )
+    reps_backfill.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
+    reps_backfill.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
+    reps_backfill.add_argument(
+        "--host", help="migrated-local 매칭에 쓸 출처 호스트 (기본: 이 머신의 hostname)"
+    )
 
     reps_migrate = reps_sub.add_parser(
         "migrate", help="로컬 bench.db reps를 handoffkeep reps 저장소로 1회 이관 (기본 dry-run)"
@@ -1223,6 +1243,36 @@ def _reps_command(args: argparse.Namespace) -> int:
             return 0
         for comparison in comparisons:
             print(bench.format_rep_comparison(comparison))
+        return 0
+    if args.reps_command == "backfill":
+        try:
+            raw = json.loads(pathlib.Path(args.mapping).read_text(encoding="utf-8"))
+            report = grades.backfill_rep_grades(
+                mapping=raw,
+                apply=args.apply,
+                source=args.mapping,
+                host=args.host,
+                allow_plaintext_http=args.allow_plaintext_http,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        mode = "applied" if args.apply else "dry-run"
+        print(f"reps backfill ({mode}): mapping {len(report.mapping)} task(s)")
+        for annotation in report.planned:
+            print(f"  annotate {annotation.rep_ref} grade={annotation.grade} task={annotation.task_ref}")
+        for ref, grade in report.already_annotated:
+            print(f"  already annotated {ref} grade={grade}")
+        for ref, task_ref, grade in report.skipped_graded:
+            print(f"  already graded {ref} task={task_ref} grade={grade} (kept)")
+        for ref, existing, mapped in report.conflicting_annotations:
+            print(f"  conflict {ref} annotation grade={existing} vs mapped {mapped} (kept)")
+        for task_ref in report.missing_tasks:
+            print(f"  no counted reps for task {task_ref}")
+        if args.apply:
+            print(f"reps backfill: wrote {report.applied} annotation row(s); original reps untouched")
+        else:
+            print("reps backfill: dry-run — rerun with --apply to write the annotations")
         return 0
     if args.reps_command == "migrate":
         try:

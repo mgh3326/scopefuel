@@ -682,6 +682,14 @@ def _schema(conn: sqlite3.Connection) -> None:
           table_grade    TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS rep_grade_annotations (
+          rep_ref      TEXT PRIMARY KEY,
+          grade        TEXT NOT NULL,
+          task_ref     TEXT,
+          source       TEXT,
+          recorded_at  TEXT NOT NULL
+        );
+
         """
     )
     existing_score_columns = {row[1] for row in conn.execute("PRAGMA table_info(model_scores)").fetchall()}
@@ -3575,6 +3583,77 @@ def _read_local_reps_for_push(*, path: pathlib.Path | str | None = None) -> list
         columns = ", ".join(column if column in available else f"NULL AS {column}" for column in _REP_COLUMNS)
         rows = conn.execute(f"SELECT {columns} FROM reps ORDER BY id").fetchall()
         return [RepRecord(**{column: row[column] for column in _REP_COLUMNS}) for row in rows]
+    finally:
+        conn.close()
+
+
+@dataclass(frozen=True)
+class RepGradeAnnotation:
+    """A backfilled task grade for one rep, linked by its canonical ref.
+
+    Written by ``reps backfill``; read by ``grades.gather_reps``. The rep row
+    itself is never modified — this table is the whole change.
+    """
+
+    rep_ref: str  # local:<id> | srv:<id>
+    grade: str
+    task_ref: str
+    source: str
+    recorded_at: str
+
+
+def read_rep_grade_annotations(*, path: pathlib.Path | str | None = None) -> dict[str, RepGradeAnnotation]:
+    """Every backfilled grade, keyed by canonical rep ref."""
+    target = pathlib.Path(path) if path is not None else db_path()
+    if str(target) != ":memory:" and not target.expanduser().exists():
+        return {}
+    conn = _readonly_connect(target)
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rep_grade_annotations'"
+        ).fetchone()
+        if table is None:
+            return {}
+        rows = conn.execute(
+            "SELECT rep_ref, grade, task_ref, source, recorded_at FROM rep_grade_annotations"
+        ).fetchall()
+        return {
+            row["rep_ref"]: RepGradeAnnotation(
+                rep_ref=row["rep_ref"],
+                grade=row["grade"],
+                task_ref=row["task_ref"],
+                source=row["source"],
+                recorded_at=row["recorded_at"],
+            )
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
+def write_rep_grade_annotations(
+    annotations: list[RepGradeAnnotation], *, path: pathlib.Path | str | None = None
+) -> int:
+    """INSERT annotations; an existing ref is a conflict, never overwritten."""
+    conn = connect(path)
+    try:
+        for annotation in annotations:
+            conn.execute(
+                "INSERT INTO rep_grade_annotations (rep_ref, grade, task_ref, source, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    annotation.rep_ref,
+                    annotation.grade,
+                    annotation.task_ref,
+                    annotation.source,
+                    annotation.recorded_at,
+                ),
+            )
+        conn.commit()
+        return len(annotations)
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
