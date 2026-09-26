@@ -170,8 +170,9 @@ def test_promote_does_not_move_when_evidence_below_current(tmp_path, isolated_ca
 # ---------------------------------------------------------------------------
 
 
-def test_demote_on_fail_at_placement(tmp_path, isolated_cache):
-    """A completed=0 rep on an at-placement task demotes one step below it."""
+def test_single_capout_at_placement_blocks_not_demotes(tmp_path, isolated_cache):
+    """Rule v1: one cap-out FAIL at placement is one short of demotion —
+    it blocks promotion instead."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed(
         [
@@ -180,22 +181,44 @@ def test_demote_on_fail_at_placement(tmp_path, isolated_cache):
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert result.target == "A+"
+    assert "demotion needs 2" in result.note
+
+
+def test_demote_two_fails_at_placement(tmp_path, isolated_cache):
+    """Two FAIL reps at-or-below the placement demote one step below the
+    weakest failed grade."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+", completed=0),
+            _rep("t2", effort="xhigh", grade="A", completed=0),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
-    assert result.target == "A"  # one below the failed A+ claim
+    assert result.target == "B"  # one below the weakest failed claim (A)
 
 
 def test_demote_below_placement_drops_below_failed_grade(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "S"))
-    _seed([_rep("t1", effort="xhigh", grade="B", completed=0)])
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="B", completed=0),
+            _rep("t2", effort="xhigh", grade="A", completed=0),
+        ]
+    )
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "C"  # can't do B work -> below B
 
 
-def test_demote_ungraded_fail_steps_below_current(tmp_path, isolated_cache):
-    """An ungraded FAIL is fail-closed: treated as failing at the placement."""
+def test_demote_ungraded_fails_step_below_current(tmp_path, isolated_cache):
+    """Ungraded FAILs are fail-closed: they count at the placement, and two
+    of them demote one step below it."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
-    _seed([_rep("t1", effort="xhigh", completed=0)])
+    _seed([_rep("t1", effort="xhigh", completed=0), _rep("t2", effort="xhigh", completed=0)])
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "A"
@@ -203,7 +226,7 @@ def test_demote_ungraded_fail_steps_below_current(tmp_path, isolated_cache):
 
 def test_demote_floors_at_c(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "C"))
-    _seed([_rep("t1", effort="xhigh", grade="C", completed=0)])
+    _seed([_rep("t1", effort="xhigh", grade="C", completed=0), _rep("t2", effort="xhigh", completed=0)])
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "C"
@@ -235,6 +258,7 @@ def test_conflict_holds_when_at_grade_passes_exist(tmp_path, isolated_cache):
             _rep("t1", effort="xhigh", grade="A+"),
             _rep("t2", effort="xhigh", grade="A+"),
             _rep("t3", effort="xhigh", grade="A+", completed=0),
+            _rep("t4", effort="xhigh", grade="A", completed=0),  # 2nd demote-grade fail
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -243,8 +267,26 @@ def test_conflict_holds_when_at_grade_passes_exist(tmp_path, isolated_cache):
     assert _propose(view).changes() == []
 
 
+def test_single_marker_fail_still_conflicts(tmp_path, isolated_cache):
+    """One post-merge marker at-or-below is a full demote trigger on its own —
+    the conflict rule still applies against measured at-grade passes."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A"),
+            _rep("t2", effort="xhigh", grade="A"),
+            _rep("t3", effort="xhigh", grade="B", completed=0, notes="[rollback] merge"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "conflicted"
+    assert result.target == "A"
+    assert _propose(view).changes() == []
+
+
 def test_rollback_marker_is_fail_evidence(tmp_path, isolated_cache):
-    """A [rollback] notes marker is FAIL evidence even on a completed rep."""
+    """A [rollback] notes marker is FAIL evidence even on a completed rep —
+    and under rule v1 one marker at-or-below demotes alone."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed([_rep("t1", effort="xhigh", completed=1, notes="merged then reverted [rollback]")])
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -256,6 +298,37 @@ def test_post_merge_blocker_marker_is_fail(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed([_rep("t1", effort="xhigh", completed=1, notes="[post-merge-blocker] found by ops")])
     assert _result(_propose(view), "grok-hi", "xhigh").action == "demote"
+
+
+def test_marker_fail_above_placement_blocks_not_demotes(tmp_path, isolated_cache):
+    """Rule v1 scoping: a marker FAIL on a task *above* the placement is
+    overreach evidence — it blocks promotion but does not demote, because
+    the placement never claimed that level."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="B"),
+            _rep("t2", effort="xhigh", grade="S", completed=0, notes="[rollback]"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert result.target == "A"
+
+
+def test_one_at_below_plus_one_above_fail_not_demote(tmp_path, isolated_cache):
+    """Counting trap: one at-or-below FAIL plus one above-placement FAIL must
+    not add up to a two-FAIL demotion."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="B", completed=0),
+            _rep("t2", effort="xhigh", grade="S", completed=0),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert result.target == "A"
 
 
 # ---------------------------------------------------------------------------
@@ -1127,3 +1200,231 @@ def test_off_ladder_catalog_grade_raises_bench_error(tmp_path, isolated_cache):
     _seed([_rep("t1", effort="xhigh", grade="A+")])
     with pytest.raises(bench.BenchError, match="grok-hi@xhigh"):
         _propose(view)
+
+
+# ---------------------------------------------------------------------------
+# task #743 — rule v1 supplements: required --grade, non-mutating backfill
+# ---------------------------------------------------------------------------
+
+
+def _reps_add_argv(**extra) -> list[str]:
+    argv = [
+        "reps",
+        "add",
+        "--profile",
+        "builder-x",
+        "--model",
+        "model-x",
+        "--task",
+        "743",
+        "--tier",
+        "T2",
+        "--role",
+        "impl",
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+    ]
+    for flag, value in extra.items():
+        argv += [f"--{flag.replace('_', '-')}", str(value)]
+    return argv
+
+
+def test_reps_add_requires_grade(tmp_path, isolated_cache, capsys):
+    """Missing --grade refuses at the parser, writes nothing, names the flag."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main(_reps_add_argv())
+    assert exc.value.code == 2
+    assert "--grade" in capsys.readouterr().err
+    assert bench.read_reps() == []
+
+
+def test_reps_add_with_grade_still_records(tmp_path, isolated_cache):
+    assert cli.main(_reps_add_argv(grade="A+")) == 0
+    reps = bench.read_reps()
+    assert len(reps) == 1 and reps[0].grade == "A+"
+
+
+def _mapping_file(tmp_path, payload) -> str:
+    path = tmp_path / "grade-map.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def _annotations() -> dict:
+    return bench.read_rep_grade_annotations()
+
+
+def test_backfill_dry_run_writes_nothing(tmp_path, isolated_cache, capsys):
+    _seed([_rep("743", effort="xhigh")])
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"743": "A+"})])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "dry-run" in out
+    assert "annotate local:1 grade=A+ task=743" in out
+    assert _annotations() == {}
+
+
+def test_backfill_apply_annotates_without_mutating_originals(tmp_path, isolated_cache, capsys):
+    _seed([_rep("743", effort="xhigh")])
+    before = [rep.as_dict() for rep in bench.read_reps()]
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"743": "A+"}), "--apply"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "wrote 1 annotation row(s)" in out
+    after = [rep.as_dict() for rep in bench.read_reps()]
+    assert after == before  # the original row is byte-identical
+    annotations = _annotations()
+    assert list(annotations) == ["local:1"]
+    assert annotations["local:1"].grade == "A+"
+
+
+def test_backfill_proposal_consumes_annotated_grade(tmp_path, isolated_cache):
+    """After --apply, propose evaluates the annotated reps at their filled
+    grade — and discloses the overlay."""
+    view = _view(_entry("grok-hi", "xhigh", "B"))
+    _seed([_rep("743", effort="xhigh"), _rep("743", effort="xhigh")])
+    report = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    assert report.applied == 2
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert result.action == "promote"
+    assert result.target == "A+"
+    assert proposal.evidence.annotations_applied
+    text = grades.render_proposal(proposal, view)
+    assert "(backfilled)" in text
+    assert "backfilled grades applied" in text
+
+
+def test_backfill_without_apply_changes_no_proposal(tmp_path, isolated_cache):
+    """Dry-run plans but never persists — propose still sees ungraded reps."""
+    view = _view(_entry("grok-hi", "xhigh", "B"))
+    _seed([_rep("743", effort="xhigh"), _rep("743", effort="xhigh")])
+    report = grades.backfill_rep_grades(mapping={"743": "A+"})
+    assert len(report.planned) == 2 and report.applied == 0
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert len(result.ungraded_passes) == 2
+    assert result.action != "promote"
+
+
+def test_backfill_never_overwrites_existing_grade(tmp_path, isolated_cache):
+    """An already-graded rep keeps its recorded grade; the annotation is
+    reported as skipped, not written."""
+    _seed(
+        [
+            _rep("743", effort="xhigh", grade="B"),  # recorded grade wins
+            _rep("743", effort="xhigh"),  # the only annotatable row
+        ]
+    )
+    report = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    assert report.applied == 1
+    assert report.skipped_graded == [("local:1", "743", "B")]
+    annotations = _annotations()
+    assert "local:1" not in annotations
+    assert annotations["local:2"].grade == "A+"
+
+
+def test_backfill_rerun_is_idempotent(tmp_path, isolated_cache):
+    _seed([_rep("743", effort="xhigh")])
+    assert grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True).applied == 1
+    second = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    assert second.applied == 0
+    assert second.already_annotated == [("local:1", "A+")]
+    assert len(_annotations()) == 1
+
+
+def test_backfill_conflicting_annotation_keeps_original(tmp_path, isolated_cache):
+    """A second mapping that names a different grade for an annotated rep is a
+    conflict — reported, never rewritten."""
+    _seed([_rep("743", effort="xhigh")])
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    second = grades.backfill_rep_grades(mapping={"743": "S"}, apply=True)
+    assert second.applied == 0
+    assert second.conflicting_annotations == [("local:1", "A+", "S")]
+    assert _annotations()["local:1"].grade == "A+"
+
+
+def test_backfill_missing_task_reported(tmp_path, isolated_cache, capsys):
+    _seed([_rep("742", effort="xhigh")])
+    rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, {"999": "A"})])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no counted reps for task 999" in out
+    assert _annotations() == {}
+
+
+def test_backfill_rejects_bad_mapping(tmp_path, isolated_cache, capsys):
+    _seed([_rep("743", effort="xhigh")])
+    for payload in (["743"], {"743": "Q"}, {"": "A+"}, {}):
+        rc = cli.main(["reps", "backfill", "--mapping", _mapping_file(tmp_path, payload)])
+        assert rc == 2
+        assert "error:" in capsys.readouterr().err
+    assert _annotations() == {}
+
+
+def test_backfill_annotated_fail_counts_as_demote_evidence(tmp_path, isolated_cache):
+    """The overlay feeds every classifier, not just passes: a backfilled
+    post-merge marker FAIL demotes at-or-below alone."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed([_rep("743", effort="xhigh", completed=0, notes="[rollback]")])
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"
+    assert result.target == "A"
+
+
+def test_superseded_fail_never_double_counts_demote(tmp_path, isolated_cache):
+    """Directed surface: a superseded FAIL row and its replacement must not
+    add up to the two-FAIL demotion threshold."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed_at_id(11, effort="xhigh", grade="A+", completed=0)
+    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, notes="supersedes id=11")
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"  # only rep 12 counts — one FAIL short
+    assert result.target == "A+"
+
+
+def test_two_distinct_fails_still_demote_after_exclusion(tmp_path, isolated_cache):
+    """…but two genuinely distinct FAILs still reach the threshold."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed_at_id(11, effort="xhigh", grade="A+", completed=0)
+    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, notes="supersedes id=11")
+    _seed_at_id(13, effort="xhigh", grade="A", completed=0)
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"  # reps 12 + 13 count
+    assert result.target == "B"  # one step below the weaker fail (A)
+
+
+def test_backfill_conflict_follows_annotation_across_migration(tmp_path, monkeypatch):
+    """Round-1 BLOCKER: an annotation that reached a rep through migration
+    fan-out is still an existing annotation — re-backfilling the task at a
+    different grade is a reported conflict on the canonical ref, never a
+    second annotation that splits the rep's grade."""
+    migrated = bench.add_rep(**_rep("743", effort="xhigh"))  # local:1, ungraded
+    assert grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST).applied == 1
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]  # local:1 -> srv:501
+
+    second = grades.backfill_rep_grades(mapping={"743": "S"}, apply=True, host=HOST)
+    assert second.applied == 0
+    assert second.conflicting_annotations == [("srv:501", "A+", "S")]
+    annotations = _annotations()
+    assert list(annotations) == ["local:1"]
+    assert annotations["local:1"].grade == "A+"
+
+
+def test_backfill_same_grade_after_migration_is_idempotent(tmp_path, monkeypatch):
+    """Same-grade re-backfill against the migrated canonical ref reports
+    already-annotated and writes nothing."""
+    migrated = bench.add_rep(**_rep("743", effort="xhigh"))
+    grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST)
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]
+
+    second = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True, host=HOST)
+    assert second.applied == 0
+    assert second.already_annotated == [("srv:501", "A+")]
+    assert len(_annotations()) == 1

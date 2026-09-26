@@ -29,20 +29,25 @@ The rule (operator proposal, decision 4088 part A — draft, tunable via
     ``min_passes`` PASSes on tasks of grade G and the rung carries **no** FAIL
     evidence at all (a rollback or cap-out undermines any pending promotion,
     whatever grade the failed task asked for).
-*   **Demote** a rung when a FAIL rep's task grade is at or below the rung's
-    current placement — the rung demonstrably could not do work it was placed
-    to do. The target is one step below the weakest failed grade (a FAIL on an
-    ungraded task drops the rung one step below its placement). A FAIL on a
-    task *above* the placement is overreach evidence: it does not demote (the
-    placement never claimed that level) but it blocks promotion.
+*   **Demote** a rung on **two** FAIL reps whose task grades are at or below
+    the placement, **or one** FAIL carrying a post-merge marker at-or-below —
+    a rollback alone is demote-grade evidence; a lone cap-out is not. The
+    target is one step below the weakest failed grade (a FAIL on an ungraded
+    task drops the rung one step below its placement). A FAIL on a task
+    *above* the placement — marker included — is overreach evidence: it does
+    not demote (the placement never claimed that level) but it blocks
+    promotion.
 *   **Conflicted**: when a demote trigger fires but the rung *also* holds
     ``min_passes`` clean PASSes at its current grade, the evidence contradicts
-    itself — a single outlier fail does not outweigh a measured body of
+    itself — a demote trigger does not outweigh a measured body of
     at-placement passes. No move is proposed; both sides print for the
     operator.
 *   Reps whose ``grade`` is empty are ungraded passes — shown, never counted:
     the rule claims "can do grade-G work", and a pass on a task of unrecorded
-    difficulty cannot establish G.
+    difficulty cannot establish G. ``reps add`` requires ``--grade``; pre-E6
+    rows stay ungraded until ``reps backfill`` writes an annotation row linked
+    by the rep's ref — the original row is never rewritten, and every
+    application is disclosed in the proposal.
 """
 
 from __future__ import annotations
@@ -215,7 +220,8 @@ def _judging_row(rows: list[bench.CatalogEntry], effort: str) -> bench.CatalogEn
 _KIND_PASS = "pass"  # completed, zero blockers, no marker
 _KIND_PASS_UNGRADED = "pass-ungraded"  # a pass whose task grade was not recorded
 _KIND_PASS_UNCLEAN = "pass-unclean"  # completed but blockers were found
-_KIND_FAIL = "fail"  # completed=0 or a post-merge marker
+_KIND_FAIL = "fail"  # completed=0 without a post-merge marker
+_KIND_FAIL_POSTMERGE = "fail-postmerge"  # a [rollback] / [post-merge-blocker] notes marker
 _KIND_UNKNOWN = "unknown"  # rep row with no completed flag
 
 _KIND_LABELS = {
@@ -223,6 +229,7 @@ _KIND_LABELS = {
     _KIND_PASS_UNGRADED: "PASS(ungraded)",
     _KIND_PASS_UNCLEAN: "PASS(blockers)",
     _KIND_FAIL: "FAIL",
+    _KIND_FAIL_POSTMERGE: "FAIL(post-merge)",
     _KIND_UNKNOWN: "?",
 }
 
@@ -237,11 +244,14 @@ class EvidenceRep:
     rung: tuple[str, str] = ()  # the measured rung (catalog spelling)
     row_key: tuple[str, str] | None = None  # the catalog row governing the rung
     excluded: str = ""  # non-empty reason when not counted
+    grade_backfilled: bool = False  # rep.grade came from a rep_grade_annotations row
 
 
 def _classify(rep: bench.RepRecord) -> str:
     notes = rep.notes or ""
-    if rep.completed == 0 or FAIL_MARKERS.search(notes):
+    if FAIL_MARKERS.search(notes):
+        return _KIND_FAIL_POSTMERGE
+    if rep.completed == 0:
         return _KIND_FAIL
     if rep.completed == 1:
         # blockers_found=None means "not recorded", not "zero" — a pass whose
@@ -325,6 +335,9 @@ class RepsEvidence:
     # follow the row onto its server copy.
     migrated: dict[int, int] = field(default_factory=dict)
     remote_items: list[bench._RemoteRep] = field(default_factory=list)
+    # (ref, grade) pairs overlaid from rep_grade_annotations — disclosed so a
+    # backfilled grade is never indistinguishable from a recorded one.
+    annotations_applied: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def counted(self) -> list[EvidenceRep]:
@@ -420,8 +433,42 @@ def gather_reps(
         migrated=migrated,
         remote_items=remote_items,
     )
+    _apply_grade_annotations(evidence, path=path)
     _finish_rows(evidence, view, exclusions or [])
     return evidence
+
+
+def _apply_grade_annotations(evidence: RepsEvidence, *, path=None) -> None:
+    """Overlay ``reps backfill`` annotations onto ungraded evidence rows.
+
+    The rep row itself is never rewritten — the annotation is applied to the
+    in-memory copy the rule sees, and every application is disclosed via
+    ``evidence.annotations_applied``. A rep that already carries a grade keeps
+    it: an annotation can fill a gap, never override the original record.
+    An annotation written against a local ref follows the row across
+    migration through the migrated map, so a backfill does not die when the
+    rep it named moves to ``srv:``.
+    """
+    annotations = bench.read_rep_grade_annotations(path=path)
+    if not annotations:
+        return
+    resolved = {ref: a.grade for ref, a in annotations.items()}
+    for local_id, server_id in evidence.migrated.items():
+        local_ref, srv_ref = f"local:{local_id}", f"srv:{server_id}"
+        if local_ref in resolved and srv_ref not in resolved:
+            resolved[srv_ref] = resolved[local_ref]
+        elif srv_ref in resolved and local_ref not in resolved:
+            resolved[local_ref] = resolved[srv_ref]
+    for index, row in enumerate(evidence.rows):
+        if row.rep.grade:
+            continue
+        grade = resolved.get(row.ref)
+        if grade is None:
+            continue
+        evidence.rows[index] = dataclasses.replace(
+            row, rep=dataclasses.replace(row.rep, grade=grade), grade_backfilled=True
+        )
+        evidence.annotations_applied.append((row.ref, grade))
 
 
 def _notes_spec(row: EvidenceRep, cited: str, evidence: RepsEvidence) -> tuple[str, str, str, list[str]]:
@@ -554,6 +601,106 @@ def degraded_reasons(view: bench.CatalogView, evidence: RepsEvidence) -> list[st
 
 
 # ---------------------------------------------------------------------------
+# Grade backfill — annotations linked by rep ref; originals never touched
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BackfillReport:
+    """The plan ``reps backfill`` computed — what --apply would/did write."""
+
+    mapping: dict[str, str]
+    planned: list[bench.RepGradeAnnotation] = field(default_factory=list)
+    already_annotated: list[tuple[str, str]] = field(default_factory=list)  # (ref, grade)
+    skipped_graded: list[tuple[str, str, str]] = field(default_factory=list)  # (ref, task_ref, grade)
+    conflicting_annotations: list[tuple[str, str, str]] = field(
+        default_factory=list
+    )  # (ref, existing grade, mapped grade)
+    missing_tasks: list[str] = field(default_factory=list)
+    applied: int = 0
+
+
+def backfill_rep_grades(
+    *,
+    mapping: dict[str, str],
+    apply: bool = False,
+    source: str = "reps backfill",
+    host: str | None = None,
+    allow_plaintext_http: bool = False,
+    path=None,
+) -> BackfillReport:
+    """Annotate ungraded reps with their task's grade — never a rewrite.
+
+    Every rep the canonical evidence view counts (server ref when migrated,
+    local ref otherwise) whose ``task_ref`` is a mapping key and whose
+    ``grade`` is empty gets a ``rep_grade_annotations`` row linked by that
+    ref. ``gather_reps`` then overlays the grade, so proposals evaluate the
+    rep as graded while the original row stays byte-identical. An already
+    graded rep, an existing annotation, and a task with no counted reps are
+    reported, never silently changed.
+    """
+    if not isinstance(mapping, dict) or not mapping:
+        raise bench.BenchError("backfill mapping must be a non-empty task-ref -> grade object")
+    clean: dict[str, str] = {}
+    for task_ref, grade in mapping.items():
+        if not isinstance(task_ref, str) or not task_ref.strip():
+            raise bench.BenchError("backfill mapping task refs must be non-blank strings")
+        if grade not in bench.REP_GRADES:
+            raise bench.BenchError(
+                f"backfill grade for task {task_ref} must be one of {', '.join(bench.REP_GRADES)}"
+            )
+        clean[task_ref.strip()] = grade
+
+    # An empty catalog view still runs the full canonical-ref + exclusion
+    # machinery — only counted rows can earn an annotation.
+    empty_view = bench.CatalogView(
+        entries=(),
+        source=bench.CATALOG_SOURCE_SNAPSHOT,
+        backend=bench.BENCH_BACKEND_LOCAL,
+        reason="reps backfill",
+    )
+    evidence = gather_reps(view=empty_view, host=host, allow_plaintext_http=allow_plaintext_http, path=path)
+    report = BackfillReport(mapping=clean)
+    by_task: dict[str, list[EvidenceRep]] = {}
+    for row in evidence.counted:
+        if row.rep.task_ref:
+            by_task.setdefault(row.rep.task_ref, []).append(row)
+
+    for task_ref, grade in clean.items():
+        rows = by_task.get(task_ref, [])
+        if not rows:
+            report.missing_tasks.append(task_ref)
+            continue
+        for row in rows:
+            if row.rep.grade and not row.grade_backfilled:
+                report.skipped_graded.append((row.ref, task_ref, row.rep.grade))
+            elif row.grade_backfilled:
+                # An effective annotation already governs this row — including
+                # one that reached it through migration fan-out (local:<id> ->
+                # srv:<id>). Judging by the row's post-overlay grade keeps a
+                # re-backfill at a different grade a reported conflict on the
+                # canonical ref instead of a second annotation that splits the
+                # rep's grade across the migration boundary.
+                if row.rep.grade == grade:
+                    report.already_annotated.append((row.ref, grade))
+                else:
+                    report.conflicting_annotations.append((row.ref, row.rep.grade, grade))
+            else:
+                report.planned.append(
+                    bench.RepGradeAnnotation(
+                        rep_ref=row.ref,
+                        grade=grade,
+                        task_ref=task_ref,
+                        source=source,
+                        recorded_at=bench._utc_now(),
+                    )
+                )
+    if apply and report.planned:
+        report.applied = bench.write_rep_grade_annotations(report.planned, path=path)
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -602,14 +749,17 @@ def _evaluate_row(
     ungraded: list[str] = []
     unclean: list[str] = []
     fails: list[tuple[str, str | None]] = []
+    postmerge: set[str] = set()
     for item in counted:
         if item.kind == _KIND_PASS:
             assert item.rep.grade  # _classify only returns PASS for graded reps
             passes_at.setdefault(item.rep.grade, []).append(item.ref)
         elif item.kind == _KIND_PASS_UNGRADED:
             ungraded.append(item.ref)
-        elif item.kind == _KIND_FAIL:
+        elif item.kind in (_KIND_FAIL, _KIND_FAIL_POSTMERGE):
             fails.append((item.ref, item.rep.grade))
+            if item.kind == _KIND_FAIL_POSTMERGE:
+                postmerge.add(item.ref)
         else:
             unclean.append(item.ref)
 
@@ -622,10 +772,14 @@ def _evaluate_row(
         )
     cur_s = GRADE_STRENGTH[current]
 
-    # A FAIL whose task grade sits outside the ladder cannot establish "the
-    # rung failed at G" — fail-closed: it counts like an ungraded FAIL.
+    # Rule v1 demotion: two FAILs on tasks at-or-below the placement, OR one
+    # post-merge marker FAIL at-or-below. A FAIL whose task grade sits outside
+    # the ladder cannot establish "the rung failed at G" — fail-closed: it
+    # counts like an ungraded FAIL. A marker FAIL on a task *above* the
+    # placement stays overreach evidence (promotion-blocking, never demoting).
     demote_fails = [(ref, g) for ref, g in fails if g is None or GRADE_STRENGTH.get(g, -1) <= cur_s]
-    if demote_fails:
+    marker_demote = [(ref, g) for ref, g in demote_fails if ref in postmerge]
+    if len(demote_fails) >= 2 or marker_demote:
         if len(passes_at.get(current, ())) >= min_passes:
             # Contradictory evidence: the rung fails at-or-below its grade yet
             # still measures clean passes at it. Not a silent hold — both sides
@@ -643,7 +797,7 @@ def _evaluate_row(
                 fails=fails,
                 evidence_refs=sorted(ref for ref, _ in fails),
                 note=(
-                    f"FAIL at-or-below {current} but {len(passes_at[current])} "
+                    f"demote trigger at-or-below {current} but {len(passes_at[current])} "
                     f"clean PASSes at {current} — evidence conflicts"
                 ),
             )
@@ -653,7 +807,13 @@ def _evaluate_row(
         target_idx = min(GRADE_STRENGTH[g] - 1 if g in GRADE_STRENGTH else cur_s - 1 for _, g in demote_fails)
         target_idx = max(target_idx, 0)
         target = GRADE_LADDER[target_idx]
-        note = "FAIL evidence at-or-below placement"
+        if marker_demote:
+            note = (
+                f"post-merge FAIL evidence at-or-below placement "
+                f"({len(marker_demote)} marker, {len(demote_fails)} total FAILs)"
+            )
+        else:
+            note = f"{len(demote_fails)} FAILs at-or-below placement"
         if target == current:
             note += "; already at floor C"
         return RungResult(
@@ -672,6 +832,17 @@ def _evaluate_row(
         )
 
     if fails:
+        # No demote trigger, but a FAIL of any kind still bars promotion: a
+        # lone at-or-below cap-out is one short of demotion, and overreach
+        # FAILs sit above the placement.
+        above = [ref for ref, g in fails if g in GRADE_STRENGTH and GRADE_STRENGTH[g] > cur_s]
+        parts = []
+        if demote_fails:
+            parts.append(
+                f"{len(demote_fails)} FAIL(s) at-or-below {current} (demotion needs 2 or a post-merge marker)"
+            )
+        if above:
+            parts.append(f"{len(above)} FAIL(s) above the placement")
         return RungResult(
             key=row.key,
             row=row,
@@ -684,7 +855,7 @@ def _evaluate_row(
             unclean_passes=unclean,
             fails=fails,
             evidence_refs=sorted(ref for ref, _ in fails),
-            note="promotion blocked by FAIL evidence above the placement",
+            note="promotion blocked by FAIL evidence — " + "; ".join(parts),
         )
 
     qualifying = [g for g, refs in passes_at.items() if len(refs) >= min_passes]
@@ -808,9 +979,11 @@ def _input_digest(proposal: Proposal, view: bench.CatalogView) -> str:
                 "rung": list(row.rung),
                 "row_key": list(row.row_key) if row.row_key else None,
                 "excluded": row.excluded or None,
+                "grade_backfilled": row.grade_backfilled,
             }
             for row in evidence.rows
         ],
+        "annotations_applied": [list(item) for item in evidence.annotations_applied],
         "results": [r.as_dict() for r in proposal.results],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -830,7 +1003,7 @@ def _fmt_evidence(item: EvidenceRep) -> str:
         _KIND_LABELS.get(item.kind, item.kind),
     ]
     if rep.grade:
-        bits.append(f"task-grade={rep.grade}")
+        bits.append(f"task-grade={rep.grade}{'(backfilled)' if item.grade_backfilled else ''}")
     bits.append(f"rounds={rep.rounds if rep.rounds is not None else '-'}")
     bits.append(f"blockers={rep.blockers_found if rep.blockers_found is not None else '-'}")
     if item.row_key and item.rung != item.row_key:
@@ -874,8 +1047,9 @@ def render_proposal(
     lines = [
         "scopefuel grades propose — measured-rep grade proposals (read-only)",
         f"rule v{RULE_VERSION}: promote needs >= {proposal.min_passes} clean PASSes on "
-        "tasks of grade G with zero FAIL evidence; demote on FAIL at-or-below the "
-        "placement; any unresolved FAIL blocks promotion",
+        "tasks of grade G with zero FAIL evidence; demote on two FAILs at-or-below "
+        "the placement or one post-merge marker FAIL at-or-below; any unresolved "
+        "FAIL blocks promotion",
         f"reps source={evidence.backend} (reason={evidence.backend_reason}) host={evidence.host} "
         f"rows: server={evidence.remote_count} local={evidence.local_count}",
     ]
@@ -886,6 +1060,9 @@ def render_proposal(
         )
     if evidence.backend == bench.BENCH_BACKEND_LOCAL:
         lines.append("  note: local backend — server reps were not read on this host")
+    if evidence.annotations_applied:
+        refs = ", ".join(f"{ref}={grade}" for ref, grade in evidence.annotations_applied)
+        lines.append(f"  backfilled grades applied from annotations: {refs}")
     degraded = degraded_reasons(view, evidence)
     if degraded:
         lines.append(
