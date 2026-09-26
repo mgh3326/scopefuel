@@ -891,11 +891,13 @@ def _finish_rows(
             tags.append("migrated")
         if row.ref in excluded:
             tags.append("superseded")
-        anomaly = ""
+        # v1.1: the anomaly label is a *shape* property of the rep, computed for
+        # every row — a migrated or superseded row that is anomaly-shaped stays
+        # labeled, so apply's refusal cannot be bypassed by citing its excluded
+        # twin's ref. The needs-review list, though, keeps only rows that would
+        # otherwise count (an excluded row needs no review to stay out).
+        anomaly = _rep_anomaly(row.rep)
         if not reason:
-            # v1.1 evidence hygiene — only rows that would otherwise count
-            # are screened, so the needs-review list carries no dead weight.
-            anomaly = _rep_anomaly(row.rep)
             if anomaly:
                 reason = f"anomalous rep — needs review: {_ANOMALY_LABELS[anomaly]}"
                 tags.append("anomaly")
@@ -1727,14 +1729,16 @@ def render_proposal(
         for item in evidence.exclusions:
             lines.append(f"  {item.status(refs)}")
 
-    anomalous = [row for row in evidence.rows if row.anomaly]
+    anomalous = [row for row in evidence.rows if "anomaly" in row.exclusion_tags]
     if anomalous:
         lines.append(f"needs review — anomalous reps ({len(anomalous)}, excluded until reviewed):")
         for row in anomalous:
             lines.append(f"  {_fmt_evidence(row)}  [{row.anomaly}]")
 
     unrung_excluded = [
-        row for row in evidence.rows if row.excluded and row.row_key is None and not row.anomaly
+        row
+        for row in evidence.rows
+        if row.excluded and row.row_key is None and "anomaly" not in row.exclusion_tags
     ]
     if unrung_excluded:
         lines.append("excluded evidence with no catalog rung (reported, never counted):")

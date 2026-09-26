@@ -2112,3 +2112,38 @@ def test_apply_replays_artifact_non_coding_and_window(tmp_path, isolated_cache, 
     broken2 = dict(artifact, params=dict(artifact["params"], demote_fail_rate=1.5))
     with pytest.raises(bench.BenchError, match="demote_fail_rate"):
         grades.apply_proposals(broken2, decided_by="operator:test", deviation_ref="task-759")
+
+
+def test_apply_refuses_artifact_naming_excluded_anomaly_twin(tmp_path, monkeypatch):
+    """Directed E-surface regression (codex-luna-max finding): a migrated local
+    row whose server twin is the anomaly carries the anomaly *shape* label even
+    though the migration already excludes it — a forged artifact naming the
+    quiet local ref as promote evidence must be refused. The label is a shape
+    property of every row; needs-review stays gated on the exclusion tag."""
+    migrated = bench.add_rep(
+        **_rep(
+            "t-a",
+            completed=0,
+            rounds=0,
+            blockers_found=0,
+            recorded_at="2026-09-20T10:00:00Z",
+        )
+    )
+    bench.add_rep(**_rep("t-b", completed=1, grade="A+", effort="xhigh", recorded_at="2026-09-21T10:00:00Z"))
+    bench.add_rep(**_rep("t-c", completed=1, grade="A+", effort="xhigh", recorded_at="2026-09-22T10:00:00Z"))
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps = [_remote_row(migrated, 501, host=HOST)]
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    evidence = grades.gather_reps(view=view, host=HOST)
+    rows = {row.ref: row for row in evidence.rows}
+    assert rows["srv:501"].anomaly == "zero-round-fail"
+    assert rows["local:1"].anomaly == "zero-round-fail"  # shape recorded despite migration exclusion
+    assert "migrated" in rows["local:1"].exclusion_tags and "anomaly" not in rows["local:1"].exclusion_tags
+    artifact = grades.proposal_to_json(grades.evaluate(evidence, view), view)
+    for item in artifact["results"]:
+        if item.get("profile") == "grok-hi" and item.get("action") == "promote":
+            item["evidence"].append("local:1")
+    canon = _canon_view(_entry("grok-hi", "xhigh", "A"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    with pytest.raises(bench.BenchError, match="anomalous rep"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-759")
