@@ -1283,10 +1283,10 @@ def test_imminent_reset_thresholds_configurable_via_settings():
 
 def test_capacity_weight_price_usd_shifts_rank_but_not_cutoff():
     """AC3: claude price_usd=200 → weight=10 → 실효잔여 반영으로 순위 상승, raw 90%/99% 컷은 불변."""
-    policy.set_policy("claude", "preserve", until=dt.date(2026, 8, 31))
-    config = policy.load_config()
-    config["pools"]["claude"]["price_usd"] = 200
-    policy._write_config(config)
+    policy.config_path().parent.mkdir(parents=True, exist_ok=True)
+    policy.config_path().write_text(
+        '[pools.claude]\nclass = "preserve"\nuntil = 2026-08-31\nprice_usd = 200\n'
+    )
 
     weight, _ = policy.get_capacity_weight("claude")
     assert weight == 10.0
@@ -1310,10 +1310,8 @@ def test_capacity_weight_price_usd_shifts_rank_but_not_cutoff():
 
 def test_capacity_weight_does_not_bypass_raw_cutoff():
     """capacity_weight 가 커도 raw used_pct 컷(90%/99%)은 그대로 적용되어 후보에서 제외된다."""
-    config = policy.load_config()
-    pools = config.setdefault("pools", {})
-    pools["claude"] = {"price_usd": 200}
-    policy._write_config(config)
+    policy.config_path().parent.mkdir(parents=True, exist_ok=True)
+    policy.config_path().write_text("[pools.claude]\nprice_usd = 200\n")
 
     providers = [_result("claude", 90.0, pool_class="preserve")]  # cutoff 90% 이상 → 소진
     out = recommend(providers, "S+", today=TODAY, now=NOW)
@@ -1326,9 +1324,8 @@ def test_capacity_weight_does_not_bypass_raw_cutoff():
 
 def test_reset_urgency_hours_setting_changes_fallback_threshold():
     """AC6: [settings] reset_urgency_hours 변경이 폴백(pace 불가) 🔥 판정에 반영된다."""
-    config = policy.load_config()
-    config["settings"] = {"reset_urgency_hours": 20}
-    policy._write_config(config)
+    policy.config_path().parent.mkdir(parents=True, exist_ok=True)
+    policy.config_path().write_text("[settings]\nreset_urgency_hours = 20\n")
 
     # window="?" → pace 계산 불가 → 폴백. reset 15h 남음: 기본 12h 라면 not urgent, 20h 로 늘리면 urgent.
     providers = [_result("kiro", 50.0, pool_class="spend", window="?", resets_at=_reset_in(15))]
@@ -1347,9 +1344,9 @@ def test_reset_urgency_hours_default_backcompat_without_settings():
 
 def test_pace_urgent_path_is_independent_of_reset_urgency_hours_setting():
     """pace 경로(소모속도 산출 가능)는 reset_urgency_hours 설정과 무관하게 수식으로만 결정된다."""
-    config = policy.load_config()
-    config["settings"] = {"reset_urgency_hours": 0.01}  # 매우 작게 설정해도 pace 판정에는 영향 없음
-    policy._write_config(config)
+    policy.config_path().parent.mkdir(parents=True, exist_ok=True)
+    # 매우 작게 설정해도 pace 판정에는 영향 없음을 본다
+    policy.config_path().write_text("[settings]\nreset_urgency_hours = 0.01\n")
 
     # 30d 창, 707h 경과, 50% 사용 (느린 소모) → pace 로 urgent=True (reset_urgency_hours 무관)
     providers = [_result("kiro", 50.0, pool_class="spend", window="30d", resets_at=_reset_in(13))]
