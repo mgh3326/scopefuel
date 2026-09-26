@@ -45,7 +45,10 @@ def _entry(profile: str, effort: str, grade: str, **overrides) -> bench.CatalogE
     fields = {
         "profile": profile,
         "effort": effort,
-        "model_id": "model-x",
+        # Fixture reps record model_id="grok-4.7" — the rung's catalog model
+        # defaults to the same so v1.1 model-match admits them; tests probing
+        # the match itself override either side explicitly.
+        "model_id": "grok-4.7",
         "pool": "test",
         "grade": grade,
     }
@@ -177,13 +180,13 @@ def test_single_capout_at_placement_blocks_not_demotes(tmp_path, isolated_cache)
     _seed(
         [
             _rep("t1", effort="xhigh", grade="A", completed=1),  # 1 clean A pass (< 2)
-            _rep("t2", effort="xhigh", grade="A+", completed=0),  # FAIL at placement
+            _rep("t2", effort="xhigh", grade="A+", completed=0, blockers_found=1),  # FAIL at placement
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "blocked"
     assert result.target == "A+"
-    assert "demotion needs 2" in result.note
+    assert "demotion needs" in result.note
 
 
 def test_demote_two_fails_at_placement(tmp_path, isolated_cache):
@@ -192,8 +195,8 @@ def test_demote_two_fails_at_placement(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "A+"))
     _seed(
         [
-            _rep("t1", effort="xhigh", grade="A+", completed=0),
-            _rep("t2", effort="xhigh", grade="A", completed=0),
+            _rep("t1", effort="xhigh", grade="A+", completed=0, blockers_found=1),
+            _rep("t2", effort="xhigh", grade="A", completed=0, blockers_found=1),
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -205,8 +208,8 @@ def test_demote_below_placement_drops_below_failed_grade(tmp_path, isolated_cach
     view = _view(_entry("grok-hi", "xhigh", "S"))
     _seed(
         [
-            _rep("t1", effort="xhigh", grade="B", completed=0),
-            _rep("t2", effort="xhigh", grade="A", completed=0),
+            _rep("t1", effort="xhigh", grade="B", completed=0, blockers_found=1),
+            _rep("t2", effort="xhigh", grade="A", completed=0, blockers_found=1),
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -218,7 +221,12 @@ def test_demote_ungraded_fails_step_below_current(tmp_path, isolated_cache):
     """Ungraded FAILs are fail-closed: they count at the placement, and two
     of them demote one step below it."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
-    _seed([_rep("t1", effort="xhigh", completed=0), _rep("t2", effort="xhigh", completed=0)])
+    _seed(
+        [
+            _rep("t1", effort="xhigh", completed=0, blockers_found=1),
+            _rep("t2", effort="xhigh", completed=0, blockers_found=1),
+        ]
+    )
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "A"
@@ -226,7 +234,12 @@ def test_demote_ungraded_fails_step_below_current(tmp_path, isolated_cache):
 
 def test_demote_floors_at_c(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "C"))
-    _seed([_rep("t1", effort="xhigh", grade="C", completed=0), _rep("t2", effort="xhigh", completed=0)])
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="C", completed=0, blockers_found=1),
+            _rep("t2", effort="xhigh", completed=0, blockers_found=1),
+        ]
+    )
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"
     assert result.target == "C"
@@ -242,7 +255,7 @@ def test_overreach_fail_blocks_promote_never_demotes(tmp_path, isolated_cache):
         [
             _rep("t1", effort="xhigh", grade="A+", completed=1),
             _rep("t2", effort="xhigh", grade="A+", completed=1),
-            _rep("t3", effort="xhigh", grade="S", completed=0),  # overreach fail
+            _rep("t3", effort="xhigh", grade="S", completed=0, blockers_found=1),  # overreach fail
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -257,8 +270,8 @@ def test_conflict_holds_when_at_grade_passes_exist(tmp_path, isolated_cache):
         [
             _rep("t1", effort="xhigh", grade="A+"),
             _rep("t2", effort="xhigh", grade="A+"),
-            _rep("t3", effort="xhigh", grade="A+", completed=0),
-            _rep("t4", effort="xhigh", grade="A", completed=0),  # 2nd demote-grade fail
+            _rep("t3", effort="xhigh", grade="A+", completed=0, blockers_found=1),
+            _rep("t4", effort="xhigh", grade="A", completed=0, blockers_found=1),  # 2nd demote-grade fail
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -322,8 +335,8 @@ def test_one_at_below_plus_one_above_fail_not_demote(tmp_path, isolated_cache):
     view = _view(_entry("grok-hi", "xhigh", "A"))
     _seed(
         [
-            _rep("t1", effort="xhigh", grade="B", completed=0),
-            _rep("t2", effort="xhigh", grade="S", completed=0),
+            _rep("t1", effort="xhigh", grade="B", completed=0, blockers_found=1),
+            _rep("t2", effort="xhigh", grade="S", completed=0, blockers_found=1),
         ]
     )
     result = _result(_propose(view), "grok-hi", "xhigh")
@@ -1292,8 +1305,9 @@ def test_backfill_proposal_consumes_annotated_grade(tmp_path, isolated_cache):
     """After --apply, propose evaluates the annotated reps at their filled
     grade — and discloses the overlay."""
     view = _view(_entry("grok-hi", "xhigh", "B"))
-    _seed([_rep("743", effort="xhigh"), _rep("743", effort="xhigh")])
-    report = grades.backfill_rep_grades(mapping={"743": "A+"}, apply=True)
+    # Two distinct tasks — v1.1 counts one task once per rung.
+    _seed([_rep("743", effort="xhigh"), _rep("744", effort="xhigh")])
+    report = grades.backfill_rep_grades(mapping={"743": "A+", "744": "A+"}, apply=True)
     assert report.applied == 2
     proposal = _propose(view)
     result = _result(proposal, "grok-hi", "xhigh")
@@ -1308,8 +1322,8 @@ def test_backfill_proposal_consumes_annotated_grade(tmp_path, isolated_cache):
 def test_backfill_without_apply_changes_no_proposal(tmp_path, isolated_cache):
     """Dry-run plans but never persists — propose still sees ungraded reps."""
     view = _view(_entry("grok-hi", "xhigh", "B"))
-    _seed([_rep("743", effort="xhigh"), _rep("743", effort="xhigh")])
-    report = grades.backfill_rep_grades(mapping={"743": "A+"})
+    _seed([_rep("743", effort="xhigh"), _rep("744", effort="xhigh")])
+    report = grades.backfill_rep_grades(mapping={"743": "A+", "744": "A+"})
     assert len(report.planned) == 2 and report.applied == 0
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert len(result.ungraded_passes) == 2
@@ -1386,8 +1400,8 @@ def test_superseded_fail_never_double_counts_demote(tmp_path, isolated_cache):
     """Directed surface: a superseded FAIL row and its replacement must not
     add up to the two-FAIL demotion threshold."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
-    _seed_at_id(11, effort="xhigh", grade="A+", completed=0)
-    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, notes="supersedes id=11")
+    _seed_at_id(11, effort="xhigh", grade="A+", completed=0, blockers_found=1)
+    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, blockers_found=1, notes="supersedes id=11")
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "blocked"  # only rep 12 counts — one FAIL short
     assert result.target == "A+"
@@ -1396,9 +1410,9 @@ def test_superseded_fail_never_double_counts_demote(tmp_path, isolated_cache):
 def test_two_distinct_fails_still_demote_after_exclusion(tmp_path, isolated_cache):
     """…but two genuinely distinct FAILs still reach the threshold."""
     view = _view(_entry("grok-hi", "xhigh", "A+"))
-    _seed_at_id(11, effort="xhigh", grade="A+", completed=0)
-    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, notes="supersedes id=11")
-    _seed_at_id(13, effort="xhigh", grade="A", completed=0)
+    _seed_at_id(11, effort="xhigh", grade="A+", completed=0, blockers_found=1)
+    _seed_at_id(12, effort="xhigh", grade="A+", completed=0, blockers_found=1, notes="supersedes id=11")
+    _seed_at_id(13, effort="xhigh", grade="A", completed=0, blockers_found=1)
     result = _result(_propose(view), "grok-hi", "xhigh")
     assert result.action == "demote"  # reps 12 + 13 count
     assert result.target == "B"  # one step below the weaker fail (A)
@@ -1434,3 +1448,631 @@ def test_backfill_same_grade_after_migration_is_idempotent(tmp_path, monkeypatch
     assert second.applied == 0
     assert second.already_annotated == [("srv:501", "A+")]
     assert len(_annotations()) == 1
+
+
+# ---------------------------------------------------------------------------
+# rule v1.1 — evidence hygiene (operator decision 2026-09-27, task #759)
+#
+# Every gate is pinned both directions: a rep counts only when its recorded
+# model matches the rung's catalog model (declared renames aside), non-coding
+# task refs and anomalous rows are excluded and reported, one task counts once
+# per rung (latest recorded rep), and demotion is a FAIL rate over the most
+# recent N counted tasks — never a raw FAIL count. Removing any gate turns
+# the matching assertion RED.
+# ---------------------------------------------------------------------------
+
+
+def _excluded(proposal: grades.Proposal, ref: str) -> grades.EvidenceRep:
+    row = next(r for r in proposal.evidence.rows if r.ref == ref)
+    assert row.excluded
+    return row
+
+
+# --- AC1: model match -----------------------------------------------------
+
+
+def test_rep_model_matches_rung_model_counts(tmp_path, isolated_cache):
+    """Baseline: rep.model == rung catalog model -> the rep counts."""
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    _seed(
+        [
+            _rep("t1", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="A+"),
+            _rep("t2", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="A+"),
+        ]
+    )
+    result = _result(_propose(view), "codex-sol", "high")
+    assert result.action == "promote"
+    assert result.target == "A+"
+
+
+def test_model_mismatch_reported_never_counted(tmp_path, isolated_cache):
+    """The held-proposal defect: a rep recorded as `codex` resolves to the
+    codex-sol rung by spelling, but its recorded model is not the rung's
+    gpt-6-sol — mismatch is reported, never counted, so pre-09-22 evidence
+    cannot promote the new-generation rung."""
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    _seed(
+        [
+            _rep("t1", profile="codex", model_id="codex", effort="high", grade="S"),
+            _rep("t2", profile="codex", model_id="gpt-5", effort="high", grade="S"),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "codex-sol", "high")
+    assert result.action == "insufficient" and not result.counted
+    assert len(result.excluded) == 2
+    assert all("model mismatch" in r.excluded for r in result.excluded)
+    text = grades.render_proposal(proposal, view)
+    assert "model mismatch" in text
+    assert "model-mismatch=2" in text
+
+
+def test_older_generation_never_equivalent(tmp_path, isolated_cache):
+    """gpt-5.6-sol is an older generation of the same line — not equivalent."""
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    _seed([_rep("t1", profile="codex-sol", model_id="gpt-5.6-sol", effort="high", grade="S")])
+    row = _excluded(_propose(view), "local:1")
+    assert "model mismatch" in row.excluded and "model-mismatch" in row.exclusion_tags
+
+
+def test_model_equivalence_declared_rename_counts(tmp_path, isolated_cache):
+    """The declared list covers provable same-model spellings: a rep recorded
+    as `devin-swe2-max` — the launcher profile that pins exactly that model —
+    counts on the swe-2-max rung."""
+    view = _view(_entry("devin-swe2-max", "", "C", model_id="swe-2-max"))
+    _seed(
+        [
+            _rep("t1", profile="builder-devin-max", model_id="devin-swe2-max", grade="A+"),
+            _rep("t2", profile="builder-devin-max", model_id="devin-swe2-max", grade="A+"),
+        ]
+    )
+    result = _result(_propose(view), "devin-swe2-max", "")
+    assert result.action == "promote"
+    assert result.target == "A+"
+
+
+def test_model_unrecorded_never_counts(tmp_path, isolated_cache):
+    """A rep with no recorded model cannot prove it ran the rung's model —
+    fail-closed: reported, never counted."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed_at_id(9, model_id=None, effort="xhigh", grade="A+")
+    row = _excluded(_propose(view), "local:9")
+    assert "model not recorded" in row.excluded
+    assert "model-mismatch" in row.exclusion_tags
+
+
+def test_rung_model_unrecorded_never_counts(tmp_path, isolated_cache):
+    """A catalog row with no model id gives the rep nothing to match —
+    fail-closed rather than counting an unverifiable rep."""
+    view = _view(_entry("grok-hi", "xhigh", "C", model_id=""))
+    _seed([_rep("t1", effort="xhigh", grade="A+")])
+    row = _excluded(_propose(view), "local:1")
+    assert "rung model not recorded" in row.excluded
+
+
+def test_model_disposition_unit_edges(tmp_path, isolated_cache):
+    """assertion-RED: deleting the equivalence/mismatch logic flips these."""
+    entry = _entry("grok-hi", "xhigh", "C", model_id="grok-4.7")
+    rep = bench.RepRecord(
+        id=1,
+        profile="builder-grok",
+        model_id="grok-4.7",
+        task_ref="t",
+        tier="T1",
+        role="impl",
+        rounds=1,
+        blockers_found=0,
+        completed=1,
+        input_tokens=None,
+        output_tokens=None,
+        notes=None,
+        recorded_at="2026-09-20T10:00:00Z",
+        effort="xhigh",
+        grade="A+",
+    )
+    assert grades._model_disposition(rep, entry) == ""
+    assert "mismatch" in grades._model_disposition(
+        dataclasses_replace_model(rep, "grok-4.6"), entry
+    )
+    equiv_entry = _entry("devin-swe2-max", "", "C", model_id="swe-2-max")
+    assert grades._model_disposition(dataclasses_replace_model(rep, "devin-swe2-max"), equiv_entry) == ""
+    assert "mismatch" in grades._model_disposition(
+        dataclasses_replace_model(rep, "devin-swe2"), equiv_entry
+    )
+
+
+def dataclasses_replace_model(rep: bench.RepRecord, model_id: str | None) -> bench.RepRecord:
+    import dataclasses
+
+    return dataclasses.replace(rep, model_id=model_id)
+
+
+# --- AC2: task-level aggregation ------------------------------------------
+
+
+def test_duplicate_task_cannot_reach_min_passes(tmp_path, isolated_cache):
+    """The #677/#568 defect: two reps of the SAME task on the same rung are
+    one measurement — they cannot add up to min_passes."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("677", effort="xhigh", grade="A+"),
+            _rep("677", effort="xhigh", grade="A+", recorded_at="2026-09-20T11:00:00Z"),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert result.action == "insufficient"
+    assert len(result.counted) == 1
+    text = grades.render_proposal(proposal, view)
+    assert "same task '677' counted once" in text
+    assert "final rep is local:2" in text
+
+
+def test_latest_final_rep_wins_fail_then_pass(tmp_path, isolated_cache):
+    """A task re-run counts once by its final disposition: an early FAIL
+    superseded by a later PASS of the same task leaves the PASS."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep(
+                "retry",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
+            ),
+            _rep(
+                "retry",
+                effort="xhigh",
+                grade="A+",
+                completed=1,
+                recorded_at="2026-09-20T12:00:00Z",
+            ),
+            _rep("other", effort="xhigh", grade="A+"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "promote"
+    assert len(result.fails) == 0  # the early FAIL is not the task's final rep
+
+
+def test_latest_final_rep_wins_pass_then_fail(tmp_path, isolated_cache):
+    """…and the inverse: an early PASS superseded by a later FAIL counts the
+    FAIL — one task can flip its final verdict either direction."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("flip", effort="xhigh", grade="A+", completed=1),
+            _rep(
+                "flip",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                blockers_found=1,
+                recorded_at="2026-09-20T12:00:00Z",
+            ),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert len(result.fails) == 1
+
+
+def test_anomalous_latest_rep_cannot_suppress_valid_earlier(tmp_path, isolated_cache):
+    """Only counted candidates compete for the task's final slot: an anomalous
+    latest row is excluded by the hygiene gate before aggregation, so it
+    cannot silence an earlier valid measurement."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("ghost", effort="xhigh", grade="A+", completed=1),
+            _rep(
+                "ghost",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                rounds=0,
+                blockers_found=0,
+                recorded_at="2026-09-20T12:00:00Z",
+            ),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert len(result.counted) == 1
+    assert result.counted[0].rep.completed == 1
+    ghost = next(r for r in result.excluded if r.anomaly)
+    assert ghost.anomaly == "zero-round-fail"
+
+
+def test_task_final_tie_breaks_to_later_store_row(tmp_path, isolated_cache):
+    """Same recorded_at on duplicate task rows: the higher store id is the
+    later record — deterministic, printed."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed([_rep("tie", effort="xhigh", grade="A"), _rep("tie", effort="xhigh", grade="A")])
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert [r.ref for r in result.counted] == ["local:2"]
+    assert "final rep is local:2" in grades.render_proposal(_propose(view), view)
+
+
+# --- AC3: non-coding exclusion --------------------------------------------
+
+
+def test_b0x_trading_slot_excluded_and_reported(tmp_path, isolated_cache):
+    """The default list: a B0X-* trading-slot rep is not coding evidence —
+    excluded with the pattern named, never counted."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("B0X-CRYPTO-SLOT9-A", effort="xhigh", grade="A+"),
+            _rep("B0X-US-SLOT4-VERIFY", effort="xhigh", grade="A+"),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert not result.counted
+    assert all("non-coding task" in r.excluded for r in result.excluded)
+    text = grades.render_proposal(proposal, view)
+    assert "non-coding task patterns" in text and "^B0X-" in text
+    assert "non-coding=2" in text
+
+
+def test_coding_task_unaffected_by_b0x_pattern(tmp_path, isolated_cache):
+    """Negative: the anchored pattern does not eat ordinary task refs."""
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("task-B0X-rework", effort="xhigh", grade="A+"),
+            _rep("677", effort="xhigh", grade="A+"),
+        ]
+    )
+    assert len(_result(_propose(view), "grok-hi", "xhigh").counted) == 2
+
+
+def test_config_non_coding_patterns_honored(tmp_path, isolated_cache):
+    """``[grades].non_coding_task_patterns`` in config.toml extends the
+    default list — the operator's analysis/research refs."""
+    config = tmp_path / "config" / "scopefuel" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[grades]\nnon_coding_task_patterns = ["^analysis-", "^research-"]\n')
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed(
+        [
+            _rep("analysis-12", effort="xhigh", grade="A+"),
+            _rep("research-doc", effort="xhigh", grade="A+"),
+            _rep("568", effort="xhigh", grade="A+"),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert [r.rep.task_ref for r in result.counted] == ["568"]
+    assert set(proposal.evidence.non_coding_patterns) >= {"^B0X-", "^analysis-", "^research-"}
+
+
+def test_cli_non_coding_pattern_honored(tmp_path, isolated_cache):
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed([_rep("audit-4", effort="xhigh", grade="A+")])
+    evidence = grades.gather_reps(view=view, non_coding=["^audit-"], host=HOST)
+    row = _excluded(grades.evaluate(evidence, view), "local:1")
+    assert "non-coding task audit-4" in row.excluded
+    assert evidence.cli_non_coding == ["^audit-"]
+
+
+def test_invalid_non_coding_pattern_refused():
+    """A bad regex fails loud at gather time, never silently matches."""
+    with pytest.raises(bench.BenchError, match="non-coding task pattern"):
+        grades._non_coding_patterns(["(unclosed"])
+
+
+# --- AC4: demotion = FAIL rate over the most recent N counted tasks --------
+
+
+def test_demotion_needs_fail_rate_in_recent_window(tmp_path, isolated_cache):
+    """Two at-or-below FAILs inside the last-5 window at >=40% demote — the
+    rule prints the window and the rate."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("f1", effort="xhigh", grade="A+", completed=0, blockers_found=1),
+            _rep(
+                "f2", effort="xhigh", grade="A", completed=0, blockers_found=1,
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
+            _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T12:00:00Z"),
+            _rep("p2", effort="xhigh", grade="A", recorded_at="2026-09-20T13:00:00Z"),
+            _rep("p3", effort="xhigh", grade="A", recorded_at="2026-09-20T14:00:00Z"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"
+    assert result.target == "B"  # one below the weakest window FAIL (A -> B)
+    assert "2/5" in result.note and "window 5" in result.note
+
+
+def test_fail_rate_below_threshold_blocks(tmp_path, isolated_cache):
+    """Two FAILs in a six-task window is 33% — below the 40% rate, so the
+    rung is blocked, not demoted."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("f1", effort="xhigh", grade="A+", completed=0, blockers_found=1),
+            _rep(
+                "f2", effort="xhigh", grade="A+", completed=0, blockers_found=1,
+                recorded_at="2026-09-20T11:00:00Z",
+            ),
+            _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T12:00:00Z"),
+            _rep("p2", effort="xhigh", grade="A", recorded_at="2026-09-20T13:00:00Z"),
+            _rep("p3", effort="xhigh", grade="A", recorded_at="2026-09-20T14:00:00Z"),
+            _rep("p4", effort="xhigh", grade="A", recorded_at="2026-09-20T15:00:00Z"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+    assert "demotion needs" in result.note
+
+
+def test_single_fail_never_demotes_even_at_full_rate(tmp_path, isolated_cache):
+    """The floor: one FAIL in a thin window is 100% but still one FAIL —
+    demotion needs at least two, so the rung blocks instead."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed([_rep("lone", effort="xhigh", grade="A+", completed=0, blockers_found=1)])
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+
+
+def test_fails_older_than_window_never_demote(tmp_path, isolated_cache):
+    """Recency: a FAIL older than the most recent N counted tasks is stale —
+    it still blocks promotion but no longer demotes, and says why."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("old-fail", effort="xhigh", grade="A+", completed=0, blockers_found=1,
+                 recorded_at="2026-09-20T09:00:00Z"),
+            _rep("f2", effort="xhigh", grade="A+", completed=0, blockers_found=1,
+                 recorded_at="2026-09-20T11:00:00Z"),
+            _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T12:00:00Z"),
+            _rep("p2", effort="xhigh", grade="A", recorded_at="2026-09-20T13:00:00Z"),
+            _rep("p3", effort="xhigh", grade="A", recorded_at="2026-09-20T14:00:00Z"),
+            _rep("p4", effort="xhigh", grade="A", recorded_at="2026-09-20T15:00:00Z"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    # Window is the newest 5 of 6: f2 + four passes inside -> 1 FAIL, 20% ->
+    # blocked; the oldest FAIL is reported as outside the window.
+    assert result.action == "blocked"
+    assert "older than" in result.note
+
+
+def test_marker_fail_outside_window_never_demotes(tmp_path, isolated_cache):
+    """A post-merge marker demotes alone only inside the window — an old
+    rollback is stale evidence, blocking but not demoting."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("old-rollback", effort="xhigh", grade="B", completed=0, notes="[rollback]",
+                 recorded_at="2026-09-20T08:00:00Z"),
+            *[
+                _rep(f"p{i}", effort="xhigh", grade="A", recorded_at=f"2026-09-20T1{i}:00:00Z")
+                for i in range(5)
+            ],
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "blocked"
+
+
+def test_marker_fail_inside_window_demotes(tmp_path, isolated_cache):
+    """…and inside the window a single marker is still a full demote trigger."""
+    view = _view(_entry("grok-hi", "xhigh", "A"))
+    _seed(
+        [
+            _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T10:00:00Z"),
+            _rep("rollback", effort="xhigh", grade="B", completed=0, notes="[rollback]",
+                 recorded_at="2026-09-20T11:00:00Z"),
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"
+
+
+def test_cli_demote_window_flag_validated(tmp_path, monkeypatch, capsys):
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
+    assert cli.main(["grades", "propose", "--demote-window", "0"]) == 2
+    assert "demote-window" in capsys.readouterr().err
+    assert cli.main(["grades", "propose", "--demote-rate", "0"]) == 2
+    assert "demote-rate" in capsys.readouterr().err
+    assert cli.main(["grades", "propose", "--demote-rate", "1.5"]) == 2
+
+
+def test_cli_demote_window_flag_narrows_the_window(tmp_path, monkeypatch, capsys):
+    """--demote-window 2 makes the newest two counted tasks the slice: two
+    FAILs there demote even with older passes alongside."""
+    _cli_view(monkeypatch, [_entry("grok-hi", "xhigh", "A+")])
+    _seed(
+        [
+            _rep("p1", effort="xhigh", grade="A", recorded_at="2026-09-20T10:00:00Z"),
+            _rep("f1", effort="xhigh", grade="A+", completed=0, blockers_found=1,
+                 recorded_at="2026-09-20T11:00:00Z"),
+            _rep("f2", effort="xhigh", grade="A+", completed=0, blockers_found=1,
+                 recorded_at="2026-09-20T12:00:00Z"),
+        ]
+    )
+    assert cli.main(["grades", "propose", "--demote-window", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "demote grok-hi@xhigh" in out
+    assert "2/2" in out
+
+
+# --- AC5: anomalous reps ---------------------------------------------------
+
+
+def test_zero_round_fail_is_anomaly_never_counts(tmp_path, isolated_cache):
+    """The srv:756 shape: FAIL with 0 rounds and 0 blockers measured nothing
+    — listed as needing review, excluded, so it cannot drive a demotion."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+", completed=0, blockers_found=1),
+            _rep("t2", effort="xhigh", grade="A+", completed=0, rounds=0, blockers_found=0),
+        ]
+    )
+    proposal = _propose(view)
+    result = _result(proposal, "grok-hi", "xhigh")
+    assert result.action == "blocked"  # one real FAIL remains — no demote
+    ghost = _excluded(proposal, "local:2")
+    assert ghost.anomaly == "zero-round-fail"
+    assert "needs review" in ghost.excluded
+    text = grades.render_proposal(proposal, view)
+    assert "anomalous reps (1" in text and "zero-round-fail" in text
+
+
+def test_pass_shaped_fail_is_anomaly(tmp_path, isolated_cache):
+    """completed=0 with zero blockers recorded is a FAIL that found nothing —
+    the completed=0-with-PASS contradiction the AC names."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed([_rep("t1", effort="xhigh", completed=0, rounds=2, blockers_found=0)])
+    row = _excluded(_propose(view), "local:1")
+    assert row.anomaly == "pass-shaped-fail"
+
+
+def test_no_completion_flag_is_anomaly(tmp_path, isolated_cache):
+    """A rep with no completed flag never recorded an outcome."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed_at_id(7, effort="xhigh", completed=None)
+    row = _excluded(_propose(view), "local:7")
+    assert row.anomaly == "no-completion-flag"
+
+
+def test_marker_fail_exempt_from_anomaly(tmp_path, isolated_cache):
+    """A rollback legitimately records 0 rounds/0 blockers — the failure was
+    found after merge. Marker FAILs are exempt and still demote alone."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed(
+        [
+            _rep(
+                "t1",
+                effort="xhigh",
+                grade="A+",
+                completed=0,
+                rounds=0,
+                blockers_found=0,
+                notes="[rollback] post-merge revert",
+            )
+        ]
+    )
+    result = _result(_propose(view), "grok-hi", "xhigh")
+    assert result.action == "demote"
+    assert all(not r.anomaly for r in _propose(view).evidence.rows)
+
+
+def test_legit_fail_with_blockers_is_not_anomaly(tmp_path, isolated_cache):
+    """Negative: a FAIL that recorded blockers is a measurement, not an
+    anomaly — every real fleet FAIL carries them."""
+    view = _view(_entry("grok-hi", "xhigh", "A+"))
+    _seed([_rep("t1", effort="xhigh", completed=0, blockers_found=3)])
+    proposal = _propose(view)
+    row = next(r for r in proposal.evidence.rows if r.ref == "local:1")
+    assert not row.anomaly and not row.excluded
+
+
+def test_apply_refuses_proposal_built_on_anomaly(tmp_path, isolated_cache, monkeypatch):
+    """AC6: an artifact whose recorded results name an anomalous rep as
+    evidence is refused — anomalies are excluded until reviewed, and apply
+    cannot launder one through."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+"),
+            _rep("t2", effort="xhigh", grade="A+"),
+            _rep("t3", effort="xhigh", grade="A+", completed=0, rounds=0, blockers_found=0),
+        ]
+    )
+    proposal = _propose(canon)
+    artifact = grades.proposal_to_json(proposal, canon)
+    # Forge the promote result to cite the anomalous rep as evidence.
+    promote = next(r for r in artifact["results"] if r["action"] == "promote")
+    promote["evidence"].append("local:3")
+    with pytest.raises(bench.BenchError, match="anomalous rep"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-759")
+
+
+def test_apply_accepts_clean_proposal_with_anomalies_present(tmp_path, isolated_cache, monkeypatch):
+    """Negative: an artifact built on clean evidence still applies when the
+    store merely *contains* an anomaly the proposal did not cite."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+"),
+            _rep("t2", effort="xhigh", grade="A+"),
+            _rep("t3", effort="xhigh", grade="A+", completed=0, rounds=0, blockers_found=0),
+        ]
+    )
+    proposal = _propose(canon)
+    artifact = grades.proposal_to_json(proposal, canon)
+    entries, live, _view = grades.apply_proposals(
+        artifact, decided_by="operator:test", deviation_ref="task-759"
+    )
+    rows = {e.key: e for e in entries}
+    assert rows[("grok-hi", "xhigh")].grade == "A+"
+
+
+# --- AC6: printed summary + artifact params --------------------------------
+
+
+def test_render_prints_evidence_summary_and_patterns(tmp_path, isolated_cache):
+    """Every proposal ends with the counted/excluded tally by reason — the
+    audit summary the operator asked for."""
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    _seed(
+        [
+            _rep("B0X-US-SLOT1", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="S"),
+            _rep("mismatch", profile="codex-sol", model_id="gpt-5", effort="high", grade="S"),
+            _rep("ok", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="S"),
+        ]
+    )
+    text = grades.render_proposal(_propose(view), view)
+    assert "non-coding task patterns" in text
+    assert "evidence summary:" in text
+    assert "non-coding=1" in text and "model-mismatch=1" in text
+    assert "1 counted" in text
+
+
+def test_json_carries_demote_params_and_anomalies(tmp_path, isolated_cache):
+    view = _view(_entry("grok-hi", "xhigh", "C"))
+    _seed([_rep("t1", effort="xhigh", grade="A+", completed=0, rounds=0, blockers_found=0)])
+    evidence = grades.gather_reps(view=view, non_coding=["^audit-"], host=HOST)
+    payload = grades.proposal_to_json(grades.evaluate(evidence, view), view)
+    assert payload["params"]["demote_window"] == grades.DEMOTE_WINDOW
+    assert payload["params"]["demote_fail_rate"] == grades.DEMOTE_FAIL_RATE
+    assert payload["params"]["cli_non_coding"] == ["^audit-"]
+    assert payload["anomalies"] == [
+        {"ref": "local:1", "rule": "zero-round-fail", "task_ref": "t1"}
+    ]
+    assert "^B0X-" in payload["non_coding_patterns"]
+
+
+def test_apply_replays_artifact_non_coding_and_window(tmp_path, isolated_cache, monkeypatch):
+    """The artifact params drive apply's re-evaluation: same cli patterns and
+    demote window -> the digest matches; forged params fail shape checks."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("audit-9", effort="xhigh", grade="A+")])
+    evidence = grades.gather_reps(view=canon, non_coding=["^audit-"], host=HOST)
+    artifact = grades.proposal_to_json(
+        grades.evaluate(evidence, canon, demote_window=3, demote_fail_rate=0.5), canon
+    )
+    entries, live, _ = grades.apply_proposals(
+        artifact, decided_by="operator:test", deviation_ref="task-759"
+    )
+    assert live.demote_window == 3 and live.demote_fail_rate == 0.5
+    assert "audit-9" in live.evidence.rows[0].excluded or any(
+        "non-coding" in r.excluded for r in live.evidence.rows
+    )
+    broken = dict(artifact, params=dict(artifact["params"], demote_window=0))
+    with pytest.raises(bench.BenchError, match="demote_window"):
+        grades.apply_proposals(broken, decided_by="operator:test", deviation_ref="task-759")
+    broken2 = dict(artifact, params=dict(artifact["params"], demote_fail_rate=1.5))
+    with pytest.raises(bench.BenchError, match="demote_fail_rate"):
+        grades.apply_proposals(broken2, decided_by="operator:test", deviation_ref="task-759")

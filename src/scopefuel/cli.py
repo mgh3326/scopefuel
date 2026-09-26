@@ -379,6 +379,28 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help=f"승급에 필요한 같은-급 PASS 수 (기본 {grades.MIN_PASSES}; decision 4088 draft N=2)",
     )
     grades_propose.add_argument(
+        "--demote-window",
+        type=int,
+        default=grades.DEMOTE_WINDOW,
+        help="강급 FAIL-rate 를 재는 최근 counted task 수 "
+        f"(기본 {grades.DEMOTE_WINDOW}; rule v1.1 operator proposal)",
+    )
+    grades_propose.add_argument(
+        "--demote-rate",
+        type=float,
+        default=grades.DEMOTE_FAIL_RATE,
+        help="그 창 안 at-or-below FAIL 비율 강급 임계 (0 < r <= 1; 기본 "
+        f"{grades.DEMOTE_FAIL_RATE})",
+    )
+    grades_propose.add_argument(
+        "--non-coding-task",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="비코딩 task_ref 패턴 추가 (기본 ^B0X- + config.toml "
+        "[grades].non_coding_task_patterns). 반복 가능",
+    )
+    grades_propose.add_argument(
         "--exclude",
         action="append",
         default=[],
@@ -1466,6 +1488,12 @@ def _grades_command(args: argparse.Namespace) -> int:
         if args.min_passes < 1:
             print("error: --min-passes 는 1 이상이어야 합니다", file=sys.stderr)
             return 2
+        if args.demote_window < 1:
+            print("error: --demote-window 는 1 이상이어야 합니다", file=sys.stderr)
+            return 2
+        if not 0 < args.demote_rate <= 1:
+            print("error: --demote-rate 는 0 보다 크고 1 이하여야 합니다", file=sys.stderr)
+            return 2
         exclusions: list[tuple[str, str]] = []
         for spec in args.exclude:
             old, sep, new = spec.partition("=")
@@ -1478,9 +1506,16 @@ def _grades_command(args: argparse.Namespace) -> int:
             evidence = grades.gather_reps(
                 view=view,
                 exclusions=exclusions,
+                non_coding=args.non_coding_task,
                 allow_plaintext_http=args.allow_plaintext_http,
             )
-            proposal = grades.evaluate(evidence, view, min_passes=args.min_passes)
+            proposal = grades.evaluate(
+                evidence,
+                view,
+                min_passes=args.min_passes,
+                demote_window=args.demote_window,
+                demote_fail_rate=args.demote_rate,
+            )
         except bench.BenchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2

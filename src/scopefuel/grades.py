@@ -13,10 +13,39 @@ host; the artifact is what an operator propagates. A matching fingerprint is
 not enough on its own: when the live stores are degraded (snapshot catalog,
 unread reps canon, truncated rep window — see ``degraded_reasons``), apply
 refuses to write unless the operator passes ``--allow-degraded <reason>`` and
-that reason is stamped into the output.
+that reason is stamped into the output. A proposal whose recorded results rest
+on an anomalous rep is refused outright — anomalies are excluded until the
+operator reviews them.
 
-The rule (operator proposal, decision 4088 part A — draft, tunable via
-``--min-passes``):
+The rule v1.1 (operator decision 2026-09-27, tunable via ``--min-passes``,
+``--demote-window`` and ``--demote-rate``):
+
+Evidence hygiene — applied per rep before any rung is evaluated, each excluded
+row printed with its reason:
+
+*   **Model match** — a rep counts toward a rung only when its recorded
+    ``model_id`` is the rung's catalog ``model_id`` or a spelling the declared
+    ``MODEL_EQUIVALENCE`` list maps onto it (documented renames only — floating
+    CLI spellings and older generations never equate). A rep with no recorded
+    model, or one recorded on a rung whose catalog row carries no model id,
+    cannot be matched and never counts. Mismatches are reported, never counted:
+    this is the guard that keeps an August ``codex``/``gpt-5`` rep off the
+    post-09-22 ``gpt-6-sol`` rungs.
+*   **Non-coding tasks** — reps whose ``task_ref`` matches a non-coding pattern
+    (``NON_CODING_TASK_PATTERNS`` defaults such as the B0X-* trading slots,
+    plus ``[grades].non_coding_task_patterns`` in config.toml and any
+    ``--non-coding-task`` regex) are excluded and reported; a trading-slot or
+    analysis run is not coding-grade evidence.
+*   **Anomalous reps** — rows whose own fields contradict a real measurement
+    (a FAIL with 0 rounds and 0 blockers; ``completed=0`` with zero blockers
+    recorded; no completion flag at all) are listed as needing review and
+    excluded until reviewed. ``apply`` refuses a proposal built on them.
+
+Task-level aggregation — inside a rung, several reps of the same task count
+once: the surviving rep with the latest ``recorded_at`` is the task's final
+disposition on that rung (ties break to the higher store id); earlier reps are
+excluded and printed. A rep that failed evidence hygiene cannot be the task's
+final rep — the latest *counted* rep stands.
 
 *   A **PASS** is a rep with ``completed=1``, ``blockers_found=0``, and no
     post-merge failure marker in ``notes``. A rep that completed but the tester
@@ -29,14 +58,16 @@ The rule (operator proposal, decision 4088 part A — draft, tunable via
     ``min_passes`` PASSes on tasks of grade G and the rung carries **no** FAIL
     evidence at all (a rollback or cap-out undermines any pending promotion,
     whatever grade the failed task asked for).
-*   **Demote** a rung on **two** FAIL reps whose task grades are at or below
-    the placement, **or one** FAIL carrying a post-merge marker at-or-below —
-    a rollback alone is demote-grade evidence; a lone cap-out is not. The
-    target is one step below the weakest failed grade (a FAIL on an ungraded
-    task drops the rung one step below its placement). A FAIL on a task
-    *above* the placement — marker included — is overreach evidence: it does
-    not demote (the placement never claimed that level) but it blocks
-    promotion.
+*   **Demote** a rung on FAIL *rate* over its most recent ``demote_window``
+    counted tasks — at least ``DEMOTE_MIN_FAILS`` FAILs at-or-below the
+    placement inside that window reaching ``demote_fail_rate`` — **or one**
+    FAIL carrying a post-merge marker at-or-below inside the same window. A
+    lone cap-out is still not demotion, and FAILs older than the window count
+    toward nothing but blocking promotion. The target is one step below the
+    weakest failed grade (a FAIL on an ungraded task drops the rung one step
+    below its placement). A FAIL on a task *above* the placement — marker
+    included — is overreach evidence: it does not demote (the placement never
+    claimed that level) but it blocks promotion.
 *   **Conflicted**: when a demote trigger fires but the rung *also* holds
     ``min_passes`` clean PASSes at its current grade, the evidence contradicts
     itself — a demote trigger does not outweigh a measured body of
@@ -53,6 +84,7 @@ The rule (operator proposal, decision 4088 part A — draft, tunable via
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import json
 import re
@@ -61,18 +93,90 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from . import bench, launch
+from .policy import load_config
 from .recommend import PROFILE_ALIASES, profile_pool, profile_subscription
 
 # ---------------------------------------------------------------------------
 # The rule
 # ---------------------------------------------------------------------------
 
-RULE_VERSION = 1
+RULE_VERSION = "1.1"
 MIN_PASSES = 2
+
+# Rule v1.1 demotion: a FAIL *rate* over the rung's most recent ``DEMOTE_WINDOW``
+# counted tasks, not a raw all-history count (operator decision 2026-09-27 —
+# the v1 two-FAIL rule let an anomalous row and duplicate tasks drive the
+# opus@high demotion). Tunable via --demote-window/--demote-rate; a lone
+# cap-out still never demotes, a post-merge marker inside the window still does.
+DEMOTE_WINDOW = 5
+DEMOTE_FAIL_RATE = 0.4
+DEMOTE_MIN_FAILS = 2
 
 # Weakest-to-strongest ladder; the index is the rung's strength rank.
 GRADE_LADDER = ("C", "B", "A", "A+", "S", "S+")
 GRADE_STRENGTH = {grade: index for index, grade in enumerate(GRADE_LADDER)}
+
+# ---------------------------------------------------------------------------
+# Model match (rule v1.1 AC1)
+#
+# A rep counts toward a rung only when its recorded ``model_id`` is the rung's
+# catalog model id or a spelling this table maps onto it. The list is
+# deliberately short and provable: every entry is a same-generation rename —
+# a profile spelling whose launcher pins exactly that model (the devin-*
+# launchers embed the model in the profile name), a provider-namespaced id, or
+# a launcher whose recorded name is the model's own.
+#
+# Deliberately NOT equivalent: floating CLI spellings (``opus``, ``claude``,
+# ``sonnet``, ``codex``, ``codex-sol``, ``codex-luna``, ``grok``, ``kimi-code``
+# alone) and older generations (``gpt-5*``, ``gpt-5.6-sol``, ``grok-4.6``,
+# ``claude-opus-5``) — the 2026-09-27 operator decision named the August
+# ``codex -> codex-sol`` mapping that let pre-09-22 gpt-5-era reps land on the
+# gpt-6-sol rungs. Those reps report as model mismatches, never count, and the
+# operator reviews the mismatch list to extend this table.
+# ---------------------------------------------------------------------------
+
+MODEL_EQUIVALENCE: dict[str, frozenset[str]] = {
+    # devin launcher spellings recorded as the model — the profile argv pins
+    # exactly this model id.
+    "swe-2": frozenset({"devin-swe2"}),
+    "swe-2-medium": frozenset({"devin-swe2-medium"}),
+    "swe-2-max": frozenset({"devin-swe2-max"}),
+    "swe-1-7": frozenset({"devin-swe17"}),
+    "glm-5-2": frozenset({"devin-glm52"}),
+    "deepseek-v4-1-flash-high": frozenset({"devin-ds41"}),
+    "deepseek-v4-1-flash-max": frozenset({"devin-ds41-max"}),
+    # provider-namespaced / launcher spellings of the same model id.
+    "solar-pro4": frozenset({"upstage/solar-pro4"}),
+    "kimi-k3": frozenset({"kimi-code", "kimi-code/k3"}),
+    "gemini-3.7-flash": frozenset({"agy-flash", "agy-flash37"}),
+    # profile spellings that pin one catalog model id.
+    "gpt-6-luna": frozenset({"codex-luna-max"}),
+}
+
+# ---------------------------------------------------------------------------
+# Non-coding tasks (rule v1.1 AC3)
+#
+# Task refs that never establish coding-grade evidence: the B0X-* trading-slot
+# runs (auto_trader cycles and their -VERIFY rounds). ``[grades]
+# non_coding_task_patterns`` in config.toml and ``--non-coding-task <regex>``
+# extend the set — e.g. analysis/research task refs — and the effective list
+# prints in every proposal.
+# ---------------------------------------------------------------------------
+
+NON_CODING_TASK_PATTERNS: tuple[str, ...] = (r"^B0X-",)
+
+# ---------------------------------------------------------------------------
+# Anomalous reps (rule v1.1 AC5) — rows whose own fields contradict a real
+# measurement. They are excluded and listed as needing review; every legit
+# FAIL in the fleet store carries blockers >= 1, so a FAIL with zero recorded
+# blockers is never silently trusted.
+# ---------------------------------------------------------------------------
+
+_ANOMALY_LABELS = {
+    "zero-round-fail": "FAIL with 0 rounds and 0 blockers — nothing was measured",
+    "pass-shaped-fail": "completed=0 with zero blockers recorded — a pass-shaped FAIL",
+    "no-completion-flag": "rep has no completed flag — outcome unrecorded",
+}
 
 # Post-merge failure vocabulary, recorded in rep notes. Bracketed and explicit
 # so ordinary prose ("rolled back the lock", "no rollback") cannot trip it.
@@ -374,6 +478,10 @@ class EvidenceRep:
     resolution: str = ""  # direct | builder map | alias | default effort ("" when unrung)
     effort_inferred: bool = False  # rung effort came from the catalog default
     resolution_detail: str = ""  # the printed basis; the unrung reason when row_key is None
+    anomaly: str = ""  # _ANOMALY_LABELS key when the row contradicts itself (v1.1)
+    # why the row is out: migrated | superseded | anomaly | model-mismatch |
+    # non-coding | same-task | alias-duplicate
+    exclusion_tags: tuple[str, ...] = ()
 
 
 def _classify(rep: bench.RepRecord) -> str:
@@ -395,6 +503,87 @@ def _classify(rep: bench.RepRecord) -> str:
 
 
 _REF_RE = re.compile(r"^(?:(srv|local)(?:@([^:]+))?:)?(\d+)$")
+
+
+def _rep_anomaly(rep: bench.RepRecord) -> str:
+    """The anomaly rule a rep trips, or "" — v1.1 AC5.
+
+    A post-merge marker FAIL is exempt: a rollback can legitimately record zero
+    rounds and zero blockers — the failure was found after merge, not in a run.
+    Every other FAIL with no failure evidence of its own is a contradiction,
+    not a measurement.
+    """
+
+    if rep.completed is None:
+        return "no-completion-flag"
+    if rep.completed == 0 and not FAIL_MARKERS.search(rep.notes or ""):
+        if rep.rounds == 0 and rep.blockers_found == 0:
+            return "zero-round-fail"
+        if rep.blockers_found == 0:
+            return "pass-shaped-fail"
+    return ""
+
+
+def _normalize_model_id(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _model_disposition(rep: bench.RepRecord, judging: bench.CatalogEntry) -> str:
+    """"" when the rep's model may count on this rung; a reason otherwise.
+
+    Strict by construction (v1.1 AC1): the rung's catalog ``model_id`` is the
+    only identity a rep can match, plus the declared ``MODEL_EQUIVALENCE``
+    renames. A rep with no recorded model, or a rung with no catalog model id,
+    can never be proven to match — fail-closed, reported, never counted.
+    """
+
+    rung_model = _normalize_model_id(judging.model_id)
+    rep_model = _normalize_model_id(rep.model_id)
+    if not rep_model:
+        rung_note = rung_model or "unrecorded"
+        return f"model not recorded — cannot prove the rep ran the rung's model ({rung_note})"
+    if not rung_model:
+        return f"rung model not recorded on the catalog row — cannot match rep model '{rep.model_id}'"
+    if rep_model == rung_model or rep_model in MODEL_EQUIVALENCE.get(rung_model, ()):
+        return ""
+    return f"model mismatch: rep model '{rep.model_id}' vs rung model '{judging.model_id}'"
+
+
+def _non_coding_patterns(cli_patterns: list[str] | None = None) -> tuple[re.Pattern[str], ...]:
+    """The effective non-coding task-ref patterns: defaults, config, CLI.
+
+    ``[grades].non_coding_task_patterns`` in config.toml is the operator's
+    persistent list (e.g. analysis/research refs); ``--non-coding-task`` adds
+    run-scoped regexes. A bad pattern fails closed with a clear error rather
+    than silently matching nothing.
+    """
+
+    raw: list[str] = list(NON_CODING_TASK_PATTERNS)
+    grades_cfg = load_config().get("grades")
+    if isinstance(grades_cfg, dict):
+        configured = grades_cfg.get("non_coding_task_patterns")
+        if isinstance(configured, list):
+            raw.extend(item for item in configured if isinstance(item, str) and item.strip())
+    raw.extend(cli_patterns or ())
+    compiled = []
+    for pattern in raw:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            raise bench.BenchError(f"invalid non-coding task pattern {pattern!r}: {exc}") from exc
+    return tuple(compiled)
+
+
+def _non_coding_reason(rep: bench.RepRecord, patterns: tuple[re.Pattern[str], ...]) -> str:
+    """The non-coding exclusion reason for a rep's task_ref, or ""."""
+
+    task = (rep.task_ref or "").strip()
+    if not task:
+        return ""
+    for pattern in patterns:
+        if pattern.search(task):
+            return f"non-coding task {task} (pattern {pattern.pattern})"
+    return ""
 
 
 def resolve_refs(spec: str, *, backend_name: str, host: str) -> tuple[str, ...]:
@@ -458,6 +647,10 @@ class RepsEvidence:
     window_incomplete: bool
     rows: list[EvidenceRep]
     exclusions: list[Exclusion] = field(default_factory=list)
+    # The effective non-coding task-ref regexes (defaults + config + CLI) and
+    # the subset the CLI passed — apply must replay the CLI part exactly.
+    non_coding_patterns: list[str] = field(default_factory=list)
+    cli_non_coding: list[str] = field(default_factory=list)
     # local_id -> server_id for this host's migrated rows, plus the fetched
     # remote set. Both drive the exclusion pass: a ``supersedes id=N`` note
     # written before migration names a *local* id, and the exclusion must
@@ -494,6 +687,7 @@ def gather_reps(
     *,
     view: bench.CatalogView,
     exclusions: list[tuple[str, str]] | None = None,
+    non_coding: list[str] | None = None,
     allow_plaintext_http: bool = False,
     path=None,
     host: str | None = None,
@@ -512,6 +706,7 @@ def gather_reps(
 
     resolved_host = host or socket.gethostname()
     backend = bench.bench_backend(use="reps", allow_plaintext_http=allow_plaintext_http)
+    non_coding_patterns = _non_coding_patterns(non_coding)
 
     rows: list[EvidenceRep] = []
     remote_items: list[bench._RemoteRep] = []
@@ -561,9 +756,11 @@ def gather_reps(
         rows=rows,
         migrated=migrated,
         remote_items=remote_items,
+        non_coding_patterns=[p.pattern for p in non_coding_patterns],
+        cli_non_coding=list(non_coding or ()),
     )
     _apply_grade_annotations(evidence, path=path)
-    _finish_rows(evidence, view, exclusions or [])
+    _finish_rows(evidence, view, exclusions or [], non_coding_patterns)
     return evidence
 
 
@@ -638,8 +835,16 @@ def _finish_rows(
     evidence: RepsEvidence,
     view: bench.CatalogView,
     exclusions: list[tuple[str, str]],
+    non_coding: tuple[re.Pattern[str], ...] = (),
 ) -> None:
-    """Kind, rung, judging row, and exclusion disposition for every row."""
+    """Kind, rung, judging row, and exclusion disposition for every row.
+
+    Exclusion precedence, first reason wins: an already-migrated local copy or
+    a superseded id, then the v1.1 hygiene gates — anomalous rows (needs
+    review), non-coding tasks, and model mismatches against the judging row's
+    catalog model. Every applicable gate is recorded in ``exclusion_tags``
+    even when an earlier reason printed.
+    """
 
     catalog_rows: dict[str, list[bench.CatalogEntry]] = {}
     for entry in _grading_entries(view):
@@ -681,6 +886,28 @@ def _finish_rows(
         candidates = catalog_rows.get(rung[0])
         judging = _judging_row(candidates, rung[1]) if candidates else None
         reason = row.excluded or excluded.get(row.ref, "")
+        tags: list[str] = []
+        if row.excluded:
+            tags.append("migrated")
+        if row.ref in excluded:
+            tags.append("superseded")
+        anomaly = ""
+        if not reason:
+            # v1.1 evidence hygiene — only rows that would otherwise count
+            # are screened, so the needs-review list carries no dead weight.
+            anomaly = _rep_anomaly(row.rep)
+            if anomaly:
+                reason = f"anomalous rep — needs review: {_ANOMALY_LABELS[anomaly]}"
+                tags.append("anomaly")
+            nc = _non_coding_reason(row.rep, non_coding)
+            if nc:
+                reason = reason or nc
+                tags.append("non-coding")
+            if judging is not None:
+                mismatch = _model_disposition(row.rep, judging)
+                if mismatch:
+                    reason = reason or mismatch
+                    tags.append("model-mismatch")
         if judging is None:
             # Unrung — reported, never counted. The detail names the blockage:
             # an unknown spelling has no rows at all; an exact-effort row that
@@ -705,6 +932,8 @@ def _finish_rows(
             resolution=resolved_kind,
             effort_inferred=inferred,
             resolution_detail=detail,
+            anomaly=anomaly,
+            exclusion_tags=tuple(tags),
         )
 
 
@@ -897,6 +1126,8 @@ def _evaluate_row(
     counted: list[EvidenceRep],
     excluded: list[EvidenceRep],
     min_passes: int,
+    demote_window: int,
+    demote_fail_rate: float,
 ) -> RungResult:
     passes_at: dict[str, list[str]] = {}
     ungraded: list[str] = []
@@ -925,14 +1156,27 @@ def _evaluate_row(
         )
     cur_s = GRADE_STRENGTH[current]
 
-    # Rule v1 demotion: two FAILs on tasks at-or-below the placement, OR one
-    # post-merge marker FAIL at-or-below. A FAIL whose task grade sits outside
+    # Rule v1.1 demotion: a FAIL *rate* over the rung's most recent
+    # demote_window counted tasks — at least DEMOTE_MIN_FAILS at-or-below
+    # FAILs inside that window reaching demote_fail_rate — OR one post-merge
+    # marker FAIL at-or-below inside the same window. Recency is the window
+    # itself: counted reps order by recorded_at (ties by store id) and a FAIL
+    # older than the newest demote_window of them is stale — it still blocks
+    # promotion but no longer demotes. A FAIL whose task grade sits outside
     # the ladder cannot establish "the rung failed at G" — fail-closed: it
     # counts like an ungraded FAIL. A marker FAIL on a task *above* the
     # placement stays overreach evidence (promotion-blocking, never demoting).
-    demote_fails = [(ref, g) for ref, g in fails if g is None or GRADE_STRENGTH.get(g, -1) <= cur_s]
+    recent = sorted(counted, key=_recency_key)[-demote_window:]
+    recent_refs = {item.ref for item in recent}
+    demote_fails = [
+        (ref, g)
+        for ref, g in fails
+        if ref in recent_refs and (g is None or GRADE_STRENGTH.get(g, -1) <= cur_s)
+    ]
     marker_demote = [(ref, g) for ref, g in demote_fails if ref in postmerge]
-    if len(demote_fails) >= 2 or marker_demote:
+    fail_rate = len(demote_fails) / len(recent) if recent else 0.0
+    rate_hit = len(demote_fails) >= DEMOTE_MIN_FAILS and fail_rate >= demote_fail_rate
+    if marker_demote or rate_hit:
         if len(passes_at.get(current, ())) >= min_passes:
             # Contradictory evidence: the rung fails at-or-below its grade yet
             # still measures clean passes at it. Not a silent hold — both sides
@@ -963,10 +1207,14 @@ def _evaluate_row(
         if marker_demote:
             note = (
                 f"post-merge FAIL evidence at-or-below placement "
-                f"({len(marker_demote)} marker, {len(demote_fails)} total FAILs)"
+                f"({len(marker_demote)} marker, {len(demote_fails)} window FAILs)"
             )
         else:
-            note = f"{len(demote_fails)} FAILs at-or-below placement"
+            note = (
+                f"{len(demote_fails)}/{len(recent)} counted tasks failed at-or-below {current} "
+                f"in the rung's most recent {len(recent)} (window {demote_window}; "
+                f"rate {fail_rate:.0%} >= {demote_fail_rate:.0%})"
+            )
         if target == current:
             note += "; already at floor C"
         return RungResult(
@@ -986,13 +1234,26 @@ def _evaluate_row(
 
     if fails:
         # No demote trigger, but a FAIL of any kind still bars promotion: a
-        # lone at-or-below cap-out is one short of demotion, and overreach
-        # FAILs sit above the placement.
+        # lone at-or-below cap-out is below the demotion rate, FAILs older
+        # than the window are stale, and overreach FAILs sit above the
+        # placement.
         above = [ref for ref, g in fails if g in GRADE_STRENGTH and GRADE_STRENGTH[g] > cur_s]
+        stale = [
+            (ref, g)
+            for ref, g in fails
+            if ref not in recent_refs and (g is None or GRADE_STRENGTH.get(g, -1) <= cur_s)
+        ]
         parts = []
         if demote_fails:
             parts.append(
-                f"{len(demote_fails)} FAIL(s) at-or-below {current} (demotion needs 2 or a post-merge marker)"
+                f"{len(demote_fails)} FAIL(s) at-or-below {current} in the most recent "
+                f"{len(recent)} counted (demotion needs >= {DEMOTE_MIN_FAILS} at "
+                f"rate >= {demote_fail_rate:.0%} or a post-merge marker)"
+            )
+        if stale:
+            parts.append(
+                f"{len(stale)} FAIL(s) at-or-below {current} older than the "
+                f"most recent {len(recent)}-task window"
             )
         if above:
             parts.append(f"{len(above)} FAIL(s) above the placement")
@@ -1067,6 +1328,8 @@ class Proposal:
     unrung: list[EvidenceRep]  # counted reps whose rung has no catalog row
     evidence: RepsEvidence
     min_passes: int
+    demote_window: int = DEMOTE_WINDOW
+    demote_fail_rate: float = DEMOTE_FAIL_RATE
     digest: str = ""
     # The rung universe actually evaluated: canon rows plus bundled snapshot
     # rows for profiles the canon never mentions (see _grading_entries).
@@ -1165,13 +1428,76 @@ def _collapse_alias_duplicates(evidence: RepsEvidence) -> None:
             evidence.rows[index] = dataclasses.replace(item, excluded=reason)
 
 
+def _ref_id(ref: str) -> int:
+    """The numeric tail of a store ref — the later record's tie-break."""
+
+    try:
+        return int(ref.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _recency_key(item: EvidenceRep) -> tuple:
+    """Chronological key for counted reps — normalized instant, then ref id.
+
+    ``bench._recorded_at_key`` can return a parsed datetime or a raw string;
+    both are normalized back to a comparable isoformat string so ``Z`` and
+    ``+00:00`` spellings of one instant order together. The ref id breaks the
+    remaining ties deterministically (a later store row is the later record).
+    """
+
+    stamp = bench._recorded_at_key(item.rep.recorded_at or "")
+    normalized = stamp.isoformat() if isinstance(stamp, dt.datetime) else str(stamp)
+    return (normalized, _ref_id(item.ref))
+
+
+def _collapse_task_repeats(evidence: RepsEvidence) -> None:
+    """One task counts once per rung — the latest counted rep stands (v1.1 AC2).
+
+    Duplicate reps of the same task on the same rung (re-runs, retries, or a
+    store bug like #677/#568 counted twice) are not independent measurements:
+    the surviving rep with the latest ``recorded_at`` is the task's final
+    disposition on that rung, ties breaking to the higher store id. Only
+    counted candidates compete — a rep already excluded by the hygiene gates
+    cannot be the task's final rep, so an anomalous latest row cannot silence
+    an earlier valid measurement. The same task on *different* rungs keeps
+    counting: each rung's claim is measured separately.
+    """
+
+    groups: dict[tuple[str, tuple[str, str]], list[int]] = {}
+    for index, item in enumerate(evidence.rows):
+        if item.excluded or item.row_key is None:
+            continue
+        task = (item.rep.task_ref or "").strip()
+        if task:
+            groups.setdefault((task, item.row_key), []).append(index)
+    for (task, _key), indexes in groups.items():
+        if len(indexes) < 2:
+            continue
+        final = max((evidence.rows[i] for i in indexes), key=_recency_key)
+        for index in indexes:
+            item = evidence.rows[index]
+            if item is final:
+                continue
+            reason = (
+                f"same task '{task}' counted once — final rep is {final.ref} "
+                f"(latest recorded_at {final.rep.recorded_at})"
+            )
+            evidence.rows[index] = dataclasses.replace(
+                item, excluded=reason, exclusion_tags=item.exclusion_tags + ("same-task",)
+            )
+
+
 def evaluate(
     evidence: RepsEvidence,
     view: bench.CatalogView,
     *,
     min_passes: int = MIN_PASSES,
+    demote_window: int = DEMOTE_WINDOW,
+    demote_fail_rate: float = DEMOTE_FAIL_RATE,
 ) -> Proposal:
     _collapse_alias_duplicates(evidence)
+    _collapse_task_repeats(evidence)
     grouped: dict[tuple[str, str], list[EvidenceRep]] = {}
     excluded_by_row: dict[tuple[str, str], list[EvidenceRep]] = {}
     unrung: list[EvidenceRep] = []
@@ -1204,7 +1530,9 @@ def evaluate(
         excluded = excluded_by_row.get(key, [])
         if not counted and not excluded:
             continue
-        result = _evaluate_row(row, counted, excluded, min_passes)
+        result = _evaluate_row(
+            row, counted, excluded, min_passes, demote_window, demote_fail_rate
+        )
         if key[0] in snapshot_profiles:
             result.snapshot_row = True
         results.append(result)
@@ -1214,6 +1542,8 @@ def evaluate(
         unrung=unrung,
         evidence=evidence,
         min_passes=min_passes,
+        demote_window=demote_window,
+        demote_fail_rate=demote_fail_rate,
         catalog_entries=entries,
         snapshot_profiles=snapshot_profiles,
     )
@@ -1236,6 +1566,9 @@ def _input_digest(proposal: Proposal) -> str:
     payload = {
         "rule_version": RULE_VERSION,
         "min_passes": proposal.min_passes,
+        "demote_window": proposal.demote_window,
+        "demote_fail_rate": proposal.demote_fail_rate,
+        "non_coding_patterns": evidence.non_coding_patterns,
         "backend": evidence.backend,
         "catalog": [entry.as_dict() for entry in sorted(proposal.catalog_entries, key=lambda e: e.key)],
         "exclusions": [{"old": e.old_spec, "new": e.new_spec} for e in evidence.exclusions],
@@ -1250,6 +1583,8 @@ def _input_digest(proposal: Proposal) -> str:
                 "grade_backfilled": row.grade_backfilled,
                 "resolution": row.resolution or None,
                 "effort_inferred": row.effort_inferred or None,
+                "anomaly": row.anomaly or None,
+                "exclusion_tags": list(row.exclusion_tags),
             }
             for row in evidence.rows
         ],
@@ -1339,12 +1674,22 @@ def render_proposal(
     lines = [
         "scopefuel grades propose — measured-rep grade proposals (read-only)",
         f"rule v{RULE_VERSION}: promote needs >= {proposal.min_passes} clean PASSes on "
-        "tasks of grade G with zero FAIL evidence; demote on two FAILs at-or-below "
-        "the placement or one post-merge marker FAIL at-or-below; any unresolved "
-        "FAIL blocks promotion",
+        "tasks of grade G with zero FAIL evidence; demote on "
+        f">= {DEMOTE_MIN_FAILS} FAILs at-or-below the placement reaching "
+        f"{proposal.demote_fail_rate:.0%} of the rung's most recent "
+        f"{proposal.demote_window} counted tasks, or one post-merge marker FAIL "
+        "at-or-below in that window; any counted FAIL still blocks promotion. "
+        "Evidence hygiene: rep model must match the rung's catalog model "
+        "(declared renames only), non-coding task refs are excluded, anomalous "
+        "reps are excluded pending review, and each task counts once per rung "
+        "(the surviving rep with the latest recorded_at).",
         f"reps source={evidence.backend} (reason={evidence.backend_reason}) host={evidence.host} "
         f"rows: server={evidence.remote_count} local={evidence.local_count}",
     ]
+    lines.append(
+        "non-coding task patterns (excluded, reported): "
+        + ", ".join(evidence.non_coding_patterns)
+    )
     if evidence.window_incomplete:
         lines.append(
             f"  warning: server rep window full ({bench._MIGRATE_REP_WINDOW}) — "
@@ -1386,6 +1731,22 @@ def render_proposal(
         refs = {row.ref for row in evidence.rows}
         for item in evidence.exclusions:
             lines.append(f"  {item.status(refs)}")
+
+    anomalous = [row for row in evidence.rows if row.anomaly]
+    if anomalous:
+        lines.append(
+            f"needs review — anomalous reps ({len(anomalous)}, excluded until reviewed):"
+        )
+        for row in anomalous:
+            lines.append(f"  {_fmt_evidence(row)}  [{row.anomaly}]")
+
+    unrung_excluded = [
+        row for row in evidence.rows if row.excluded and row.row_key is None and not row.anomaly
+    ]
+    if unrung_excluded:
+        lines.append("excluded evidence with no catalog rung (reported, never counted):")
+        for row in unrung_excluded:
+            lines.append(f"  {_fmt_evidence(row)}  [excluded: {row.excluded}]")
 
     changes = proposal.changes()
     changed_keys = {r.key for r in changes}
@@ -1457,6 +1818,14 @@ def render_proposal(
         lines.append("missing exclusion targets (never silently ignored):")
         lines.extend(f"  {line}" for line in missing)
 
+    counted_rows = [row for row in evidence.rows if not row.excluded and row.row_key is not None]
+    excluded_rows = [row for row in evidence.rows if row.excluded]
+    tag_counts = Counter(tag for row in excluded_rows for tag in row.exclusion_tags)
+    tag_summary = " ".join(f"{tag}={tag_counts[tag]}" for tag in sorted(tag_counts)) or "none"
+    lines.append(
+        f"evidence summary: {len(counted_rows)} counted, {len(excluded_rows)} excluded "
+        f"({tag_summary}), {len(proposal.unrung)} unrung"
+    )
     lines.append(f"proposal-digest={proposal.digest}")
     return "\n".join(lines)
 
@@ -1475,7 +1844,16 @@ def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
                 for item in proposal.evidence.exclusions
                 if item.origin == "cli"
             ],
+            "cli_non_coding": list(proposal.evidence.cli_non_coding),
+            "demote_window": proposal.demote_window,
+            "demote_fail_rate": proposal.demote_fail_rate,
         },
+        "non_coding_patterns": list(proposal.evidence.non_coding_patterns),
+        "anomalies": [
+            {"ref": row.ref, "rule": row.anomaly, "task_ref": row.rep.task_ref}
+            for row in proposal.evidence.rows
+            if row.anomaly
+        ],
         "reps": {
             "backend": proposal.evidence.backend,
             "backend_reason": proposal.evidence.backend_reason,
@@ -1517,6 +1895,32 @@ def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
 # ---------------------------------------------------------------------------
 # Apply — writes the updated catalog artifact; never touches a host.
 # ---------------------------------------------------------------------------
+
+
+def _recorded_result_refs(item: dict) -> list:
+    """Every rep ref a recorded result claims as evidence, however shaped.
+
+    ``as_dict()`` writes ``evidence`` (flat refs), ``passes_at`` (grade ->
+    refs), ``ungraded_passes``/``unclean_passes`` (flat refs) and ``fails``
+    ([ref, grade] pairs) — all of them are the artifact's claim of what the
+    change rests on.
+    """
+
+    refs: list = []
+    for ref in item.get("evidence") or ():
+        refs.append(ref)
+    for key in ("ungraded_passes", "unclean_passes"):
+        for ref in item.get(key) or ():
+            refs.append(ref)
+    passes = item.get("passes_at")
+    if isinstance(passes, dict):
+        for group in passes.values():
+            if isinstance(group, list):
+                refs.extend(group)
+    for pair in item.get("fails") or ():
+        if isinstance(pair, list | tuple) and pair:
+            refs.append(pair[0])
+    return refs
 
 
 def apply_proposals(
@@ -1565,9 +1969,29 @@ def apply_proposals(
         for pair in raw_exclusions
         if isinstance(pair, list | tuple) and len(pair) == 2
     ]
+    raw_non_coding = params.get("cli_non_coding")
+    if raw_non_coding is None:
+        raw_non_coding = []
+    if not isinstance(raw_non_coding, list):
+        raise bench.BenchError("proposal artifact cli_non_coding must be a JSON array")
+    non_coding = [str(pattern) for pattern in raw_non_coding if isinstance(pattern, str)]
+    demote_window = params.get("demote_window", DEMOTE_WINDOW)
+    if not isinstance(demote_window, int) or isinstance(demote_window, bool) or demote_window < 1:
+        raise bench.BenchError("proposal artifact has no valid demote_window")
+    demote_fail_rate = params.get("demote_fail_rate", DEMOTE_FAIL_RATE)
+    if (
+        not isinstance(demote_fail_rate, int | float)
+        or isinstance(demote_fail_rate, bool)
+        or not 0 < demote_fail_rate <= 1
+    ):
+        raise bench.BenchError("proposal artifact has no valid demote_fail_rate")
     view = bench.read_catalog(path=path, commit_cache=False, allow_plaintext_http=allow_plaintext_http)
     evidence = gather_reps(
-        view=view, exclusions=exclusions, allow_plaintext_http=allow_plaintext_http, path=path
+        view=view,
+        exclusions=exclusions,
+        non_coding=non_coding,
+        allow_plaintext_http=allow_plaintext_http,
+        path=path,
     )
     degraded = degraded_reasons(view, evidence)
     if degraded:
@@ -1580,7 +2004,13 @@ def apply_proposals(
                 "--allow-degraded <reason> to record why the override is safe"
             )
         deviation_ref = f"{deviation_ref}; degraded-override: {override}"
-    live = evaluate(evidence, view, min_passes=min_passes)
+    live = evaluate(
+        evidence,
+        view,
+        min_passes=min_passes,
+        demote_window=demote_window,
+        demote_fail_rate=demote_fail_rate,
+    )
     if proposal_file.get("digest") != live.digest:
         raise bench.BenchError(
             "proposal digest does not match the live evidence — rerun `grades propose` "
@@ -1594,6 +2024,24 @@ def apply_proposals(
         and isinstance(item.get("profile"), str)
         and isinstance(item.get("effort"), str)
     }
+    # v1.1: an anomalous rep is excluded pending review — a proposal artifact
+    # that names one as evidence was forged or built on an unreviewed anomaly,
+    # and apply refuses it outright (the digest check alone cannot see the
+    # artifact's claimed evidence).
+    anomaly_refs = {row.ref for row in live.evidence.rows if row.anomaly}
+    for key, item in recorded.items():
+        claimed = {
+            ref
+            for ref in _recorded_result_refs(item)
+            if isinstance(ref, str)
+        }
+        bad = sorted(claimed & anomaly_refs)
+        if bad:
+            raise bench.BenchError(
+                f"proposal for {key[0]}@{key[1]} rests on anomalous rep(s) "
+                f"{', '.join(bad)} — excluded pending review; rerun `grades propose` "
+                "after the operator reviews the anomaly"
+            )
     for result in live.changes():
         want = recorded.get(result.key)
         if want is None or want.get("target") != result.target:
