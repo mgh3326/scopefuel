@@ -449,7 +449,7 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
     assert {"codex-terra", "codex-luna"}.issubset(aplus_names)
-    # ROB-591: opus --effort low moved from A+ (escalation, 57) to S (escalation, 62)
+    # ROB-591: opus --effort low moved from A+ (escalation, 57) to S (62)
     # as part of the Opus 5.5 refresh — see test_ac1b_opus_low_moved_to_s below.
     assert not any(p.name == "opus" for p in GRADE_TABLE["A+"])
     assert "agy-flash" in aplus_names  # ROB-1251: AA v1.3 실측 승급
@@ -477,20 +477,17 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
 
 
 def test_ac1b_opus_low_moved_to_s():
-    """ROB-591: opus --effort low is now S (escalation, 62), not A+ (escalation, 57)."""
+    """ROB-591: opus --effort low is S (62), not A+ (57). #738 (operator decision
+    hk:doc note/2026-09-26/grade-cost-table, id 4098): an ordinary placement row —
+    Opus low dominates every Sonnet effort on cost and score, so no escalation gate."""
     s_low = next(p for p in GRADE_TABLE["S"] if p.name == "opus")
     assert s_low.launcher_effort == "low"
     assert s_low.benchmark == 62.0
-    assert s_low.gate == "escalation"
+    assert s_low.gate == "default"
+    assert s_low.gate_reason is None
     assert s_low.model == "Opus 5.5 (low)"
     assert s_low.aa_agent_model_id == "claude-opus-5-5"
     assert s_low.aa_model_id == "claude-opus-5-5"
-    # CodeRabbit #68: the pre-move gate_reason named Sonnet 5 (high), an A+
-    # candidate — that's not an S alternative and must not survive the move.
-    assert "Sonnet" not in (s_low.gate_reason or "")
-    assert s_low.gate_reason is not None
-    for alt in ("Terra", "Kimi K3", "Grok"):
-        assert alt in s_low.gate_reason
 
 
 def test_task689_aa_model_mappings_pinned_by_exact_equality():
@@ -697,15 +694,15 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
         _result("grok", 10.0),
     ]
 
-    # ROB-591: opus high/xhigh/medium moved to S+; only opus --effort low (escalation)
-    # remains in S.
+    # ROB-591: opus high/xhigh/medium moved to S+; only opus --effort low remains
+    # in S — a ranked ordinary candidate since #738, not an escalation listing.
     sp_output = recommend(providers, "S+", today=TODAY, now=NOW)
     assert any(line[:1].isdigit() and "opus --effort high" in line for line in sp_output.splitlines())
     assert any(line[:1].isdigit() and "opus --effort medium" in line for line in sp_output.splitlines())
 
     s_output = recommend(providers, "S", today=TODAY, now=NOW)
     assert "opus --effort low" in s_output
-    assert not any(line[:1].isdigit() and "opus --effort low" in line for line in s_output.splitlines())
+    assert any(line[:1].isdigit() and "opus --effort low" in line for line in s_output.splitlines())
     assert not any(
         "opus --effort high" in line or "opus --effort medium" in line for line in s_output.splitlines()
     )
@@ -1537,9 +1534,9 @@ def test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool():
     """The short-window waste illusion no longer outranks a higher weekly budget waste.
 
     ROB-591: uses codex (codex-terra-max) instead of claude (opus) as the weekly+5h
-    pool under test — opus's only grade-S row is now escalation-gated (opus --effort
-    low), so it is no longer a *normal* ranked candidate at grade S. The waste-score
-    math itself is pool-agnostic, so this substitution preserves the exact assertions.
+    pool under test — kept after #738 (opus --effort low is an ordinary S row again,
+    but a claude pool here would also rank it and disturb the pinned ordering). The
+    waste-score math itself is pool-agnostic, so the substitution still isolates it.
     """
     out = recommend(
         [

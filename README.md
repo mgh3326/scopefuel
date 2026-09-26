@@ -176,11 +176,11 @@ SCOPEFUEL_E6_ARM=sonnet@max scopefuel gate -m sonnet --effort max  # → exit 0,
 - 표식이 그 런그를 가리키지 않으면 **아무것도 넓히지 못합니다** — 다른 프로필·다른 런그·
   형식 오류는 무시되고, C 급 E6 런그는 계속 거부됩니다(exit 3).
 - 표식은 C 급 런그의 admission key이면서 **게이트가 판정할 런그를 지명하는 스포너 경로**입니다
-  (wrk 는 `gate` 에 `--effort` 를 넘기지 않습니다). 그래서 arm B의 `opus@low` 같은 escalation
+  (wrk 는 `gate` 에 `--effort` 를 넘기지 않습니다). 그래서 `sonnet@xhigh` 같은 escalation
   런그는 표식으로 런그를 지명한 뒤 기존 `--operator-request` 경로로 엽니다 — 표식 자체가
   escalation 을 우회하지는 않습니다. 배치된 런그를 지명하면 판정이 그 런그로 **좁아질 뿐**
-  넓어지지는 않습니다(예: `SCOPEFUEL_E6_ARM=opus@low gate -m opus` 는 low 런그의 escalation
-  판정).
+  넓어지지는 않습니다(예: `SCOPEFUEL_E6_ARM=sonnet@xhigh gate -m sonnet` 는 xhigh 런그의
+  escalation 판정).
 - 캐논이 런그를 retire 하면 표식으로도 열리지 않습니다 — 닫는 수단은 retire 또는 C 밖 배치입니다.
 - 표식 없이 `policy launch`는 기존 폴백을 그대로 씁니다(`wrk -m codex`는 codex-sol@high를,
   `-m builder-grok`은 grok-hi@xhigh를 pin하므로 이 스펠링들은 변하지 않습니다). 캐논이 E6
