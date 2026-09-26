@@ -9,7 +9,11 @@ never writes the reps store, the catalog cache, or any other state.
 ``propose --json`` run, re-verifies the evidence fingerprint against the live
 stores, and writes the updated catalog as C1 JSON — the shape
 ``bench push-catalog`` PUTs to the canon. Nothing here touches an installed
-host; the artifact is what an operator propagates.
+host; the artifact is what an operator propagates. A matching fingerprint is
+not enough on its own: when the live stores are degraded (snapshot catalog,
+unread reps canon, truncated rep window — see ``degraded_reasons``), apply
+refuses to write unless the operator passes ``--allow-degraded <reason>`` and
+that reason is stamped into the output.
 
 The rule (operator proposal, decision 4088 part A — draft, tunable via
 ``--min-passes``):
@@ -510,6 +514,46 @@ def _finish_rows(
 
 
 # ---------------------------------------------------------------------------
+# Degraded inputs — apply refuses them without an explicit override
+# ---------------------------------------------------------------------------
+
+
+def degraded_reasons(view: bench.CatalogView, evidence: RepsEvidence) -> list[str]:
+    """Every degraded-input reason ``apply`` must refuse without an override.
+
+    A matching digest only proves propose and apply read the same stores —
+    never that those stores were the canon. The degraded states:
+
+    * the catalog came from the bundled snapshot (server unreachable, or a
+      local backend — including the ``auto-local-insecure-url`` fallback), or
+      the server has no catalog route at all and the snapshot stood in;
+    * the reps backend resolved local while handoffkeep credentials exist —
+      the per-use insecure-url path leaves the server reps unread;
+    * the server rep window came back full, so rows older than the window —
+      FAIL evidence included — may be missing from the evaluation.
+
+    A server-*cache* catalog is not degraded: it is a copy the canon itself
+    served inside the operator-configured staleness budget.
+    """
+
+    reasons: list[str] = []
+    if view.source == bench.CATALOG_SOURCE_SNAPSHOT:
+        reasons.append(f"catalog source is the bundled snapshot, not the canon ({view.label})")
+    elif view.source == bench.CATALOG_SOURCE_UNSUPPORTED:
+        reasons.append("server has no catalog route — the bundled snapshot stood in for the canon")
+    if evidence.backend == bench.BENCH_BACKEND_LOCAL and evidence.backend_reason == "auto-local-insecure-url":
+        reasons.append(
+            "reps read the local table only — handoffkeep credentials exist but the "
+            "insecure-url opt-in left the server reps unread"
+        )
+    if evidence.window_incomplete:
+        reasons.append(
+            f"server rep window full ({bench._MIGRATE_REP_WINDOW}) — older FAIL evidence may be missing"
+        )
+    return reasons
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -842,6 +886,11 @@ def render_proposal(
         )
     if evidence.backend == bench.BENCH_BACKEND_LOCAL:
         lines.append("  note: local backend — server reps were not read on this host")
+    degraded = degraded_reasons(view, evidence)
+    if degraded:
+        lines.append(
+            "  degraded input — apply refuses this proposal without --allow-degraded: " + "; ".join(degraded)
+        )
     lines.append(view.label)
 
     if evidence.exclusions:
@@ -936,6 +985,7 @@ def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
             "window_incomplete": proposal.evidence.window_incomplete,
         },
         "catalog_source": view.source,
+        "degraded": degraded_reasons(view, proposal.evidence),
         "exclusions": [
             {
                 "old": item.old_spec,
@@ -962,6 +1012,7 @@ def apply_proposals(
     decided_by: str,
     deviation_ref: str,
     allow_plaintext_http: bool = False,
+    allow_degraded: str | None = None,
     path=None,
 ) -> tuple[list[bench.CatalogEntry], Proposal, bench.CatalogView]:
     """Verify a proposal artifact against live stores, then stamp the catalog.
@@ -970,6 +1021,11 @@ def apply_proposals(
     resulting digest must equal the artifact's, or the evidence changed since
     it was computed and nothing is written. Returns the full updated catalog,
     the live proposal, and the catalog view it was computed against.
+
+    A digest match still says nothing about *what* was read: when the live
+    inputs are degraded (``degraded_reasons``), the write is refused unless
+    the operator passes an explicit ``allow_degraded`` reason, which is then
+    stamped into every changed row's ``deviation_ref``.
     """
 
     if not isinstance(proposal_file, dict):
@@ -977,16 +1033,40 @@ def apply_proposals(
     min_passes = proposal_file.get("min_passes")
     if not isinstance(min_passes, int) or min_passes < 1:
         raise bench.BenchError("proposal artifact has no valid min_passes")
-    params = proposal_file.get("params") or {}
+    params = proposal_file.get("params")
+    if params is not None and not isinstance(params, dict):
+        raise bench.BenchError("proposal artifact params must be a JSON object")
+    params = params or {}
+    raw_exclusions = params.get("cli_exclusions")
+    if raw_exclusions is None:
+        raw_exclusions = []
+    if not isinstance(raw_exclusions, list):
+        raise bench.BenchError("proposal artifact cli_exclusions must be a JSON array")
+    results = proposal_file.get("results")
+    if results is None:
+        results = []
+    if not isinstance(results, list):
+        raise bench.BenchError("proposal artifact results must be a JSON array")
     exclusions = [
         (str(pair[0]), str(pair[1]))
-        for pair in params.get("cli_exclusions") or []
+        for pair in raw_exclusions
         if isinstance(pair, list | tuple) and len(pair) == 2
     ]
     view = bench.read_catalog(path=path, commit_cache=False, allow_plaintext_http=allow_plaintext_http)
     evidence = gather_reps(
         view=view, exclusions=exclusions, allow_plaintext_http=allow_plaintext_http, path=path
     )
+    degraded = degraded_reasons(view, evidence)
+    if degraded:
+        override = (allow_degraded or "").strip()
+        if not override:
+            raise bench.BenchError(
+                "grades apply refuses degraded input: "
+                + "; ".join(degraded)
+                + " — rerun `grades propose` against the canon, or pass "
+                "--allow-degraded <reason> to record why the override is safe"
+            )
+        deviation_ref = f"{deviation_ref}; degraded-override: {override}"
     live = evaluate(evidence, view, min_passes=min_passes)
     if proposal_file.get("digest") != live.digest:
         raise bench.BenchError(
@@ -995,8 +1075,11 @@ def apply_proposals(
         )
     recorded = {
         (item["profile"], item["effort"]): item
-        for item in proposal_file.get("results") or []
-        if isinstance(item, dict) and item.get("action") in ("promote", "demote")
+        for item in results
+        if isinstance(item, dict)
+        and item.get("action") in ("promote", "demote")
+        and isinstance(item.get("profile"), str)
+        and isinstance(item.get("effort"), str)
     }
     for result in live.changes():
         want = recorded.get(result.key)

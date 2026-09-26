@@ -356,6 +356,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         action="store_true",
         help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
     )
+    grades_apply.add_argument(
+        "--allow-degraded",
+        metavar="REASON",
+        help="degraded 입력(스냅샷 카탈로그·불완전 rep 증거)에서도 적용 — 사유가 산출물과 "
+        "카탈로그 행 deviation_ref 에 기록된다",
+    )
 
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
@@ -1298,6 +1304,9 @@ def _grades_command(args: argparse.Namespace) -> int:
             print(grades.render_proposal(proposal, view, focus=focus))
         return 0
     if args.grades_command == "apply":
+        if args.allow_degraded is not None and not args.allow_degraded.strip():
+            print("error: --allow-degraded 는 비어 있지 않은 사유가 필요합니다", file=sys.stderr)
+            return 2
         try:
             proposal_file = json.loads(pathlib.Path(args.proposal).read_text(encoding="utf-8"))
             entries, live, _view = grades.apply_proposals(
@@ -1305,13 +1314,24 @@ def _grades_command(args: argparse.Namespace) -> int:
                 decided_by=args.decided_by,
                 deviation_ref=args.deviation_ref,
                 allow_plaintext_http=args.allow_plaintext_http,
+                allow_degraded=args.allow_degraded,
             )
-        except (OSError, ValueError) as exc:
+        # TypeError joins the clean-refusal set: a malformed artifact that
+        # slips past the shape checks dies inside a comprehension, and the
+        # operator still gets exit 2 instead of a traceback.
+        except (OSError, ValueError, TypeError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         changes = live.changes()
+        degraded = grades.degraded_reasons(_view, live.evidence)
+        override_reason = (args.allow_degraded or "").strip()
         if not changes:
             print("grades apply: proposal carries no grade changes — nothing written")
+            if degraded:
+                print(
+                    f"grades apply: proceeded over degraded input under --allow-degraded "
+                    f"({override_reason}) — {'; '.join(degraded)}"
+                )
             return 0
         # The "catalog" list carries only the stamped changed rows so the file
         # can go straight into `bench push-catalog` (which requires decided_by
@@ -1322,10 +1342,20 @@ def _grades_command(args: argparse.Namespace) -> int:
             "catalog": [e.as_dict() for e in entries if e.key in changed_rows],
             "snapshot": [e.as_dict() for e in entries],
         }
+        if degraded:
+            payload["degraded_override"] = {
+                "reason": override_reason,
+                "inputs": degraded,
+            }
         pathlib.Path(args.out).write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
         print(f"grades apply: wrote {args.out} changed={len(changed_rows)} rows={len(entries)}")
+        if degraded:
+            print(
+                f"grades apply: degraded input applied under --allow-degraded "
+                f"({override_reason}) — {'; '.join(degraded)}"
+            )
         for result in changes:
             print(
                 f"  {result.action} {result.label()} "
