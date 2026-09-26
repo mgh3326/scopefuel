@@ -3351,39 +3351,76 @@ def _put_rep_batches(backend: BenchBackend, reps: list[_RemoteRep], *, batch_siz
             raise BenchBackendError("handoffkeep rejected a rep write")
 
 
-def _bind_server_ids(written: list[_RemoteRep], fetched: list[_RemoteRep]) -> list[_RemoteRep]:
+def _bind_server_ids(
+    written: list[_RemoteRep],
+    fetched: list[_RemoteRep],
+    *,
+    backend: BenchBackend,
+) -> list[_RemoteRep]:
     """Attach the server pk each written rep got, proven by the post-write GET.
 
     A PUT response carries only an upsert count — the assigned ``id`` is only
     observable through a read. The server's upsert key is ``(created_by,
     origin_id)`` and it stamps ``created_by`` itself, so the client-side echo
     cannot name its own row by key. The remote row that proves a write is the
-    one whose stored rep content equals what was sent: origin_id alone is a
-    per-machine value another client's row may share.
+    *unique* holder of the rep's ``origin_id`` + content — but uniqueness is
+    only decidable inside a provably complete window: two clients may write
+    same-content reps under the same per-machine ``origin_id``, so when the
+    fetched page is full the just-written row may sit outside it while
+    another client's twin sits inside. ``fetched`` must therefore come from a
+    GET at ``_MIGRATE_REP_WINDOW``: a short page proves completeness. A full
+    page falls back to the rep's own profile page, which still contains every
+    possible twin (identical content implies identical profile); if that page
+    is full too the write stays unbound — ``origin:`` is honest, a foreign pk
+    is not.
     """
 
     by_origin: dict[int, list[_RemoteRep]] = {}
     for item in fetched:
         by_origin.setdefault(item.origin_id, []).append(item)
-    bound: list[_RemoteRep] = []
-    for item in written:
+    window_complete = len(fetched) < _MIGRATE_REP_WINDOW
+    profile_pages: dict[str, tuple[list[_RemoteRep], bool]] = {}
+
+    def _profile_page(profile: str) -> tuple[list[_RemoteRep], bool]:
+        if profile not in profile_pages:
+            page = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW, "profile": profile})
+            profile_pages[profile] = (page, len(page) < _MIGRATE_REP_WINDOW)
+        return profile_pages[profile]
+
+    def _proven_match(item: _RemoteRep) -> _RemoteRep | None:
         candidates = [
             remote
             for remote in by_origin.get(item.origin_id, ())
             if _same_rep_row(item.record, remote.record)
         ]
-        if len(candidates) == 1:
-            remote = candidates[0]
-            bound.append(
-                _RemoteRep(
-                    record=item.record,
-                    origin_id=item.origin_id,
-                    created_by=remote.created_by,
-                    server_id=remote.server_id,
-                )
-            )
-        else:
+        if len(candidates) > 1:
+            return None
+        if window_complete:
+            return candidates[0] if candidates else None
+        page, complete = _profile_page(item.record.profile)
+        if not complete:
+            return None
+        candidates = [
+            remote
+            for remote in page
+            if remote.origin_id == item.origin_id and _same_rep_row(item.record, remote.record)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    bound: list[_RemoteRep] = []
+    for item in written:
+        remote = _proven_match(item)
+        if remote is None:
             bound.append(item)
+            continue
+        bound.append(
+            _RemoteRep(
+                record=item.record,
+                origin_id=item.origin_id,
+                created_by=remote.created_by,
+                server_id=remote.server_id,
+            )
+        )
     return bound
 
 
@@ -3406,8 +3443,8 @@ def _write_reps_handoffkeep(
     if not reps:
         return reps
     _put_rep_batches(backend, reps)
-    fetched = _fetch_reps(backend)
-    written = _bind_server_ids(reps, fetched)
+    fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
+    written = _bind_server_ids(reps, fetched, backend=backend)
     try:
         _commit_rep_cache(path=path, fetched=fetched, written=written, backend=backend)
     except (sqlite3.Error, OSError) as exc:
@@ -4226,7 +4263,8 @@ class RepIdRefresh:
     unmatched: list[str]  # cache keys whose origin_id no remote row carries
     conflicts: list[str]  # keys the server holds under a different rep's content
     ambiguous: list[str]  # keys with more than one same-content server copy
-    window_incomplete: bool  # remote window full — unseen copies stay unfilled
+    window_blocked: list[str]  # NULL-created_by keys no fetched window can prove
+    window_incomplete: bool  # unfiltered remote window full — some proofs degraded
 
 
 def refresh_rep_server_ids(
@@ -4239,11 +4277,16 @@ def refresh_rep_server_ids(
 
     Dry-run unless ``apply``. The match follows the server's own upsert key:
     a cache row carrying ``created_by`` binds only the remote row under the
-    same ``(created_by, origin_id)`` pair; an anonymous echo row (``created_by``
-    NULL — this host's own write, cached before its identity was known) binds
-    only when exactly one remote row carries that ``origin_id`` *and* stores
-    identical rep content. Either way the rep fields must be equal, so a pk
-    is never bound to a different rep — and a second run finds the rows it
+    same ``(created_by, origin_id)`` pair — the pair is unique server-side, so
+    a visible pair row *is* that row, whatever else the window hides. An
+    anonymous echo row (``created_by`` NULL — this host's own write, cached
+    before its identity was known) binds only a *unique* same-content holder
+    of its ``origin_id``, and uniqueness is only decidable inside a provably
+    complete window: the unfiltered page, or the cache row's own profile page
+    (identical content implies identical profile, so every rival is in it).
+    Echoes no window can prove land in ``window_blocked`` rather than taking a
+    possibly-foreign pk. Either way the rep fields must be equal, so a pk is
+    never bound to a different rep — and a second run finds the rows it
     filled already excluded from the candidate set, making the pass
     idempotent.
     """
@@ -4271,10 +4314,34 @@ def refresh_rep_server_ids(
     for item in remote:
         by_origin.setdefault(item.origin_id, []).append(item)
 
+    profile_pages: dict[str, tuple[list[_RemoteRep], bool]] = {}
+
+    def _profile_page(profile: str) -> tuple[list[_RemoteRep], bool]:
+        """(rows, complete) for one profile — fetched lazily, only when the
+        unfiltered window cannot prove a candidate."""
+
+        if profile not in profile_pages:
+            page = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW, "profile": profile})
+            profile_pages[profile] = (page, len(page) < _MIGRATE_REP_WINDOW)
+        return profile_pages[profile]
+
+    def _echo_holders(row: sqlite3.Row) -> list[_RemoteRep] | None:
+        """Every remote row carrying this origin_id — or None when no fetched
+        window provably contains all of them."""
+
+        holders = by_origin.get(row["origin_id"], [])
+        if not window_incomplete:
+            return holders
+        page, complete = _profile_page(row["profile"])
+        if not complete:
+            return None
+        return [item for item in page if item.origin_id == row["origin_id"]]
+
     filled: list[tuple[str, int, str | None]] = []
     unmatched: list[str] = []
     conflicts: list[str] = []
     ambiguous: list[str] = []
+    window_blocked: list[str] = []
     for row in candidates:
         record = RepRecord(
             id=row["origin_id"],
@@ -4294,19 +4361,43 @@ def refresh_rep_server_ids(
             grade=row["grade"],
             table_grade=row["table_grade"],
         )
-        key_matches = [
-            item
-            for item in by_origin.get(row["origin_id"], ())
-            if row["created_by"] is None or item.created_by == row["created_by"]
-        ]
-        content_matches = [item for item in key_matches if _same_rep_row(record, item.record)]
+        if row["created_by"] is not None:
+            # The server's upsert key is unique, so this can only ever be the
+            # one pair row — window-completeness cannot change that. When the
+            # unfiltered page misses it, the profile page may still hold it.
+            pair = [
+                item for item in by_origin.get(row["origin_id"], ()) if item.created_by == row["created_by"]
+            ]
+            if not pair and window_incomplete:
+                page, complete = _profile_page(row["profile"])
+                if complete:
+                    pair = [
+                        item
+                        for item in page
+                        if item.origin_id == row["origin_id"] and item.created_by == row["created_by"]
+                    ]
+            if not pair:
+                unmatched.append(row["cache_key"])
+            elif _same_rep_row(record, pair[0].record):
+                remote_row = pair[0]
+                assert remote_row.server_id is not None
+                filled.append((row["cache_key"], remote_row.server_id, remote_row.created_by))
+            else:
+                conflicts.append(row["cache_key"])
+            continue
+
+        holders = _echo_holders(row)
+        if holders is None:
+            window_blocked.append(row["cache_key"])
+            continue
+        content_matches = [item for item in holders if _same_rep_row(record, item.record)]
         if len(content_matches) == 1:
             remote_row = content_matches[0]
             assert remote_row.server_id is not None  # wire rows always carry id
             filled.append((row["cache_key"], remote_row.server_id, remote_row.created_by))
         elif len(content_matches) > 1:
             ambiguous.append(row["cache_key"])
-        elif key_matches:
+        elif holders:
             conflicts.append(row["cache_key"])
         else:
             unmatched.append(row["cache_key"])
@@ -4334,6 +4425,7 @@ def refresh_rep_server_ids(
         unmatched=unmatched,
         conflicts=conflicts,
         ambiguous=ambiguous,
+        window_blocked=window_blocked,
         window_incomplete=window_incomplete,
     )
 

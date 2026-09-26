@@ -530,3 +530,143 @@ def test_mutant_wrong_source_and_wrong_row_binding(tmp_path, monkeypatch, capsys
     assert "id=srv:77" in out
     assert "id=origin:7" in out  # still honest about its source
     assert not _BARE_ID.search(out), out
+
+
+def test_add_retry_never_binds_a_foreign_twin(tmp_path, monkeypatch, capsys):
+    """Tester round-1 regression: a full post-write GET page is not a proof.
+
+    Our just-written row can sit outside the newest-5000 window while another
+    client's same-content twin sits inside. The add must stay origin: rather
+    than claim the twin's pk.
+    """
+
+    fake = _remote_backend(tmp_path, monkeypatch)
+    # Freeze the add's timestamp so the retry sends byte-identical content —
+    # otherwise recorded_at alone makes the "twin" a different rep.
+    monkeypatch.setattr(bench, "_utc_now", lambda: "2026-09-26T12:00:00+00:00")
+    fake.fail_next_get = True  # the first add's post-write GET dies
+    assert cli.main(_add_args()) == 2
+    assert len(fake.reps) == 1  # but the write landed: (ops, origin_id=1) -> id=1
+
+    # A foreign twin: clone the stored wire row verbatim so every rep field
+    # matches, only the client identity and pk differ. Newest on the server,
+    # plus enough filler to push our id=1 out of the GET page.
+    twin = dict(fake.reps[0])
+    twin["id"] = 60000
+    twin["created_by"] = "other-client"
+    fake.reps.append(twin)
+    for i in range(4999):
+        fake.reps.append(
+            _remote_row(
+                id=70000 + i,
+                origin_id=900_000 + i,
+                profile="filler",
+                task_ref=f"f{i}",
+            )
+        )
+    capsys.readouterr()
+
+    assert cli.main(_add_args()) == 0
+    out = capsys.readouterr().out
+    assert "recorded rep id=origin:1" in out
+    assert "srv:60000" not in out
+    conn = _cache_db(tmp_path)
+    try:
+        ours = conn.execute("SELECT server_id FROM bench_cache_reps WHERE cache_key = 'origin:1'").fetchall()
+    finally:
+        conn.close()
+    assert ours == [] or all(row["server_id"] is None for row in ours)
+
+
+def test_refresh_echo_needs_a_proven_window(tmp_path, monkeypatch, capsys):
+    """Tester round-1 regression: an echo may not fill from a partial window.
+
+    Two same-content holders of origin_id=777 under different clients; the
+    unfiltered page hides one of them, so the visible singleton is a fake
+    proof — the rep's own profile page exposes the true ambiguity.
+    """
+
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_row(id=60000, origin_id=777, task_ref="dup"))
+    fake.reps.append(_remote_row(id=1000, origin_id=777, created_by="other-client", task_ref="dup"))
+    for i in range(4999):
+        fake.reps.append(
+            _remote_row(
+                id=70000 + i,
+                origin_id=900_000 + i,
+                profile="filler",
+                task_ref=f"f{i}",
+            )
+        )
+    _seed_cache_row(tmp_path, cache_key="origin:777", origin_id=777, task_ref="dup")
+
+    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "ambiguous origin:777" in out
+    assert "fill origin:777" not in out
+    conn = _cache_db(tmp_path)
+    try:
+        row = conn.execute("SELECT server_id FROM bench_cache_reps WHERE cache_key = 'origin:777'").fetchone()
+    finally:
+        conn.close()
+    assert row["server_id"] is None
+
+
+def test_refresh_echo_binds_via_complete_profile_window(tmp_path, monkeypatch, capsys):
+    """A full unfiltered page must not block provable fills: every rival twin
+    shares the rep's profile, so a complete profile page is still a proof."""
+
+    fake = _remote_backend(tmp_path, monkeypatch)
+    fake.reps.append(_remote_row(id=60000, origin_id=777))
+    for i in range(5000):
+        fake.reps.append(
+            _remote_row(
+                id=70000 + i,
+                origin_id=900_000 + i,
+                profile="filler",
+                task_ref=f"f{i}",
+            )
+        )
+    _seed_cache_row(tmp_path, cache_key="origin:777", origin_id=777)
+
+    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "fill origin:777 -> srv:60000" in out
+    conn = _cache_db(tmp_path)
+    try:
+        row = conn.execute(
+            "SELECT server_id, created_by FROM bench_cache_reps WHERE cache_key = 'origin:777'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert (row["server_id"], row["created_by"]) == (60000, CLIENT)
+
+
+def test_refresh_echo_window_blocked_when_no_window_proves(tmp_path, monkeypatch, capsys):
+    """No complete window at all -> window-limited, never a guessed pk."""
+
+    fake = _remote_backend(tmp_path, monkeypatch)
+    # Every fetched page is full: 5000 same-profile fillers crowd out the one
+    # real holder (id=1), so neither the unfiltered nor the profile page can
+    # show all rivals.
+    for i in range(5000):
+        fake.reps.append(
+            _remote_row(
+                id=70000 + i,
+                origin_id=900_000 + i,
+                task_ref=f"f{i}",
+            )
+        )
+    fake.reps.append(_remote_row(id=1, origin_id=777))
+    _seed_cache_row(tmp_path, cache_key="origin:777", origin_id=777)
+
+    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "window-limited origin:777" in out
+    assert "fill origin:777" not in out
+    conn = _cache_db(tmp_path)
+    try:
+        row = conn.execute("SELECT server_id FROM bench_cache_reps WHERE cache_key = 'origin:777'").fetchone()
+    finally:
+        conn.close()
+    assert row["server_id"] is None

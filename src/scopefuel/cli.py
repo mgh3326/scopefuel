@@ -1423,7 +1423,8 @@ def _reps_command(args: argparse.Namespace) -> int:
         print(
             f"reps refresh-ids ({mode}): candidates={result.candidates} "
             f"filled={len(result.filled)} unmatched={len(result.unmatched)} "
-            f"conflicts={len(result.conflicts)} ambiguous={len(result.ambiguous)}{incomplete}"
+            f"conflicts={len(result.conflicts)} ambiguous={len(result.ambiguous)} "
+            f"window-limited={len(result.window_blocked)}{incomplete}"
         )
         for cache_key, server_id in result.filled:
             print(f"  fill {cache_key} -> srv:{server_id}")
@@ -1433,6 +1434,8 @@ def _reps_command(args: argparse.Namespace) -> int:
             print(f"  conflict {cache_key} (server holds the id slot under a different rep)")
         for cache_key in result.ambiguous:
             print(f"  ambiguous {cache_key} (multiple same-content server rows)")
+        for cache_key in result.window_blocked:
+            print(f"  window-limited {cache_key} (remote window incomplete — cannot prove the server row)")
         if not args.apply:
             print("pass --apply to write")
         return 0
