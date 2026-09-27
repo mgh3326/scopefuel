@@ -1991,6 +1991,15 @@ def apply_proposals(
 
     if not isinstance(proposal_file, dict):
         raise bench.BenchError("proposal artifact must be a JSON object")
+    # The artifact format is pinned to the rule that wrote it: a proposal
+    # recorded under a different RULE_VERSION was evaluated with different
+    # semantics, and the digest — which binds evidence, not the rule — cannot
+    # see that. Fail closed rather than adopt another version's content.
+    if proposal_file.get("rule_version") != RULE_VERSION:
+        raise bench.BenchError(
+            f"proposal artifact declares rule v{proposal_file.get('rule_version')}, "
+            f"not v{RULE_VERSION} — rerun `grades propose` under the current rule"
+        )
     min_passes = proposal_file.get("min_passes")
     if not isinstance(min_passes, int) or min_passes < 1:
         raise bench.BenchError("proposal artifact has no valid min_passes")
@@ -2081,11 +2090,13 @@ def apply_proposals(
                 "rerun `grades propose`"
             )
         seen.add(key)
+    # Every keyed item is validated against the live results — promote/demote
+    # and hold/insufficient alike. The artifact's results are meant to be a
+    # verbatim copy of a live evaluation; anything else is forged.
     recorded = {
         (item["profile"], item["effort"]): item
         for item in results
         if isinstance(item, dict)
-        and item.get("action") in ("promote", "demote")
         and isinstance(item.get("profile"), str)
         and isinstance(item.get("effort"), str)
     }
@@ -2114,7 +2125,16 @@ def apply_proposals(
                 f"proposal artifact disagrees with live evaluation for {live_result.label()} — "
                 "rerun `grades propose`"
             )
-        claimed = {ref for ref in _recorded_result_refs(item) if isinstance(ref, str)}
+        # Every claimed ref must be a string — a legit artifact only ever
+        # emits strings, so a nested list or number is forgery or a corrupt
+        # file; refuse it rather than silently filter it away.
+        raw_claimed = list(_recorded_result_refs(item))
+        if any(not isinstance(ref, str) for ref in raw_claimed):
+            raise bench.BenchError(
+                f"proposal for {key[0]}@{key[1]} claims a non-string rep ref — "
+                "the artifact was forged or hand-edited; rerun `grades propose`"
+            )
+        claimed = set(raw_claimed)
         bad = sorted(claimed & anomaly_refs)
         if bad:
             raise bench.BenchError(
