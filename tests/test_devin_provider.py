@@ -936,7 +936,12 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
         if entry.profile in expected and (entry.effort == "low" if entry.profile == "codex-luna" else True)
     }
     assert set(snapshot) == expected
-    assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())
+    # #781: devin-swe2-medium's bundled row carries the approved arm grade (A);
+    # every other unscored row keeps its C stamp, and all stay scoreless.
+    assert all(
+        entry.grade == ("A" if entry.profile == "devin-swe2-medium" else "C") and entry.score is None
+        for entry in snapshot.values()
+    )
     assert snapshot["oc-omni"].gate == "escalation"
 
 

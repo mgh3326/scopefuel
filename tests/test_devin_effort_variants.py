@@ -62,6 +62,15 @@ def test_variant_annotation_is_unmeasured_and_cites_high_only_as_reference():
     assert "#594 E6" in DEVIN_EFFORT_VARIANT_ANNOTATION
 
 
+# #781: devin-swe2-medium's bundled row carries the approved arm grade (A) —
+# the other variants stay unmeasured C. The placement table is untouched.
+CATALOG_GRADE: dict[str, str] = {
+    "devin-swe2-medium": "A",
+    "devin-swe2-max": "C",
+    "devin-ds41-max": "C",
+}
+
+
 @pytest.mark.parametrize("name", sorted(VARIANTS))
 def test_variant_snapshot_and_launch_carry_the_devin_model_id(name):
     rows = [entry for entry in launch.snapshot_entries() if entry.profile == name]
@@ -69,7 +78,7 @@ def test_variant_snapshot_and_launch_carry_the_devin_model_id(name):
     (row,) = rows
     assert row.model_id == VARIANTS[name]
     assert row.pool == "devin"
-    assert row.grade == "C"
+    assert row.grade == CATALOG_GRADE[name]
     assert row.score is None
     assert row.benchmark_annotation == DEVIN_EFFORT_VARIANT_ANNOTATION
 

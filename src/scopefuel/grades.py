@@ -1688,12 +1688,20 @@ def _unsubscribed_tag(profile: str, pool: str | None) -> str:
     return "" if profile_subscription(profile, resolved).subscribed else " [unsubscribed]"
 
 
+def _decided_tag(row: bench.CatalogEntry) -> str:
+    """#781 — decision provenance on a rung line; empty unless the row carries it."""
+
+    if not row.decided_by:
+        return ""
+    return f" [decided_by={row.decided_by} decided_at={row.decided_at or '-'} ref={row.deviation_ref or '-'}]"
+
+
 def render_rung_detail(result: RungResult) -> list[str]:
     """Every evidence row for one rung — the audit view a --rung query wants."""
 
     lines = [
         f"rung {result.label()} current={result.row.grade}"
-        f"{_unsubscribed_tag(result.key[0], result.row.pool)}:"
+        f"{_unsubscribed_tag(result.key[0], result.row.pool)}{_decided_tag(result.row)}:"
     ]
     for item in sorted(result.counted + result.excluded, key=lambda x: (x.ref.partition(":")[0], x.ref)):
         suffix = f"  [excluded: {item.excluded}]" if item.excluded else ""

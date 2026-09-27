@@ -40,6 +40,7 @@ from .recommend import (
     GRADE_TABLE,
     PROFILE_ALIASES,
     REP_GRADES_ORDER,
+    Grade,
     e6_arm_matches,
     e6_arm_rung_for,
     normalize_effort,
@@ -196,13 +197,71 @@ def snapshot_entries() -> tuple[CatalogEntry, ...]:
             existing = best.get(key)
             if existing is None or rank < existing[0]:
                 best[key] = (rank, entry)
-    entries = [entry for _, entry in best.values()]
+    entries = [_arm_grade_override(entry) for _, entry in best.values()]
     entries.extend(CONSULT_ONLY_SNAPSHOT)
     return tuple(sorted(entries, key=lambda e: (e.profile, CATALOG_EFFORT_RANKS.get(e.effort, 99))))
 
 
 # #692: the E6 plan the measurement rungs exist for (hk:doc plan/2026-09-25/e6-effort-ladder).
 E6_ARM_DEVIATION_REF = "hk:doc plan/2026-09-25/e6-effort-ladder (#594 E6)"
+
+
+@dataclass(frozen=True)
+class ArmGradeOverride:
+    """An operator-approved grade move stamped on one bundled arm row (#781).
+
+    Hosts read the bundled catalog snapshot — the server catalog is not in use
+    (#712 on hold) — so a ``grades apply`` artifact never reaches them.  This
+    entry is the code-side record of the approved grade: the bundled catalog
+    row carries the decided grade and the decision provenance exactly the way
+    the pushed canon row would have carried them.
+    """
+
+    grade: Grade
+    decided_by: str
+    decided_at: str
+    deviation_ref: str
+
+
+# #781: the arm rungs' approved grades — exactly the rungs the operator decision
+# named (hk:doc 5177 item 2, evidence reps srv:973, srv:976, srv:988).  The other
+# rungs the same decision reviewed — codex-terra@medium, kimi-k3@high, oc-solar4
+# — were NOT applied and keep their rows unchanged.
+#
+# The override restates the *catalog row* only; it is deliberately not a
+# placement change (``recommend.GRADE_TABLE`` is untouched).  On a
+# bundled-snapshot host a rung stamped above C therefore does NOT become a
+# recommend/gate candidate at the approved grade — ``--recommend`` and the quota
+# gate judge the placement table, which still carries the rung at C
+# (``devin-swe2-medium`` stays listed for grade-C tasks; the ``E6_ARM_RUNGS``
+# measurement rungs stay marker-gated non-candidates).  A server-canonical host
+# reading the same stamped row WOULD place it at its grade
+# (``bench._catalog_grade_table`` filters only unmeasured-C arm rows — the
+# measured->ordinary transition); whether the bundled placement should follow
+# that canon behaviour is the operator's separate call.
+ARM_GRADE_OVERRIDES: dict[tuple[str, str], ArmGradeOverride] = {
+    ("devin-swe2-medium", ""): ArmGradeOverride(
+        grade="A",
+        decided_by="operator:2026-09-27 via operator-desk",
+        decided_at="2026-09-27",
+        deviation_ref="hk:doc 5177 item 2 (evidence srv:973, srv:976, srv:988)",
+    ),
+}
+
+
+def _arm_grade_override(entry: CatalogEntry) -> CatalogEntry:
+    """Restate one bundled row with its approved arm grade and provenance (#781)."""
+
+    override = ARM_GRADE_OVERRIDES.get(entry.key)
+    if override is None:
+        return entry
+    return dataclasses.replace(
+        entry,
+        grade=override.grade,
+        deviation_ref=override.deviation_ref,
+        decided_at=override.decided_at,
+        decided_by=override.decided_by,
+    )
 
 
 def e6_arm_entries() -> tuple[CatalogEntry, ...]:
@@ -217,17 +276,19 @@ def e6_arm_entries() -> tuple[CatalogEntry, ...]:
     """
 
     return tuple(
-        CatalogEntry(
-            profile=row.name,
-            effort=row.launcher_effort or "",
-            model_id=_snapshot_model_id(row.name, row),
-            pool=profile_pool(row.name)[0],
-            grade=E6_ARM_GRADE,
-            score=None,
-            gate=GATE_DEFAULT,
-            benchmark_source=row.benchmark_source,
-            benchmark_annotation=row.benchmark_annotation,
-            deviation_ref=E6_ARM_DEVIATION_REF,
+        _arm_grade_override(
+            CatalogEntry(
+                profile=row.name,
+                effort=row.launcher_effort or "",
+                model_id=_snapshot_model_id(row.name, row),
+                pool=profile_pool(row.name)[0],
+                grade=E6_ARM_GRADE,
+                score=None,
+                gate=GATE_DEFAULT,
+                benchmark_source=row.benchmark_source,
+                benchmark_annotation=row.benchmark_annotation,
+                deviation_ref=E6_ARM_DEVIATION_REF,
+            )
         )
         for row in E6_ARM_RUNGS
     )
