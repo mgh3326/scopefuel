@@ -1,8 +1,10 @@
 """#635: catalog rows for the Devin effort variants.
 
 devin keys effort into the model id (``--model swe-2-max``), so each rung is its
-own profile. The variants are unmeasured: the high rung's grade is a reference,
-never an inherited placement — #594 E6 settles them.
+own profile. The variants start unmeasured: the high rung's grade is a
+reference, never an inherited placement — #594 E6 settles them. #787 moved
+``devin-swe2-medium`` to A on the operator-approved reps measurement
+(hk:doc 5177 item 2, 2026-09-27); the other two variants stay unmeasured C.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from scopefuel import cli, launch
 from scopefuel.providers import devin
 from scopefuel.recommend import (
     DEVIN_EFFORT_VARIANT_ANNOTATION,
+    DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
     GRADE_TABLE,
     profile_pool,
     recommend,
@@ -43,16 +46,26 @@ def _placements(name: str) -> list[str]:
 
 # -- AC1: rows ----------------------------------------------------------------
 
+# #787: placement + annotation per variant. devin-swe2-medium carries the
+# reps-measured A row (hk:doc 5177 item 2); the others keep the #635
+# unmeasured-variant row at C.
+PLACEMENT: dict[str, tuple[str, str]] = {
+    "devin-swe2-medium": ("A", DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION),
+    "devin-swe2-max": ("C", DEVIN_EFFORT_VARIANT_ANNOTATION),
+    "devin-ds41-max": ("C", DEVIN_EFFORT_VARIANT_ANNOTATION),
+}
+
 
 @pytest.mark.parametrize("name", sorted(VARIANTS))
 def test_variant_row_is_unmeasured_with_high_reference(name):
-    assert _placements(name) == ["C"]
-    (profile,) = [p for p in GRADE_TABLE["C"] if p.name == name]
+    grade, annotation = PLACEMENT[name]
+    assert _placements(name) == [grade]
+    (profile,) = [p for p in GRADE_TABLE[grade] if p.name == name]
     assert profile.benchmark is None
     assert profile.benchmark_source is None
     assert profile.launcher_effort is None  # devin takes no effort flag
     assert profile.gate == "default"
-    assert profile.benchmark_annotation == DEVIN_EFFORT_VARIANT_ANNOTATION
+    assert profile.benchmark_annotation == annotation
     assert profile_pool(name) == ("devin", None)
 
 
@@ -62,8 +75,8 @@ def test_variant_annotation_is_unmeasured_and_cites_high_only_as_reference():
     assert "#594 E6" in DEVIN_EFFORT_VARIANT_ANNOTATION
 
 
-# #781: devin-swe2-medium's bundled row carries the approved arm grade (A) —
-# the other variants stay unmeasured C. The placement table is untouched.
+# #781+#787: devin-swe2-medium's bundled row carries the approved arm grade
+# (A) — the other variants stay unmeasured C.
 CATALOG_GRADE: dict[str, str] = {
     "devin-swe2-medium": "A",
     "devin-swe2-max": "C",
@@ -80,7 +93,7 @@ def test_variant_snapshot_and_launch_carry_the_devin_model_id(name):
     assert row.pool == "devin"
     assert row.grade == CATALOG_GRADE[name]
     assert row.score is None
-    assert row.benchmark_annotation == DEVIN_EFFORT_VARIANT_ANNOTATION
+    assert row.benchmark_annotation == PLACEMENT[name][1]
 
     decision = launch.resolve_launch(name)
     assert decision.model_id == VARIANTS[name]
@@ -136,22 +149,35 @@ def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, 
     )
 
 
-# -- AC3: never a confirmed A+ candidate -------------------------------------
+# -- AC3: recommend lists each variant only at its measured placement --------
 
 
-def test_recommend_above_c_never_lists_variants(fixture_text):
+def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_text):
     providers = [devin.parse(_models_list(fixture_text))]
-    for grade in ("S+", "S", "A+", "A", "B"):
+    # Measured placements are A (medium) and C (max rungs) — nowhere else.
+    for grade in ("S+", "S", "A+", "B"):
         out = recommend(providers, grade, explain=True)
         for name in VARIANTS:
             assert name not in out, (grade, name, out)
 
 
-def test_recommend_c_lists_variants_only_as_unmeasured(fixture_text):
+def test_recommend_c_lists_only_the_still_unmeasured_variants(fixture_text):
     providers = [devin.parse(_models_list(fixture_text))]
     out = recommend(providers, "C")
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    for name in VARIANTS:
+    assert "devin-swe2-medium" not in out
+    for name in ("devin-swe2-max", "devin-ds41-max"):
         rows = [line for line in ranked if line.split()[1] == name]
         assert len(rows) == 1, (name, out)
         assert "미측정" in rows[0], rows[0]
+
+
+def test_recommend_a_lists_only_the_measured_variant(fixture_text):
+    """#787: devin-swe2-medium is the A candidate; the C variants stay out."""
+    providers = [devin.parse(_models_list(fixture_text))]
+    out = recommend(providers, "A")
+    ranked = [line for line in out.splitlines() if line[:1].isdigit()]
+    rows = [line for line in ranked if line.split()[1] == "devin-swe2-medium"]
+    assert len(rows) == 1, out
+    for name in ("devin-swe2-max", "devin-ds41-max"):
+        assert name not in out, (name, out)
