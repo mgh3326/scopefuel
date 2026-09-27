@@ -1218,15 +1218,17 @@ def _seed_catalog_json(args: argparse.Namespace) -> int:
     rows = []
     for entry in launch.snapshot_entries():
         row = entry.as_dict()
-        row["decided_by"] = decided_by
-        row["deviation_ref"] = deviation_ref
+        # #781: a row carrying its own operator-decision provenance (an arm
+        # grade override) keeps it; every other row takes the seed's.
+        row["decided_by"] = entry.decided_by or decided_by
+        row["deviation_ref"] = entry.deviation_ref or deviation_ref
         rows.append(row)
     # #692: the E6 measurement rungs are catalog rows too — the canon has to carry
     # them, or a server-backed host cannot resolve the arm. Each keeps its own
     # deviation_ref (the E6 plan) rather than the generic seed provenance.
     for entry in launch.e6_arm_entries():
         row = entry.as_dict()
-        row["decided_by"] = decided_by
+        row["decided_by"] = entry.decided_by or decided_by
         row["deviation_ref"] = entry.deviation_ref or deviation_ref
         rows.append(row)
     print(json.dumps({"catalog": rows}, ensure_ascii=False, indent=2, sort_keys=True))

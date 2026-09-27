@@ -2704,11 +2704,19 @@ def catalog_report(*, path: pathlib.Path | str | None = None) -> str:
         retired = " retired" if entry.retired_at else ""
         unsubscribed = " unsubscribed" if not _entry_subscribed(entry) else ""
         score = "-" if entry.score is None else f"{entry.score:g}"
+        # #781: decision provenance prints only on rows that carry it — every
+        # other row's line stays byte-identical.
+        decided = (
+            f" decided_by={entry.decided_by} decided_at={entry.decided_at or '-'}"
+            f" ref={entry.deviation_ref or '-'}"
+            if entry.decided_by
+            else ""
+        )
         lines.append(
             f"{entry.grade:<3} {entry.profile}"
             f"{'@' + entry.effort if entry.effort else ''} "
             f"model={entry.model_id or '-'} pool={entry.pool or '-'} "
-            f"gate={entry.gate} score={score}{retired}{unsubscribed}"
+            f"gate={entry.gate} score={score}{retired}{unsubscribed}{decided}"
         )
     return "\n".join(lines)
 
