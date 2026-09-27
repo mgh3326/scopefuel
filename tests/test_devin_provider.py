@@ -926,22 +926,21 @@ def test_task631_ds41_measured_grade_is_in_both_snapshot_consumers(capsys, fixtu
 
 def test_task631_other_unscored_c_rows_keep_their_placements():
     expected = {"codex-luna", "kiro-cheap", "oc-omni", "devin-glm52", "devin-swe17"}
-    # #635 effort variants are unmeasured C rows of their own (high rung is only a reference).
-    expected |= {"devin-swe2-medium", "devin-swe2-max", "devin-ds41-max"}
+    # #635 effort variants are unmeasured C rows of their own (high rung is only
+    # a reference) — except devin-swe2-medium, which #787 moved to an unscored
+    # A row on the operator-approved reps measurement (hk:doc 5177 item 2).
+    expected |= {"devin-swe2-max", "devin-ds41-max"}
     actual = {p.name for p in GRADE_TABLE["C"] if p.benchmark is None}
     assert actual == expected
+    medium = next(p for p in GRADE_TABLE["A"] if p.name == "devin-swe2-medium")
+    assert medium.benchmark is None
     snapshot = {
         entry.profile: entry
         for entry in launch.snapshot_entries()
         if entry.profile in expected and (entry.effort == "low" if entry.profile == "codex-luna" else True)
     }
     assert set(snapshot) == expected
-    # #781: devin-swe2-medium's bundled row carries the approved arm grade (A);
-    # every other unscored row keeps its C stamp, and all stay scoreless.
-    assert all(
-        entry.grade == ("A" if entry.profile == "devin-swe2-medium" else "C") and entry.score is None
-        for entry in snapshot.values()
-    )
+    assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())
     assert snapshot["oc-omni"].gate == "escalation"
 
 

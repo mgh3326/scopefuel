@@ -228,17 +228,17 @@ class ArmGradeOverride:
 # rungs the same decision reviewed — codex-terra@medium, kimi-k3@high, oc-solar4
 # — were NOT applied and keep their rows unchanged.
 #
-# The override restates the *catalog row* only; it is deliberately not a
-# placement change (``recommend.GRADE_TABLE`` is untouched).  On a
-# bundled-snapshot host a rung stamped above C therefore does NOT become a
-# recommend/gate candidate at the approved grade — ``--recommend`` and the quota
-# gate judge the placement table, which still carries the rung at C
-# (``devin-swe2-medium`` stays listed for grade-C tasks; the ``E6_ARM_RUNGS``
-# measurement rungs stay marker-gated non-candidates).  A server-canonical host
-# reading the same stamped row WOULD place it at its grade
+# #787: ``recommend.GRADE_TABLE`` now carries ``devin-swe2-medium`` at A too —
+# the placement canon follows the same decision, so the override's *grade*
+# restatement is a no-op.  The entry stays anyway: it is the only carrier of
+# the decision provenance (``decided_by``/``decided_at``/``deviation_ref``) on
+# the bundled catalog row.  Removing it would keep grade A (from GRADE_TABLE)
+# but strip the provenance from ``bench catalog list``, the grades rung
+# detail, and the canon seed emit — an observable change, so the row remains.
+# The ``E6_ARM_RUNGS`` measurement rungs still stay marker-gated
+# non-candidates; a server-canonical host places a stamped row at its grade
 # (``bench._catalog_grade_table`` filters only unmeasured-C arm rows — the
-# measured->ordinary transition); whether the bundled placement should follow
-# that canon behaviour is the operator's separate call.
+# measured->ordinary transition).
 ARM_GRADE_OVERRIDES: dict[tuple[str, str], ArmGradeOverride] = {
     ("devin-swe2-medium", ""): ArmGradeOverride(
         grade="A",

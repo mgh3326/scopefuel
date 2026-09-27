@@ -310,6 +310,17 @@ DEVIN_SWE2_PLACEMENT_NOTE = "보수 배치(A+; reps 3건 전 · AA-agent 미측�
 # #635: devin 은 effort 를 모델 id 안에 둔다(--model swe-2-max). 변형 rung 은 high 의
 # 급을 상속하지 않는다 — high 의 A+ 는 참조로만 적고 #594 E6 판정까지 C 무점수 미측정.
 DEVIN_EFFORT_VARIANT_ANNOTATION = "미측정(high A+ 참조 · 급 비상속 · #594 E6 판정 대기)"
+# #787 — hk:doc 5177 item 2, operator 2026-09-27 via operator-desk (decision
+# item 1): devin-swe2-medium C -> A on counted clean A PASSes srv:988 (task
+# 701) · srv:976 (task 695) · srv:973 (task 682), plus srv:995 (B) and
+# srv:1076 (PASS with blockers). Effort is builder-map inferred
+# (builder-devin-medium -> devin-swe2-medium) and the task grades are
+# backfilled — the operator accepted both per the decision. A reps-measured
+# placement like DEVIN_DS41_GRADE_ANNOTATION, not an AA-agent score.
+DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION = (
+    "급 실측(A; reps PASS srv:988, srv:976, srv:973 + srv:995, srv:1076 · "
+    "operator 2026-09-27 · hk:doc 5177 item 2) · AA-agent 점수 미측정"
+)
 
 # task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
 # opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
@@ -890,6 +901,18 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_model_id="kimi-k2-7-code",
         ),
         _devin_swe2_profile(),
+        # #787 — operator 2026-09-27 via operator-desk, hk:doc 5177 item 2:
+        # devin-swe2-medium promoted C -> A (evidence reps srv:988·976·973 +
+        # srv:995·1076; builder-map effort inference accepted). The bundled
+        # catalog row already carries this grade via launch.ARM_GRADE_OVERRIDES
+        # (#781); this row makes the placement canon agree. swe2-max/ds41-max
+        # stay unmeasured C below.
+        Profile(
+            "devin-swe2-medium",
+            "SWE-2 (medium)",
+            None,
+            benchmark_annotation=DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
+        ),
     ],
     "B": [
         # ROB-1201: measured Luna medium (42) belongs to B (40–47).
@@ -1050,12 +1073,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile("devin-glm52", "GLM-5.2", None, benchmark_annotation=UNMEASURED_ANNOTATION),
         Profile("devin-swe17", "SWE-1.7", None, benchmark_annotation=UNMEASURED_ANNOTATION),
         # #635: effort 변형 rung. 모델 id 는 launch.LAUNCH_MODEL_IDS.
-        Profile(
-            "devin-swe2-medium",
-            "SWE-2 (medium)",
-            None,
-            benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
-        ),
+        # #787: devin-swe2-medium 은 hk:doc 5177 item 2(operator 2026-09-27)의
+        # A 승급으로 위 A 행으로 이동했다. swe2-max·ds41-max 는 계속 미측정 C.
         Profile(
             "devin-swe2-max",
             "SWE-2 (max)",
