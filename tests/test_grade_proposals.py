@@ -10,6 +10,7 @@ never count twice, and missing exclusion targets are reported, never silent.
 from __future__ import annotations
 
 import json
+import pathlib
 import sqlite3
 import urllib.parse
 
@@ -2413,3 +2414,377 @@ def test_apply_refuses_any_action_result_for_absent_rung(tmp_path, isolated_cach
         )
         with pytest.raises(bench.BenchError, match="absent from the live results"):
             grades.apply_proposals(forged, decided_by="operator:test", deviation_ref="task-777")
+
+
+# ---------------------------------------------------------------------------
+# task #788 — grades apply --only: apply the approved rungs only
+#
+# The rung universe below produces two changes (grok-hi@xhigh promote,
+# opus@high promote), one hold (kimi-k3@high), one insufficient
+# (sonnet@xhigh), and no result at all for absent rungs — enough to pin the
+# filter, the refusal set, and the not-applied report in both directions.
+# ---------------------------------------------------------------------------
+
+
+def _only_view(monkeypatch) -> bench.CatalogView:
+    canon = _canon_view(
+        _entry("grok-hi", "xhigh", "C"),
+        _entry("opus", "high", "C"),
+        _entry("kimi-k3", "high", "B", model_id="kimi-k3"),
+        _entry("sonnet", "xhigh", "C"),
+    )
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+"),
+            _rep("t2", effort="xhigh", grade="A+"),
+            _rep("t3", profile="opus", effort="high", grade="S"),
+            _rep("t4", profile="opus", effort="high", grade="S"),
+            _rep("t5", profile="kimi-k3", model_id="kimi-k3", effort="high", grade="B"),
+            _rep("t6", profile="kimi-k3", model_id="kimi-k3", effort="high", grade="B"),
+            _rep("t7", profile="sonnet", effort="xhigh", grade="S"),
+        ]
+    )
+    return canon
+
+
+def _only_artifact(tmp_path, monkeypatch) -> pathlib.Path:
+    _only_view(monkeypatch)
+    artifact = tmp_path / "proposal.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    return artifact
+
+
+def _only_proposal(tmp_path, monkeypatch) -> dict:
+    canon = _only_view(monkeypatch)
+    return grades.proposal_to_json(_propose(canon), canon)
+
+
+def test_cli_apply_only_writes_named_rungs_reports_rest(tmp_path, monkeypatch, capsys):
+    """AC1: --only applies the named change; the other recorded change is
+    reported not applied (operator not approved) in console AND payload —
+    never written, never refused."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(_apply_args(artifact, out_file, "--only", "grok-hi@xhigh")) == 0
+    payload = json.loads(out_file.read_text())
+    rows = {(r["profile"], r["effort"]): r for r in payload["catalog"]}
+    assert list(rows) == [("grok-hi", "xhigh")]
+    assert rows[("grok-hi", "xhigh")]["grade"] == "A+"
+    assert rows[("grok-hi", "xhigh")]["decided_by"] == "operator:test"
+    snap = {(r["profile"], r["effort"]): r for r in payload["snapshot"]}
+    assert snap[("grok-hi", "xhigh")]["grade"] == "A+"
+    assert snap[("opus", "high")]["grade"] == "C"  # withheld — unstamped
+    assert snap[("opus", "high")]["decided_by"] is None
+    assert snap[("kimi-k3", "high")]["grade"] == "B"
+    assert "not_applied" in payload  # the withheld set is disclosed, not dropped
+    withheld = payload["not_applied"]
+    assert len(withheld) == 1
+    assert withheld[0]["profile"] == "opus" and withheld[0]["effort"] == "high"
+    assert withheld[0]["action"] == "promote" and withheld[0]["target"] == "S"
+    assert withheld[0]["status"] == "not applied (operator not approved)"
+    out = capsys.readouterr().out
+    assert "promote grok-hi@xhigh C -> A+" in out
+    assert "not applied (operator not approved): promote opus@high C -> S" in out
+    assert "2 recorded change(s); 1 not applied" in out
+
+
+def test_cli_apply_only_all_changes_behaves_like_full_apply(tmp_path, monkeypatch, capsys):
+    """Naming every change writes the same rows a no---only apply would —
+    not_applied is an empty list, the record still discloses the filter."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(_apply_args(artifact, out_file, "--only", "grok-hi@xhigh,opus@high")) == 0
+    payload = json.loads(out_file.read_text())
+    assert {(r["profile"], r["effort"]) for r in payload["catalog"]} == {
+        ("grok-hi", "xhigh"),
+        ("opus", "high"),
+    }
+    assert payload["not_applied"] == []
+    out = capsys.readouterr().out
+    assert "  not applied" not in out  # no per-change withheld lines
+    assert "0 not applied" in out
+
+
+def test_apply_only_stamps_approved_subset(tmp_path, isolated_cache, monkeypatch):
+    """The function-level contract: apply_proposals(only=...) returns the
+    catalog with only the approved rungs stamped."""
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    entries, live, _view = grades.apply_proposals(
+        artifact,
+        decided_by="operator:test",
+        deviation_ref="task-788",
+        only=[("opus", "high")],
+    )
+    rows = {e.key: e for e in entries}
+    assert rows[("opus", "high")].grade == "S"
+    assert rows[("opus", "high")].decided_by == "operator:test"
+    assert rows[("grok-hi", "xhigh")].grade == "C"
+    assert rows[("grok-hi", "xhigh")].decided_by is None
+    # The live evaluation still reports both changes — filtering is a write
+    # decision, never an evaluation change.
+    assert {r.key for r in live.changes()} == {("grok-hi", "xhigh"), ("opus", "high")}
+
+
+# --- AC3: --only naming a non-change rung is refused ------------------------
+
+
+def test_cli_apply_only_refuses_hold_and_insufficient_rungs(tmp_path, monkeypatch, capsys):
+    """A rung recorded with a non-change outcome (hold, insufficient) is not
+    an approvable change — refused with the recorded action named."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    out_file = tmp_path / "catalog.json"
+    for spec, action in (("kimi-k3@high", "hold"), ("sonnet@xhigh", "insufficient")):
+        assert cli.main(_apply_args(artifact, out_file, "--only", spec)) == 2
+        err = capsys.readouterr().err
+        assert "not changes in the proposal artifact" in err and action in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_only_refuses_absent_rung(tmp_path, monkeypatch, capsys):
+    """A rung the artifact's results never mention — catalog row without
+    evidence, or a profile the catalog does not know — is refused."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(_apply_args(artifact, out_file, "--only", "nosuch@low")) == 2
+    err = capsys.readouterr().err
+    assert "not changes in the proposal artifact" in err and "absent" in err
+    assert not out_file.exists()
+
+
+def test_cli_apply_only_refuses_empty_and_malformed(tmp_path, monkeypatch, capsys):
+    """Empty --only, an empty entry, and a spec without a profile are all
+    refused before the artifact is even read."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    out_file = tmp_path / "catalog.json"
+    for spec in ("", "   ", ",", " , ", "grok-hi@xhigh,", ",grok-hi@xhigh", "@xhigh"):
+        assert cli.main(_apply_args(artifact, out_file, "--only", spec)) == 2
+        assert "only" in capsys.readouterr().err
+    assert not out_file.exists()
+
+
+def test_apply_only_empty_list_refused(tmp_path, isolated_cache, monkeypatch):
+    """Defense in depth: apply_proposals(only=[]) is a refusal, not an
+    apply-nothing pass."""
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    with pytest.raises(bench.BenchError, match="names no rungs"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-788", only=[])
+
+
+def test_apply_only_refuses_non_change_at_function_level(tmp_path, isolated_cache, monkeypatch):
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    with pytest.raises(bench.BenchError, match="not changes in the proposal artifact"):
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("kimi-k3", "high")],
+        )
+    with pytest.raises(bench.BenchError, match="absent"):
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh"), ("nosuch", "low")],
+        )
+
+
+# --- AC2: every whole-artifact check still refuses under --only -------------
+
+
+def test_cli_apply_only_still_refuses_stale_digest(tmp_path, monkeypatch, capsys):
+    """A rep recorded after propose makes the artifact stale — refused even
+    though --only names a valid change."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    out_file = tmp_path / "catalog.json"
+    _seed([_rep("t9", effort="xhigh", grade="B")])
+    assert cli.main(_apply_args(artifact, out_file, "--only", "grok-hi@xhigh")) == 2
+    assert "digest does not match" in capsys.readouterr().err
+    assert not out_file.exists()
+
+
+def test_cli_apply_only_still_refuses_degraded_input(tmp_path, monkeypatch, capsys):
+    """Degraded inputs refuse before the --only filter — a snapshot catalog
+    cannot be laundered through an approved-rung apply."""
+    artifact = _only_artifact(tmp_path, monkeypatch)
+    snapshot = _view(
+        _entry("grok-hi", "xhigh", "C"),
+        _entry("opus", "high", "C"),
+        _entry("kimi-k3", "high", "B", model_id="kimi-k3"),
+        _entry("sonnet", "xhigh", "C"),
+    )
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: snapshot)
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(_apply_args(artifact, out_file, "--only", "grok-hi@xhigh")) == 2
+    assert "refuses degraded input" in capsys.readouterr().err
+    assert not out_file.exists()
+
+
+def test_apply_only_still_refuses_wrong_rule_version(tmp_path, isolated_cache, monkeypatch):
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    artifact["rule_version"] = "9.9"
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "rule v" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_duplicate_rung_results(tmp_path, isolated_cache, monkeypatch):
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    promote = next(r for r in artifact["results"] if r["action"] == "promote")
+    bad = dict(artifact, results=[*artifact["results"], dict(promote)])
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            bad, decided_by="operator:test", deviation_ref="task-788", only=[("grok-hi", "xhigh")]
+        )
+    assert "more than once" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_result_for_absent_rung(tmp_path, isolated_cache, monkeypatch):
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    artifact["results"].append(
+        {
+            "profile": "kiro-opus",
+            "effort": "max",
+            "action": "promote",
+            "target": "S",
+            "current": "A",
+            "passes_at": {},
+            "ungraded_passes": [],
+            "unclean_passes": [],
+            "fails": [],
+            "evidence": [],
+            "note": "forged",
+        }
+    )
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "absent from the live results" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_ghost_and_foreign_refs(tmp_path, isolated_cache, monkeypatch):
+    """A claimed ref absent from the rung's live evidence — a ghost (local:999)
+    or a ref borrowed from another rung — is refused under --only too."""
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    promote = next(r for r in artifact["results"] if r["profile"] == "grok-hi" and r["action"] == "promote")
+    promote["evidence"] = [*promote["evidence"], "local:999"]
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "absent from its live evidence" in str(excinfo.value)
+    artifact2 = _only_proposal(tmp_path, monkeypatch)
+    grok = next(r for r in artifact2["results"] if r["profile"] == "grok-hi" and r["action"] == "promote")
+    opus = next(r for r in artifact2["results"] if r["profile"] == "opus" and r["action"] == "promote")
+    # Borrow one of opus's own refs — live-verified, just not this rung's.
+    grok["evidence"] = [*grok["evidence"], opus["evidence"][0]]
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact2,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "absent from its live evidence" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_non_string_ref(tmp_path, isolated_cache, monkeypatch):
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    promote = next(r for r in artifact["results"] if r["action"] == "promote")
+    promote["evidence"] = [*promote["evidence"], 42]
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "non-string" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_action_target_disagreement(tmp_path, isolated_cache, monkeypatch):
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    held = next(r for r in artifact["results"] if r["action"] == "insufficient")
+    forged = dict(held, action="promote", target="S")
+    artifact["results"] = [forged if r is held else r for r in artifact["results"]]
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "disagrees with live evaluation" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_missing_change_record(tmp_path, isolated_cache, monkeypatch):
+    """An artifact that drops one of the live evaluation's changes disagrees
+    with live even when --only names the remaining valid change."""
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    artifact["results"] = [
+        r for r in artifact["results"] if not (r["profile"] == "opus" and r["action"] == "promote")
+    ]
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "disagrees with live evaluation" in str(excinfo.value)
+
+
+def test_apply_only_still_refuses_anomalous_ref(tmp_path, isolated_cache, monkeypatch):
+    """The anomaly lives in the store before propose, so the digest still
+    matches and the per-key anomaly gate is what fires — under --only too."""
+    canon = _canon_view(
+        _entry("grok-hi", "xhigh", "C"),
+        _entry("opus", "high", "C"),
+    )
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed(
+        [
+            _rep("t1", effort="xhigh", grade="A+"),
+            _rep("t2", effort="xhigh", grade="A+"),
+            _rep("t3", profile="opus", effort="high", grade="S"),
+            _rep("t4", profile="opus", effort="high", grade="S"),
+            _rep("t5", effort="xhigh", grade="A+", completed=0, rounds=0, blockers_found=0),
+        ]
+    )
+    artifact = grades.proposal_to_json(_propose(canon), canon)
+    promote = next(r for r in artifact["results"] if r["profile"] == "grok-hi" and r["action"] == "promote")
+    promote["evidence"] = [*promote["evidence"], "local:5"]  # the anomalous rep
+    with pytest.raises(bench.BenchError) as excinfo:
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("grok-hi", "xhigh")],
+        )
+    assert "anomalous rep" in str(excinfo.value)
+
+
+def test_apply_only_validation_runs_after_integrity_checks(tmp_path, isolated_cache, monkeypatch):
+    """Mutant guard on ordering: when the artifact is forged AND --only names
+    a non-change, the integrity refusal — not the --only refusal — fires."""
+    artifact = _only_proposal(tmp_path, monkeypatch)
+    artifact["rule_version"] = "9.9"
+    with pytest.raises(bench.BenchError, match="rule v"):
+        grades.apply_proposals(
+            artifact,
+            decided_by="operator:test",
+            deviation_ref="task-788",
+            only=[("nosuch", "low")],
+        )

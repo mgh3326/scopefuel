@@ -444,6 +444,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help="degraded 입력(스냅샷 카탈로그·불완전 rep 증거)에서도 적용 — 사유가 산출물과 "
         "카탈로그 행 deviation_ref 에 기록된다",
     )
+    grades_apply.add_argument(
+        "--only",
+        metavar="PROFILE[@EFFORT][,...]",
+        help="지명된 rung 변경만 적용 — 나머지 변경은 not applied (operator not approved) "
+        "로 출력과 산출물에 보고되며 거부되지 않는다",
+    )
 
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
@@ -1536,6 +1542,33 @@ def _grades_command(args: argparse.Namespace) -> int:
         if args.allow_degraded is not None and not args.allow_degraded.strip():
             print("error: --allow-degraded 는 비어 있지 않은 사유가 필요합니다", file=sys.stderr)
             return 2
+        only: list[tuple[str, str]] | None = None
+        if args.only is not None:
+            if not args.only.strip():
+                print(
+                    "error: --only 는 비어 있을 수 없습니다 — 적용할 "
+                    "profile[@effort] rung 를 하나 이상 적으십시오",
+                    file=sys.stderr,
+                )
+                return 2
+            only = []
+            for part in args.only.split(","):
+                spec = part.strip()
+                if not spec:
+                    print(
+                        f"error: --only 에 빈 rung 항목이 있습니다: {args.only!r}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                profile, effort = grades.parse_rung_spec(spec)
+                if not profile:
+                    print(
+                        f"error: --only 항목이 profile[@effort] 형식이 아닙니다: {spec!r}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if (profile, effort) not in only:
+                    only.append((profile, effort))
         try:
             proposal_file = json.loads(pathlib.Path(args.proposal).read_text(encoding="utf-8"))
             entries, live, _view = grades.apply_proposals(
@@ -1544,6 +1577,7 @@ def _grades_command(args: argparse.Namespace) -> int:
                 deviation_ref=args.deviation_ref,
                 allow_plaintext_http=args.allow_plaintext_http,
                 allow_degraded=args.allow_degraded,
+                only=only,
             )
         # TypeError joins the clean-refusal set: a malformed artifact that
         # slips past the shape checks dies inside a comprehension, and the
@@ -1564,13 +1598,28 @@ def _grades_command(args: argparse.Namespace) -> int:
             return 0
         # The "catalog" list carries only the stamped changed rows so the file
         # can go straight into `bench push-catalog` (which requires decided_by
-        # on every row it PUTs). The full post-apply catalog rides along under
-        # "snapshot" for the audit record.
-        changed_rows = {r.key for r in changes}
+        # on every row it PUTs) — under --only that is the approved subset.
+        # The full post-apply catalog rides along under "snapshot" for the
+        # audit record, and "not_applied" records every withheld change.
+        applied_rows = {r.key for r in changes if only is None or r.key in set(only)}
+        skipped = [r for r in changes if only is not None and r.key not in set(only)]
         payload = {
-            "catalog": [e.as_dict() for e in entries if e.key in changed_rows],
+            "catalog": [e.as_dict() for e in entries if e.key in applied_rows],
             "snapshot": [e.as_dict() for e in entries],
         }
+        if only is not None:
+            payload["not_applied"] = [
+                {
+                    "profile": r.key[0],
+                    "effort": r.key[1],
+                    "action": r.action,
+                    "current": r.row.grade,
+                    "target": r.target,
+                    "evidence": list(r.evidence_refs),
+                    "status": "not applied (operator not approved)",
+                }
+                for r in skipped
+            ]
         if degraded:
             payload["degraded_override"] = {
                 "reason": override_reason,
@@ -1579,18 +1628,27 @@ def _grades_command(args: argparse.Namespace) -> int:
         pathlib.Path(args.out).write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
-        print(f"grades apply: wrote {args.out} changed={len(changed_rows)} rows={len(entries)}")
+        print(f"grades apply: wrote {args.out} changed={len(applied_rows)} rows={len(entries)}")
+        if only is not None:
+            print(
+                f"grades apply: --only approved {len(applied_rows)} of {len(changes)} "
+                f"recorded change(s); {len(skipped)} not applied (operator not approved)"
+            )
         if degraded:
             print(
                 f"grades apply: degraded input applied under --allow-degraded "
                 f"({override_reason}) — {'; '.join(degraded)}"
             )
         for result in changes:
-            print(
-                f"  {result.action} {result.label()} "
+            line = (
+                f"{result.action} {result.label()} "
                 f"{result.row.grade} -> {result.target} "
                 f"(evidence: {', '.join(result.evidence_refs)})"
             )
+            if result.key in applied_rows:
+                print(f"  {line}")
+            else:
+                print(f"  not applied (operator not approved): {line}")
         print("propagate with: scopefuel bench push-catalog <out> (operator token)")
         return 0
     return 2
