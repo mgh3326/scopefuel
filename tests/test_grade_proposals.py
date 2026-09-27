@@ -428,13 +428,17 @@ def test_known_static_pairs_present_in_output(tmp_path, isolated_cache):
 
 
 def test_rep_effort_wins_over_spelling_pin(tmp_path, isolated_cache):
-    """builder-grok pins xhigh, but a rep recorded at effort=high measured high."""
+    """builder-grok pins xhigh, but a rep recorded at effort=high measured
+    high — the recorded effort still wins, and with no grok-hi@high row the
+    rep is unrung, never re-judged by the profile's other rungs (v1.2)."""
     view = _view(_entry("grok-hi", "", "S"), _entry("grok-hi", "xhigh", "C"))
     _seed([_rep("t1", effort="high", grade="S")])
     proposal = _propose(view)
-    # (grok-hi, high) has no row -> judged by the profile default row "".
-    result = _result(proposal, "grok-hi", "")
-    assert any(item.rep.task_ref == "t1" for item in result.counted)
+    assert not proposal.results
+    row = next(r for r in proposal.evidence.rows if r.rep.task_ref == "t1")
+    assert row.rung == ("grok-hi", "high")  # recorded effort wins over the xhigh pin
+    assert row.row_key is None
+    assert [r.rep.task_ref for r in proposal.unrung] == ["t1"]
 
 
 def test_spelling_pin_used_when_effort_unrecorded(tmp_path, isolated_cache):
@@ -890,16 +894,22 @@ def test_cli_apply_malformed_artifact_is_a_clean_error(tmp_path, monkeypatch, ca
     crash with AttributeError/KeyError — now a BenchError with exit 2."""
     _cli_canon_view(monkeypatch, [_entry("grok-hi", "xhigh", "C")])
     bad_params = tmp_path / "bad-params.json"
-    bad_params.write_text(json.dumps({"min_passes": 2, "params": ["cli_exclusions"]}))
+    bad_params.write_text(
+        json.dumps({"rule_version": grades.RULE_VERSION, "min_passes": 2, "params": ["cli_exclusions"]})
+    )
     assert cli.main(_apply_args(bad_params, tmp_path / "o1.json")) == 2
     assert "params" in capsys.readouterr().err
     # A truthy non-array cli_exclusions or results used to TypeError before the
     # comprehension — both are clean exit-2 errors now.
     bad_collections = tmp_path / "bad-collections.json"
-    bad_collections.write_text(json.dumps({"min_passes": 2, "params": {"cli_exclusions": 42}}))
+    bad_collections.write_text(
+        json.dumps({"rule_version": grades.RULE_VERSION, "min_passes": 2, "params": {"cli_exclusions": 42}})
+    )
     assert cli.main(_apply_args(bad_collections, tmp_path / "o1b.json")) == 2
     assert "cli_exclusions" in capsys.readouterr().err
-    bad_collections.write_text(json.dumps({"min_passes": 2, "results": 42}))
+    bad_collections.write_text(
+        json.dumps({"rule_version": grades.RULE_VERSION, "min_passes": 2, "results": 42})
+    )
     assert cli.main(_apply_args(bad_collections, tmp_path / "o1c.json")) == 2
     assert "results" in capsys.readouterr().err
     # A results row missing profile/effort must not KeyError — it loses the
@@ -2260,3 +2270,146 @@ def test_apply_refuses_artifact_naming_ghost_ref(tmp_path, isolated_cache, monke
     promote["evidence"].append("local:999")
     with pytest.raises(bench.BenchError, match="absent from its live evidence"):
         grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-759")
+
+
+# ---------------------------------------------------------------------------
+# task #777 — artifact result-key integrity (v1.2)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_refuses_duplicate_rung_results(tmp_path, isolated_cache, monkeypatch):
+    """AC1 (#777): an artifact that lists the same (profile, effort) result
+    more than once is refused BEFORE the recorded map is built — the r4
+    smuggle was an earlier duplicate carrying local:999 hidden behind a
+    later clean duplicate. Both orders refuse, and a duplicate carrying a
+    different action refuses too: every item that claims a rung key counts."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    proposal = _propose(canon)
+    artifact = grades.proposal_to_json(proposal, canon)
+    promote = next(r for r in artifact["results"] if r["action"] == "promote")
+    forged = dict(promote, evidence=["local:999"])  # the hidden ghost carrier
+    for results in ([forged, promote], [promote, forged]):
+        bad = dict(artifact, results=[*artifact["results"], *results])
+        with pytest.raises(bench.BenchError, match="more than once"):
+            grades.apply_proposals(bad, decided_by="operator:test", deviation_ref="task-777")
+    hold_twin = dict(promote, action="hold", target=None)
+    bad = dict(artifact, results=[*artifact["results"], hold_twin])
+    with pytest.raises(bench.BenchError, match="more than once"):
+        grades.apply_proposals(bad, decided_by="operator:test", deviation_ref="task-777")
+
+
+def test_apply_refuses_result_for_rung_absent_from_live(tmp_path, isolated_cache, monkeypatch):
+    """AC2 (#777): an extra recorded result for a rung the live evaluation
+    never produced is refused even when every evidence list is empty — the
+    live result's existence, not the artifact's claimed refs, is the gate."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    proposal = _propose(canon)
+    artifact = grades.proposal_to_json(proposal, canon)
+    # opus@high is a bundled-snapshot rung the live evaluation never produced
+    # (no evidence at all): a forged promote on it must fail closed.
+    artifact["results"].append(
+        {
+            "profile": "opus",
+            "effort": "high",
+            "action": "promote",
+            "target": "S",
+            "current": "A",
+            "passes_at": {},
+            "ungraded_passes": [],
+            "unclean_passes": [],
+            "fails": [],
+            "evidence": [],
+            "note": "forged",
+        }
+    )
+    with pytest.raises(bench.BenchError, match="absent from the live results"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-777")
+
+
+def test_apply_refuses_recorded_action_disagreeing_with_live(tmp_path, isolated_cache, monkeypatch):
+    """AC2 (#777): a forged promote on a rung live evaluates as insufficient
+    is refused even when it borrows the live result's own refs — the digest
+    binds live evidence, never the artifact's claimed action/target."""
+    canon = _canon_view(_entry("opus", "high", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", profile="opus", effort="high", grade="A")])
+    proposal = _propose(canon)
+    artifact = grades.proposal_to_json(proposal, canon)
+    held = next(r for r in artifact["results"] if r["action"] == "insufficient")
+    forged = dict(held, action="promote", target="S")
+    artifact["results"] = [forged if r is held else r for r in artifact["results"]]
+    with pytest.raises(bench.BenchError, match="disagrees with live evaluation"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-777")
+
+
+def test_apply_refuses_artifact_written_under_another_rule_version(tmp_path, isolated_cache, monkeypatch):
+    """Tester r1 BLOCKER: rule_version pins the artifact to the semantics
+    that wrote it — a v1.1 artifact must not apply under v1.2 even with a
+    matching digest, and a missing field refuses the same way."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = grades.proposal_to_json(_propose(canon), canon)
+    artifact["rule_version"] = "1.1"
+    with pytest.raises(bench.BenchError, match="rule v"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-777")
+    artifact["rule_version"] = None
+    with pytest.raises(bench.BenchError, match="rule v"):
+        grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-777")
+
+
+def test_apply_refuses_non_string_claimed_ref(tmp_path, isolated_cache, monkeypatch):
+    """Tester r1 BLOCKER: a claimed ref that is not a string (nested list,
+    number) must be refused — silently filtering it would pass a corrupt
+    artifact through the same gate a ghost string fails."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = grades.proposal_to_json(_propose(canon), canon)
+    promote = next(r for r in artifact["results"] if r["action"] == "promote")
+    for bad_ref in (["local:999"], 999):
+        forged = dict(
+            artifact,
+            results=[
+                dict(r, evidence=[*r["evidence"], bad_ref]) if r is promote else r
+                for r in artifact["results"]
+            ],
+        )
+        with pytest.raises(bench.BenchError, match="non-string"):
+            grades.apply_proposals(forged, decided_by="operator:test", deviation_ref="task-777")
+
+
+def test_apply_refuses_any_action_result_for_absent_rung(tmp_path, isolated_cache, monkeypatch):
+    """Tester r1 SHOULD: the live-result gate covers every keyed item — a
+    hold/insufficient/blocked entry for a rung live never produced is
+    refused, not only promote/demote."""
+    canon = _canon_view(_entry("grok-hi", "xhigh", "C"))
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
+    _seed([_rep("t1", effort="xhigh", grade="A+"), _rep("t2", effort="xhigh", grade="A+")])
+    artifact = grades.proposal_to_json(_propose(canon), canon)
+    for action in ("hold", "insufficient", "blocked"):
+        forged = dict(
+            artifact,
+            results=[
+                *artifact["results"],
+                {
+                    "profile": "opus",
+                    "effort": "high",
+                    "action": action,
+                    "target": "A",
+                    "current": "A",
+                    "passes_at": {},
+                    "ungraded_passes": [],
+                    "unclean_passes": [],
+                    "fails": [],
+                    "evidence": [],
+                    "note": "forged",
+                },
+            ],
+        )
+        with pytest.raises(bench.BenchError, match="absent from the live results"):
+            grades.apply_proposals(forged, decided_by="operator:test", deviation_ref="task-777")
