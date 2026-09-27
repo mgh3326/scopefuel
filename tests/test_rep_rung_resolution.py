@@ -417,17 +417,19 @@ def test_uncovered_profile_resolves_via_snapshot_and_is_marked(tmp_path, isolate
 
 def test_covered_profile_never_reads_snapshot_rungs(tmp_path, isolated_cache):
     """A profile the canon mentions is canon's to define — snapshot rungs of
-    that profile must not leak back into the evaluated universe."""
+    that profile must not leak back into the evaluated universe, and a rep
+    recorded at an effort with no canon row is unrung rather than judged by
+    the profile's live default or a snapshot stand-in (v1.2)."""
     view = _canon_view(_entry("opus", "high", "S"))  # canon carries only opus@high
     _seed([_rep("t1", profile="opus", effort="low", grade="S")])
     proposal = _propose(view)
-    # opus@low has no canon row: judged by the profile's live default
-    # (opus@high), never by a snapshot stand-in.
-    keys = _keys(proposal)
-    assert keys == {("opus", "high")}
+    # opus@low has no canon row: unrung — a measured effort counts only on its
+    # own rung, never on opus@high and never on a snapshot stand-in.
+    assert _keys(proposal) == set()
     row = _counted(proposal, "t1")
     assert row.rung == ("opus", "low")
-    assert row.row_key == ("opus", "high")
+    assert row.row_key is None
+    assert [r.rep.task_ref for r in proposal.unrung] == ["t1"]
 
 
 def test_empty_canon_evaluates_the_full_snapshot_universe(tmp_path, isolated_cache):
@@ -836,3 +838,155 @@ def test_mutant_alias_dedup_would_fail(tmp_path, monkeypatch, isolated_cache):
     view = _view(_entry("codex-sol", "high", "C", model_id="gpt-5-sol"))
     proposal = _propose(view)
     assert len(proposal.evidence.counted) == 1
+
+
+# ---------------------------------------------------------------------------
+# effort exactness (task #777 / rule v1.2) — a rep counts on its measured rung
+# only; the resolved (profile, effort) is judged by the exact-effort catalog
+# row or nothing. Affected paths: direct (recorded effort), builder map and
+# alias (the pin, or a recorded effort overriding it). Unaffected: a rep with
+# no effort at all still lands on the profile default via ``effort inferred``.
+# ---------------------------------------------------------------------------
+
+
+def test_recorded_max_reps_never_promote_the_medium_rung(tmp_path, isolated_cache):
+    """The live regression (hk:doc 5177, #777 AC3, direct path): reps recorded
+    codex-terra@max must not promote codex-terra@medium — a measured effort
+    with no exact-effort row is unrung, never judged-by-medium."""
+    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "high", "A+"))
+    _seed(
+        [
+            _rep("t1", profile="codex-terra", effort="max", grade="S"),
+            _rep("t2", profile="codex-terra", effort="max", grade="S"),
+            _rep("t3", profile="codex-terra", effort="max", grade="S"),
+        ]
+    )
+    proposal = _propose(view)
+    assert _keys(proposal) == set()  # medium keeps its A — zero counted evidence
+    assert {r.rep.task_ref for r in proposal.unrung} == {"t1", "t2", "t3"}
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-terra", "max")
+    assert row.row_key is None
+    assert "counts only on that effort's rung" in row.resolution_detail
+    text = grades.render_proposal(proposal, view)
+    assert "judged-by" not in text  # the rung-effort=max->judged-by-medium print is gone
+
+
+def test_builder_pin_unrung_without_exact_effort_row(tmp_path, isolated_cache):
+    """Builder-map path: builder-terra-max pins codex-terra@max — with no max
+    row the rep is unrung; the pin cannot borrow the medium default."""
+    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "high", "A+"))
+    _seed([_rep("t1", profile="builder-terra-max", grade="S")])
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-terra", "max")
+    assert row.row_key is None
+    assert [r.rep.task_ref for r in proposal.unrung] == ["t1"]
+
+
+def test_builder_pin_recorded_effort_override_unrung(tmp_path, isolated_cache):
+    """Builder-map + recorded override: a builder-terra-max rep that recorded
+    effort=xhigh measured xhigh — unrung without an xhigh row, not adopted by
+    the pinned max's sibling rungs."""
+    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "max", "C"))
+    _seed([_rep("t1", profile="builder-terra-max", effort="xhigh", grade="S")])
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-terra", "xhigh")
+    assert row.row_key is None
+
+
+def test_alias_recorded_effort_unrung_without_exact_row(tmp_path, isolated_cache):
+    """Alias path: codex-med aliases to codex-terra@medium — a rep recorded at
+    xhigh on that spelling measured xhigh, and with no xhigh row it is unrung:
+    the alias's medium pin cannot adopt it."""
+    view = _view(_entry("codex-terra", "medium", "A"))
+    _seed([_rep("t1", profile="codex-med", effort="xhigh", grade="S")])
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-terra", "xhigh")
+    assert row.row_key is None
+    assert [r.rep.task_ref for r in proposal.unrung] == ["t1"]
+
+
+def test_profile_alias_recorded_effort_unrung(tmp_path, isolated_cache):
+    """PROFILE_ALIASES path: codex-max folds to codex-sol — a rep recorded at
+    effort=max on that spelling is unrung when only codex-sol@high exists."""
+    view = _view(_entry("codex-sol", "high", "C"))
+    _seed([_rep("t1", profile="codex-max", effort="max", grade="S")])
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-sol", "max")
+    assert row.row_key is None
+
+
+def test_effort_less_rung_judges_only_effort_less_reps(tmp_path, isolated_cache):
+    """Effort-less rungs are explicit: a rep recorded at effort=max on an
+    effort-less profile measured a rung that does not exist and is unrung —
+    while a rep that recorded no effort still lands on the "" row flagged
+    'effort inferred'."""
+    view = _view(_entry("codex-terra-max", "", "S"))
+    _seed(
+        [
+            _rep("measured", profile="codex-terra-max", effort="max", grade="S"),
+            _rep("quiet", profile="codex-terra-max", grade="A+"),
+        ]
+    )
+    proposal = _propose(view)
+    measured = _counted(proposal, "measured")
+    assert measured.rung == ("codex-terra-max", "max")
+    assert measured.row_key is None
+    quiet = _counted(proposal, "quiet")
+    assert quiet.rung == ("codex-terra-max", "")
+    assert quiet.row_key == ("codex-terra-max", "")
+    assert quiet.effort_inferred is True
+
+
+def test_inferred_effort_still_lands_on_profile_default(tmp_path, isolated_cache):
+    """Unaffected path: an effort-less rep still lands on the profile's
+    default rung marked 'effort inferred' — inference IS the resolved rung,
+    so an exact-effort row exists by construction."""
+    view = _view(_entry("opus", "medium", "A"), _entry("opus", "high", "S"))
+    _seed([_rep("t1", profile="opus", grade="S")])  # no effort recorded
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("opus", "high")  # launcher's default for opus
+    assert row.row_key == ("opus", "high")
+    assert row.effort_inferred is True
+    assert row.resolution == "default effort"
+
+
+def test_mutant_exact_effort_boundary_would_fail(tmp_path, isolated_cache):
+    """assertion-RED: same effort counts, adjacent effort doesn't — a mutant
+    that re-admits a different-effort row flips exactly one of the two
+    assertions."""
+    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "max", "C"))
+    _seed(
+        [
+            _rep("kept", profile="codex-terra", effort="max", grade="S"),
+            _rep("lost", profile="codex-terra", effort="high", grade="S"),
+        ]
+    )
+    proposal = _propose(view)
+    assert _counted(proposal, "kept").row_key == ("codex-terra", "max")
+    lost = _counted(proposal, "lost")
+    assert lost.rung == ("codex-terra", "high")
+    assert lost.row_key is None
+    assert [r.rep.task_ref for r in proposal.unrung] == ["lost"]
+
+
+def test_mutant_cross_effort_fallback_would_promote_medium(tmp_path, isolated_cache):
+    """assertion-RED: restoring judged-by-default fallback re-counts max
+    evidence on the medium rung — the 'no result' and unrung assertions both
+    go red."""
+    view = _view(_entry("codex-terra", "medium", "C"), _entry("codex-terra", "high", "A+"))
+    _seed(
+        [
+            _rep("t1", profile="codex-terra", effort="max", grade="S"),
+            _rep("t2", profile="codex-terra", effort="max", grade="S"),
+        ]
+    )
+    proposal = _propose(view)
+    assert ("codex-terra", "medium") not in _keys(proposal)  # fallback would produce it
+    assert _keys(proposal) == set()
+    assert {r.rep.task_ref for r in proposal.unrung} == {"t1", "t2"}

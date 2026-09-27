@@ -17,8 +17,9 @@ that reason is stamped into the output. A proposal whose recorded results rest
 on an anomalous rep is refused outright — anomalies are excluded until the
 operator reviews them.
 
-The rule v1.1 (operator decision 2026-09-27, tunable via ``--min-passes``,
-``--demote-window`` and ``--demote-rate``):
+The rule v1.2 (operator decisions 2026-09-27 — the v1.1 rule plus the #777
+effort-exactness fix; tunable via ``--min-passes``, ``--demote-window`` and
+``--demote-rate``):
 
 Evidence hygiene — applied per rep before any rung is evaluated, each excluded
 row printed with its reason:
@@ -40,6 +41,16 @@ row printed with its reason:
     (a FAIL with 0 rounds and 0 blockers; ``completed=0`` with zero blockers
     recorded; no completion flag at all) are listed as needing review and
     excluded until reviewed. ``apply`` refuses a proposal built on them.
+
+*   **Effort exactness (v1.2)** — a rep is evidence for the rung it measured
+    only. A rep *recorded* at one effort — directly or through a
+    builder/alias spelling pin — counts on the catalog row at exactly that
+    effort; when the catalog has no such row the rep is unrung, never
+    re-judged by the profile's default row (the
+    ``rung-effort=max -> judged-by-medium`` leak is gone). Only an *inferred*
+    effort — no recorded effort and no pin — lands on the profile's default
+    rung, flagged ``effort inferred``; effort-less rungs (catalog effort "")
+    are judged by effort-less reps and by nothing else.
 
 Task-level aggregation — inside a rung, several reps of the same task count
 once: the surviving rep with the latest ``recorded_at`` is the task's final
@@ -100,7 +111,7 @@ from .recommend import PROFILE_ALIASES, profile_pool, profile_subscription
 # The rule
 # ---------------------------------------------------------------------------
 
-RULE_VERSION = "1.1"
+RULE_VERSION = "1.2"
 MIN_PASSES = 2
 
 # Rule v1.1 demotion: a FAIL *rate* over the rung's most recent ``DEMOTE_WINDOW``
@@ -233,6 +244,17 @@ STATIC_SUPERSEDES: tuple[tuple[str, str], ...] = (
 #   record of what actually ran;
 # * a spelling pin wins over the profile default — it is the rung the launch
 #   consulted (``builder-sol`` consults codex-sol@high, not the max default).
+#
+# Effort exactness (v1.2, operator decision 2026-09-27): the resolved rung is
+# judged only by a catalog row at *exactly* that effort. The affected paths
+# are ``direct`` (the rep's recorded effort), ``builder map`` (the spelling's
+# pin, or a recorded effort overriding it), and ``alias`` (same two cases):
+# each demands an exact-effort live row or the rep is unrung — it is never
+# re-judged by the profile's default row. The ``default effort`` path is
+# unaffected: a rep that recorded no effort and carries no pin still lands on
+# the profile's default rung, marked ``effort inferred``. Effort-less rungs
+# (catalog effort "") are judged by effort-less reps and by nothing else — a
+# rep recorded at any named effort never counts on them.
 #
 # A rep that still cannot be resolved — an unknown spelling, or a rung no live
 # catalog row governs — is reported as unrung, never silently counted.
@@ -422,27 +444,25 @@ def _grading_entries(view: bench.CatalogView) -> tuple[bench.CatalogEntry, ...]:
 
 
 def _judging_row(rows: list[bench.CatalogEntry], effort: str) -> bench.CatalogEntry | None:
-    """The catalog row that governs a rung — the same row launch resolves.
+    """The catalog row that governs a rung — the exact-effort row only.
 
     An exact (profile, effort) row always judges its own rung, including an
     unmeasured E6 row: a rep recorded on that rung is exactly the arm's
-    measurement. A rung the catalog never placed takes the profile's ordinary
-    default placement, which is what ``_default_effort`` computes over the
-    non-E6, non-retired rows the launch would actually see.
+    measurement. There is no cross-effort fallback (v1.2, operator decision
+    2026-09-27): a rep recorded or pinned at one effort never counts on a
+    rung of a different effort — a rung the catalog never placed is unrung,
+    not adopted by the profile's default row. A retired exact-effort row is
+    still a real placement record, so its evidence is unrung too rather than
+    flowing to a live sibling.
     """
 
     exact = [row for row in rows if row.effort == effort]
-    if exact:
-        # A retired row is a real placement record, not an absent one: the
-        # rung was placed and then withdrawn, so its evidence is unrung — it
-        # must not flow to a live sibling via the default fallback.
-        return exact[0] if not exact[0].retired_at else None
-    ordinary = [row for row in rows if not row.retired_at and not launch._unmeasured_e6_row(row)]
-    if not ordinary:
+    if not exact:
         return None
-    fallback_effort, _ = launch._default_effort(rows[0].profile, ordinary)
-    matched = [row for row in ordinary if row.effort == fallback_effort]
-    return matched[0] if matched else None
+    # A retired row is a real placement record, not an absent one: the rung
+    # was placed and then withdrawn, so its evidence is unrung — it must not
+    # flow to a live sibling.
+    return exact[0] if not exact[0].retired_at else None
 
 
 # ---------------------------------------------------------------------------
@@ -930,11 +950,17 @@ def _finish_rows(
             # Unrung — reported, never counted. The detail names the blockage:
             # an unknown spelling has no rows at all; an exact-effort row that
             # is retired, or a profile left with only unmeasured E6/retired
-            # rows, has no live row to judge it.
+            # rows, has no live row to judge it; and a measured effort with no
+            # exact-effort row can never borrow the profile's other rungs.
             if not candidates:
                 detail = f"no catalog profile for '{resolution.profile}'"
             elif any(e.effort == rung[1] and e.retired_at for e in candidates):
                 detail = f"rung retired: {resolution.detail}"
+            elif rung[1] and not resolution.effort_inferred:
+                detail = (
+                    f"no live catalog row for {resolution.detail} — a rep measured at "
+                    f"'{rung[1]}' counts only on that effort's rung"
+                )
             else:
                 detail = f"no live catalog row for {resolution.detail}"
             resolved_kind, inferred = "", False
@@ -1633,10 +1659,6 @@ def _fmt_evidence(item: EvidenceRep) -> str:
         bits.append(f"task-grade={rep.grade}{'(backfilled)' if item.grade_backfilled else ''}")
     bits.append(f"rounds={rep.rounds if rep.rounds is not None else '-'}")
     bits.append(f"blockers={rep.blockers_found if rep.blockers_found is not None else '-'}")
-    if item.row_key and item.rung != item.row_key:
-        rung_effort = item.rung[1] or "(none)"
-        row_effort = item.row_key[1] or "(default)"
-        bits.append(f"rung-effort={rung_effort}->judged-by-{row_effort}")
     if item.resolution:
         # The printed basis (AC2): which rule resolved the rung, and whether
         # the effort was measured on the rep or inferred from the profile's
@@ -1704,7 +1726,10 @@ def render_proposal(
         "Evidence hygiene: rep model must match the rung's catalog model "
         "(declared renames only), non-coding task refs are excluded, anomalous "
         "reps are excluded pending review, and each task counts once per rung "
-        "(the surviving rep with the latest recorded_at).",
+        "(the surviving rep with the latest recorded_at). A rep counts only "
+        "on its resolved effort's own rung — recorded or pinned efforts with "
+        "no exact row are unrung; effort-less reps land on the profile "
+        "default (effort inferred).",
         f"reps source={evidence.backend} (reason={evidence.backend_reason}) host={evidence.host} "
         f"rows: server={evidence.remote_count} local={evidence.local_count}",
     ]
@@ -2035,6 +2060,27 @@ def apply_proposals(
             "proposal digest does not match the live evidence — rerun `grades propose` "
             "(the reps store, exclusions, or catalog changed since the artifact was written)"
         )
+    # v1.2: an artifact that names the same (profile, effort) result more than
+    # once is refused BEFORE the per-key map is built — the map's last-write-
+    # wins is exactly what let a forged earlier duplicate (the r4 local:999
+    # carrier) hide behind a later clean one. Every item that claims a rung
+    # key counts, whatever action it carries; a legit artifact lists each rung
+    # exactly once.
+    seen: set[tuple[str, str]] = set()
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        profile, effort = item.get("profile"), item.get("effort")
+        if not isinstance(profile, str) or not isinstance(effort, str):
+            continue
+        key = (profile, effort)
+        if key in seen:
+            raise bench.BenchError(
+                f"proposal artifact lists rung {profile}@{effort or '(default)'} "
+                "more than once — the artifact was forged or hand-edited; "
+                "rerun `grades propose`"
+            )
+        seen.add(key)
     recorded = {
         (item["profile"], item["effort"]): item
         for item in results
@@ -2050,6 +2096,24 @@ def apply_proposals(
     anomaly_refs = {row.ref for row in live.evidence.rows if row.anomaly}
     live_by_key = {result.key: result for result in live.results}
     for key, item in recorded.items():
+        # v1.2: the recorded rung must be a rung the live evaluation actually
+        # produced — a key absent from live results means the artifact was
+        # forged or built on a different store, and empty evidence lists must
+        # not bypass the check. The live result's action and target must match
+        # the record too: the digest binds live evidence, not the artifact's
+        # claims, so a forged promote on a rung live holds cannot stand.
+        live_result = live_by_key.get(key)
+        if live_result is None:
+            raise bench.BenchError(
+                f"proposal artifact records a result for rung {key[0]}@{key[1] or '(default)'} "
+                "absent from the live results — the artifact was forged or built "
+                "on a different store; rerun `grades propose`"
+            )
+        if item.get("action") != live_result.action or item.get("target") != live_result.target:
+            raise bench.BenchError(
+                f"proposal artifact disagrees with live evaluation for {live_result.label()} — "
+                "rerun `grades propose`"
+            )
         claimed = {ref for ref in _recorded_result_refs(item) if isinstance(ref, str)}
         bad = sorted(claimed & anomaly_refs)
         if bad:
@@ -2063,12 +2127,7 @@ def apply_proposals(
         # this rung actually rests on. A ghost (a ref absent from the store) or
         # a borrowed ref from another rung means the artifact was forged after
         # recording — fail closed.
-        live_result = live_by_key.get(key)
-        live_refs = (
-            {ref for ref in _recorded_result_refs(live_result.as_dict())}
-            if live_result is not None
-            else set()
-        )
+        live_refs = {ref for ref in _recorded_result_refs(live_result.as_dict())}
         ghosts = sorted(ref for ref in claimed if ref not in live_refs)
         if ghosts:
             raise bench.BenchError(
