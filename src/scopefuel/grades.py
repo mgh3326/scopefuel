@@ -15,7 +15,10 @@ unread reps canon, truncated rep window — see ``degraded_reasons``), apply
 refuses to write unless the operator passes ``--allow-degraded <reason>`` and
 that reason is stamped into the output. A proposal whose recorded results rest
 on an anomalous rep is refused outright — anomalies are excluded until the
-operator reviews them.
+operator reviews them. ``--only <profile[@effort]>[,...]`` approves a subset:
+only the named recorded changes are written, and every other change in the
+verified artifact is reported as not applied (operator not approved) rather
+than refused or silently dropped.
 
 The rule v1.2 (operator decisions 2026-09-27 — the v1.1 rule plus the #777
 effort-exactness fix; tunable via ``--min-passes``, ``--demote-window`` and
@@ -1982,6 +1985,7 @@ def apply_proposals(
     deviation_ref: str,
     allow_plaintext_http: bool = False,
     allow_degraded: str | None = None,
+    only: list[tuple[str, str]] | None = None,
     path=None,
 ) -> tuple[list[bench.CatalogEntry], Proposal, bench.CatalogView]:
     """Verify a proposal artifact against live stores, then stamp the catalog.
@@ -1995,6 +1999,12 @@ def apply_proposals(
     inputs are degraded (``degraded_reasons``), the write is refused unless
     the operator passes an explicit ``allow_degraded`` reason, which is then
     stamped into every changed row's ``deviation_ref``.
+
+    ``only`` is the operator-approved rung subset (#788): when it is not None,
+    only those (profile, effort) changes are stamped and every other recorded
+    change passes through unwritten. The filter sits after every integrity
+    check on the whole artifact — a forged artifact is refused even when the
+    named rungs are valid.
     """
 
     if not isinstance(proposal_file, dict):
@@ -2172,6 +2182,40 @@ def apply_proposals(
             )
 
     changed = {r.key: r for r in live.changes()}
+    if only is None:
+        approved = set(changed)
+    else:
+        # #788: --only approves a subset of the artifact's recorded changes.
+        # Every named rung must be a live-verified change — an absent rung or
+        # a non-change outcome (hold/insufficient/blocked/conflicted, or a
+        # demote floored at the current grade) is refused, never silently
+        # skipped. This gate runs only after every whole-artifact check above:
+        # the digest and per-key refusals still fire on a forged artifact
+        # even when --only names a valid rung.
+        if not only:
+            raise bench.BenchError(
+                "grades apply --only names no rungs — list at least one profile[@effort] change to apply"
+            )
+        approved = set(only)
+        not_changes = []
+        for key in only:
+            if key in changed:
+                continue
+            label = f"{key[0]}{'@' + key[1] if key[1] else ''}"
+            item = recorded.get(key)
+            if item is None:
+                not_changes.append(f"{label} (absent from the artifact's results)")
+            else:
+                not_changes.append(
+                    f"{label} (recorded action {item.get('action')!r} "
+                    f"target {item.get('target')!r} is not a change)"
+                )
+        if not_changes:
+            raise bench.BenchError(
+                "grades apply --only names rung(s) that are not changes in the "
+                f"proposal artifact: {'; '.join(not_changes)} — only recorded "
+                "promote/demote changes can be applied"
+            )
     now = bench._utc_now()
     entries: list[bench.CatalogEntry] = []
     # The evaluated universe, not only the backend's rows: a promote/demote on
@@ -2179,7 +2223,7 @@ def apply_proposals(
     # write the row into the canon.
     for entry in live.catalog_entries:
         result = changed.get(entry.key)
-        if result is None:
+        if result is None or result.key not in approved:
             entries.append(entry)
             continue
         entries.append(
