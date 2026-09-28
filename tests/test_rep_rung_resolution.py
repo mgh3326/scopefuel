@@ -496,10 +496,10 @@ def test_apply_writes_promoted_snapshot_row(tmp_path, isolated_cache, monkeypatc
     monkeypatch.setattr(bench, "read_catalog", lambda **kw: canon)
     _seed(
         [
-            # The snapshot's sonnet rows carry model claude-sonnet-5 — the reps
-            # must record that model to count (v1.1 model match).
-            _rep("t1", profile="sonnet", model_id="claude-sonnet-5", effort="low", grade="A+"),
-            _rep("t2", profile="sonnet", model_id="claude-sonnet-5", effort="low", grade="A+"),
+            # The snapshot's sonnet rows carry model claude-sonnet-5-5 — the
+            # reps must record that model to count (v1.1 model match).
+            _rep("t1", profile="sonnet", model_id="claude-sonnet-5-5", effort="medium", grade="B"),
+            _rep("t2", profile="sonnet", model_id="claude-sonnet-5-5", effort="medium", grade="B"),
         ]
     )
     proposal = _propose(canon)
@@ -512,11 +512,11 @@ def test_apply_writes_promoted_snapshot_row(tmp_path, isolated_cache, monkeypatc
     }
     entries, live, _ = grades.apply_proposals(artifact, decided_by="operator:test", deviation_ref="task-750")
     rows = {e.key: e for e in entries}
-    # sonnet@low is a snapshot stand-in (canon covers only devin-ds41): its
-    # promote A -> A+ must reach the artifact with the decision stamps.
-    assert rows[("sonnet", "low")].grade == "A+"
-    assert rows[("sonnet", "low")].decided_by == "operator:test"
-    assert rows[("sonnet", "low")].deviation_ref.startswith("task-750")
+    # sonnet@medium is a snapshot stand-in (canon covers only devin-ds41): its
+    # promote C -> B must reach the artifact with the decision stamps.
+    assert rows[("sonnet", "medium")].grade == "B"
+    assert rows[("sonnet", "medium")].decided_by == "operator:test"
+    assert rows[("sonnet", "medium")].deviation_ref.startswith("task-750")
     assert rows[("devin-ds41", "")].grade == "A+"  # untouched canon row
 
 

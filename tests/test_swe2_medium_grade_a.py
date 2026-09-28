@@ -52,17 +52,29 @@ def test_devin_swe2_medium_is_a_single_a_row_with_provenance():
 
 
 def test_no_other_grade_table_row_changed():
-    """AC1: the delta against the pre-#787 table is exactly this one move."""
+    """AC1: the delta against the pre-#787 table is this one move plus the
+    #920 Sonnet 5.5 relabel (Sonnet 5 rows replaced by estimated 5.5 rows)."""
     pre = json.loads(PRE_787_ROWS.read_text())
     pre_counts = Counter(json.dumps(row, sort_keys=True) for row in pre)
     post_counts = Counter(json.dumps(row, sort_keys=True) for row in _rows(GRADE_TABLE))
 
     added = [json.loads(key) for key, n in (post_counts - pre_counts).items() for _ in range(n)]
     removed = [json.loads(key) for key, n in (pre_counts - post_counts).items() for _ in range(n)]
-    (added_row,) = added
-    (removed_row,) = removed
-    assert added_row["name"] == "devin-swe2-medium" and added_row["grade"] == "A"
-    assert removed_row["name"] == "devin-swe2-medium" and removed_row["grade"] == "C"
-    # The annotation carries the new provenance; nothing else on the row moved.
-    moved_fields = {k for k in added_row if added_row[k] != removed_row[k]}
-    assert moved_fields == {"grade", "benchmark_annotation"}
+
+    def key(row: dict) -> tuple:
+        return (row["grade"], row["name"], row["launcher_effort"])
+
+    assert {key(row) for row in added} == {
+        ("A", "devin-swe2-medium", None),
+        ("S", "sonnet", "max"),
+        ("A+", "sonnet", "xhigh"),
+        ("C", "sonnet", "high"),
+        ("C", "sonnet", "medium"),
+    }
+    assert {key(row) for row in removed} == {
+        ("C", "devin-swe2-medium", None),
+        ("A+", "sonnet", "high"),
+        ("A+", "sonnet", "xhigh"),
+        ("A", "sonnet", "medium"),
+        ("A", "sonnet", "low"),
+    }

@@ -325,6 +325,10 @@ class ModelPrice:
 AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     ModelPrice("kimi-k2-7-code", 1.7125, 0.95, 4.0, "2026-09-09T00:00:00+00:00"),
     ModelPrice("grok-4-6", 3.0, 2.0, 6.0, "2026-09-09T00:00:00+00:00"),
+    # #920: claude-sonnet-5-5 vendor list price input $2 / output $10 per 1M
+    # (hk:doc report/2026-09-29/sonnet55-catalog-and-reps-status). The AA-synced
+    # price table does not carry the new id yet; a synced row wins when it lands.
+    ModelPrice("claude-sonnet-5-5", 4.0, 2.0, 10.0, "2026-09-29T00:00:00+00:00"),
 )
 
 

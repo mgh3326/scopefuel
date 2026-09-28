@@ -174,7 +174,8 @@ WRK_PRE_593_RESOLUTION: dict[str, tuple[str, str]] = {
     # model id below is the catalog's identity rather than the launcher's argv —
     # the catalog route requires a non-blank model_id on every row, and these
     # spellings are catalog-exempt on the wrk side (see WRK_CATALOG_EXEMPT).
-    "sonnet": ("claude-sonnet-5", "high"),
+    # #920: the alias serves claude-sonnet-5-5 since 2026-09-29.
+    "sonnet": ("claude-sonnet-5-5", "high"),
     "haiku": ("claude-haiku-4.5", "low"),
     "fable": ("claude-fable-5-1", ""),
 }

@@ -103,11 +103,13 @@ def test_local_table_selection_keeps_first_grade_placement():
         "devin-swe2",
         "haiku",
     ):
+        # First *ordinary* (default-gate) row — #920 puts sonnet's escalation
+        # max rung in S, above its default-gate high/medium rows in C.
         original = next(
             (grade, profile)
             for grade, profiles in GRADE_TABLE.items()
             for profile in profiles
-            if profile.name == spelling
+            if profile.name == spelling and profile.gate == "default"
         )
         assert _find_profile(spelling, grade_table=GRADE_TABLE) == original
 

@@ -218,7 +218,7 @@ def test_a_canon_row_stamped_above_c_would_be_an_ordinary_placement():
             bench.CatalogEntry(
                 profile="sonnet",
                 effort="max",
-                model_id="claude-sonnet-5",
+                model_id="claude-sonnet-5-5",
                 pool="claude",
                 grade="A",
                 score=50.0,
@@ -226,7 +226,7 @@ def test_a_canon_row_stamped_above_c_would_be_an_ordinary_placement():
             bench.CatalogEntry(
                 profile="sonnet",
                 effort="high",
-                model_id="claude-sonnet-5",
+                model_id="claude-sonnet-5-5",
                 pool="claude",
                 grade="A+",
                 score=55.0,
@@ -242,10 +242,13 @@ def test_a_canon_row_stamped_above_c_would_be_an_ordinary_placement():
 
 
 def test_the_e6_arms_stay_marker_gated_on_bundled_hosts():
-    """The never-a-recommendation behaviour for unmeasured arm rungs: unchanged."""
+    """The never-a-recommendation behaviour for unmeasured arm rungs: unchanged.
 
-    providers = [_provider("claude")]
-    result = gate_check(providers, "sonnet", effort="max", today=TODAY, now=NOW)
+    #920: sonnet@max is a placed S row now; kimi-k3@max stands in as the
+    still-unmeasured arm rung for this pin."""
+
+    providers = [_provider("kimi")]
+    result = gate_check(providers, "kimi-k3", effort="max", today=TODAY, now=NOW)
     assert result.ok is False
     assert "e6_arm_required" in result.reason
     for grade in ("S+", "S", "A+", "A", "B", "C"):
@@ -275,4 +278,6 @@ def test_the_arm_rung_lookup_is_unaffected():
 
     assert OVERRIDE_KEY not in E6_ARM_KEYS
     assert e6_arm_rung_for("devin-swe2-medium", "") is None
-    assert isinstance(e6_arm_rung_for("sonnet", "max"), Profile)
+    # #920: sonnet@max graduated to a placed S row; kimi-k3@max is still an arm.
+    assert e6_arm_rung_for("sonnet", "max") is None
+    assert isinstance(e6_arm_rung_for("kimi-k3", "max"), Profile)

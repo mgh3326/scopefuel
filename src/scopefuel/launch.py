@@ -71,7 +71,11 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     # route requires a non-blank model_id, so a row without one is rejected and
     # the whole seed batch with it. The launcher keeps its alias either way —
     # these spellings are catalog-exempt on the wrk side.
-    "sonnet": "claude-sonnet-5",
+    # #920: alias sonnet serves claude-sonnet-5-5 since 2026-09-29 (hk:doc
+    # report/2026-09-29/sonnet55-catalog-and-reps-status) — the catalog identity
+    # follows the served model so new reps land under the exact new id while
+    # pre-refresh claude-sonnet-5 reps stay attributed to the old model.
+    "sonnet": "claude-sonnet-5-5",
     "haiku": "claude-haiku-4.5",
     "devin-swe2": "swe-2",
     "devin-glm52": "glm-5-2",
