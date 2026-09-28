@@ -155,7 +155,6 @@ E6(#594, `hk:doc plan/2026-09-25/e6-effort-ladder`)는 한 모델을 여러 effo
 
 | profile | model | effort | pool | 급 |
 |---|---|---|---|---|
-| `sonnet` | claude-sonnet-5 | max | claude | C |
 | `codex-sol` | gpt-6-sol | high | codex | C |
 | `codex-sol` | gpt-6-sol | medium | codex | C |
 | `kimi-k3` | kimi-k3 | high | kimi | C |
@@ -169,9 +168,9 @@ wrk는 자신의 환경을 자식 `scopefuel` 호출에 그대로 넘기므로 �
 같은 선언을 봅니다.
 
 ```bash
-SCOPEFUEL_E6_ARM=sonnet@max wrk spawn -m sonnet --effort max ...   # E6 arm 스폰
-scopefuel gate -m sonnet --effort max                              # 표식 없음 → exit 3, 런그 이름을 댄 사유
-SCOPEFUEL_E6_ARM=sonnet@max scopefuel gate -m sonnet --effort max  # → exit 0, allow 라인에 [E6 arm, unmeasured C: sonnet@max]
+SCOPEFUEL_E6_ARM=codex-sol@high wrk spawn -m codex-sol --effort high ...   # E6 arm 스폰
+scopefuel gate -m codex-sol --effort high                              # 표식 없음 → exit 3, 런그 이름을 댄 사유
+SCOPEFUEL_E6_ARM=codex-sol@high scopefuel gate -m codex-sol --effort high  # → exit 0, allow 라인에 [E6 arm, unmeasured C: codex-sol@high]
 ```
 
 - 표식 값은 `<profile>@<effort>`이며 effort 어휘는 소문자 폐쇄 집합입니다(`--effort`와 같은

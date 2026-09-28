@@ -495,11 +495,15 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
 
     Slugs verified against the recorded GET /api/v2/data/llms/models response
     (2026-09-25): claude-sonnet-5, deepseek-v4-1-flash, kimi-k3.
+    #920: alias sonnet serves claude-sonnet-5-5 since 2026-09-29 — the sonnet
+    rows' aa_model_id is the new exact model id, so v1.1 rep matching never
+    folds pre-refresh claude-sonnet-5 reps into Sonnet 5.5 rungs.
     """
     sonnet_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "sonnet"]
-    assert len(sonnet_rows) == 4  # A+ high/xhigh, A medium/low
+    assert len(sonnet_rows) == 4  # S max, A+ xhigh, C high/medium — low has no vendor point
+    assert {p.launcher_effort for p in sonnet_rows} == {"max", "xhigh", "high", "medium"}
     for profile in sonnet_rows:
-        assert profile.aa_model_id == "claude-sonnet-5"
+        assert profile.aa_model_id == "claude-sonnet-5-5"
 
     ds41 = next(p for p in GRADE_TABLE["A+"] if p.name == "devin-ds41")
     assert ds41.aa_model_id == "deepseek-v4-1-flash"
@@ -536,8 +540,15 @@ def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     assert "8.0분" in with_measurement
     assert "8.0분" not in without_measurement
 
-    c_names = [profile.model for profile in GRADE_TABLE["C"][:4]]
-    assert c_names == ["Luna (low)", "Qwen3 Coder", "Sonnet 4.6", "Claude Haiku 4.5"]
+    # #920: Sonnet 5.5 high/medium sit in C right after oc-sonnet46.
+    c_names = [profile.model for profile in GRADE_TABLE["C"][:5]]
+    assert c_names == [
+        "Luna (low)",
+        "Qwen3 Coder",
+        "Sonnet 4.6",
+        "Sonnet 5.5 (high)",
+        "Sonnet 5.5 (medium)",
+    ]
 
 
 def test_rob1193_splus_default_and_escalation_efforts_have_exact_reasons():
@@ -708,11 +719,12 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     )
 
     aplus_output = recommend(providers, "A+", today=TODAY, now=NOW)
-    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in aplus_output.splitlines())
+    # #920: Sonnet 5.5 — xhigh stays in A+ as an escalation listing; high/medium
+    # moved to C, max is the S escalation rung. No ranked sonnet row in A+.
+    assert not any(line[:1].isdigit() and line.split()[1] == "sonnet" for line in aplus_output.splitlines())
     assert "sonnet --effort xhigh" in aplus_output
     # ROB-591: opus --effort low no longer lives in A+ at all (moved to S).
     assert "opus --effort low" not in aplus_output
-    assert "벤치 55.0(추정(내삽))" in aplus_output
     # ROB-1202: Grok medium relocated here — estimated + unmeasured, not the raw high score.
     assert any(line[:1].isdigit() and "grok --effort medium" in line for line in aplus_output.splitlines())
     assert "벤치 59.4(추정(외삽))" in aplus_output
@@ -735,6 +747,13 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert "codex-luna --effort low" in c_output
     assert "미측정" in c_output
     assert "codex-luna --effort medium" not in c_output
+    # #920: Sonnet 5.5 vendor-TB4 estimates — high raw 43.0 (B) placed C,
+    # medium raw 29.0 already at the floor, each marked estimate with reason.
+    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines())
+    assert any(line[:1].isdigit() and "sonnet --effort medium" in line for line in c_output.splitlines())
+    assert "벤치 43.0(추정(외삽))" in c_output
+    assert "벤치 29.0(추정(외삽))" in c_output
+    assert "보수 배치(C; raw 43.0 은 B 구간" in c_output
 
     all_profiles = {profile.name for profiles in GRADE_TABLE.values() for profile in profiles}
     assert "gpt-5.4-mini" not in all_profiles
@@ -786,11 +805,11 @@ def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
 
 
 def test_rob1204_existing_top_rank_intent_remains_for_claude_only_inputs():
-    aplus = recommend([_result("claude", 10.0, pool_class="preserve")], "A+", today=TODAY, now=NOW)
+    # #920: sonnet's ranked claude candidate moved from A+ (Sonnet 5 high) to C
+    # (Sonnet 5.5 high, vendor TB4 43.0 one step below its raw B read).
+    c = recommend([_result("claude", 10.0, pool_class="preserve")], "C", today=TODAY, now=NOW)
     b = recommend([_result("claude", 10.0, pool_class="preserve")], "B", today=TODAY, now=NOW)
-    assert next(line for line in aplus.splitlines() if line[:1].isdigit()).startswith(
-        "1. sonnet --effort high"
-    )
+    assert next(line for line in c.splitlines() if line[:1].isdigit()).startswith("1. sonnet --effort high")
     assert next(line for line in b.splitlines() if line[:1].isdigit()).startswith("1. haiku --effort high")
 
 

@@ -348,7 +348,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         (index, profile.launcher_effort)
         for index, profile in enumerate(GRADE_TABLE["A+"])
         if profile.name == "codex-terra"
-    ] == [(2, "xhigh"), (6, "high")]  # ROB-591: opus --effort low left A+ (moved to S)
+    ] == [(2, "xhigh"), (5, "high")]  # #920: sonnet high left A+ for C (Sonnet 5.5)
     assert actual == expected
 
     priced_aplus = _ranked_labels(
