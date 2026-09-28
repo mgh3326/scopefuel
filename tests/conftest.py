@@ -89,6 +89,10 @@ def isolated_cache(tmp_path, monkeypatch):
     # observed usage-limit 403s — point it at an absent dir so no test sees the
     # developer's real ~/.kimi-code/sessions (which may hold a live lockout).
     monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "kimi-sessions-absent")
+    # task #928: kimi.fetch seeds a workspace-trust entry under KIMI_CODE_HOME
+    # (default ~/.kimi-code) — point it at a tmp home so no test writes a real
+    # trust entry for a throwaway workdir.
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
     # The catalog is memoised per process so one command cannot straddle the TTL
     # boundary; that memo must not survive from one test into the next.
     bench.reset_catalog_memo()

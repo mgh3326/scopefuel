@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -268,27 +269,18 @@ def test_fetch_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypatch):
     assert "LINES=50" in result.raw["stdout"] or "COLUMNS=200" in result.raw["stdout"]
 
 
-def test_fetch_auto_accepts_trust_in_a_per_probe_instance_dir(tmp_path, monkeypatch):
-    """Each probe gets a fresh flocked ``probe-*`` instance dir as child cwd.
+def test_probe_runs_in_one_fixed_trusted_workdir(tmp_path, monkeypatch):
+    """#928: kimi enforces workspace trust per exact directory.
 
-    #608: the child's cwd moved from the shared workdir to a per-probe
-    instance directory so proctrack can identify its descendants. The fake's
-    ``.trusted`` marker therefore does not survive between probes — the trust
-    prompt reappears and is auto-accepted every run.
+    A fresh ``probe-*`` cwd per run re-triggered "Trust this folder?" on every
+    probe (and auto-answering it littered workspace-trust with one entry per
+    run).  The probe's cwd is now the single fixed workdir, whose trust entry
+    is seeded once — the same scheme wrk's ``kimi_seed_workspace_trust`` uses.
     """
     binary = tmp_path / "fake-kimi-trust"
     binary.write_text(
         "#!/bin/sh\n"
         "printf 'CWD=%s\\r\\n' \"$PWD\"\n"
-        "if [ ! -f .trusted ]; then\n"
-        "  printf 'Trust this folder?\\r\\n  ❯ Trust this folder\\r\\n'\n"
-        "  IFS= read -r trust_input\n"
-        '  [ -z "$trust_input" ] || exit 8\n'
-        "  : > .trusted\n"
-        "  printf 'TRUST_ACCEPTED\\r\\n'\n"
-        "else\n"
-        "  printf 'TRUST_ALREADY_ACCEPTED\\r\\n'\n"
-        "fi\n"
         "printf '│ >\\r\\n'\n"
         "IFS= read -r command\n"
         "[ \"$command\" = '/usage' ] || exit 9\n"
@@ -296,8 +288,10 @@ def test_fetch_auto_accepts_trust_in_a_per_probe_instance_dir(tmp_path, monkeypa
     )
     binary.chmod(binary.stat().st_mode | 0o111)
     workdir = tmp_path / "provider-workdir"
+    kimi_home = tmp_path / "kimi-home"
     monkeypatch.setattr(kimi, "BINARY", str(binary))
     monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
+    monkeypatch.setenv("KIMI_CODE_HOME", str(kimi_home))
 
     first_output = kimi._probe_once()
     second_output = kimi._probe_once()
@@ -306,25 +300,84 @@ def test_fetch_auto_accepts_trust_in_a_per_probe_instance_dir(tmp_path, monkeypa
 
     assert first.error is None
     assert second.error is None
-    assert "Trust this folder?" in first_output
-    assert "TRUST_ACCEPTED" in first_output
-    assert "Trust this folder?" in second_output
-    assert "TRUST_ACCEPTED" in second_output
     cwds = [
-        pathlib.Path(line.removeprefix("CWD=").strip())
+        pathlib.Path(line.removeprefix("CWD=").strip()).resolve()
         for line in (first_output + second_output).splitlines()
         if line.startswith("CWD=")
     ]
-    assert len(cwds) == 2
-    for cwd in cwds:
-        assert cwd.resolve().parent == workdir.resolve()
-        assert cwd.name.startswith("probe-")
-    # Probe exit removes the instance dirs; only the sweep lock file remains.
-    assert [p for p in workdir.iterdir() if p.name.startswith("probe-")] == []
+    # Both probes ran in the same fixed dir — no probe-* instance dirs.
+    assert cwds == [workdir.resolve(), workdir.resolve()]
+    assert not any(p.name.startswith("probe-") for p in workdir.iterdir())
     assert [(bucket.label, bucket.used_pct) for bucket in second.buckets] == [
         ("5h", 50.0),
         ("weekly", 20.0),
     ]
+
+    # The workdir was trusted exactly once: one wd_<san>_<sha256[:12]> entry
+    # whose root is the workdir itself — never HOME or a parent directory.
+    entries = list((kimi_home / "workspace-trust").iterdir())
+    assert len(entries) == 1
+    root = os.path.realpath(workdir)
+    digest = hashlib.sha256(root.encode()).hexdigest()[:12]
+    sanitized = re.sub(r"[^a-z0-9]+$", "", workdir.name.lower()[:40])
+    assert entries[0].name == f"wd_{sanitized}_{digest}"
+    body = json.loads(entries[0].read_text())
+    assert body == {"root": root, "trustedAt": body["trustedAt"]}
+    assert body["root"] != os.path.realpath(pathlib.Path.home())
+    assert body["root"] != os.path.realpath(workdir.parent)
+    # The second probe did not rewrite the entry.
+    assert isinstance(body["trustedAt"], int)
+
+
+def test_seed_workspace_trust_is_idempotent_and_never_home(tmp_path, monkeypatch):
+    kimi_home = tmp_path / "kimi-home"
+    monkeypatch.setenv("KIMI_CODE_HOME", str(kimi_home))
+    workdir = tmp_path / "MiXeD-Name.Dir"  # exercises lowercase sanitization
+    workdir.mkdir()
+
+    kimi._seed_workspace_trust(workdir)
+    kimi._seed_workspace_trust(workdir)  # trusted once: second call is a no-op
+
+    root = os.path.realpath(workdir)
+    digest = hashlib.sha256(root.encode()).hexdigest()[:12]
+    entries = list((kimi_home / "workspace-trust").iterdir())
+    assert [e.name for e in entries] == [f"wd_mixed-name.dir_{digest}"]
+    assert json.loads(entries[0].read_text())["root"] == root
+
+    # Guard: seeding HOME itself (or an ancestor of HOME) is refused.
+    kimi._seed_workspace_trust(pathlib.Path.home())
+    kimi._seed_workspace_trust(pathlib.Path("/"))
+    assert [e.name for e in (kimi_home / "workspace-trust").iterdir()] == [entries[0].name]
+
+
+def test_fetch_trust_prompt_is_unmeasurable_and_never_answered(tmp_path, monkeypatch):
+    """#928 regression shape: kimi blocking on the trust dialog must surface
+    as unmeasurable — and the probe must not answer the dialog for the CLI."""
+    binary = tmp_path / "fake-kimi-trust-block"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "printf ' Trust this folder?\\r\\n'\n"
+        "printf '  Trust this folder\\r\\n'\n"
+        "printf '  Do not trust\\r\\n'\n"
+        "IFS= read -r answer\n"
+        "printf 'DIALOG_ANSWERED\\r\\n'\n"
+    )
+    binary.chmod(binary.stat().st_mode | 0o111)
+    workdir = tmp_path / "provider-workdir"
+    monkeypatch.setattr(kimi, "BINARY", str(binary))
+    monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
+
+    result = kimi.fetch()
+
+    assert result.error is not None
+    assert "trust" in result.error.lower()
+    assert result.buckets == []
+    # The probe bailed on the dialog instead of sending Enter through it.
+    assert "DIALOG_ANSWERED" not in result.raw["stdout"]
+    gate = gate_check([result], "kimi-k3")
+    assert gate.ok is False
+    assert gate.unmeasurable is True
 
 
 def test_child_env_removes_herdr_integration_variables(monkeypatch):
@@ -350,6 +403,11 @@ def test_child_env_removes_herdr_integration_variables(monkeypatch):
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 PANEL_LOCKOUT = (FIXTURES / "kimi_usage_v210_weekly_lockout.txt").read_text()
 SESSION_LOCKOUT_LOG = (FIXTURES / "kimi_session_weekly_lockout_log.txt").read_text().strip()
+# task #928 — real PTY capture of the kimi 2.1.1 trust dialog (recorded
+# 2026-09-29, an untrusted tmp dir, Esc-ed out; path neutralized to
+# <WORKDIR>), plus a no-panel garbage capture.
+TRUST_PROMPT_V211 = (FIXTURES / "kimi_trust_prompt_v211.txt").read_text()
+GARBAGE_PROBE = (FIXTURES / "kimi_probe_garbage.txt").read_text()
 
 
 def _session_log_at(ts: dt.datetime) -> str:
@@ -374,6 +432,31 @@ def test_parse_real_panel_fixture_reads_used_pct_verbatim():
         ("5h", "5h", 0.0),
         ("weekly", "7d", 0.0),
     ]
+
+
+def test_parse_trust_prompt_fixture_is_unmeasurable_never_100():
+    """#928 desk finding: a probe that stalls on the trust dialog must report
+    unmeasurable — never a fabricated percentage (the stale 100% weekly that
+    refused every kimi spawn)."""
+    result = kimi.parse(TRUST_PROMPT_V211)
+
+    assert result.error is not None
+    assert "trust" in result.error.lower()
+    assert result.buckets == []
+    gate = gate_check([result], "kimi-k3")
+    assert gate.ok is False
+    assert gate.unmeasurable is True
+
+
+def test_parse_garbage_probe_output_is_unmeasurable():
+    """Output with no /usage panel at all is unmeasurable — not 0%, not 100%."""
+    result = kimi.parse(GARBAGE_PROBE)
+
+    assert result.error is not None
+    assert result.buckets == []
+    gate = gate_check([result], "kimi-k3")
+    assert gate.ok is False
+    assert gate.unmeasurable is True
 
 
 def test_parse_zero_percent_left_is_fully_used_and_gate_refuses():

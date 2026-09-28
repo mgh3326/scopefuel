@@ -26,6 +26,7 @@ import contextlib
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -50,8 +51,13 @@ IDLE_TIMEOUT_S = 8.0
 USAGE_SETTLE_S = 0.5
 PROBE_INPUT = "/usage\r"
 PROBE_WORKDIR = Path.home() / ".local" / "share" / "scopefuel" / "kimi-probe-workdir"
+# task #928 — kimi enforces workspace trust per exact directory: the probe's
+# cwd is the fixed PROBE_WORKDIR whose trust entry is seeded once, so the
+# dialog below must never render.  A fresh probe-* dir per run re-prompted
+# forever and (on versions whose default answer is "Don't trust") exited the
+# CLI before /usage was ever read.
 TRUST_MARKER = "Trust this folder?"
-_READY_MARKERS = ("│ >", "Kimi K3 thinking", TRUST_MARKER)
+_READY_MARKERS = ("│ >", "Kimi K3 thinking")
 # A/B 실측(grok): 크기 미설정 PTY에서는 TUI가 usage 패널을 렌더하지 않아 timeout한다.
 # kimi 도 동일 PTY 경로이므로 같은 크기를 선제 적용한다.
 PTY_ROWS = 50
@@ -90,12 +96,16 @@ _PERCENT_ANY = re.compile(r"\d+(?:\.\d+)?\s*%")
 SESSIONS_DIR: Path | None = None  # test override; None resolves env/home per call
 
 
+def _kimi_home() -> Path:
+    # kimi honours KIMI_CODE_HOME for its data dir (#705 tester F6).
+    home = os.environ.get("KIMI_CODE_HOME") or str(Path.home() / ".kimi-code")
+    return Path(home).expanduser()
+
+
 def _sessions_dir() -> Path:
     if SESSIONS_DIR is not None:
         return Path(SESSIONS_DIR)
-    # kimi honours KIMI_CODE_HOME for its data dir (#705 tester F6).
-    home = os.environ.get("KIMI_CODE_HOME") or str(Path.home() / ".kimi-code")
-    return Path(home).expanduser() / "sessions"
+    return _kimi_home() / "sessions"
 
 
 _SESSION_LOG_MAX_AGE_S = 32 * 86400  # a lockout cannot outlive its 30d window
@@ -163,6 +173,53 @@ def fetch() -> ProviderResult:
     return result
 
 
+def _seed_workspace_trust(workdir: Path) -> None:
+    """Seed kimi's workspace-trust entry for the fixed probe dir, once.
+
+    Same scheme as ``kimi_seed_workspace_trust`` in agent-skills' bin/wrk
+    (ROB-1307): kimi resolves a directory's trust by looking up
+    ``<kimi home>/workspace-trust/wd_<sanitized>_<sha256(abs)[:12]>`` where
+    ``sanitized`` is the basename lowercased, cut to 40 chars, with trailing
+    non-alphanumerics dropped; the body is ``{"root": <abs>, "trustedAt":
+    <epoch ms>}``.  kimi 2.1.1 ships no trust flag (``kimi --help``), so the
+    file is the only non-interactive path.
+
+    Deliberately fail-open like the wrk original: a seeding failure never
+    blocks the probe — the CLI then renders its trust dialog and parse()
+    reports the pool unmeasurable.  Only the probe's own fixed workdir is
+    written — never HOME or a parent directory.
+    """
+
+    try:
+        root = Path(os.path.realpath(workdir))
+        home = Path(os.path.realpath(Path.home()))
+        if root == home or root in home.parents:
+            return  # never trust HOME or an ancestor of it
+        sanitized = root.name.lower()[:40]
+        sanitized = re.sub(r"[^a-z0-9]+$", "", sanitized)
+        if not sanitized:
+            return
+        digest = hashlib.sha256(str(root).encode()).hexdigest()[:12]
+        trust_dir = _kimi_home() / "workspace-trust"
+        trust_file = trust_dir / f"wd_{sanitized}_{digest}"
+        if trust_file.exists():
+            return
+        trust_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {"root": str(root), "trustedAt": int(time.time() * 1000)},
+            separators=(",", ":"),
+        )
+        # O_EXCL keeps an existing entry immutable even if another seeding
+        # races between the existence check and this write (wrk's noclobber).
+        fd = os.open(trust_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, f"{payload}\n".encode())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return
+
+
 def _probe_once() -> str:
     """Run ``kimi`` in a PTY, wait for its prompt, then probe usage once or twice.
 
@@ -173,22 +230,29 @@ def _probe_once() -> str:
     burning CPU. That is the 2026-09-23 desktop incident's shape (22 grok
     orphans, load 28); kimi's PTY probe shares it.
 
-    The four devices that bound it are proctrack's, already proven on the
-    devin probe (be0c0a9) and the grok probe (#593):
+    The devices that bound it are proctrack's, already proven on the devin
+    probe (be0c0a9) and the grok probe (#593) — with one #928 change: the
+    child's cwd is the single fixed ``PROBE_WORKDIR``, not a per-probe
+    ``probe-*`` dir, because kimi gates on workspace trust per exact
+    directory.  The dir is scopefuel-private, so cwd still identifies only
+    this provider's processes:
 
-    * a per-probe instance directory, flocked, used as the child's cwd — cwd
-      is the only identifier that cannot kill an unrelated long-lived worker;
+    * the fixed workdir as the child's cwd — cwd is the only identifier that
+      cannot kill an unrelated long-lived worker;
     * a pre-probe sweep of leftovers from probes whose owner has died;
     * pgid + expected-cwd registration, so refresh's timeout handler can
       reclaim the child before ``os._exit``;
     * a detached reaper that watches for the parent's death — the last line
       of defence, and the only one that survives SIGKILL of this process.
+      (The reaper's target is now the shared fixed dir: a dead parent's
+      reaper could sweep a brand-new probe's child inside its ~1.6s sweep
+      window — rare, and costs one unmeasurable round, never an orphan.)
     """
 
     workdir = Path(PROBE_WORKDIR).expanduser()
     workdir.mkdir(parents=True, exist_ok=True)
+    _seed_workspace_trust(workdir)
     proctrack.kill_stale_probe_leftovers(workdir)
-    instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
     master_fd = slave_fd = -1
     process: subprocess.Popen[bytes] | None = None
     reaper: subprocess.Popen[bytes] | None = None
@@ -198,7 +262,7 @@ def _probe_once() -> str:
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command/input; binary is explicit/env-configured
             [BINARY],
-            cwd=instance_dir,
+            cwd=workdir,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -209,8 +273,8 @@ def _probe_once() -> str:
         with contextlib.suppress(OSError):
             child_pgid = os.getpgid(process.pid)
         if child_pgid is not None:
-            proctrack.register(child_pgid, instance_dir)
-        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
+            proctrack.register(child_pgid, workdir)
+        reaper = proctrack.spawn_reaper(workdir, ttl_s=TIMEOUT_S + 90.0)
         os.close(slave_fd)
         slave_fd = -1
 
@@ -222,7 +286,6 @@ def _probe_once() -> str:
         last_input = None
         usage_seen_at = None
         ready = False
-        trust_sent = False
         sends = 0
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
@@ -238,12 +301,13 @@ def _probe_once() -> str:
                 output.extend(chunk)
                 last_data = time.monotonic()
                 clean = _clean(output.decode("utf-8", errors="replace"))
-                if not trust_sent and TRUST_MARKER in clean:
-                    os.write(master_fd, b"\r")
-                    trust_sent = True
-                    last_input = time.monotonic()
-                    last_data = last_input
-                    continue
+                if TRUST_MARKER in clean:
+                    # The seeded trust entry did not take (or the CLI changed
+                    # its scheme) — never answer the dialog for it: a blind
+                    # Enter accepts whatever is highlighted, which trusts
+                    # whatever cwd it was launched in.  Bail out; parse()
+                    # reports the marker as unmeasurable.
+                    break
                 if not ready and _normal_prompt_ready(clean):
                     ready = True
                 if _RATE_LIMIT.search(clean) or _QUOTA_LIMIT.search(clean):
@@ -304,10 +368,10 @@ def _probe_once() -> str:
         # CLI that backgrounds a helper and returns 0 leaves that helper running,
         # and the block above skips entirely because ``process.poll()`` is not
         # None — the success path leaked where the timeout path did not. Sweep
-        # the instance directory unconditionally, by cwd, before it is removed:
-        # once it is gone proctrack has no cwd left to recognise them by.
+        # the workdir unconditionally, by cwd — the directory itself stays (it
+        # is the fixed trusted dir), only the processes inside it are reaped.
         with contextlib.suppress(OSError):
-            proctrack.kill_leftovers_at_cwd(instance_dir, nested=True)
+            proctrack.kill_leftovers_at_cwd(workdir, nested=True)
         if child_pgid is not None:
             proctrack.unregister(child_pgid)
         if reaper is not None:
@@ -316,9 +380,7 @@ def _probe_once() -> str:
                     reaper.kill()
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 reaper.wait(timeout=2.0)
-        with contextlib.suppress(OSError):
-            os.close(owner_fd)
-        shutil.rmtree(instance_dir, ignore_errors=True)
+        # The workdir is the fixed trusted dir — it must survive the probe.
         if slave_fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(slave_fd)
@@ -373,6 +435,18 @@ def parse(text: str) -> ProviderResult:
     """
 
     clean = _clean(text)
+    if TRUST_MARKER in clean:
+        # The probe hit kimi's workspace-trust dialog — /usage was never read.
+        # Unmeasurable, never a fabricated percentage: a partially blocked
+        # startup is not evidence about the pool in either direction.
+        return ProviderResult(
+            id="kimi",
+            error="Kimi CLI 가 작업 디렉터리 trust 를 물어 /usage 출력이 없음",
+            hint="kimi 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+            source="cli:/usage",
+            raw={"stdout": clean},
+            pool_class="spend",
+        )
     if _RATE_LIMIT.search(clean):
         return ProviderResult(
             id="kimi",
