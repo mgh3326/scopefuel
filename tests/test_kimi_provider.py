@@ -294,6 +294,10 @@ def test_probe_runs_in_one_fixed_trusted_workdir(tmp_path, monkeypatch):
     monkeypatch.setenv("KIMI_CODE_HOME", str(kimi_home))
 
     first_output = kimi._probe_once()
+    trust_dir = kimi_home / "workspace-trust"
+    assert trust_dir.is_dir()
+    first_body = json.loads(next(iter(trust_dir.iterdir())).read_text())
+    first_mtime = next(iter(trust_dir.iterdir())).stat().st_mtime_ns
     second_output = kimi._probe_once()
     first = kimi.parse(first_output)
     second = kimi.parse(second_output)
@@ -325,7 +329,10 @@ def test_probe_runs_in_one_fixed_trusted_workdir(tmp_path, monkeypatch):
     assert body == {"root": root, "trustedAt": body["trustedAt"]}
     assert body["root"] != os.path.realpath(pathlib.Path.home())
     assert body["root"] != os.path.realpath(workdir.parent)
-    # The second probe did not rewrite the entry.
+    # The second probe did not rewrite the entry — same body and same
+    # mtime as after the first probe.
+    assert body == first_body
+    assert entries[0].stat().st_mtime_ns == first_mtime
     assert isinstance(body["trustedAt"], int)
 
 
@@ -344,8 +351,11 @@ def test_seed_workspace_trust_is_idempotent_and_never_home(tmp_path, monkeypatch
     assert [e.name for e in entries] == [f"wd_mixed-name.dir_{digest}"]
     assert json.loads(entries[0].read_text())["root"] == root
 
-    # Guard: seeding HOME itself (or an ancestor of HOME) is refused.
+    # Guard: seeding HOME itself (or an ancestor of HOME) is refused. The
+    # ancestor half needs a non-root ancestor — "/" has an empty basename
+    # and would be refused even without the parent check.
     kimi._seed_workspace_trust(pathlib.Path.home())
+    kimi._seed_workspace_trust(pathlib.Path.home().parent)
     kimi._seed_workspace_trust(pathlib.Path("/"))
     assert [e.name for e in (kimi_home / "workspace-trust").iterdir()] == [entries[0].name]
 
@@ -366,14 +376,22 @@ def test_fetch_trust_prompt_is_unmeasurable_and_never_answered(tmp_path, monkeyp
     workdir = tmp_path / "provider-workdir"
     monkeypatch.setattr(kimi, "BINARY", str(binary))
     monkeypatch.setattr(kimi, "PROBE_WORKDIR", workdir)
+    # If the dialog-break regresses the probe hangs until the timeout —
+    # keep that failure fast so it cannot hide as a slow pass.
+    monkeypatch.setattr(kimi, "TIMEOUT_S", 5.0)
     monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
 
     result = kimi.fetch()
 
     assert result.error is not None
-    assert "trust" in result.error.lower()
+    # The trust-specific message: the timeout error embeds the binary path,
+    # and this test's own tmp dir name contains "trust" — a substring match
+    # on "trust" alone would pass on the timeout path too.
+    assert "작업 디렉터리 trust" in result.error
     assert result.buckets == []
-    # The probe bailed on the dialog instead of sending Enter through it.
+    # The probe bailed on the dialog instead of sending Enter through it;
+    # raw is only populated on the parse() path, not on timeouts.
+    assert result.raw is not None
     assert "DIALOG_ANSWERED" not in result.raw["stdout"]
     gate = gate_check([result], "kimi-k3")
     assert gate.ok is False
@@ -445,6 +463,20 @@ def test_parse_trust_prompt_fixture_is_unmeasurable_never_100():
     assert result.buckets == []
     gate = gate_check([result], "kimi-k3")
     assert gate.ok is False
+    assert gate.unmeasurable is True
+
+
+def test_parse_trust_prompt_split_by_cursor_moves_is_still_unmeasurable():
+    """A TUI may draw the title with cursor-move escapes between words —
+    _clean strips them without inserting spaces, so the marker check must
+    not depend on the literal spacing."""
+    text = "Trust\x1b[1Cthis\x1b[1Cfolder?\nWeekly limit: 100% used\n"
+    result = kimi.parse(text)
+
+    assert result.error is not None
+    assert "trust" in result.error.lower()
+    assert result.buckets == []
+    gate = gate_check([result], "kimi-k3")
     assert gate.unmeasurable is True
 
 

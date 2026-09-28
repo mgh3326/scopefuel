@@ -56,7 +56,9 @@ PROBE_WORKDIR = Path.home() / ".local" / "share" / "scopefuel" / "kimi-probe-wor
 # dialog below must never render.  A fresh probe-* dir per run re-prompted
 # forever and (on versions whose default answer is "Don't trust") exited the
 # CLI before /usage was ever read.
-TRUST_MARKER = "Trust this folder?"
+# Whitespace-insensitive: a TUI may draw the dialog title with cursor-move
+# escapes between words, which _clean strips without inserting spaces.
+TRUST_MARKER = re.compile(r"trust\s*this\s*folder\?", re.IGNORECASE)
 _READY_MARKERS = ("│ >", "Kimi K3 thinking")
 # A/B 실측(grok): 크기 미설정 PTY에서는 TUI가 usage 패널을 렌더하지 않아 timeout한다.
 # kimi 도 동일 PTY 경로이므로 같은 크기를 선제 적용한다.
@@ -301,7 +303,7 @@ def _probe_once() -> str:
                 output.extend(chunk)
                 last_data = time.monotonic()
                 clean = _clean(output.decode("utf-8", errors="replace"))
-                if TRUST_MARKER in clean:
+                if TRUST_MARKER.search(clean):
                     # The seeded trust entry did not take (or the CLI changed
                     # its scheme) — never answer the dialog for it: a blind
                     # Enter accepts whatever is highlighted, which trusts
@@ -406,7 +408,7 @@ def _prompt_ready(text: str) -> bool:
 
 
 def _normal_prompt_ready(text: str) -> bool:
-    return _prompt_ready(_clean(text).replace(TRUST_MARKER, ""))
+    return _prompt_ready(TRUST_MARKER.sub("", _clean(text)))
 
 
 def _usage_panel_seen(text: str) -> bool:
@@ -435,7 +437,7 @@ def parse(text: str) -> ProviderResult:
     """
 
     clean = _clean(text)
-    if TRUST_MARKER in clean:
+    if TRUST_MARKER.search(clean):
         # The probe hit kimi's workspace-trust dialog — /usage was never read.
         # Unmeasurable, never a fabricated percentage: a partially blocked
         # startup is not evidence about the pool in either direction.
