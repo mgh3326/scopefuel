@@ -721,9 +721,7 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     aplus_output = recommend(providers, "A+", today=TODAY, now=NOW)
     # #920: Sonnet 5.5 — xhigh stays in A+ as an escalation listing; high/medium
     # moved to C, max is the S escalation rung. No ranked sonnet row in A+.
-    assert not any(
-        line[:1].isdigit() and line.split()[1] == "sonnet" for line in aplus_output.splitlines()
-    )
+    assert not any(line[:1].isdigit() and line.split()[1] == "sonnet" for line in aplus_output.splitlines())
     assert "sonnet --effort xhigh" in aplus_output
     # ROB-591: opus --effort low no longer lives in A+ at all (moved to S).
     assert "opus --effort low" not in aplus_output
@@ -751,12 +749,8 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert "codex-luna --effort medium" not in c_output
     # #920: Sonnet 5.5 vendor-TB4 estimates — high raw 43.0 (B) placed C,
     # medium raw 29.0 already at the floor, each marked estimate with reason.
-    assert any(
-        line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines()
-    )
-    assert any(
-        line[:1].isdigit() and "sonnet --effort medium" in line for line in c_output.splitlines()
-    )
+    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines())
+    assert any(line[:1].isdigit() and "sonnet --effort medium" in line for line in c_output.splitlines())
     assert "벤치 43.0(추정(외삽))" in c_output
     assert "벤치 29.0(추정(외삽))" in c_output
     assert "보수 배치(C; raw 43.0 은 B 구간" in c_output
@@ -815,9 +809,7 @@ def test_rob1204_existing_top_rank_intent_remains_for_claude_only_inputs():
     # (Sonnet 5.5 high, vendor TB4 43.0 one step below its raw B read).
     c = recommend([_result("claude", 10.0, pool_class="preserve")], "C", today=TODAY, now=NOW)
     b = recommend([_result("claude", 10.0, pool_class="preserve")], "B", today=TODAY, now=NOW)
-    assert next(line for line in c.splitlines() if line[:1].isdigit()).startswith(
-        "1. sonnet --effort high"
-    )
+    assert next(line for line in c.splitlines() if line[:1].isdigit()).startswith("1. sonnet --effort high")
     assert next(line for line in b.splitlines() if line[:1].isdigit()).startswith("1. haiku --effort high")
 
 
