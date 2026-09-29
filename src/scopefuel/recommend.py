@@ -229,9 +229,23 @@ ESTIMATE_PROVENANCE_LEGEND = (
     "· (·미측정)=AA-agent 실행 실측 없음"
 )
 
-SONNET_ESTIMATE_REASON = (
-    "Opus 5 동일 effort 실측 곡선 대비 고정 오프셋(-8~-10점) — 상하 effort 모두 대조 가능"
+# #920: Claude Code 별칭 sonnet 은 2026-09-29 기준 claude-sonnet-5-5 를 서빙한다
+# (hk:doc report/2026-09-29/sonnet55-catalog-and-reps-status). AA-agent 미발표 —
+# 벤더 발표 Terminal-Bench 4 effort 곡선을 추정 점수로 그대로 표기하고, 벤더가
+# 주지 않은 effort(low)는 외삽하지 않는다. FrontierCode 수치는 TB4를 전부 하회해
+# 교차 확인용으로만 인용한다.
+SONNET_5_5_ESTIMATE_REASON = (
+    "claude-sonnet-5-5: AA-agent 미발표 — 벤더 발표 Terminal-Bench 4 effort 곡선 "
+    "(medium 29.0 · high 43.0 · xhigh 61.0 · max 70.6)을 추정 점수로 표기; "
+    "FrontierCode xhigh 52.1 · max 46.2는 TB4 하회라 교차 확인용 "
+    "(hk:doc report/2026-09-29/sonnet55-catalog-and-reps-status). "
+    "실측 reps 전까지 각 런그는 점수가 가리키는 급의 한 단계 아래에 배치"
 )
+SONNET_5_5_MEDIUM_PLACEMENT_NOTE = "raw 29.0 은 이미 최하위 급(C) — 낮출 급이 없어 C 유지"
+SONNET_5_5_HIGH_PLACEMENT_NOTE = "보수 배치(C; raw 43.0 은 B 구간 — 실측 reps 전 1단계 보수)"
+SONNET_5_5_XHIGH_PLACEMENT_NOTE = "보수 배치(A+; raw 61.0 은 S 구간 — 실측 reps 전 1단계 보수)"
+SONNET_5_5_MAX_PLACEMENT_NOTE = "보수 배치(S; raw 70.6 은 S+ 구간 — 실측 reps 전 1단계 보수)"
+SONNET_5_5_MAX_ESCALATION_REASON = "최상위 effort 추정 런그 — 실측 reps 전 운영자 명시 요청 시에만"
 KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가능한 기준점 없이 단일 추정"
 HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
 HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
@@ -681,6 +695,21 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="claude-opus-5-5",
             aa_model_id="claude-opus-5-5",
         ),
+        # #920: Sonnet 5.5 (max) — 벤더 TB4 70.6 은 S+ 구간이지만 실측 reps 전까지
+        # 한 단계 보수(S). 최상위 effort 런그라 운영자 명시 요청으로만 연다.
+        Profile(
+            "sonnet",
+            "Sonnet 5.5 (max)",
+            70.6,
+            gate="escalation",
+            gate_reason=SONNET_5_5_MAX_ESCALATION_REASON,
+            launcher_effort="max",
+            benchmark_effort="max",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
+            placement_note=SONNET_5_5_MAX_PLACEMENT_NOTE,
+            aa_model_id="claude-sonnet-5-5",
+        ),
     ],
     "A+": [
         Profile(
@@ -709,27 +738,20 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gpt-5.6-terra",
             aa_model_id="gpt-5-6-terra",
         ),
+        # #920: Sonnet 5.5 (xhigh) — 벤더 TB4 61.0 은 S 구간이지만 실측 reps 전까지
+        # 한 단계 보수(A+). escalation 게이트는 기존 xhigh 런그의 것을 유지한다.
         Profile(
             "sonnet",
-            "Sonnet 5 (high)",
-            55.0,
-            launcher_effort="high",
-            benchmark_effort="high",
-            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
-            estimate_reason=SONNET_ESTIMATE_REASON,
-            aa_model_id="claude-sonnet-5",
-        ),
-        Profile(
-            "sonnet",
-            "Sonnet 5 (xhigh)",
-            58.0,
+            "Sonnet 5.5 (xhigh)",
+            61.0,
             gate="escalation",
             gate_reason="쿼타 여유 시",
             launcher_effort="xhigh",
             benchmark_effort="xhigh",
-            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
-            estimate_reason=SONNET_ESTIMATE_REASON,
-            aa_model_id="claude-sonnet-5",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
+            placement_note=SONNET_5_5_XHIGH_PLACEMENT_NOTE,
+            aa_model_id="claude-sonnet-5-5",
         ),
         Profile(
             "grok",
@@ -851,26 +873,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="gpt-5.6-terra",
             aa_model_id="gpt-5-6-terra",
         ),
-        Profile(
-            "sonnet",
-            "Sonnet 5 (medium)",
-            52.0,
-            launcher_effort="medium",
-            benchmark_effort="medium",
-            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
-            estimate_reason=SONNET_ESTIMATE_REASON,
-            aa_model_id="claude-sonnet-5",
-        ),
-        Profile(
-            "sonnet",
-            "Sonnet 5 (low)",
-            48.0,
-            launcher_effort="low",
-            benchmark_effort="low",
-            benchmark_annotation=ESTIMATED_INTERPOLATED_ANNOTATION,
-            estimate_reason=SONNET_ESTIMATE_REASON,
-            aa_model_id="claude-sonnet-5",
-        ),
+        # #920: Sonnet 5.5 medium(29.0)은 C 로, low 는 벤더 점이 없어 외삽하지
+        # 않고 행을 두지 않는다 — C 버킷 참조.
         # ROB-1212 follow-up: kimi-k3 low effort has no AA-agent measurement in
         # bench.db, only an AA-model coding_index=72.0 row.  Derived via the
         # same _MODEL_ONLY_ANCHORS interpolation pattern used by the C-grade
@@ -1020,6 +1024,31 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="claude-sonnet-4.6",
             aa_model_id="claude-sonnet-4-6",
         ),
+        # #920: Sonnet 5.5 high/medium — 벤더 TB4 곡선(medium 29.0 · high 43.0)을
+        # 추정 점수로 표기하고 실측 reps 전까지 한 단계 보수. high 의 raw 43.0 은
+        # B 구간 → C 배치; medium 의 raw 29.0 은 이미 최하위 급이라 C 유지.
+        Profile(
+            "sonnet",
+            "Sonnet 5.5 (high)",
+            43.0,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
+            placement_note=SONNET_5_5_HIGH_PLACEMENT_NOTE,
+            aa_model_id="claude-sonnet-5-5",
+        ),
+        Profile(
+            "sonnet",
+            "Sonnet 5.5 (medium)",
+            29.0,
+            launcher_effort="medium",
+            benchmark_effort="medium",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
+            placement_note=SONNET_5_5_MEDIUM_PLACEMENT_NOTE,
+            aa_model_id="claude-sonnet-5-5",
+        ),
         # ROB-1201: estimated Haiku low is a C-tier exception, not a B candidate.
         Profile(
             "haiku",
@@ -1133,14 +1162,9 @@ def _e6_arm_profile(name: str, model: str, effort: str, reference: str, **kwargs
     )
 
 
+# #920: sonnet@max left the E6 table — the Sonnet 5.5 refresh places it at S
+# (estimated, one step below the vendor TB4 70.6 raw-S+ read).
 E6_ARM_RUNGS: tuple[Profile, ...] = (
-    _e6_arm_profile(
-        "sonnet",
-        "Sonnet 5 (max)",
-        "max",
-        "claude-sonnet-5 AA-model intelligence max 38.2 · xhigh 34.4",
-        aa_model_id="claude-sonnet-5",
-    ),
     _e6_arm_profile(
         "codex-sol",
         "GPT-6 Sol (high)",

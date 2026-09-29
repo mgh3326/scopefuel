@@ -39,8 +39,9 @@ TODAY = dt.date(2026, 9, 25)
 NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
 
 # (profile, effort) -> (pool, catalog model id, the AA number scopefuel stores)
+# #920: sonnet@max left this table — the Sonnet 5.5 refresh placed the rung at
+# S (estimated vendor TB4 70.6, one step below its raw S+ read).
 NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
-    ("sonnet", "max"): ("claude", "claude-sonnet-5", "max 38.2"),
     ("codex-sol", "high"): ("codex", "gpt-6-sol", "high 42.8"),
     ("codex-sol", "medium"): ("codex", "gpt-6-sol", "medium 미저장"),
     ("kimi-k3", "high"): ("kimi", "kimi-k3", "default 61.0"),
@@ -55,6 +56,9 @@ NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
 EXISTING_RUNGS: dict[tuple[str, str], str] = {
     ("opus", "low"): "S",
     ("opus", "medium"): "S+",
+    # #920: sonnet@max graduated from the E6 table to a placed S row
+    # (estimated); sonnet@xhigh stays A+ (raw 61.0 is S, one step down).
+    ("sonnet", "max"): "S",
     ("sonnet", "xhigh"): "A+",
     ("codex-sol", "xhigh"): "S+",
     ("codex-sol", "max"): "S+",
@@ -260,7 +264,7 @@ def test_a_measured_canon_row_gets_no_e6_arm_label():
             bench.CatalogEntry(
                 profile="sonnet",
                 effort="max",
-                model_id="claude-sonnet-5",
+                model_id="claude-sonnet-5-5",
                 pool="claude",
                 grade="B",
                 score=45.0,
@@ -292,7 +296,7 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
         return bench.CatalogEntry(
             profile=profile,
             effort=effort,
-            model_id="claude-sonnet-5" if profile == "sonnet" else "gpt-6-sol",
+            model_id="claude-sonnet-5-5" if profile == "sonnet" else "gpt-6-sol",
             pool="claude" if profile == "sonnet" else "codex",
             grade=grade,
             benchmark_annotation=E6_ARM_ANNOTATION,
@@ -300,7 +304,7 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
 
     view = bench.CatalogView(
         entries=tuple(entry(profile, effort, "C") for profile, effort in NEW_RUNGS)
-        + (entry("sonnet", "high", "A+"),),
+        + (entry("sonnet", "high", "C"),),
         source="server",
         backend="handoffkeep",
     )
@@ -354,46 +358,46 @@ def test_gate_admits_the_rung_with_the_marker_and_tags_the_allow_reason(key):
 
 def test_gate_cli_refuses_and_names_the_remedy(monkeypatch, capsys, tmp_path):
     rc, out, err, record = _gate_cli(
-        monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet", "--effort", "max"]
+        monkeypatch, capsys, tmp_path, "kimi", ["gate", "-m", "kimi-k3", "--effort", "max"]
     )
     assert rc == 3
     assert "e6_arm_required" in err
-    assert "sonnet@max" in err
-    assert f"{E6_ARM_MARKER_ENV}=sonnet@max" in err
+    assert "kimi-k3@max" in err
+    assert f"{E6_ARM_MARKER_ENV}=kimi-k3@max" in err
     assert "대안(C) 없음" not in err  # not a quota/alternatives refusal
     assert record["ok"] is False
-    assert record["e6_arm"] == "sonnet@max"
+    assert record["e6_arm"] == "kimi-k3@max"
     assert out == ""
 
 
 def test_gate_cli_admits_with_the_marker_and_prints_the_visible_tag(monkeypatch, capsys, tmp_path):
-    monkeypatch.setenv(E6_ARM_MARKER_ENV, "sonnet@max")
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "kimi-k3@max")
     rc, out, _err, record = _gate_cli(
-        monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet", "--effort", "max"]
+        monkeypatch, capsys, tmp_path, "kimi", ["gate", "-m", "kimi-k3", "--effort", "max"]
     )
     assert rc == 0
     first_line = out.splitlines()[0]
-    assert "[E6 arm, unmeasured C: sonnet@max]" in first_line
+    assert "[E6 arm, unmeasured C: kimi-k3@max]" in first_line
     assert record["ok"] is True
-    assert record["e6_arm"] == "sonnet@max"
+    assert record["e6_arm"] == "kimi-k3@max"
     assert record["grade"] == "C"
 
 
 def test_the_marker_alone_names_the_rung_for_the_gate(monkeypatch, capsys, tmp_path):
     """The spawn path: wrk calls `gate -m <profile>` and passes no --effort."""
 
-    monkeypatch.setenv(E6_ARM_MARKER_ENV, "sonnet@max")
-    rc, out, _err, _record = _gate_cli(monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet"])
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "kimi-k3@max")
+    rc, out, _err, _record = _gate_cli(monkeypatch, capsys, tmp_path, "kimi", ["gate", "-m", "kimi-k3"])
     assert rc == 0
-    assert "[E6 arm, unmeasured C: sonnet@max]" in out.splitlines()[0]
+    assert "[E6 arm, unmeasured C: kimi-k3@max]" in out.splitlines()[0]
 
 
-@pytest.mark.parametrize("marker", ["SONNET@MAX", " sonnet@max ", "Sonnet@Max"])
+@pytest.mark.parametrize("marker", ["KIMI-K3@MAX", " kimi-k3@max ", "Kimi-K3@Max"])
 def test_the_marker_is_normalized_like_an_effort_spelling(monkeypatch, capsys, tmp_path, marker):
     monkeypatch.setenv(E6_ARM_MARKER_ENV, marker)
-    rc, out, _err, _record = _gate_cli(monkeypatch, capsys, tmp_path, "claude", ["gate", "-m", "sonnet"])
+    rc, out, _err, _record = _gate_cli(monkeypatch, capsys, tmp_path, "kimi", ["gate", "-m", "kimi-k3"])
     assert rc == 0
-    assert "[E6 arm, unmeasured C: sonnet@max]" in out.splitlines()[0]
+    assert "[E6 arm, unmeasured C: kimi-k3@max]" in out.splitlines()[0]
 
 
 def test_the_marker_accepts_the_launcher_alias(monkeypatch, capsys, tmp_path):
@@ -408,18 +412,18 @@ def test_the_marker_accepts_the_launcher_alias(monkeypatch, capsys, tmp_path):
 @pytest.mark.parametrize(
     "marker",
     [
-        "sonnet@high",  # a placed rung, not an E6 rung
-        "sonnet",  # no rung named
-        "sonnet@",  # empty rung
+        "kimi-k3@high",  # a different E6 rung of the same profile
+        "kimi-k3",  # no rung named
+        "kimi-k3@",  # empty rung
         "@max",  # empty profile
         "opus@low",  # a different profile's rung
-        "sonnet@max@max",  # not a rung name
+        "kimi-k3@max@max",  # not a rung name
     ],
 )
 def test_a_marker_that_does_not_name_this_rung_opens_nothing(marker):
     result = gate_check(
-        [_provider("claude", pool_class="spend")],
-        "sonnet",
+        [_provider("kimi", pool_class="spend")],
+        "kimi-k3",
         effort="max",
         e6_arm=marker,
         today=TODAY,
@@ -427,7 +431,7 @@ def test_a_marker_that_does_not_name_this_rung_opens_nothing(marker):
     )
     assert result.ok is False
     assert "e6_arm_required" in result.reason
-    assert "sonnet@max" in result.reason
+    assert "kimi-k3@max" in result.reason
 
 
 def test_the_marker_parser_folds_spelling_and_rejects_a_value_that_names_no_rung():
@@ -443,21 +447,21 @@ def test_the_marker_parser_folds_spelling_and_rejects_a_value_that_names_no_rung
 def test_the_marker_cannot_widen_across_profiles():
     """A marker names one profile's rung — a cross-profile forgery opens nothing.
 
-    kimi-k3@max is a real E6 rung; naming it must not open sonnet@max (the
+    grok-hi@low is a real E6 rung; naming it must not open kimi-k3@max (the
     profile comparison is what stops it).
     """
 
     result = gate_check(
-        [_provider("claude", pool_class="spend")],
-        "sonnet",
+        [_provider("kimi", pool_class="spend")],
+        "kimi-k3",
         effort="max",
-        e6_arm="kimi-k3@max",
+        e6_arm="grok-hi@low",
         today=TODAY,
         now=NOW,
     )
     assert result.ok is False
     assert "e6_arm_required" in result.reason
-    assert "sonnet@max" in result.reason
+    assert "kimi-k3@max" in result.reason
 
 
 def test_the_marker_selects_the_rung_it_names_for_a_placed_rung_too():
@@ -485,12 +489,12 @@ def test_the_marker_selects_the_rung_it_names_for_a_placed_rung_too():
 def test_a_retired_e6_rung_is_not_revived_by_the_marker():
     """Retiring the rung is the canon closing it — the marker is not a way back."""
 
-    retired = frozenset({("sonnet", "max")})
+    retired = frozenset({("kimi-k3", "max")})
     result = gate_check(
-        [_provider("claude", pool_class="spend")],
-        "sonnet",
+        [_provider("kimi", pool_class="spend")],
+        "kimi-k3",
         effort="max",
-        e6_arm="sonnet@max",
+        e6_arm="kimi-k3@max",
         retired_rungs=retired,
         today=TODAY,
         now=NOW,
@@ -501,7 +505,10 @@ def test_a_retired_e6_rung_is_not_revived_by_the_marker():
 
 
 def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
-    """sonnet@high is a placement: the marker neither opens nor closes anything."""
+    """sonnet@high is a placement: the marker neither opens nor closes anything.
+
+    #920: sonnet@high is the Sonnet 5.5 C row (vendor TB4 43.0, one step below
+    its raw B read) — the marker still changes nothing about the judgement."""
 
     result = gate_check(
         [_provider("claude", pool_class="spend")],
@@ -512,7 +519,7 @@ def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
         now=NOW,
     )
     assert result.ok is True
-    assert result.grade == "A+"
+    assert result.grade == "C"
     assert result.e6_arm is None
     assert "E6 arm" not in result.reason
 
@@ -537,11 +544,11 @@ def test_a_measured_canon_row_lifts_the_e6_restriction():
 
     table = {grade: list(profiles) for grade, profiles in GRADE_TABLE.items()}
     table["B"].append(
-        Profile("sonnet", "Sonnet 5 (max)", 45.0, launcher_effort="max", benchmark_effort="max")
+        Profile("kimi-k3", "Kimi K3 (max)", 45.0, launcher_effort="max", benchmark_effort="max")
     )
     result = gate_check(
-        [_provider("claude", pool_class="spend")],
-        "sonnet",
+        [_provider("kimi", pool_class="spend")],
+        "kimi-k3",
         effort="max",
         today=TODAY,
         now=NOW,
@@ -574,10 +581,13 @@ def test_builder_grok_pin_still_resolves_without_a_marker():
     assert decision.e6_arm is None
 
 
-def test_an_unmarked_new_rung_keeps_todays_fallback():
+def test_an_unmarked_max_rung_resolves_its_own_placed_row():
+    """#920: sonnet@max is a placed S row now, not an E6 rung — no marker needed."""
+
     decision = launch.resolve_launch("sonnet", effort="max")
     assert decision.effort == "max"
-    assert decision.grade == "A+"  # sonnet@high's placement, as before #692
+    assert decision.grade == "S"
+    assert decision.gate == "escalation"
     assert decision.e6_arm is None
 
 
@@ -588,7 +598,7 @@ def test_the_marker_does_not_change_a_request_that_names_no_rung(monkeypatch, ca
     assert cli.main(["policy", "launch", "sonnet", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["effort"] == "high"
-    assert payload["grade"] == "A+"
+    assert payload["grade"] == "C"
     assert payload["e6_arm"] is None
 
 
