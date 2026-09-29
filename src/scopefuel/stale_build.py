@@ -34,12 +34,14 @@ check — the ops kill switch and the test isolation knob.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import json
 import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import tomllib
@@ -331,14 +333,20 @@ def _read_cache() -> dict[str, Any] | None:
 
 def _write_cache(entry: dict[str, Any]) -> None:
     path = _cache_path()
+    tmp: pathlib.Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(entry))
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix="stale_build.", suffix=".tmp")
+        tmp = pathlib.Path(name)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(entry))
         tmp.chmod(0o600)
-        tmp.replace(path)
+        os.replace(tmp, path)
     except OSError:
-        pass  # a cache write failure must not break the check
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        # a cache write failure must not break the check
 
 
 def _cache_verdict(cached: dict[str, Any]) -> Verdict | None:
@@ -379,28 +387,30 @@ def _cache_entry(
 
 def _probe(
     installed: str | None,
-    now: float,
     deadline: float,
     expired: threading.Event,
-) -> Verdict | None:
+) -> tuple[str, str | None, Verdict | None]:
     """The probe sequence itself — origin head, then compare distance.
 
-    ``expired`` is set by the caller when the wall-clock bound ran out: the
-    abandoned worker must then not write the cache, since the caller already
-    recorded the attempt as skipped.
+    Returns ``(status, head, verdict)`` for the caller to record; ``_probe``
+    never touches the cache — the calling thread in ``_bounded_probe`` is the
+    only writer — so a worker abandoned at the wall-clock bound cannot
+    overwrite the caller's skipped record. ``expired`` is set by the caller
+    when the bound ran out: the abandoned worker then cuts the sequence short
+    instead of finishing calls nobody will read.
     """
 
     head = _origin_rev(deadline)
     status: str
     verdict: Verdict | None
-    if head is None:
+    if head is None or expired.is_set():
         status, verdict = _STATUS_SKIPPED, None
     elif installed is None:
         status, verdict = _STATUS_REV_UNKNOWN, Verdict(_STATUS_REV_UNKNOWN, None, head, None)
     elif installed == head:
         status, verdict = _STATUS_CURRENT, None
     else:
-        behind = _commits_ahead(installed, head, deadline)
+        behind = None if expired.is_set() else _commits_ahead(installed, head, deadline)
         if behind == 0:
             # Installed strictly ahead of main (e.g. an unreleased local build
             # installed by rev) — ahead, never behind: no warning.
@@ -408,9 +418,7 @@ def _probe(
         else:
             status, verdict = _STATUS_BEHIND, Verdict(_STATUS_BEHIND, installed, head, behind)
 
-    if not expired.is_set():
-        _write_cache(_cache_entry(installed, head, verdict, status, now))
-    return verdict
+    return status, head, verdict
 
 
 def _bounded_probe(installed: str | None, now: float) -> Verdict | None:
@@ -419,20 +427,25 @@ def _bounded_probe(installed: str | None, now: float) -> Verdict | None:
     ``_remaining(deadline)`` hands each socket operation the leftover budget,
     but urllib's timeout is per operation (connect, then each read) — one
     probe could otherwise take several times PROBE_BUDGET_S. The probe runs on
-    a daemon thread so a wedged socket cannot keep the process alive; on
-    expiry the caller records a skip and returns while the abandoned thread is
-    kept from touching the cache.
+    a daemon thread so a wedged socket cannot keep the process alive.
+
+    The calling thread is the only cache writer — exactly one write per call:
+    if the worker is still alive at the deadline the caller flags ``expired``
+    (the abandoned thread then stops early and never writes), records the
+    attempt as skipped and returns; otherwise the caller writes the entry
+    built from the worker's result. A worker that raised writes nothing — the
+    cache simply keeps whatever it held, as before.
     """
 
     deadline = _monotonic() + PROBE_BUDGET_S
     expired = threading.Event()
-    box: dict[str, Verdict | None] = {"verdict": None}
+    box: dict[str, tuple[str, str | None, Verdict | None] | None] = {"result": None}
 
     def run() -> None:
         try:
-            box["verdict"] = _probe(installed, now, deadline, expired)
+            box["result"] = _probe(installed, deadline, expired)
         except Exception:
-            box["verdict"] = None
+            box["result"] = None
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
@@ -441,7 +454,12 @@ def _bounded_probe(installed: str | None, now: float) -> Verdict | None:
         expired.set()
         _write_cache(_cache_entry(installed, None, None, _STATUS_SKIPPED, now))
         return None
-    return box["verdict"]
+    result = box["result"]
+    if result is None:
+        return None
+    status, head, verdict = result
+    _write_cache(_cache_entry(installed, head, verdict, status, now))
+    return verdict
 
 
 def _check() -> Verdict | None:
@@ -456,7 +474,7 @@ def _check() -> Verdict | None:
         fresh = (
             cached is not None and checked_at <= now + _CHECKED_AT_SKEW_S and now - checked_at < CHECK_TTL_S
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         fresh = False
     if fresh and cached is not None and cached.get("installed_rev") == installed:
         # The install did not move since the probe — the cached verdict stands.
