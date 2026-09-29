@@ -34,6 +34,8 @@ from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_us
 from .policy import (
     ConfigEditError,
     clear_policy,
+    config_path,
+    config_problem,
     list_policy_rows,
     list_profile_subscriptions,
     set_policy,
@@ -281,6 +283,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "--decided-by", help="--emit-seed 가 각 행에 넣을 provenance (카탈로그 route 필수 필드)"
     )
     push_catalog.add_argument("--deviation-ref", help="--emit-seed 가 각 행에 넣을 근거 참조 (예: hk:doc/…)")
+    push_catalog.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 호출 한정 평문 http endpoint 허용 (allow_plaintext_catalog 의 1회성 대안; "
+        "설정 파일에 기록되지 않음)",
+    )
 
     catalog_parser = bench_sub.add_parser("catalog", help="정본 카탈로그 조회")
     catalog_sub = catalog_parser.add_subparsers(dest="catalog_command", required=True)
@@ -1337,7 +1345,7 @@ def _push_catalog_command(args: argparse.Namespace) -> int:
         print("error: push-catalog needs a JSON file (or --emit-seed)", file=sys.stderr)
         return 2
     try:
-        written = bench.push_catalog(args.json)
+        written = bench.push_catalog(args.json, allow_plaintext_http=args.allow_plaintext_http)
     except bench.BenchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1395,6 +1403,13 @@ def _bench_command(args: argparse.Namespace) -> int:
             print(bench.catalog_status_report())
             if not args.check:
                 return 0
+            # #1024: a config that cannot be parsed means every [bench] key was
+            # silently dropped — the check can never pass on that, even when the
+            # served view itself would.
+            problem = config_problem()
+            if problem is not None:
+                print(f"check failed: {config_path()} {problem}", file=sys.stderr)
+                return 2
             # Machine check: only a view the canon may as well have served
             # passes — a live fetch (server) or a fresh clean cache, since a
             # healthy host answers from the cache inside catalog_ttl_s without
