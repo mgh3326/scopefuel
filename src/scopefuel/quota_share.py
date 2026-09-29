@@ -162,7 +162,7 @@ def _measured_by(host: str, session_fp: str | None, result: ProviderResult) -> d
 
 
 def _bucket_payload(bucket: Bucket, measured_by: dict) -> dict:
-    return {
+    payload = {
         "label": bucket.label,
         "window": bucket.window,
         "horizon": bucket.horizon,
@@ -174,6 +174,11 @@ def _bucket_payload(bucket: Bucket, measured_by: dict) -> dict:
         # 계정 판정으로 번지지 않는다는 것을 관측 가능하게 하는 provenance(AC5).
         "measured_by": dict(measured_by),
     }
+    # task #966 — 관측 잠금(실소진)만 추가 키로 실린다: 원격 독자의 판정이
+    # 발행 호스트와 같아야 한다. 평범한 버킷의 키 집합은 바뀌지 않는다.
+    if bucket.locked:
+        payload["locked"] = True
+    return payload
 
 
 def _payload(pool: str, result: ProviderResult, host: str, session_fp: str | None, epoch: float) -> dict:
@@ -307,6 +312,7 @@ def _bucket(data: dict) -> Bucket:
         scope=Scope(kind, name if isinstance(name, str) else None),
         horizon=horizon if horizon in ("now", "week", "month") else "week",
         note=data.get("note") if isinstance(data.get("note"), str) else None,
+        locked=bool(data.get("locked")),
     )
 
 

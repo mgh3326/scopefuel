@@ -93,6 +93,12 @@ def isolated_cache(tmp_path, monkeypatch):
     # (default ~/.kimi-code) — point it at a tmp home so no test writes a real
     # trust entry for a throwaway workdir.
     monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
+    # task #966: the lockout scan also reads the pinned-effort clone homes
+    # (KIMI_CODE_*_HOME or the XDG defaults under ~/.local/share/kimi-code-*).
+    # XDG_DATA_HOME is already redirected above; clear any inherited overrides
+    # so no test ever scans a real clone home's sessions.
+    for clone_env in ("KIMI_CODE_LOW_HOME", "KIMI_CODE_HIGH_HOME", "KIMI_CODE_MAX_HOME"):
+        monkeypatch.delenv(clone_env, raising=False)
     # task #952: the stale-build check calls the GitHub API / git ls-remote —
     # default it off suite-wide so no test ever reaches the real network;
     # tests of the feature opt in per test and fake the probe seams.

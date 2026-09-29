@@ -257,6 +257,7 @@ def _from_entry(
             scope=Scope((b.get("scope") or {}).get("kind", "account"), (b.get("scope") or {}).get("name")),
             horizon=b.get("horizon", "week"),
             note=b.get("note"),
+            locked=bool(b.get("locked")),
         )
         for b in payload.get("buckets") or []
     ]

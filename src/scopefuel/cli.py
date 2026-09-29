@@ -39,7 +39,7 @@ from .policy import (
     set_policy,
     set_profile_subscribed,
 )
-from .providers import default_order, registry
+from .providers import default_order, kimi, registry
 from .recommend import grade_help_text
 from .refresh import REFRESH_POOLS, run_worker, spawn
 
@@ -110,7 +110,8 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "--recommend 시 연속 점수 구성요소(capacity/waste/throughput·제약 창) 및 "
-            "추정(내삽/외삽) 근거를 함께 표시"
+            "추정(내삽/외삽) 근거를 함께 표시. 일반 조회에서는 provider 진단 블록을 "
+            "stderr 에 출력 (kimi: lockout 스캔)"
         ),
     )
     parser.add_argument(
@@ -629,6 +630,17 @@ def _emit_stale_build_warning() -> None:
     verdict = _stale_build_verdict()
     if verdict is not None:
         print(verdict.line, file=sys.stderr)
+
+
+def _emit_provider_explain(results: list[ProviderResult], names: list[str], now: dt.datetime) -> None:
+    """``--explain`` provider 진단 블록 — stderr 전용 (stdout 계약 유지).
+
+    kimi 의 lockout 스캔은 '왜 못 잡았나'를 답하는 채널이다: 어느 루트를
+    스캔했고 무엇을 봤는지 경로·개수·시각으로만 보여준다(기록 본문 출력 금지).
+    """
+    if "kimi" in names:
+        result = next((r for r in results if r.id == "kimi"), None)
+        print(kimi.explain_lockout_scan(result, now=now), file=sys.stderr)
 
 
 def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.datetime) -> str:
@@ -1875,6 +1887,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.raw:
             results = manual.apply_for_display(results, now=now)
         print(_render(results, args, now), flush=True)
+        if args.explain:
+            _emit_provider_explain(results, names, now)
         if not args.raw and not args.json:
             _emit_stale_build_warning()
         if not args.watch:

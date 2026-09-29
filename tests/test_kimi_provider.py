@@ -7,8 +7,12 @@ import os
 import pathlib
 import re
 
-from scopefuel.providers import kimi
-from scopefuel.recommend import gate_check
+import pytest
+
+from scopefuel import cache, cli, render
+from scopefuel.model import ProviderResult
+from scopefuel.providers import FetcherWrapper, kimi
+from scopefuel.recommend import Profile, gate_check, recommend
 
 SAMPLE = "\x1b[2KWeekly: 75% left (resets in 5d 12h)\r\n\x1b[2K5h: 30% left (resets in 2h 10m)\r\n"
 
@@ -831,3 +835,583 @@ def test_sessions_dir_honours_kimi_code_home(tmp_path, monkeypatch):
 
     assert checked.error is None
     assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 0.0), ("weekly", 100.0)]
+
+
+# ------------------------------------------------------------------ #966
+# Clone-home lockout coverage.  wrk's pinned-effort kimi profiles run the CLI
+# under a clone home (bin/kimi-clone-home; KIMI_CODE_*_HOME or the XDG
+# defaults under ${XDG_DATA_HOME:-~/.local/share}/kimi-code-*), so a 403 lands
+# in <clone>/sessions — invisible to a scan that only reads ~/.kimi-code.
+# Every kimi home must be scanned, and the exhausted override must reach
+# severity/mark/verdict — never pass as a healthy 0%.
+
+
+def _assert_weekly_locked_out(checked: ProviderResult, now: dt.datetime) -> None:
+    """The every-surface contract of an observed weekly lockout (AC1/AC4)."""
+    weekly = checked.buckets[1]
+    assert (weekly.label, weekly.used_pct) == ("weekly", 100.0)
+    assert weekly.locked is True
+    # the panel's 'used 0%' wording must not survive next to the override
+    assert "used 0%" not in (weekly.note or "")
+    assert "usage limit" in (weekly.note or "")
+    verdict = checked.verdict_at(now)
+    assert verdict.mark != "ok"
+    assert [b.label for b in verdict.exhausted] == ["weekly"]
+    payload = checked.as_dict(now=now)
+    # AC4 — no surface may show used_pct 100 with severity/mark ok
+    assert not (payload["buckets"][1]["used_pct"] == 100 and payload["buckets"][1]["severity"] == "ok")
+    assert payload["buckets"][1]["severity"] == "crit"
+    assert payload["verdict"]["mark"] != "ok"
+    assert payload["verdict"]["week_pct"] == 100.0
+    assert render.brief([checked], color=False, now=now).startswith("[CRIT]")
+
+
+def test_lockout_in_a_clone_home_is_observed(tmp_path, monkeypatch):
+    """AC1 / M1 — a lockout in a clone home is observed.
+
+    SESSIONS_DIR (the ~/.kimi-code stand-in) is empty; the 403 record lives
+    only under a KIMI_CODE_HIGH_HOME clone home.  Before #966 this scan never
+    looked there — the desk-gate passed a provider-locked pool.
+    """
+    sessions = tmp_path / "empty-sessions"
+    sessions.mkdir()
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", sessions)
+    clone_home = tmp_path / "kimi-code-high"
+    monkeypatch.setenv("KIMI_CODE_HIGH_HOME", str(clone_home))
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(clone_home / "sessions", _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    _assert_weekly_locked_out(checked, now)
+    gate = gate_check([checked], "kimi-k3")
+    assert gate.ok is False
+    assert "소진" in gate.reason
+
+
+def test_lockout_in_a_clone_home_reaches_recommend(tmp_path, monkeypatch):
+    """AC1 — --recommend must treat the locked pool as exhausted, not a candidate."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+    clone_home = tmp_path / "kimi-code-low"
+    monkeypatch.setenv("KIMI_CODE_LOW_HOME", str(clone_home))
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(clone_home / "sessions", _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    text = recommend(
+        [checked],
+        "A",
+        now=now,
+        grade_table={"A": [Profile("kimi-k3", "Kimi", 50.0, aa_model_id="kimi-k3")]},
+    )
+
+    assert "kimi 풀 소진" in text
+
+
+def test_lockout_under_default_xdg_clone_home(tmp_path, monkeypatch):
+    """AC2 — a record under XDG_DATA_HOME/kimi-code-max is found with no
+    KIMI_CODE_MAX_HOME override (the clone-home default location)."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+    xdg = tmp_path / "xdg-data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    clone_home = xdg / "kimi-code-max"
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(clone_home / "sessions", _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    _assert_weekly_locked_out(checked, now)
+
+
+def test_lockout_under_configured_extra_home(tmp_path, monkeypatch):
+    """AC1 — [kimi] extra_homes in config.toml adds scan roots."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+    extra = tmp_path / "kimi-extra"
+    cfg_home = tmp_path / "xdg-config"
+    cfg = cfg_home / "scopefuel" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(f'[kimi]\nextra_homes = ["{extra}"]\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_home))
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(extra / "sessions", _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    _assert_weekly_locked_out(checked, now)
+
+
+def test_clone_home_transcript_blob_is_not_a_lockout(tmp_path, monkeypatch):
+    """AC3 — the anchored-shape rule applies to clone roots too: a wire.jsonl
+    transcript blob quoting usage-limit text is not a lockout."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+    clone_home = tmp_path / "kimi-code-high"
+    monkeypatch.setenv("KIMI_CODE_HIGH_HOME", str(clone_home))
+    now = dt.datetime.now(dt.UTC)
+    ms = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    wire_dir = clone_home / "sessions" / "wd_test" / "session_x" / "agents" / "main"
+    wire_dir.mkdir(parents=True)
+    (wire_dir / "wire.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "agent.message.appended",
+                "agentId": "main",
+                "message": {"role": "assistant", "content": "saw: " + SESSION_LOCKOUT_LOG},
+                "time": ms,
+            }
+        )
+        + "\n"
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+    assert all(not b.locked for b in checked.buckets)
+
+
+def test_clone_home_stale_mtime_is_skipped(tmp_path, monkeypatch):
+    """AC3 — the 32-day freshness filter applies to clone homes: a record in a
+    file untouched for 33d cannot describe a current window."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+    clone_home = tmp_path / "kimi-code-low"
+    monkeypatch.setenv("KIMI_CODE_LOW_HOME", str(clone_home))
+    now = dt.datetime.now(dt.UTC)
+    old = now - dt.timedelta(days=33)
+    _write_session_log(
+        clone_home / "sessions",
+        _session_log_at(now - dt.timedelta(hours=1)) + "\n",
+        when=old,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+    assert all(not b.locked for b in checked.buckets)
+
+
+def test_exhausted_override_reaches_severity_and_the_verdict(tmp_path, monkeypatch):
+    """AC4 / M2 — an exhausted override reaches severity and the verdict.
+
+    The desk saw weekly used_pct 100.0 beside severity ok, verdict.mark ok,
+    exhausted [] and a [ok] brief line — the override must re-derive every
+    surface, not just used_pct.
+    """
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    _assert_weekly_locked_out(checked, now)
+    # a healthy panel never carries the locked flag
+    untouched = kimi.parse(PANEL_LOCKOUT)
+    assert all(not b.locked for b in untouched.buckets)
+
+
+def test_observed_lockout_survives_cache_roundtrip(tmp_path, monkeypatch):
+    """#966 — the override must still be exhausted after a cache write/read;
+    otherwise a cached snapshot resurrects the healthy-0% state."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    entry = json.loads(json.dumps(checked.as_dict(now=now)))
+    restored = cache._from_entry({"result": entry, "fetched_at": now.timestamp()}, "kimi", now.timestamp())
+
+    weekly = restored.buckets[1]
+    assert weekly.locked is True
+    assert weekly.used_pct == 100.0
+    assert restored.verdict.mark != "ok"
+    assert [b.label for b in restored.verdict.exhausted] == ["weekly"]
+
+
+def test_explain_never_leaks_record_contents(tmp_path, monkeypatch, capsys):
+    """AC5 / M3 — --explain never leaks record contents.
+
+    The block lists every scanned root (path, exists flag, file count, newest
+    mtime), the newest hit per window with its ISO timestamp and error name,
+    and the decision — but a sentinel string inside a record must not appear.
+    """
+    sentinel = "SENTINEL-966-MUST-NOT-PRINT"
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+    clone_home = tmp_path / "kimi-code-high"
+    monkeypatch.setenv("KIMI_CODE_HIGH_HOME", str(clone_home))
+    extra_home = tmp_path / "kimi-extra"
+    cfg_home = tmp_path / "xdg-config"
+    cfg = cfg_home / "scopefuel" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(f'[kimi]\nextra_homes = ["{extra_home}"]\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_home))
+    now = dt.datetime.now(dt.UTC)
+    hit_ts = now - dt.timedelta(hours=1)
+    _write_session_log(
+        clone_home / "sessions",
+        _session_log_at(hit_ts) + f" debug={sentinel}\n",
+        when=now,
+    )
+
+    parsed = kimi.parse(PANEL_LOCKOUT)
+    checked = kimi._apply_observed_lockouts(parsed, now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert text.splitlines()[0] == "kimi lockout scan"
+    root_lines = [ln for ln in text.splitlines() if ln.startswith("  root ")]
+    # 1 primary + 3 clone homes + 1 extra home
+    assert len(root_lines) == 5
+    clone_line = next(ln for ln in root_lines if str(clone_home / "sessions") in ln)
+    assert "exists=yes" in clone_line
+    assert "files=1" in clone_line
+    assert "newest=" in clone_line  # newest file mtime, ISO
+    assert any("exists=no" in ln for ln in root_lines)  # absent roots still listed
+    hit_line = next(ln for ln in text.splitlines() if ln.startswith("  hit "))
+    # the record's ISO timestamp is truncated to milliseconds in the log line
+    assert hit_ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] in hit_line
+    assert "error=APIStatusError" in hit_line
+    assert "decision=exhausted" in hit_line
+    assert "decision: exhausted" in text
+    assert sentinel not in text
+
+    # end to end through the CLI: --explain writes the block to stderr only
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert sentinel not in out.err
+    assert sentinel not in out.out
+    assert "kimi lockout scan" not in out.out  # stdout contract stays clean
+
+
+def test_explain_with_no_records_shows_roots_and_no_lockout(tmp_path, monkeypatch):
+    """AC5 — with nothing found the block still lists every root and a clean decision."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "empty-sessions")
+
+    text = kimi.explain_lockout_scan(kimi.parse(PANEL_LOCKOUT), now=dt.datetime.now(dt.UTC))
+
+    assert text.splitlines()[0] == "kimi lockout scan"
+    assert len([ln for ln in text.splitlines() if ln.startswith("  root ")]) >= 4
+    assert "decision: no usage-limit records" in text
+
+
+# --- #966 fix round 1 — errorName cannot smuggle errorMessage text ---------
+# tester BLOCKER 1: _SESSION_ERR_NAME used to search the whole line, so an
+# errorMessage body containing 'errorName=<token>' (no real field, or the real
+# field after the message) leaked into --explain's error= column.
+
+SMUGGLE_SENTINEL = "SENTINEL966VERIFY"
+
+
+@pytest.mark.parametrize(
+    "line_tpl",
+    [
+        # errorName value with quotes/spaces — not a bare token
+        '{ts}Z WARN  llm request failed  errorName="{s} two words" '
+        'errorMessage="403 weekly usage limit" statusCode=403\n',
+        # no real errorName field; the message body quotes one
+        '{ts}Z WARN  llm request failed  errorMessage="403 weekly usage limit errorName={s}" '
+        "statusCode=403\n",
+        # the real errorName sits AFTER the message that quotes a fake one
+        '{ts}Z WARN  llm request failed  errorMessage="403 weekly usage limit errorName={s}" '
+        "errorName=APIStatusError statusCode=403\n",
+    ],
+    ids=["quoted-value", "no-field", "field-after-message"],
+)
+def test_error_name_cannot_smuggle_message_text(tmp_path, monkeypatch, line_tpl):
+    """#966 fix 1 — the explain error name comes only from the record's own
+    fields; errorMessage contents never reach the scan block."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        line_tpl.format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert "hit weekly" in text
+    assert SMUGGLE_SENTINEL not in text
+
+
+def test_error_name_smuggle_end_to_end_through_cli(tmp_path, monkeypatch, capsys):
+    """#966 fix 1 — BLOCKER repro: message text must not reach stderr of
+    `scopefuel --only kimi --explain`."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        f"{(now - dt.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z WARN  "
+        f'llm request failed  errorMessage="403 weekly usage limit '
+        f'errorName={SMUGGLE_SENTINEL}" statusCode=403\n',
+        when=now,
+    )
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
+
+
+def test_error_name_still_read_when_the_field_is_real(tmp_path, monkeypatch):
+    """Guard the non-mutant direction: a genuine errorName field still prints."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    text = kimi.explain_lockout_scan(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert "error=APIStatusError" in text
+
+
+# --- #966 fix round 2 — the same smuggle through OTHER quoted fields, and
+# the length bound truncating instead of refusing (tester BLOCKER 1a/1b).
+
+LONG_NAME = SMUGGLE_SENTINEL + "A" * 80  # 97 chars — over the {1,64} bound
+
+R2_CASES = {
+    "two-errmsg-spans": '{ts}Z WARN  x  errorMessage="403 weekly usage limit errorName={s}" '
+    'errorMessage="again errorName={s}" statusCode=403\n',
+    "other-quoted-field-nospace": '{ts}Z WARN  x  errorBody="errorName={s}" '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    "other-quoted-field-space": '{ts}Z WARN  x  errorBody="x errorName={s}" '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    "other-quoted-field-space-then-real": '{ts}Z WARN  x  errorBody="x errorName={s}" '
+    'errorName=APIStatusError errorMessage="403 weekly usage limit" statusCode=403\n',
+    "escaped-quote-in-errmsg": '{ts}Z WARN  x  errorMessage="403 weekly usage limit \\" '
+    'errorName={s} \\"" statusCode=403\n',
+    "long-name-over-64": '{ts}Z WARN  x  errorName={long} errorMessage="403 weekly usage limit" '
+    "statusCode=403\n",
+}
+
+
+@pytest.mark.parametrize("case", list(R2_CASES))
+def test_r2_error_name_attacks(tmp_path, monkeypatch, case):
+    """#966 fix 2 — no quoted field value (any key=, any position) may reach
+    the explain error= column; an over-long name refuses rather than truncates."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R2_CASES[case].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+            long=LONG_NAME,
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert "hit weekly" in text
+    assert SMUGGLE_SENTINEL not in text
+
+
+def test_r2_long_name_falls_back_without_a_prefix(tmp_path, monkeypatch):
+    """A 97-char errorName value must not match at all — no 64-char prefix —
+    so the fixed context marker is printed instead."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R2_CASES["long-name-over-64"].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+            long=LONG_NAME,
+        ),
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert SMUGGLE_SENTINEL not in text
+    assert "error=statusCode=403" in text  # fixed context marker, not a prefix
+
+
+def test_r2_real_name_after_tab_is_read(tmp_path, monkeypatch):
+    """Guard: a genuine unquoted errorName field still prints (tab counts as
+    the field boundary it is)."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        f"{(now - dt.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z WARN  x\t"
+        'errorName=APIStatusError\terrorMessage="403 weekly usage limit" statusCode=403\n',
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert "error=APIStatusError" in text
+
+
+def test_r2_nastiest_end_to_end(tmp_path, monkeypatch, capsys):
+    """#966 fix 2 — the three nastiest lines in one file, through cli.main:
+    the sentinel must be absent from stdout AND stderr."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    body = "".join(
+        R2_CASES[c].format(ts=ts, s=SMUGGLE_SENTINEL, long=LONG_NAME)
+        for c in ("other-quoted-field-space-then-real", "two-errmsg-spans", "long-name-over-64")
+    )
+    _write_session_log(tmp_path, body, when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
+
+
+def test_r2_realpath_dedupe_shapes(tmp_path, monkeypatch):
+    """A symlinked alias of a clone home scans once (realpath dedupe); a
+    dangling alias and a missing env home each still list as exists=no."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "primary")
+    real_clone = tmp_path / "real-clone"
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(real_clone / "sessions", _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+    alias = tmp_path / "alias-clone"
+    alias.symlink_to(real_clone)
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    monkeypatch.setenv("KIMI_CODE_LOW_HOME", str(tmp_path / "does-not-exist"))
+    monkeypatch.setenv("KIMI_CODE_HIGH_HOME", str(real_clone))
+    cfg_home = tmp_path / "xdg-config"
+    cfg = cfg_home / "scopefuel" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(f'[kimi]\nextra_homes = ["{alias}", "{dangling}", "{tmp_path / "does-not-exist"}"]\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_home))
+
+    roots = kimi._scan_roots()
+    assert len({os.path.realpath(r) for r in roots}) == len(roots)
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+    root_lines = [ln for ln in text.splitlines() if ln.startswith("  root ")]
+    assert sum("exists=yes files=1" in ln for ln in root_lines) == 1
+    assert sum("does-not-exist" in ln for ln in root_lines) == 1
+    assert any(str(dangling / "sessions") in ln and "exists=no" in ln for ln in root_lines)
+
+
+# --- #966 fix round 3 — unterminated/single-quoted quoting shapes fail
+# closed to the fixed context marker (tester BLOCKER 1c).
+
+R3_CASES = {
+    # escaped quote inside another quoted field, then errorName=
+    "escaped-quote-other-field": '{ts}Z WARN  x  errorBody="a \\" errorName={s}" '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    # unterminated quote BEFORE the message (strip swallows up to errorMessage=")
+    "unterminated-before-msg": '{ts}Z WARN  x  errorBody="a errorName={s} '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    # unterminated quote AFTER a valid message span: line still qualifies
+    "unterminated-after-msg-eol": '{ts}Z WARN  x  errorMessage="403 weekly usage limit" '
+    'statusCode=403 errorBody="a errorName={s}\n',
+    "unterminated-after-msg-mid": '{ts}Z WARN  x  errorMessage="403 weekly usage limit" '
+    'statusCode=403 errorBody="a errorName={s} tail\n',
+    # single-quoted field (brief shape, then with inner spaces)
+    "single-quoted": "{ts}Z WARN  x  errorBody='errorName={s}' "
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    "single-quoted-spaced": "{ts}Z WARN  x  errorBody='a errorName={s} b' "
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    # JSON-style field inside the message
+    "json-style-in-msg": '{ts}Z WARN  x  errorMessage="403 weekly usage limit {{\\"errorName\\":\\"{s}\\"}}" '
+    "statusCode=403\n",
+}
+
+
+@pytest.mark.parametrize("case", list(R3_CASES))
+def test_r3_error_name_probes(tmp_path, monkeypatch, case):
+    """#966 fix 3 — a leftover quote after the quoted-field strip means an
+    unparseable quoting shape: the error name fails closed to the fixed
+    context marker. The record still qualifies as a weekly hit."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R3_CASES[case].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert "hit weekly" in text
+    assert SMUGGLE_SENTINEL not in text
+
+
+def test_r3_worst_end_to_end(tmp_path, monkeypatch, capsys):
+    """#966 fix 3 — the worst quoting shapes in one file, through cli.main."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    body = "".join(
+        R3_CASES[c].format(ts=ts, s=SMUGGLE_SENTINEL)
+        for c in (
+            "escaped-quote-other-field",
+            "unterminated-before-msg",
+            "single-quoted",
+            "json-style-in-msg",
+        )
+    )
+    _write_session_log(tmp_path, body, when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
+
+
+def test_r3_worst_end_to_end_unterminated_after_msg(tmp_path, monkeypatch, capsys):
+    """#966 fix 3 — BLOCKER 1c repro: the unterminated quote after a valid
+    message span must not leak through cli.main."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R3_CASES["unterminated-after-msg-eol"].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+        ),
+        when=now,
+    )
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
