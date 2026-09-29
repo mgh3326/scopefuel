@@ -2247,14 +2247,19 @@ def set_grade(
 # express both "the cache is a copy of the canon" and "we are down to the
 # bundled table", and conflating them is how a dead server turns into free
 # dispatch (2558).
-#   fresh    age < catalog_ttl_s            — cache served, no request
-#   cached   ttl <= age < stale_max         — refetch attempted, cache on failure
-#   snapshot age >= stale_max, or no cache  — bundled table, labelled ``stale``
+#   fresh       age < catalog_ttl_s            — cache served, no request
+#   cached      ttl <= age < stale_max         — refetch attempted, cache on failure
+#   cache-stale age >= stale_max, cache exists — last-good cache, labelled stale
+#   snapshot    age >= stale_max, no cache     — bundled table, labelled ``stale``
 # ---------------------------------------------------------------------------
 
 CATALOG_SOURCE_SERVER = "server"
 CATALOG_SOURCE_CACHE = "cache"
 CATALOG_SOURCE_SNAPSHOT = "snapshot"
+# Past ``catalog_stale_max_s`` an unreachable server (or a refused catalog) no
+# longer drops the last-good cache for the older bundled snapshot — the cache
+# keeps serving, labelled and gated stale (#954).
+CATALOG_SOURCE_CACHE_STALE = "cache-stale"
 # The endpoint answered, and answered that it has no catalog route.
 CATALOG_SOURCE_UNSUPPORTED = "unsupported"
 
@@ -2314,6 +2319,10 @@ class CatalogView:
     age_s: float | None = None
     backend: str = BENCH_BACKEND_LOCAL
     reason: str = ""
+    # Why the served rows are not this run's canon — the server's own answer
+    # when the fetch degraded (``server catalog rejected: …``, or ``server
+    # unreachable`` on a stale cache). Surfaced inside the label's parentheses.
+    detail: str = ""
 
     @property
     def local_only(self) -> bool:
@@ -2329,15 +2338,16 @@ class CatalogView:
 
     @property
     def stale(self) -> bool:
-        """True when the bundled snapshot stands in for a canon we should have.
+        """True when what stands in for the canon is not a canon we should trust.
 
-        Not every snapshot read is stale. A local-only host has no canon by
-        configuration, and a server that has no catalog route has none to be
-        behind — only losing a canon this host was supposed to read is stale, and
-        only that justifies refusing to widen a gate.
+        Both degraded sources count: the bundled snapshot and a cache kept past
+        ``catalog_stale_max_s`` — while either serves, a non-default gate may
+        not widen, because the canon may have moved since the rows were written.
+        Not every snapshot read is stale: a local-only host has no canon by
+        configuration, and a server without the route has none to be behind.
         """
 
-        return self.source == CATALOG_SOURCE_SNAPSHOT and not self.local_only
+        return self.source in (CATALOG_SOURCE_SNAPSHOT, CATALOG_SOURCE_CACHE_STALE) and not self.local_only
 
     @property
     def label(self) -> str:
@@ -2346,10 +2356,11 @@ class CatalogView:
         if self.source == CATALOG_SOURCE_SNAPSHOT:
             if self.local_only:
                 return "catalog=snapshot (local backend — server catalog not in use)"
-            return "catalog=stale (snapshot)"
+            return f"catalog=stale ({self.detail or 'snapshot'})"
+        detail = f"; {self.detail}" if self.detail else ""
         if self.age_s is None:
-            return f"catalog={self.source}"
-        return f"catalog={self.source} (age {self.age_s / 3600.0:.1f}h)"
+            return f"catalog={self.source}{detail}"
+        return f"catalog={self.source} (age {self.age_s / 3600.0:.1f}h{detail})"
 
     def by_key(self) -> dict[tuple[str, str], CatalogEntry]:
         return {entry.key: entry for entry in self.entries}
@@ -2412,6 +2423,29 @@ def _catalog_from_payload(payload: dict) -> list[CatalogEntry]:
 
 def _fetch_catalog(backend: BenchBackend) -> list[CatalogEntry]:
     return _catalog_from_payload(_handoffkeep_request(backend, "catalog"))
+
+
+def _server_catalog_rejection(entries: list[CatalogEntry]) -> str | None:
+    """The validity floor a fetched catalog must pass before it may be canon.
+
+    Returns the rejection detail, or ``None`` when the catalog stands. Two
+    rejections: an empty catalog, and a catalog that never mentions a profile
+    the bundled snapshot places — *mentioned* means present as a row, live or
+    retired, so a legitimate server-side retirement still passes. Anything
+    smaller than that is not a canon, it is an accident of seeding: #667 was a
+    1-row catalog silently becoming the fleet's placements. Per-profile gaps
+    below this floor stay the launcher's problem — ``resolve_launch`` fills
+    them from the snapshot.
+    """
+
+    if not entries:
+        return "empty catalog"
+    missing = snapshot_profiles() - {entry.profile for entry in entries}
+    if not missing:
+        return None
+    row_word = "row" if len(entries) == 1 else "rows"
+    profile_word = "profile" if len(missing) == 1 else "profiles"
+    return f"{len(entries)} {row_word}, missing {len(missing)} snapshot {profile_word}"
 
 
 def _catalog_to_wire(entry: CatalogEntry) -> dict[str, object]:
@@ -2572,17 +2606,28 @@ def _read_catalog_uncached(
             reason=backend.reason,
         )
 
+    # Why the canon cannot be served this run — an unreachable server, or a
+    # fetched catalog the validity floor refused. Carried on the view so the
+    # label can say which one happened.
+    degraded = "server unreachable"
     try:
         entries = _fetch_catalog(backend)
-        if commit_cache:
-            _commit_catalog_cache(path=path, entries=entries, backend=backend)
-        return CatalogView(
-            entries=tuple(entries),
-            source=CATALOG_SOURCE_SERVER,
-            age_s=0.0,
-            backend=backend.name,
-            reason=backend.reason,
-        )
+        # The floor runs after the schema decode (inside _fetch_catalog) and
+        # before the response may replace the last-good cache: a refused
+        # catalog is never committed, and the host degrades exactly as if the
+        # server were unreachable.
+        rejection = _server_catalog_rejection(entries)
+        if rejection is None:
+            if commit_cache:
+                _commit_catalog_cache(path=path, entries=entries, backend=backend)
+            return CatalogView(
+                entries=tuple(entries),
+                source=CATALOG_SOURCE_SERVER,
+                age_s=0.0,
+                backend=backend.name,
+                reason=backend.reason,
+            )
+        degraded = f"server catalog rejected: {rejection}"
     except BenchRouteMissing:
         return CatalogView(
             entries=catalog_snapshot(),
@@ -2594,26 +2639,59 @@ def _read_catalog_uncached(
     except (BenchBackendError, sqlite3.Error, OSError, ValueError):
         pass
 
+    rejected = degraded != "server unreachable"
     if cached and age_s is not None and age_s < backend.catalog_stale_max_s:
-        _warn_cached("catalog", age_hours=age_s / 3600.0, has_data=True)
+        if rejected:
+            print(
+                f"warning: {degraded}; using cached bench catalog (age {age_s / 3600.0:.1f}h)",
+                file=sys.stderr,
+            )
+        else:
+            _warn_cached("catalog", age_hours=age_s / 3600.0, has_data=True)
         return CatalogView(
             entries=tuple(cached),
             source=CATALOG_SOURCE_CACHE,
             age_s=age_s,
             backend=backend.name,
             reason=backend.reason,
+            detail=degraded if rejected else "",
         )
 
-    print(
-        "warning: handoffkeep catalog unavailable; using the bundled snapshot (catalog=stale)",
-        file=sys.stderr,
-    )
+    if cached and age_s is not None:
+        # Past ``catalog_stale_max_s`` the last-good cache is still newer canon
+        # than the bundled snapshot — the snapshot is older than the cache and
+        # cannot carry a server-side move (a demotion, a retirement) it never
+        # saw. The cache keeps serving, labelled cache-stale and gated stale.
+        if rejected:
+            print(
+                f"warning: {degraded}; using cached bench catalog (age {age_s / 3600.0:.1f}h)",
+                file=sys.stderr,
+            )
+        else:
+            _warn_cached("catalog", age_hours=age_s / 3600.0, has_data=True)
+        return CatalogView(
+            entries=tuple(cached),
+            source=CATALOG_SOURCE_CACHE_STALE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+            detail=degraded,
+        )
+
+    if rejected:
+        print(f"warning: {degraded}; using the bundled snapshot (catalog=stale)", file=sys.stderr)
+    else:
+        print(
+            "warning: handoffkeep catalog unavailable; using the bundled snapshot (catalog=stale)",
+            file=sys.stderr,
+        )
     return CatalogView(
         entries=catalog_snapshot(),
         source=CATALOG_SOURCE_SNAPSHOT,
         age_s=age_s,
         backend=backend.name,
         reason=backend.reason,
+        detail=degraded if rejected else "",
     )
 
 
@@ -2768,11 +2846,24 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
             "for a private WireGuard/Tailscale tunnel"
         )
     if view.stale:
-        lines.append(
-            "stale: running on the bundled snapshot — server placements are NOT in effect; "
-            "non-default gates require --operator-request until the canon is readable"
-        )
-    uncovered = sorted(snapshot_profiles() - view.profiles()) if not view.stale else []
+        if view.source == CATALOG_SOURCE_CACHE_STALE:
+            lines.append(
+                "stale: running on the last-good cache past catalog_stale_max_s — server "
+                "placements may have moved; non-default gates require --operator-request "
+                "until the canon is readable"
+            )
+        else:
+            lines.append(
+                "stale: running on the bundled snapshot — server placements are NOT in effect; "
+                "non-default gates require --operator-request until the canon is readable"
+            )
+    # Disclosure applies to every served source but the snapshot: a snapshot
+    # view has nothing uncovered by definition, while a cache-stale view —
+    # stale like the snapshot but still carrying the last-good rows — must
+    # keep listing the profiles its (possibly pre-floor, partial) canon omits.
+    uncovered = (
+        sorted(snapshot_profiles() - view.profiles()) if view.source != CATALOG_SOURCE_SNAPSHOT else []
+    )
     if uncovered:
         lines.append("uncovered (snapshot-only, catalog has no row): " + ", ".join(uncovered))
     return "\n".join(lines)
@@ -2920,12 +3011,13 @@ def runtime_grade_table(*, path: pathlib.Path | str | None = None) -> dict:
     if bench_backend(use="catalog").name != BENCH_BACKEND_HANDOFFKEEP:
         return GRADE_TABLE
 
-    # Only a view that actually came from the canon may rebuild the table. A
+    # Only a view that actually came from the canon may rebuild the table — the
+    # last-good cache included, since its rows are still canon-derived. A
     # snapshot view (local, unsupported route, or stale) must fall through to the
     # grades projection and then to the code table — rebuilding from the snapshot
     # would look like a canonical answer while being a copy of the code table.
     view = read_catalog(path=path)
-    if view.source in (CATALOG_SOURCE_SERVER, CATALOG_SOURCE_CACHE):
+    if view.source in (CATALOG_SOURCE_SERVER, CATALOG_SOURCE_CACHE, CATALOG_SOURCE_CACHE_STALE):
         table = _catalog_grade_table(view)
         if table is not None:
             return table

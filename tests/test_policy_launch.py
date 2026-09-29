@@ -11,22 +11,24 @@ import json
 
 import pytest
 from test_bench_backend import FakeHandoffkeep, _set_backend
-from test_bench_catalog import _row
+from test_bench_catalog import _seed_rows
 
 from scopefuel import bench, cli, launch
 
 
 @pytest.fixture
 def stale_catalog(tmp_path, monkeypatch):
-    """A host configured for the canon that cannot reach it any more."""
+    """A host configured for the canon that cannot reach it any more.
+
+    #954: past ``catalog_stale_max_s`` the host keeps serving the last-good
+    cache labelled ``cache-stale`` — the snapshot is the no-cache floor only.
+    The canon here is the full bundled placement seed: the validity floor
+    refuses a catalog that does not mention every snapshot profile.
+    """
 
     _set_backend(tmp_path, monkeypatch)
     fake = FakeHandoffkeep()
-    fake.catalog = [
-        _row("opus", "high", "claude-opus-5-5", "claude", "S+"),
-        _row("opus", "max", "claude-opus-5-5", "claude", "S+", gate="escalation"),
-        _row("fable", "", "claude-fable-5-1", "claude", "S+", gate="consult_only"),
-    ]
+    fake.catalog = _seed_rows()
     monkeypatch.setattr(bench, "request_json", fake.request_json)
     bench.reset_catalog_memo()
     bench.read_catalog()
@@ -174,7 +176,7 @@ def test_stale_json_discloses_the_source(stale_catalog, capsys):
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["catalog"]["stale"] is True
-    assert payload["catalog"]["source"] == "snapshot"
+    assert payload["catalog"]["source"] == "cache-stale"
     assert "catalog=stale" in captured.err
 
 
