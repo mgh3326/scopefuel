@@ -46,14 +46,41 @@ def _row(profile, effort, model_id, pool, grade, **overrides):
 
 
 def _seed_rows():
-    """A small but complete canon: two Opus rungs, Sol, and one launcher-only row."""
+    """A complete canon: every bundled-snapshot profile, at its bundled placement.
 
-    return [
-        _row("opus", "high", "claude-opus-5-5", "claude", "S+"),
-        _row("opus", "xhigh", "claude-opus-5-5", "claude", "S+"),
-        _row("codex-sol", "max", "gpt-6-sol", "codex", "S+"),
-        _row("codex-terra-max", "", "gpt-5.6-terra", "codex", "S"),
-    ]
+    The #954 validity floor refuses a fetched catalog that never mentions a
+    snapshot profile, so the fake server's base state has to cover all of them
+    — a partial canon is a rejected canon, and the tests exercise that in their
+    own rows below.
+    """
+
+    return [entry.as_dict() for entry in bench.catalog_snapshot()]
+
+
+def _seed_rows_with(profile, effort, **changes):
+    """The full seed with one row's fields replaced — a canon edit, not a gap."""
+
+    rows = []
+    for row in _seed_rows():
+        if row["profile"] == profile and row["effort"] == effort:
+            row = {**row, **changes}
+        rows.append(row)
+    return rows
+
+
+def _cached_catalog_count() -> int:
+    """Rows in bench_cache_catalog — 0 when the table/database does not exist."""
+
+    target = bench.db_path()
+    if not target.exists():
+        return 0
+    conn = sqlite3.connect(target)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM bench_cache_catalog").fetchone()[0]
+    except sqlite3.Error:
+        return 0
+    finally:
+        conn.close()
 
 
 @pytest.fixture
@@ -113,10 +140,7 @@ def test_catalog_grade_change_reaches_recommend_after_the_ttl(catalog_server):
     _, fake = catalog_server
     assert bench.read_catalog().source == "server"
 
-    fake.catalog = [
-        _row("opus", "high", "claude-opus-5-5", "claude", "A"),
-        _row("codex-sol", "max", "gpt-6-sol", "codex", "S+"),
-    ]
+    fake.catalog = _seed_rows_with("opus", "high", grade="A")
     _age_catalog_cache(3601)
 
     table = bench.runtime_grade_table()
@@ -138,7 +162,7 @@ def test_catalog_model_id_change_reaches_the_launcher_without_a_grade_change(cat
     _, fake = catalog_server
     assert launch.resolve_launch("codex-sol").model_id == "gpt-6-sol"
 
-    fake.catalog = [_row("codex-sol", "max", "gpt-6-1-sol", "codex", "S+")]
+    fake.catalog = _seed_rows_with("codex-sol", "max", model_id="gpt-6-1-sol")
     _age_catalog_cache(3601)
     assert launch.resolve_launch("codex-sol").model_id == "gpt-6-1-sol"
 
@@ -173,11 +197,39 @@ def test_retiring_a_rung_server_side_removes_it_from_the_table(catalog_server):
 
 
 def test_a_profile_the_catalog_never_mentions_is_kept_not_deleted(catalog_server):
-    """A half-seeded catalog must not silently empty the table."""
+    """A half-covered catalog *view* must not silently empty the table.
 
-    table = bench.runtime_grade_table()
+    The #954 fetch-time floor now refuses such a catalog as a whole, so the
+    merge fill-in is the second line of defence — it still has to hold for a
+    view that bypassed the floor (a pre-floor cache, an in-process view).
+    """
+
+    view = bench.CatalogView(
+        entries=(
+            bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),
+            bench.CatalogEntry("codex-sol", "max", "gpt-6-sol", "codex", "S+"),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    table = bench._catalog_grade_table(view)
     names = {profile.name for profiles in table.values() for profile in profiles}
     assert "kimi-k3" in names, "an uncovered snapshot profile must survive the merge"
+
+
+def test_a_pre_floor_partial_cache_still_discloses_its_gaps(catalog_server):
+    """A cache written before the validity floor can hold a partial canon; the
+    status report keeps naming the uncovered profiles it cannot vouch for."""
+
+    backend = bench.bench_backend(use="catalog")
+    bench._commit_catalog_cache(
+        path=None,
+        entries=[bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+")],
+        backend=backend,
+    )
+    bench.reset_catalog_memo()
+
+    assert bench.read_catalog().source == "cache"
     assert "uncovered" in bench.catalog_status_report()
 
 
@@ -187,7 +239,7 @@ def test_a_profile_the_catalog_never_mentions_is_kept_not_deleted(catalog_server
 def test_a_sol_profile_off_s_plus_rejects_the_whole_catalog(catalog_server, capsys):
     _, fake = catalog_server
     bench.read_catalog()  # prime the cache so the TTL below has something to age
-    fake.catalog = _seed_rows() + [_row("kiro-sol", "", "gpt-5.6-sol", "kiro", "B")]
+    fake.catalog = _seed_rows_with("kiro-sol", "", grade="B")
     _age_catalog_cache(3601)
 
     table = bench.runtime_grade_table()
@@ -226,11 +278,37 @@ def test_offline_within_stale_max_keeps_using_the_cached_canon(catalog_server):
     assert view.stale is False
 
 
-def test_offline_past_stale_max_falls_back_to_the_snapshot_and_says_so(catalog_server, capsys):
+def test_offline_past_stale_max_keeps_serving_the_last_good_cache(catalog_server, capsys):
+    """#954: past ``catalog_stale_max_s`` the cache still beats the snapshot.
+
+    Reverting to the bundled snapshot was the one path that resurrected a
+    server-side demotion — the snapshot is older than the cache and never saw
+    it. The last-good cache keeps serving, labelled ``cache-stale`` and gated
+    stale. (This test was rewritten for the new contract: before #954 it
+    asserted the snapshot fallback.)
+    """
+
     _, fake = catalog_server
+    # A grade that differs between cache and snapshot proves which one served.
+    fake.catalog = _seed_rows_with("opus", "high", grade="A")
     bench.read_catalog()
     _age_catalog_cache(90000)  # > catalog_stale_max_s
     fake.offline = True
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "cache-stale"
+    assert view.stale is True
+    assert view.label == "catalog=cache-stale (age 25.0h; server unreachable)"
+    assert any(e.profile == "opus" and e.effort == "high" and e.grade == "A" for e in view.entries)
+    assert "unreachable" in capsys.readouterr().err
+
+
+def test_offline_past_stale_max_without_a_cache_falls_back_to_the_snapshot(catalog_server, capsys):
+    """The bundled snapshot is now only the no-cache floor — unchanged label."""
+
+    _, fake = catalog_server
+    fake.offline = True  # nothing was ever cached
 
     view = bench.read_catalog()
     assert view.source == "snapshot"
@@ -522,7 +600,7 @@ def test_a_legacy_grades_write_does_not_add_a_phantom_candidate(catalog_server):
 
     table = bench.runtime_grade_table()
     opus_rows = [p for profiles in table.values() for p in profiles if p.name == "opus"]
-    assert sorted(p.launcher_effort for p in opus_rows) == ["high", "xhigh"]
+    assert sorted(p.launcher_effort for p in opus_rows) == ["high", "low", "max", "medium", "xhigh"]
 
 
 def test_a_profile_keyed_only_on_its_default_row_still_lands(catalog_server):
@@ -530,15 +608,17 @@ def test_a_profile_keyed_only_on_its_default_row_still_lands(catalog_server):
 
     _, fake = catalog_server
     bench.read_catalog()
-    fake.catalog = _seed_rows() + [_row("grok-hi", "", "grok-4.7", "grok", "S", score=67.9)]
+    fake.catalog = _seed_rows() + [_row("brand-new", "", "brand-new-1", "codex", "S", score=67.9)]
     _age_catalog_cache(3601)
 
     table = bench.runtime_grade_table()
-    assert any(p.name == "grok-hi" for p in table["S"])
+    assert any(p.name == "brand-new" for p in table["S"])
 
 
-def test_a_ttl_above_the_stale_ceiling_cannot_keep_serving_the_cache(catalog_server):
-    """`catalog_stale_max_s` is the safety bound; a larger TTL must not outrank it."""
+def test_a_ttl_above_the_stale_ceiling_cannot_keep_the_cache_looking_fresh(catalog_server):
+    """`catalog_stale_max_s` bounds the label: a TTL that outranks it cannot
+    keep a condemned cache serving as plain ``cache`` — it comes back
+    ``cache-stale`` and gated stale, never as a clean canon copy."""
 
     _, fake = catalog_server
     config = bench.pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "scopefuel" / "config.toml"
@@ -551,8 +631,9 @@ def test_a_ttl_above_the_stale_ceiling_cannot_keep_serving_the_cache(catalog_ser
     fake.offline = True
 
     view = bench.read_catalog()
-    assert view.source == "snapshot"
+    assert view.source == "cache-stale"
     assert view.stale is True
+    assert "cache-stale" in view.label
 
 
 def test_a_cache_stamped_in_the_future_is_refetched_not_trusted_forever(catalog_server):
@@ -575,7 +656,7 @@ def test_a_cache_stamped_in_the_future_is_refetched_not_trusted_forever(catalog_
         conn.close()
     bench.reset_catalog_memo()
 
-    fake.catalog = [_row("opus", "high", "claude-opus-99", "claude", "S+")]
+    fake.catalog = _seed_rows_with("opus", "high", model_id="claude-opus-99")
     view = bench.read_catalog()
     assert view.source == "server"
     assert any(entry.model_id == "claude-opus-99" for entry in view.entries)
@@ -631,29 +712,16 @@ def test_a_fully_retired_profile_leaves_the_recommendations(catalog_server):
     bench.read_catalog()
     retired = "2026-09-24T00:00:00Z"
     fake.catalog = [
-        _row("opus", effort, "claude-opus-5-5", "claude", "S+", retired_at=retired)
-        for effort in ("high", "xhigh")
-    ] + [_row("codex-sol", "max", "gpt-6-sol", "codex", "S+")]
+        ({**row, "retired_at": retired} if row["profile"] == "opus" else row) for row in _seed_rows()
+    ]
     _age_catalog_cache(3601)
 
     table = bench.runtime_grade_table()
     assert not any(p.name == "opus" for profiles in table.values() for p in profiles)
     with pytest.raises(launch.LaunchError):
         launch.resolve_launch("opus")
-    # A profile the catalog never mentioned is still untouched.
-    assert any(p.name == "kimi-k3" for profiles in table.values() for p in profiles)
-
-
-def test_an_empty_catalog_still_falls_back_to_the_snapshot(catalog_server):
-    """ "Nothing seeded yet" and "everything retired" are different statements."""
-
-    _, fake = catalog_server
-    bench.read_catalog()
-    fake.catalog = []
-    _age_catalog_cache(3601)
-
-    table = bench.runtime_grade_table()
-    assert any(p.name == "opus" for profiles in table.values() for p in profiles)
+    # Every other covered profile keeps its canon placement.
+    assert any(p.name == "haiku" for profiles in table.values() for p in profiles)
 
 
 def test_a_half_set_environment_override_is_not_completed_from_config_env(tmp_path, monkeypatch):
@@ -787,3 +855,232 @@ def test_a_profile_the_catalog_retired_is_still_refused_not_snapshot_resolved():
     )
     with pytest.raises(launch.LaunchError, match="retired"):
         launch.resolve_launch("grok-hi", view=view)
+
+
+# --- #954: the validity floor (#667 class) ---------------------------------
+# A fetched catalog is refused as a whole when it is empty or never mentions a
+# profile the bundled snapshot places. The refuse is *carried*, not thrown: the
+# host degrades exactly like an unreachable server — cache if one exists, else
+# the snapshot — with the reason on the label, and nothing is ever committed.
+
+
+def test_a_one_row_server_catalog_is_rejected_whole_and_never_cached(catalog_server, monkeypatch, capsys):
+    """AC1: a 1-row catalog is not a canon — refused, never cached, snapshot.
+
+    #667 shipped exactly this shape: the server's single row became the fleet's
+    placements and ``catalog=stale`` ended up on spawn briefs. The floor makes
+    the small answer the one thing it cannot be — canonical.
+    """
+
+    _, fake = catalog_server
+    fake.catalog = [_row("opus", "high", "claude-opus-5-5", "claude", "S+")]
+    before = _cached_catalog_count()
+
+    monkeypatch.setattr(cli, "registry", lambda: {})
+    assert cli.main(["--recommend", "A+"]) == 0
+    out = capsys.readouterr().out
+    missing = len(bench.snapshot_profiles()) - 1
+    assert f"catalog=stale (server catalog rejected: 1 row, missing {missing} snapshot profiles)" in out
+
+    # The candidate list is the snapshot list — the 1-row "canon" placed nothing.
+    served = {
+        (p.name, p.launcher_effort): grade
+        for grade, profiles in bench.runtime_grade_table().items()
+        for p in profiles
+    }
+    expected = {
+        (p.name, p.launcher_effort): grade
+        for grade, profiles in recommend.GRADE_TABLE.items()
+        for p in profiles
+    }
+    assert served == expected
+    assert _cached_catalog_count() == before, "a refused catalog must never reach the cache"
+
+
+def test_a_rejected_catalog_falls_back_to_the_cache_not_the_snapshot(catalog_server, capsys):
+    """Degrades exactly like an unreachable server: a good cache still serves,
+    labelled with the rejection — and the refused rows stay out of the cache."""
+
+    _, fake = catalog_server
+    bench.read_catalog()  # prime the last-good cache (the full seed)
+    _age_catalog_cache(3601)  # past the 1h TTL, inside the 24h stale ceiling
+    fake.catalog = [_row("opus", "high", "claude-opus-5-5", "claude", "A")]
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert view.stale is False
+    assert "server catalog rejected: 1 row" in view.label
+    assert "server catalog rejected" in capsys.readouterr().err
+    assert _cached_catalog_count() == len(bench.catalog_snapshot())
+
+
+def test_an_empty_server_catalog_is_rejected_and_the_snapshot_stands_in(catalog_server):
+    """ "Nothing seeded yet" is not a canon — an empty catalog is refused whole
+    and never reaches the cache (#667 class)."""
+
+    _, fake = catalog_server
+    fake.catalog = []
+
+    view = bench.read_catalog()
+    assert view.source == "snapshot"
+    assert view.stale is True
+    assert "server catalog rejected: empty catalog" in view.label
+
+    table = bench.runtime_grade_table()
+    assert any(p.name == "opus" for profiles in table.values() for p in profiles)
+    assert _cached_catalog_count() == 0
+
+
+def test_a_retired_row_counts_as_mentioned_so_the_catalog_still_passes_the_floor(catalog_server):
+    """A server-side retirement is a statement, not a gap: a retired row is
+    *mentioned*, so the validity floor lets the catalog stand — and the
+    retirement takes effect instead of falling back to the snapshot."""
+
+    _, fake = catalog_server
+    fake.catalog = _seed_rows_with("codex-terra-max", "", retired_at="2026-09-29T00:00:00Z")
+
+    assert bench.read_catalog().source == "server"
+    table = bench.runtime_grade_table()
+    assert not any(p.name == "codex-terra-max" for profiles in table.values() for p in profiles)
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch("codex-terra-max")
+
+
+# --- #954: cache-stale — the last-good cache past the stale ceiling ---------
+
+
+def test_offline_past_stale_max_serves_the_last_good_cache_labelled(catalog_server, monkeypatch, capsys):
+    """AC3: a cache older than the stale ceiling still beats the snapshot.
+
+    Everything a consumer can ask reports the same answer: --recommend prints
+    the cache-stale label, the table carries the cached grade, policy launch
+    discloses source=cache-stale with stale=true, and a non-default gate still
+    needs --operator-request.
+    """
+
+    _, fake = catalog_server
+    # A grade that differs between cache and snapshot proves which one served:
+    # the cache holds opus@high at A, the snapshot says S+.
+    fake.catalog = _seed_rows_with("opus", "high", grade="A")
+    bench.read_catalog()
+    _age_catalog_cache(90000)  # > catalog_stale_max_s
+    fake.offline = True
+    bench.reset_catalog_memo()
+
+    monkeypatch.setattr(cli, "registry", lambda: {})
+    assert cli.main(["--recommend", "A"]) == 0
+    assert "catalog=cache-stale (age 25.0h; server unreachable)" in capsys.readouterr().out
+
+    placements = {
+        (p.name, p.launcher_effort): grade
+        for grade, profiles in bench.runtime_grade_table().items()
+        for p in profiles
+    }
+    assert placements[("opus", "high")] == "A", "the cached row must win over the snapshot's S+"
+
+    capsys.readouterr()
+    assert cli.main(["policy", "launch", "opus", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["catalog"]["source"] == "cache-stale"
+    assert payload["catalog"]["stale"] is True
+
+    # A non-default gate still needs --operator-request under a stale source.
+    capsys.readouterr()
+    assert cli.main(["policy", "launch", "opus", "--effort", "max", "--json"]) != 0
+    assert cli.main(["policy", "launch", "opus", "--effort", "max", "--operator-request", "--json"]) == 0
+
+
+# --- #954: bench catalog status --check ------------------------------------
+
+
+def test_catalog_status_check_exits_zero_on_a_server_view(catalog_server, capsys):
+    assert cli.main(["bench", "catalog", "status", "--check"]) == 0
+    assert "catalog=server" in capsys.readouterr().out
+
+
+def test_catalog_status_check_exits_two_on_a_local_backend(capsys):
+    """AC5: the fleet check must never raise on a local-backend host — and must
+    answer 2, naming the state, so an un-migrated machine is a red line."""
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    # stdout keeps the five report lines.
+    for prefix in ("backend=", "credentials ", "catalog_ttl_s=", "catalog=", "rows="):
+        assert any(line.startswith(prefix) for line in captured.out.splitlines()), prefix
+    assert "local backend" in captured.err
+
+
+def test_catalog_status_check_exits_two_on_a_stale_cache(catalog_server, capsys):
+    _, fake = catalog_server
+    bench.read_catalog()
+    _age_catalog_cache(90000)
+    fake.offline = True
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "catalog=cache-stale" in captured.out
+    assert "check failed: catalog=cache-stale" in captured.err
+
+
+def test_catalog_status_check_exits_two_on_a_rejected_catalog(catalog_server, capsys):
+    _, fake = catalog_server
+    fake.catalog = [_row("opus", "high", "claude-opus-5-5", "claude", "S+")]
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "server catalog rejected" in captured.out
+    assert "check failed: catalog=stale (server catalog rejected:" in captured.err
+
+
+def test_catalog_status_check_exits_zero_on_a_fresh_cache(catalog_server, capsys):
+    """AC5 (corrected): a healthy host answers from the cache between
+    refetches — source ``cache`` inside ``catalog_ttl_s`` with nothing
+    degraded about it is the canon as far as the fleet check cares."""
+
+    bench.read_catalog()  # prime the cache, then drop the memo
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "catalog=cache" in captured.out
+
+
+def test_catalog_status_check_exits_two_on_a_rejection_served_cache(catalog_server, capsys):
+    """AC5 (corrected): a cache serving only because the server refused its
+    catalog carries the rejection on ``detail`` — degraded, not canon."""
+
+    _, fake = catalog_server
+    bench.read_catalog()  # prime with the full seed
+    _age_catalog_cache(3601)  # past the 1h TTL, inside the 24h stale ceiling
+    fake.catalog = [_row("opus", "high", "claude-opus-5-5", "claude", "S+")]
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "server catalog rejected" in captured.out
+    assert "check failed: catalog=cache" in captured.err
+    assert "server catalog rejected" in captured.err
+
+
+def test_catalog_status_check_exits_two_on_an_unreachable_served_cache(catalog_server, capsys):
+    """AC5 (corrected): a cache older than the TTL is served only because the
+    server is unreachable — empty ``detail`` still fails the check on age."""
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    _age_catalog_cache(3601)
+    fake.offline = True
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "catalog=cache (age 1.0h)" in captured.out
+    assert "check failed: catalog=cache (age 1.0h)" in captured.err

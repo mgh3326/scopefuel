@@ -61,7 +61,10 @@ class FakeHk:
         self.scores: list[dict] = []
         self.reps: list[dict] = []
         self.grades: list[dict] = []
-        self.catalog: list[dict] = [dict(CATALOG_ROW)]
+        # The #954 validity floor refuses a catalog that does not mention every
+        # bundled-snapshot profile, so the fake serves the full placement seed —
+        # the opt-in tests here only care that a canonical answer comes back.
+        self.catalog: list[dict] = [entry.as_dict() for entry in bench.catalog_snapshot()]
         self.docs: dict[str, dict] = {}
         self.hits: Counter[tuple[str, str]] = Counter()
 

@@ -1196,12 +1196,12 @@ def test_read_catalog_commit_cache_false_never_writes(tmp_path, monkeypatch):
     """Tester blocker: the strictly read-only catalog path must neither
     persist the server response nor create the cache DB/schema."""
     _remote_backend(tmp_path, monkeypatch)
+    # The #954 validity floor refuses a catalog that does not mention every
+    # bundled-snapshot profile — the fake serves the full placement seed.
     monkeypatch.setattr(
         bench,
         "request_json",
-        lambda url, **kw: {
-            "catalog": [{"profile": "grok-hi", "effort": "xhigh", "grade": "A", "gate": "default"}]
-        },
+        lambda url, **kw: {"catalog": [entry.as_dict() for entry in bench.catalog_snapshot()]},
     )
     target = bench.db_path()
     assert not target.exists()
