@@ -1176,3 +1176,142 @@ def test_error_name_still_read_when_the_field_is_real(tmp_path, monkeypatch):
     text = kimi.explain_lockout_scan(kimi.parse(PANEL_LOCKOUT), now=now)
 
     assert "error=APIStatusError" in text
+
+
+# --- #966 fix round 2 — the same smuggle through OTHER quoted fields, and
+# the length bound truncating instead of refusing (tester BLOCKER 1a/1b).
+
+LONG_NAME = SMUGGLE_SENTINEL + "A" * 80  # 97 chars — over the {1,64} bound
+
+R2_CASES = {
+    "two-errmsg-spans": '{ts}Z WARN  x  errorMessage="403 weekly usage limit errorName={s}" '
+    'errorMessage="again errorName={s}" statusCode=403\n',
+    "other-quoted-field-nospace": '{ts}Z WARN  x  errorBody="errorName={s}" '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    "other-quoted-field-space": '{ts}Z WARN  x  errorBody="x errorName={s}" '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    "other-quoted-field-space-then-real": '{ts}Z WARN  x  errorBody="x errorName={s}" '
+    'errorName=APIStatusError errorMessage="403 weekly usage limit" statusCode=403\n',
+    "escaped-quote-in-errmsg": '{ts}Z WARN  x  errorMessage="403 weekly usage limit \\" '
+    'errorName={s} \\"" statusCode=403\n',
+    "long-name-over-64": '{ts}Z WARN  x  errorName={long} errorMessage="403 weekly usage limit" '
+    "statusCode=403\n",
+}
+
+
+@pytest.mark.parametrize("case", list(R2_CASES))
+def test_r2_error_name_attacks(tmp_path, monkeypatch, case):
+    """#966 fix 2 — no quoted field value (any key=, any position) may reach
+    the explain error= column; an over-long name refuses rather than truncates."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R2_CASES[case].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+            long=LONG_NAME,
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert "hit weekly" in text
+    assert SMUGGLE_SENTINEL not in text
+
+
+def test_r2_long_name_falls_back_without_a_prefix(tmp_path, monkeypatch):
+    """A 97-char errorName value must not match at all — no 64-char prefix —
+    so the fixed context marker is printed instead."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R2_CASES["long-name-over-64"].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+            long=LONG_NAME,
+        ),
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert SMUGGLE_SENTINEL not in text
+    assert "error=statusCode=403" in text  # fixed context marker, not a prefix
+
+
+def test_r2_real_name_after_tab_is_read(tmp_path, monkeypatch):
+    """Guard: a genuine unquoted errorName field still prints (tab counts as
+    the field boundary it is)."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        f"{(now - dt.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z WARN  x\t"
+        'errorName=APIStatusError\terrorMessage="403 weekly usage limit" statusCode=403\n',
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert "error=APIStatusError" in text
+
+
+def test_r2_nastiest_end_to_end(tmp_path, monkeypatch, capsys):
+    """#966 fix 2 — the three nastiest lines in one file, through cli.main:
+    the sentinel must be absent from stdout AND stderr."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    body = "".join(
+        R2_CASES[c].format(ts=ts, s=SMUGGLE_SENTINEL, long=LONG_NAME)
+        for c in ("other-quoted-field-space-then-real", "two-errmsg-spans", "long-name-over-64")
+    )
+    _write_session_log(tmp_path, body, when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
+
+
+def test_r2_realpath_dedupe_shapes(tmp_path, monkeypatch):
+    """A symlinked alias of a clone home scans once (realpath dedupe); a
+    dangling alias and a missing env home each still list as exists=no."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path / "primary")
+    real_clone = tmp_path / "real-clone"
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(real_clone / "sessions", _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+    alias = tmp_path / "alias-clone"
+    alias.symlink_to(real_clone)
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    monkeypatch.setenv("KIMI_CODE_LOW_HOME", str(tmp_path / "does-not-exist"))
+    monkeypatch.setenv("KIMI_CODE_HIGH_HOME", str(real_clone))
+    cfg_home = tmp_path / "xdg-config"
+    cfg = cfg_home / "scopefuel" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(f'[kimi]\nextra_homes = ["{alias}", "{dangling}", "{tmp_path / "does-not-exist"}"]\n')
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_home))
+
+    roots = kimi._scan_roots()
+    assert len({os.path.realpath(r) for r in roots}) == len(roots)
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+    root_lines = [ln for ln in text.splitlines() if ln.startswith("  root ")]
+    assert sum("exists=yes files=1" in ln for ln in root_lines) == 1
+    assert sum("does-not-exist" in ln for ln in root_lines) == 1
+    assert any(str(dangling / "sessions") in ln and "exists=no" in ln for ln in root_lines)
