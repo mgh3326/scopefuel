@@ -93,6 +93,10 @@ def isolated_cache(tmp_path, monkeypatch):
     # (default ~/.kimi-code) — point it at a tmp home so no test writes a real
     # trust entry for a throwaway workdir.
     monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
+    # task #952: the stale-build check calls the GitHub API / git ls-remote —
+    # default it off suite-wide so no test ever reaches the real network;
+    # tests of the feature opt in per test and fake the probe seams.
+    monkeypatch.setenv("SCOPEFUEL_STALE_WARN", "0")
     # The catalog is memoised per process so one command cannot straddle the TTL
     # boundary; that memo must not survive from one test into the next.
     bench.reset_catalog_memo()

@@ -276,6 +276,11 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-opus-medium": ("opus", "medium"),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
+    # #921 (wrk db8a58d): the non-rung Sonnet builder seat accepts
+    # --effort high|xhigh|max, default xhigh — a bare spawn consults the
+    # canon at sonnet@xhigh (CATALOG_EFFORT_PIN="${EFFORT:-xhigh}"), so the
+    # pin here is the default rung, never sonnet's own high default.
+    "builder-sonnet": ("sonnet", "xhigh"),
     "builder-sol": ("codex-sol", "high"),
     "captain-sol": ("codex-sol", "high"),
     "builder-sol-high": ("codex-sol", "high"),
