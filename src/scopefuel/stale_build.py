@@ -40,6 +40,7 @@ import os
 import pathlib
 import re
 import subprocess
+import threading
 import time
 import tomllib
 import urllib.parse
@@ -54,6 +55,14 @@ _API = "https://api.github.com"
 REINSTALL_COMMAND = "uv tool install --force git+https://github.com/mgh3326/scopefuel@main"
 CHECK_TTL_S = 3600.0
 PROBE_BUDGET_S = 2.0
+# urllib's timeout is per socket operation (connect, then each read), so the
+# probe sequence as a whole is bounded by a wall-clock deadline plus a small
+# grace for thread scheduling — not by summing per-op timeouts.
+_PROBE_GRACE_S = 0.1
+# A checked_at further than this in the future (clock step, bad write) is not
+# fresh — it would otherwise satisfy ``now - checked_at < CHECK_TTL_S``
+# forever. Same tolerance idea as bench's _CACHE_CLOCK_SKEW_S.
+_CHECKED_AT_SKEW_S = 60.0
 DISABLE_ENV = "SCOPEFUEL_STALE_WARN"
 _DIST_NAME = "scopefuel"
 _CACHE_SCHEMA = "scopefuel.stale_build.v1"
@@ -78,6 +87,12 @@ class Verdict:
     installed_rev: str | None
     origin_rev: str | None
     behind: int | None
+    # Provenance of the catalog view already resolved in this process, set by
+    # the caller (cli never reads the catalog for this). "server"/"cache*"
+    # means the rows are current and only the launcher code is stale;
+    # "snapshot"/"unsupported"/None means the bundled catalog is what a
+    # reinstall refreshes, so the wording stays #952's.
+    catalog_source: str | None = None
 
     @property
     def line(self) -> str:
@@ -94,7 +109,15 @@ class Verdict:
                 f"installed {_short(self.installed_rev)} is {self.behind} commit(s) "
                 f"behind origin/main {_short(self.origin_rev)}"
             )
-        return f"warning: scopefuel build stale — {detail}; reinstall: {REINSTALL_COMMAND}"
+        qualifier = ""
+        if self.catalog_source == "server" or (
+            isinstance(self.catalog_source, str) and self.catalog_source.startswith("cache")
+        ):
+            qualifier = (
+                f"; catalog rows come from the server (catalog={self.catalog_source}),"
+                " only the launcher code is stale"
+            )
+        return f"warning: scopefuel build stale — {detail}{qualifier}; reinstall: {REINSTALL_COMMAND}"
 
     def as_field(self) -> dict[str, Any]:
         """The --json payload form (schema=scopefuel.v1 additive field)."""
@@ -103,6 +126,7 @@ class Verdict:
             "installed_rev": self.installed_rev,
             "origin_rev": self.origin_rev,
             "behind": self.behind,
+            "catalog_source": self.catalog_source,
             "reinstall": REINSTALL_COMMAND,
             "message": self.line,
         }
@@ -336,65 +360,111 @@ def _disabled() -> bool:
     return os.environ.get(DISABLE_ENV, "").strip().lower() in {"0", "off", "false", "no"}
 
 
-def _check() -> Verdict | None:
-    now = _now()
-    installed = _installed_rev()
-    cached = _read_cache()
-    try:
-        fresh = cached is not None and now - float(cached.get("checked_at") or 0) < CHECK_TTL_S
-    except (TypeError, ValueError):
-        fresh = False
-    if fresh and cached.get("installed_rev") == installed:
-        # The install did not move since the probe — the cached verdict stands.
-        # (A changed installed rev re-probes: a fresh install must not inherit
-        # the old rev's "behind" warning.)
-        return _cache_verdict(cached)
+def _cache_entry(
+    installed: str | None,
+    head: str | None,
+    verdict: Verdict | None,
+    status: str,
+    now: float,
+) -> dict[str, Any]:
+    return {
+        "schema": _CACHE_SCHEMA,
+        "checked_at": now,
+        "installed_rev": installed,
+        "origin_rev": head,
+        "behind": verdict.behind if verdict else (0 if status == _STATUS_CURRENT else None),
+        "status": status,
+    }
 
-    deadline = _monotonic() + PROBE_BUDGET_S
+
+def _probe(
+    installed: str | None,
+    now: float,
+    deadline: float,
+    expired: threading.Event,
+) -> Verdict | None:
+    """The probe sequence itself — origin head, then compare distance.
+
+    ``expired`` is set by the caller when the wall-clock bound ran out: the
+    abandoned worker must then not write the cache, since the caller already
+    recorded the attempt as skipped.
+    """
+
     head = _origin_rev(deadline)
-    if head is None:
-        _write_cache(
-            {
-                "schema": _CACHE_SCHEMA,
-                "checked_at": now,
-                "installed_rev": installed,
-                "origin_rev": None,
-                "behind": None,
-                "status": _STATUS_SKIPPED,
-            }
-        )
-        return None
-
-    verdict: Verdict | None
     status: str
-    if installed is None:
-        status = _STATUS_REV_UNKNOWN
-        verdict = Verdict(status, None, head, None)
+    verdict: Verdict | None
+    if head is None:
+        status, verdict = _STATUS_SKIPPED, None
+    elif installed is None:
+        status, verdict = _STATUS_REV_UNKNOWN, Verdict(_STATUS_REV_UNKNOWN, None, head, None)
     elif installed == head:
-        status = _STATUS_CURRENT
-        verdict = None
+        status, verdict = _STATUS_CURRENT, None
     else:
         behind = _commits_ahead(installed, head, deadline)
         if behind == 0:
             # Installed strictly ahead of main (e.g. an unreleased local build
             # installed by rev) — ahead, never behind: no warning.
-            status = _STATUS_CURRENT
-            verdict = None
+            status, verdict = _STATUS_CURRENT, None
         else:
-            status = _STATUS_BEHIND
-            verdict = Verdict(status, installed, head, behind)
+            status, verdict = _STATUS_BEHIND, Verdict(_STATUS_BEHIND, installed, head, behind)
 
-    _write_cache(
-        {
-            "schema": _CACHE_SCHEMA,
-            "checked_at": now,
-            "installed_rev": installed,
-            "origin_rev": head,
-            "behind": verdict.behind if verdict else 0,
-            "status": status,
-        }
-    )
+    if not expired.is_set():
+        _write_cache(_cache_entry(installed, head, verdict, status, now))
     return verdict
+
+
+def _bounded_probe(installed: str | None, now: float) -> Verdict | None:
+    """Run the whole probe under one wall-clock bound.
+
+    ``_remaining(deadline)`` hands each socket operation the leftover budget,
+    but urllib's timeout is per operation (connect, then each read) — one
+    probe could otherwise take several times PROBE_BUDGET_S. The probe runs on
+    a daemon thread so a wedged socket cannot keep the process alive; on
+    expiry the caller records a skip and returns while the abandoned thread is
+    kept from touching the cache.
+    """
+
+    deadline = _monotonic() + PROBE_BUDGET_S
+    expired = threading.Event()
+    box: dict[str, Verdict | None] = {"verdict": None}
+
+    def run() -> None:
+        try:
+            box["verdict"] = _probe(installed, now, deadline, expired)
+        except Exception:
+            box["verdict"] = None
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=_remaining(deadline) + _PROBE_GRACE_S)
+    if worker.is_alive():
+        expired.set()
+        _write_cache(_cache_entry(installed, None, None, _STATUS_SKIPPED, now))
+        return None
+    return box["verdict"]
+
+
+def _check() -> Verdict | None:
+    now = _now()
+    installed = _installed_rev()
+    cached = _read_cache()
+    try:
+        # A checked_at beyond the skew tolerance (clock step, bad write) is not
+        # fresh — otherwise ``now - checked_at < TTL`` stays true forever and
+        # the verdict would never be re-probed.
+        checked_at = float(cached.get("checked_at") or 0) if cached is not None else 0.0
+        fresh = (
+            cached is not None and checked_at <= now + _CHECKED_AT_SKEW_S and now - checked_at < CHECK_TTL_S
+        )
+    except (TypeError, ValueError):
+        fresh = False
+    if fresh and cached is not None and cached.get("installed_rev") == installed:
+        # The install did not move since the probe — the cached verdict stands.
+        # (A changed installed rev re-probes: a fresh install must not inherit
+        # the old rev's "behind" warning.)
+        return _cache_verdict(cached)
+
+    return _bounded_probe(installed, now)
 
 
 def warning() -> Verdict | None:
