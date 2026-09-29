@@ -378,8 +378,10 @@ def _acquire_sweep_lock(workdir: Path, *, blocking: bool) -> int | None:
 def kill_stale_probe_leftovers(workdir: Path, *, exclude: Iterable[int] = ()) -> list[int]:
     """Sweep leftovers under ``workdir`` before a probe starts.
 
-    Kills (a) processes whose cwd is exactly ``workdir`` — no live probe
-    uses the root itself, only legacy orphans — and (b) everything inside
+    Kills (a) processes whose cwd is exactly ``workdir`` — providers that
+    probe in a per-run instance dir never use the root themselves, and a
+    provider that probes in the root (kimi, #928) only reaches this sweep
+    after the probe has exited — and (b) everything inside
     ``probe-*``/``.probe-pending-*`` dirs whose locks are all released,
     then removes those dirs. The instance-dir pass runs only while holding
     the workdir sweep lock, and only non-blockingly: if a creator or
@@ -493,8 +495,12 @@ def spawn_reaper(
 ) -> subprocess.Popen[bytes] | None:
     """Launch a detached reaper that sweeps ``target_dir`` if the parent dies.
 
-    ``target_dir`` is this probe's own instance dir — the reaper never looks
-    at the shared workdir or a sibling probe's dir. Returns the reaper
+    ``target_dir`` is normally this probe's own instance dir — the reaper
+    never looks at the shared workdir or a sibling probe's dir. A provider
+    that probes in the shared dir itself (kimi, #928) passes that dir here,
+    so a reaper firing after a SIGKILLed parent can also sweep a newer
+    probe's child in the same dir — one unmeasurable round, never an
+    orphan. Returns the reaper
     Popen, or None if it could not be started (probe still works;
     protection degrades to registry + next-probe sweep).
     """
