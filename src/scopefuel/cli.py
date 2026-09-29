@@ -572,6 +572,29 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     return parser
 
 
+def _memoized_catalog_source() -> str | None:
+    """The source of the catalog view already resolved in this process, else None.
+
+    Only ``bench._CATALOG_MEMO`` is consulted: the stale-build warning must
+    say whether the catalog *rows* or the launcher *code* are stale, but it
+    must never trigger a catalog read of its own to find out. When several
+    views are memoised, a server-sourced one wins — a snapshot fallback in
+    some other code path does not make the server's rows stale.
+    """
+    try:
+        views = list(bench._CATALOG_MEMO.values())
+    except Exception:
+        return None
+    if not views:
+        return None
+    server_sourced = [
+        v.source
+        for v in views
+        if isinstance(v.source, str) and (v.source == "server" or v.source.startswith("cache"))
+    ]
+    return server_sourced[-1] if server_sourced else views[-1].source
+
+
 def _stale_build_verdict() -> stale_build.Verdict | None:
     """The stale-build verdict for emit sites — a broken check never reaches a caller.
 
@@ -584,7 +607,12 @@ def _stale_build_verdict() -> stale_build.Verdict | None:
         verdict = stale_build.warning()
     except Exception:
         return None
-    return verdict if isinstance(verdict, stale_build.Verdict) else None
+    if not isinstance(verdict, stale_build.Verdict):
+        return None
+    try:
+        return replace(verdict, catalog_source=_memoized_catalog_source())
+    except Exception:
+        return verdict
 
 
 def _emit_stale_build_warning() -> None:

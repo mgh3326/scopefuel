@@ -12,6 +12,8 @@ import datetime as dt
 import json
 import pathlib
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -445,3 +447,199 @@ def test_no_warning_when_current(monkeypatch, capsys):
     assert cli.main(["gate", "-m", "codex-max", "--no-cache"]) == 0
     out = capsys.readouterr()
     assert "warning: scopefuel build stale" not in out.err
+
+
+# ---------------------------------------------------------------------------
+# task #956 — catalog-aware wording (AC1/AC2), one line per command (AC3)
+# ---------------------------------------------------------------------------
+
+
+def _memoize_catalog(source: str) -> None:
+    bench._CATALOG_MEMO[("path", "backend", "endpoint")] = bench.CatalogView(entries=(), source=source)
+
+
+def test_server_catalog_view_qualifies_the_warning(monkeypatch, capsys):
+    """catalog=server: the rows are current — only the launcher code is stale."""
+    _stub_codex(monkeypatch)
+    _memoize_catalog("server")
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    assert cli.main(["gate", "-m", "codex-max", "--no-cache"]) == 0
+    err = capsys.readouterr().err
+    assert "catalog rows come from the server (catalog=server)" in err
+    assert "only the launcher code is stale" in err
+    assert err.count("scopefuel build stale") == 1
+
+
+def test_cache_sourced_catalog_view_qualifies_the_warning(monkeypatch):
+    _stub_codex(monkeypatch)
+    _memoize_catalog("cache-stale")
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    verdict = cli._stale_build_verdict()
+    assert verdict is not None
+    assert "catalog rows come from the server (catalog=cache-stale)" in verdict.line
+    assert verdict.as_field()["catalog_source"] == "cache-stale"
+
+
+def test_snapshot_catalog_view_keeps_the_bundled_wording(monkeypatch):
+    """catalog=snapshot: the bundled catalog is what a reinstall refreshes —
+    the warning is exactly #952's wording."""
+    _stub_codex(monkeypatch)
+    _memoize_catalog("snapshot")
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    verdict = cli._stale_build_verdict()
+    assert verdict is not None
+    assert verdict.line == stale_build.Verdict("behind", INSTALLED, HEAD, 7).line
+    assert "catalog rows come from the server" not in verdict.line
+
+
+def test_no_memoized_view_keeps_the_bundled_wording(monkeypatch):
+    _stub_codex(monkeypatch)
+    bench.reset_catalog_memo()
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    verdict = cli._stale_build_verdict()
+    assert verdict is not None
+    assert verdict.line == stale_build.Verdict("behind", INSTALLED, HEAD, 7).line
+    assert verdict.as_field()["catalog_source"] is None
+
+
+def test_json_carries_catalog_source(monkeypatch, capsys):
+    _stub_codex(monkeypatch)
+    _memoize_catalog("server")
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    assert cli.main(["--json", "--no-cache"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stale_build"]["catalog_source"] == "server"
+
+
+def test_json_catalog_source_null_without_memoized_view(monkeypatch, capsys):
+    _stub_codex(monkeypatch)
+    bench.reset_catalog_memo()
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    assert cli.main(["--json", "--no-cache"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stale_build"]["catalog_source"] is None
+
+
+def test_warning_never_triggers_a_catalog_read(stale_on, monkeypatch):
+    """The memo is only inspected — the warning path must not read the catalog."""
+    calls = []
+
+    def counting_read_catalog(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("read_catalog must not run from the warning path")
+
+    monkeypatch.setattr(bench, "read_catalog", counting_read_catalog)
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    assert cli._stale_build_verdict() is not None
+    assert stale_build.warning() is not None
+    assert calls == []
+
+
+def test_one_warning_line_per_command_path(monkeypatch, capsys):
+    """gate accept, --brief and --recommend each print the stale line once."""
+    monkeypatch.setattr(bench, "DOTENV_PATH", pathlib.Path("/nonexistent.env"))
+    _stub_codex(monkeypatch)
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+
+    assert cli.main(["gate", "-m", "codex-max", "--no-cache"]) == 0
+    assert capsys.readouterr().err.count("scopefuel build stale") == 1
+
+    assert cli.main(["--brief", "--no-cache"]) == 0
+    assert capsys.readouterr().err.count("scopefuel build stale") == 1
+
+    assert cli.main(["--recommend", "S+", "--no-cache"]) == 0
+    assert capsys.readouterr().err.count("scopefuel build stale") == 1
+
+
+def test_gate_deny_prints_the_stale_line_exactly_once(monkeypatch, capsys):
+    policy.set_policy("codex", "exclude", until=dt.date(2099, 8, 31), note="t")
+    _stub_codex(monkeypatch)
+    monkeypatch.setattr(stale_build, "warning", _verdict)
+    assert cli.main(["gate", "-m", "codex-max", "--no-cache"]) == 3
+    assert capsys.readouterr().err.count("scopefuel build stale") == 1
+
+
+# ---------------------------------------------------------------------------
+# task #956 N3 — the probe bound is wall-clock, not per-operation (AC4)
+# ---------------------------------------------------------------------------
+
+
+def test_hung_probe_returns_within_the_wall_clock_budget(stale_on, monkeypatch):
+    """A socket op that hangs past the budget must not stall warning() —
+    urllib's per-operation timeout can otherwise multiply PROBE_BUDGET_S."""
+    _set_installed(monkeypatch, INSTALLED)
+
+    def sleepy_get_json(url: str, timeout: float):
+        stale_on["json"].append((url, timeout))
+        time.sleep(3.0)  # longer than PROBE_BUDGET_S
+        raise RuntimeError("the socket never answered")
+
+    monkeypatch.setattr(stale_build, "_get_json", sleepy_get_json)
+    start = time.monotonic()
+    verdict = stale_build.warning()
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.5, f"warning() overran the wall-clock budget: {elapsed:.2f}s"
+    assert verdict is None
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["status"] == "skipped"
+
+    # The abandoned worker finishes its sleep after we returned — it must not
+    # write the cache over the caller's skip record.
+    time.sleep(1.5)
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["status"] == "skipped"
+    assert all(t is threading.main_thread() or t.daemon for t in threading.enumerate())
+
+
+def test_prompt_probe_still_yields_the_behind_verdict(stale_on, monkeypatch):
+    """The bounding wrapper does not change a probe that answers in time."""
+    _set_installed(monkeypatch, INSTALLED)
+    _net(monkeypatch, stale_on, ahead_by=5)
+    verdict = stale_build.warning()
+    assert verdict is not None and verdict.status == "behind" and verdict.behind == 5
+
+
+# ---------------------------------------------------------------------------
+# task #956 N4 — a future-dated checked_at is not fresh forever (AC5)
+# ---------------------------------------------------------------------------
+
+
+def _seed_cache(checked_at: float) -> None:
+    stale_build._write_cache(
+        {
+            "schema": stale_build._CACHE_SCHEMA,
+            "checked_at": checked_at,
+            "installed_rev": INSTALLED,
+            "origin_rev": HEAD,
+            "behind": 3,
+            "status": "behind",
+        }
+    )
+
+
+def test_future_checked_at_reprobes_and_rewrites(stale_on, monkeypatch):
+    """A checked_at a day in the future (clock step, bad write) is not fresh —
+    the probe runs and the cache is rewritten with the real time."""
+    clock = [1_000.0]
+    monkeypatch.setattr(stale_build, "_now", lambda: clock[0])
+    _set_installed(monkeypatch, INSTALLED)
+    _seed_cache(checked_at=clock[0] + 86400.0)
+    _net(monkeypatch, stale_on, ahead_by=9)
+
+    verdict = stale_build.warning()
+    assert stale_on["json"]  # the probe ran despite the "fresh" timestamp
+    assert verdict is not None and verdict.behind == 9
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["checked_at"] == clock[0]
+
+
+def test_checked_at_within_skew_tolerance_is_still_fresh(stale_on, monkeypatch):
+    """30s into the future is ordinary clock skew — the cached verdict stands."""
+    clock = [1_000.0]
+    monkeypatch.setattr(stale_build, "_now", lambda: clock[0])
+    _set_installed(monkeypatch, INSTALLED)
+    _seed_cache(checked_at=clock[0] + 30.0)
+
+    verdict = stale_build.warning()
+    assert verdict is not None and verdict.behind == 3  # restored from cache
+    assert stale_on["json"] == [] and stale_on["run"] == []  # no probe
