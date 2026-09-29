@@ -37,6 +37,46 @@ def _result(pool: str, used: float = 10.0) -> ProviderResult:
     )
 
 
+def _kill_session_group(proc: subprocess.Popen) -> None:
+    """SIGKILL a session-leader helper's whole group if it is still running.
+
+    Helpers run with start_new_session=True, so pid == pgid and the group
+    reaches every non-detached child the helper spawned. wait() reaps the
+    leader so a failed assertion cannot leave it behind either.
+    """
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+
+def _pid_is_sleep_child(pid: int, sleep_s: int) -> bool:
+    """True only while pid still is the sleep child the helper started.
+
+    The pid file outlives the child when the timeout path works, and a dead
+    pid may already be recycled by an unrelated process — never signal a pid
+    whose command line does not match the exact sleep the helper launched.
+    """
+    out = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return out in {f"sleep {sleep_s}", f"sh -c sleep {sleep_s}"}
+
+
+def _kill_recorded_child_group(pid_file: Path, sleep_s: int) -> None:
+    """Kill the recorded child's process group only while it is still ours."""
+    if not pid_file.exists():
+        return
+    raw = pid_file.read_text().strip()
+    if not raw:
+        return
+    pid = int(raw)
+    if not _pid_is_sleep_child(pid, sleep_s):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+
+
 def test_refresh_updates_only_requested_pool(monkeypatch, tmp_path):
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
     cache.update_entry("grok", _result("grok", 10), 100.0)
@@ -48,7 +88,7 @@ def test_refresh_updates_only_requested_pool(monkeypatch, tmp_path):
     assert data["kimi"]["fetched_at"] == 200.0
 
 
-def test_refresh_lock_is_nonblocking_and_kernel_released_after_sigkill(monkeypatch, tmp_path):
+def test_refresh_lock_is_nonblocking_and_kernel_released_after_sigkill(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
     env = {**os.environ, "SCOPEFUEL_CACHE": str(tmp_path / "snapshots.json")}
     holder = subprocess.Popen(
@@ -75,7 +115,13 @@ def test_refresh_lock_is_nonblocking_and_kernel_released_after_sigkill(monkeypat
     assert time.monotonic() - started < 1.0
     holder.send_signal(signal.SIGKILL)
     holder.wait(timeout=SUBPROCESS_DEADLINE_S)
+    capsys.readouterr()  # drop the contended run's "skipped" line
     assert refresh.run_worker({"grok": lambda: _result("grok", 40)}, "grok") == 0
+    # A lock skip also returns 0 — only the update line proves this run
+    # acquired the kernel-released lock and fetched.
+    assert "refresh: pool=grok updated" in capsys.readouterr().out
+    data = json.loads((tmp_path / "snapshots.json").read_text())
+    assert data["grok"]["result"]["buckets"][0]["used_pct"] == 40
 
 
 def test_concurrent_refresh_requests_fetch_once(tmp_path):
@@ -166,15 +212,28 @@ def test_refresh_timeout_kills_worker_process_group(tmp_path):
         "raise SystemExit(refresh.run_worker({'grok': fetch}, 'grok'))\n"
     )
     proc = subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd(), start_new_session=True)
-    proc.wait(timeout=SUBPROCESS_DEADLINE_S)
-    # SIGKILL is expected because the dedicated worker session is killed as a
-    # whole; the timeout handler cannot return after killing its own group.
-    assert proc.returncode in (-signal.SIGKILL, 124)
-    child_pid = int(pid_file.read_text())
-    child_state = subprocess.run(
-        ["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True, check=False
-    )
-    assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
+    try:
+        try:
+            returncode = proc.wait(timeout=SUBPROCESS_DEADLINE_S)
+        except subprocess.TimeoutExpired:
+            # The fetch outlives the wait — only a missing timer lets the
+            # helper still be running; the returncode assertion below reports it.
+            returncode = None
+        # SIGKILL is expected because the dedicated worker session is killed as a
+        # whole; the timeout handler cannot return after killing its own group.
+        assert returncode in (-signal.SIGKILL, 124)
+        child_pid = int(pid_file.read_text())
+        child_state = subprocess.run(
+            ["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True, check=False
+        )
+        assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
+    finally:
+        # A live helper or child means the timeout path did not run to
+        # completion — kill both session groups so a failing run leaves
+        # nothing behind. The pid-file child is signalled only while its
+        # command line still proves it is our sleep, never a reused pid.
+        _kill_session_group(proc)
+        _kill_recorded_child_group(pid_file, sleep_s)
 
 
 def test_refresh_timeout_kills_registered_probe_child_in_other_session(tmp_path):
@@ -214,14 +273,39 @@ def test_refresh_timeout_kills_registered_probe_child_in_other_session(tmp_path)
     finally:
         # A live helper or child means the timeout path did not run to
         # completion — kill both session groups so a failing run leaves
-        # nothing behind. Both are session leaders, so pid == pgid.
-        if proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-        if pid_file.exists():
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        # nothing behind. The pid-file child is signalled only while its
+        # command line still proves it is our sleep, never a reused pid.
+        _kill_session_group(proc)
+        _kill_recorded_child_group(pid_file, sleep_s)
+
+
+def test_kill_recorded_child_group_skips_pid_that_is_not_our_sleep(monkeypatch, tmp_path):
+    """A stale pid file must never trigger killpg — after the child exits its
+    pid may already belong to an unrelated process group."""
+    pid_file = tmp_path / "child.pid"
+    exited = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    exited.wait(timeout=SUBPROCESS_DEADLINE_S)
+    pid_file.write_text(str(exited.pid))
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    _kill_recorded_child_group(pid_file, sleep_s=int(SUBPROCESS_DEADLINE_S * 3))
+    assert calls == []
+
+
+def test_kill_recorded_child_group_kills_live_sleep_child(monkeypatch, tmp_path):
+    """The guard passes for a live sleep child — its group still gets killed."""
+    pid_file = tmp_path / "child.pid"
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    pid_file.write_text(str(child.pid))
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    try:
+        _kill_recorded_child_group(pid_file, sleep_s=30)
+    finally:
+        # killpg was stubbed — reap the real child directly.
+        child.kill()
+        child.wait()
+    assert calls == [(child.pid, signal.SIGKILL)]
 
 
 def test_refresh_pools_match_provider_registry():
