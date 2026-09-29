@@ -7,6 +7,8 @@ import os
 import pathlib
 import re
 
+import pytest
+
 from scopefuel import cache, cli, render
 from scopefuel.model import ProviderResult
 from scopefuel.providers import FetcherWrapper, kimi
@@ -1095,3 +1097,82 @@ def test_explain_with_no_records_shows_roots_and_no_lockout(tmp_path, monkeypatc
     assert text.splitlines()[0] == "kimi lockout scan"
     assert len([ln for ln in text.splitlines() if ln.startswith("  root ")]) >= 4
     assert "decision: no usage-limit records" in text
+
+
+# --- #966 fix round 1 — errorName cannot smuggle errorMessage text ---------
+# tester BLOCKER 1: _SESSION_ERR_NAME used to search the whole line, so an
+# errorMessage body containing 'errorName=<token>' (no real field, or the real
+# field after the message) leaked into --explain's error= column.
+
+SMUGGLE_SENTINEL = "SENTINEL966VERIFY"
+
+
+@pytest.mark.parametrize(
+    "line_tpl",
+    [
+        # errorName value with quotes/spaces — not a bare token
+        '{ts}Z WARN  llm request failed  errorName="{s} two words" '
+        'errorMessage="403 weekly usage limit" statusCode=403\n',
+        # no real errorName field; the message body quotes one
+        '{ts}Z WARN  llm request failed  errorMessage="403 weekly usage limit errorName={s}" '
+        "statusCode=403\n",
+        # the real errorName sits AFTER the message that quotes a fake one
+        '{ts}Z WARN  llm request failed  errorMessage="403 weekly usage limit errorName={s}" '
+        "errorName=APIStatusError statusCode=403\n",
+    ],
+    ids=["quoted-value", "no-field", "field-after-message"],
+)
+def test_error_name_cannot_smuggle_message_text(tmp_path, monkeypatch, line_tpl):
+    """#966 fix 1 — the explain error name comes only from the record's own
+    fields; errorMessage contents never reach the scan block."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        line_tpl.format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert "hit weekly" in text
+    assert SMUGGLE_SENTINEL not in text
+
+
+def test_error_name_smuggle_end_to_end_through_cli(tmp_path, monkeypatch, capsys):
+    """#966 fix 1 — BLOCKER repro: message text must not reach stderr of
+    `scopefuel --only kimi --explain`."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        f"{(now - dt.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z WARN  "
+        f'llm request failed  errorMessage="403 weekly usage limit '
+        f'errorName={SMUGGLE_SENTINEL}" statusCode=403\n',
+        when=now,
+    )
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
+
+
+def test_error_name_still_read_when_the_field_is_real(tmp_path, monkeypatch):
+    """Guard the non-mutant direction: a genuine errorName field still prints."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+
+    text = kimi.explain_lockout_scan(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert "error=APIStatusError" in text

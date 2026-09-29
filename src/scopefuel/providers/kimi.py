@@ -153,7 +153,10 @@ def _scan_roots() -> list[Path]:
     seen: set[str] = set()
     unique: list[Path] = []
     for root in roots:
-        key = os.path.normpath(root)
+        # realpath dedupe: a symlinked alias of a clone home scans once —
+        # double-scanning only double-counts files in --explain, but the
+        # duplicate lines are themselves misleading diagnostics (#966 fix 1).
+        key = os.path.realpath(root)
         if key in seen:
             continue
         seen.add(key)
@@ -171,7 +174,10 @@ _SESSION_LOG_ERR_CTX = re.compile(r"errorName=APIStatusError|provider\.auth_erro
 # errorMessage may embed the JSON 403 body escaped — keep consuming escapes.
 _SESSION_ERRMSG = re.compile(r'errorMessage="(?P<msg>(?:[^"\\]|\\.)*)"')
 # ``--explain`` 진단에 실리는 오류 이름 — 본문이 아니라 필드 이름만.
-_SESSION_ERR_NAME = re.compile(r"errorName=(?P<name>[A-Za-z0-9_.]+)")
+# 필드 시작 경계(행 처음이거나 앞이 공백)와 길이 상한을 둔다 — errorMessage
+# 본문에 적힌 문자열이 필드로 오인되지 않도록 (#966 fix round 1, tester
+# BLOCKER 1). 본문 제외는 _log_lockout 이 메시지 구간을 잘라내고 검색한다.
+_SESSION_ERR_NAME = re.compile(r"(?<!\S)errorName=(?P<name>[A-Za-z0-9_.]{1,64})")
 # Window names are taken only from the error message itself, word-bounded —
 # a bare "7d" substring appears in hex traceIds and classifies wrong.
 _LOCKOUT_MONTHLY = re.compile(r"\bmonth", re.IGNORECASE)
@@ -669,7 +675,12 @@ def _log_lockout(line: str) -> tuple[str, dt.datetime | None, str] | None:
         ts: dt.datetime | None = dt.datetime.fromisoformat(head["ts"] + "+00:00")
     except ValueError:
         ts = None
-    name = _SESSION_ERR_NAME.search(line)
+    # The error name may only come from the record's own fields — text inside
+    # an errorMessage value is record content and must never reach --explain
+    # (#966 fix round 1: a message quoting 'errorName=<token>' used to be
+    # printed as the error name).  Every errorMessage span is cut before the
+    # search; fall back to the fixed context marker when no real field exists.
+    name = _SESSION_ERR_NAME.search(_SESSION_ERRMSG.sub("", line))
     return message, ts, name["name"] if name else ctx.group(0)
 
 
