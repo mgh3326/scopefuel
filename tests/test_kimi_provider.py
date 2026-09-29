@@ -1709,3 +1709,104 @@ def test_allowlist_quoted_fake_name_does_not_hide_the_real_field(tmp_path, monke
     assert "hit weekly" in text
     assert "error=RateLimitError" in text
     assert "error=APIStatusError" not in text
+
+
+# ------------------------------------------------------------------ #992
+# #977 tester nits: pin the leftover-quote fail-closed check (NICE-1) and give
+# the errorName=APIStatusError context marker a right boundary (NICE-3).
+# Synthetic record lines only — never a real record.
+
+
+def test_single_quoted_listed_name_fails_closed_end_to_end(tmp_path, monkeypatch, capsys):
+    """#992 NICE-1 / M1 — a LISTED name inside a single-quoted value is not
+    the record's field.
+
+    ``errorBody='x errorName=RateLimitError y'`` is untouched by the
+    double-quote strip, so the leftover-quote check must fail closed to the
+    fixed context marker — even though an UNLISTED real errorName=CustomError
+    stands next to it.  Mutant guard: with the ``name = None`` check removed,
+    the single-quoted token is the leftmost errorName= match and prints
+    error=RateLimitError instead."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorBody='x errorName=RateLimitError y' "
+        'errorName=CustomError errorMessage="403 weekly usage limit" statusCode=403\n',
+        when=now,
+    )
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    _assert_weekly_locked_out(checked, now)
+    assert "hit weekly" in out.err
+    assert "error=statusCode=403" in out.err  # fixed context marker, not a name
+    assert "RateLimitError" not in out.err
+    assert "CustomError" not in out.err
+    assert "RateLimitError" not in out.out
+
+
+# ``errorName=APIStatusError`` only marks a record when the name ends there —
+# a name-continuation character ([A-Za-z0-9_.]) makes it a different token.
+ERRCTX_BOUNDARY_LINES = {
+    "end-of-line": '{ts}Z WARN  llm request failed  errorMessage="403 weekly usage limit" '
+    "errorName=APIStatusError\n",
+    "space": "{ts}Z WARN  llm request failed  errorName=APIStatusError "
+    'errorMessage="403 weekly usage limit"\n',
+    "tab": "{ts}Z WARN  llm request failed  errorName=APIStatusError\t"
+    'errorMessage="403 weekly usage limit"\n',
+    # not a name character, so the marker still applies — but _SESSION_ERR_NAME's
+    # stricter boundary refuses the field, so the fixed marker is what prints
+    "punctuation": '{ts}Z WARN  llm request failed  errorMessage="403 weekly usage limit" '
+    "errorName=APIStatusError,\n",
+}
+
+
+@pytest.mark.parametrize("case", list(ERRCTX_BOUNDARY_LINES))
+def test_errctx_apistatuserror_at_a_right_boundary_still_qualifies(tmp_path, monkeypatch, case):
+    """#992 NICE-3 — the boundary only refuses name-continuation characters:
+    whitespace, punctuation or end-of-line after the name still qualify."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        ERRCTX_BOUNDARY_LINES[case].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    _assert_weekly_locked_out(checked, now)
+    assert "hit weekly" in text
+    assert "APIStatusError" in text
+
+
+def test_errctx_apistatuserror_with_suffix_is_not_a_marker(tmp_path, monkeypatch):
+    """#992 NICE-3 / M2 — a line whose ONLY context marker is the look-alike
+    ``errorName=APIStatusErrorX`` is not a lockout record.  Without the right
+    boundary it qualified and printed the fixed ``errorName=APIStatusError``
+    as if it were the record's own name."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f'{ts}Z WARN  llm request failed  errorName=APIStatusErrorX errorMessage="403 weekly usage limit"\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+    assert all(not b.locked for b in checked.buckets)
+    assert "decision: no usage-limit records" in text
+    assert "APIStatusError" not in text
