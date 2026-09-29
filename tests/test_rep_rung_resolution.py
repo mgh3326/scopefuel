@@ -51,6 +51,9 @@ WRK_BUILDER_SPELLINGS: dict[str, tuple[str, str]] = {
     "builder-opus-medium": ("opus", "medium"),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
+    # #921: bare builder-sonnet consults sonnet@xhigh (EFFORT:-xhigh) —
+    # accepts high|xhigh|max; a recorded rep effort still wins over the pin.
+    "builder-sonnet": ("sonnet", "xhigh"),
     "builder-sol": ("codex-sol", "high"),
     "captain-sol": ("codex-sol", "high"),
     "builder-sol-high": ("codex-sol", "high"),

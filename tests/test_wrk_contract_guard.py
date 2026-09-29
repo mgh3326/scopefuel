@@ -46,6 +46,10 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "sonnet-med": ("sonnet", None),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
+    # #921 (wrk db8a58d): builder-only, accepts --effort high|xhigh|max and
+    # defaults xhigh — resolve_catalog_profile pins "${EFFORT:-xhigh}", which
+    # for the bare spelling is the xhigh consult mirrored here.
+    "builder-sonnet": ("sonnet", "xhigh"),
     "haiku": ("haiku", None),
     "fable": ("fable", None),
     "codex": ("codex-sol", "high"),

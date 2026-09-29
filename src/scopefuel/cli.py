@@ -16,7 +16,19 @@ import sys
 import time
 from dataclasses import replace
 
-from . import bench, grades, herdr, launch, manual, quota_share, quota_v2, recommend, render, served
+from . import (
+    bench,
+    grades,
+    herdr,
+    launch,
+    manual,
+    quota_share,
+    quota_v2,
+    recommend,
+    render,
+    served,
+    stale_build,
+)
 from .cache import collect
 from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
 from .policy import (
@@ -565,11 +577,38 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     return parser
 
 
+def _stale_build_verdict() -> stale_build.Verdict | None:
+    """The stale-build verdict for emit sites — a broken check never reaches a caller.
+
+    ``stale_build.warning()`` already degrades to silence on its own failures;
+    this second guard is what keeps even a mutated/broken module from ever
+    failing or slowing a gate, recommend, or render path beyond the check's
+    own ~2s probe budget. A wrong-typed return is treated as no verdict.
+    """
+    try:
+        verdict = stale_build.warning()
+    except Exception:
+        return None
+    return verdict if isinstance(verdict, stale_build.Verdict) else None
+
+
+def _emit_stale_build_warning() -> None:
+    """Print the one-line stale-build warning to stderr (the ``warning: catalog=stale`` convention).
+
+    stdout stays contract-clean: the gate's first line keeps ``pool=``, --brief
+    stays one line for statuslines, and --json carries the field instead.
+    """
+    verdict = _stale_build_verdict()
+    if verdict is not None:
+        print(verdict.line, file=sys.stderr)
+
+
 def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.datetime) -> str:
     color = not args.no_color and sys.stdout.isatty()
     if args.raw:
         return json.dumps({r.id: r.raw for r in results}, indent=2, ensure_ascii=False)
     if args.json:
+        stale = _stale_build_verdict()
         payload = {
             "schema": SCHEMA,
             "generated_at": now.isoformat(),
@@ -578,6 +617,7 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
                 "usage_mark": overall_usage_mark(results, now=now),
             },
             "providers": [r.as_dict(now=now) for r in results],
+            "stale_build": stale.as_field() if stale is not None else None,
         }
         return json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
     if args.brief:
@@ -778,6 +818,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     # bundled snapshot instead of the canon is the failure this whole change
     # exists to make impossible to miss (hk:doc 2558).
     print(catalog.label)
+    _emit_stale_build_warning()
     return 0
 
 
@@ -1153,6 +1194,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             )
         print(first_line)
         print(result.reason)
+        _emit_stale_build_warning()
         return 0
 
     deny_reason = result.reason if not tag else f'{result.reason} account="{tag}"'
@@ -1186,6 +1228,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         print(f"대안({result.grade}): {', '.join(result.alternatives)}", file=sys.stderr)
     else:
         print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)
+    _emit_stale_build_warning()
     return exit_code
 
 
@@ -1793,6 +1836,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.raw:
             results = manual.apply_for_display(results, now=now)
         print(_render(results, args, now), flush=True)
+        if not args.raw and not args.json:
+            _emit_stale_build_warning()
         if not args.watch:
             break
         try:

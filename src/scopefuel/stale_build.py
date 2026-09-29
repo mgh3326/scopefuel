@@ -1,0 +1,412 @@
+"""task #952 — warn when the installed build lags origin/main.
+
+scopefuel ships its catalog bundled in the package (the server catalog is on
+hold), so a host only picks up catalog changes by reinstalling — and a stale
+install is otherwise invisible.  This module answers two questions cheaply:
+
+* **What rev is installed?**  PEP 610 ``direct_url.json`` in the running
+  distribution's dist-info is primary — it is the record of *this* build:
+  ``vcs_info.commit_id`` for a git install.  For an editable/local install
+  (``dir_info``) the rev is the checkout's own ``git rev-parse HEAD``.  When
+  no ``direct_url.json`` exists at all, the uv tool receipt
+  (``~/.local/share/uv/tools/scopefuel/uv-receipt.toml``) records the
+  resolved ``git=...?rev=`` — but only for a distribution that carries no
+  direct_url, since a receipt describes a *different* environment than an
+  editable install and must not be attributed to it.
+
+* **Where is origin/main?**  The GitHub REST API
+  (``GET /repos/{REPO}/commits/main``) answers the head sha, and
+  ``GET /repos/{REPO}/compare/{installed}...{head}`` answers how many
+  commits the install is behind.  ``git ls-remote`` is the head fallback.
+  The repo is public, so no credential is needed.
+
+Contract with every caller:
+
+* the verdict is cached for ``CHECK_TTL_S`` (>= 1h) so a spawn-time gate
+  almost always costs a file read;
+* the network probe is bounded by ``PROBE_BUDGET_S`` (~2s) total;
+* offline / unreachable / unparseable → silent skip (``warning()`` → None);
+* ``warning()`` never raises — a broken check must never fail a gate.
+
+``SCOPEFUEL_STALE_WARN=0`` (or ``off``/``false``/``no``) disables the whole
+check — the ops kill switch and the test isolation knob.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+import json
+import os
+import pathlib
+import re
+import subprocess
+import time
+import tomllib
+import urllib.parse
+from dataclasses import dataclass
+from typing import Any
+
+from . import http
+from .cache import cache_dir
+
+REPO = "mgh3326/scopefuel"
+_API = "https://api.github.com"
+REINSTALL_COMMAND = "uv tool install --force git+https://github.com/mgh3326/scopefuel@main"
+CHECK_TTL_S = 3600.0
+PROBE_BUDGET_S = 2.0
+DISABLE_ENV = "SCOPEFUEL_STALE_WARN"
+_DIST_NAME = "scopefuel"
+_CACHE_SCHEMA = "scopefuel.stale_build.v1"
+
+_STATUS_BEHIND = "behind"
+_STATUS_REV_UNKNOWN = "rev_unknown"
+_STATUS_CURRENT = "current"
+_STATUS_SKIPPED = "skipped"  # probe could not answer — cached so we do not retry every call
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
+
+
+def _short(rev: str | None) -> str:
+    return rev[:7] if rev else "unknown"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """A warning-worthy verdict — only ``behind``/``rev_unknown`` instances exist."""
+
+    status: str  # _STATUS_BEHIND | _STATUS_REV_UNKNOWN
+    installed_rev: str | None
+    origin_rev: str | None
+    behind: int | None
+
+    @property
+    def line(self) -> str:
+        """The one-line human warning (stderr surface for text outputs)."""
+        if self.status == _STATUS_REV_UNKNOWN:
+            detail = f"installed rev unknown; origin/main is {_short(self.origin_rev)}"
+        elif self.behind is None:
+            detail = (
+                f"installed {_short(self.installed_rev)} differs from origin/main "
+                f"{_short(self.origin_rev)} (commit distance unknown)"
+            )
+        else:
+            detail = (
+                f"installed {_short(self.installed_rev)} is {self.behind} commit(s) "
+                f"behind origin/main {_short(self.origin_rev)}"
+            )
+        return f"warning: scopefuel build stale — {detail}; reinstall: {REINSTALL_COMMAND}"
+
+    def as_field(self) -> dict[str, Any]:
+        """The --json payload form (schema=scopefuel.v1 additive field)."""
+        return {
+            "status": self.status,
+            "installed_rev": self.installed_rev,
+            "origin_rev": self.origin_rev,
+            "behind": self.behind,
+            "reinstall": REINSTALL_COMMAND,
+            "message": self.line,
+        }
+
+
+# ---------------------------------------------------------------------------
+# injectable seams (tests fake these — no real network or receipt reads)
+# ---------------------------------------------------------------------------
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _get_json(url: str, timeout: float) -> dict[str, Any]:
+    return http.request_json(
+        url,
+        headers={"User-Agent": "scopefuel", "Accept": "application/vnd.github+json"},
+        timeout=timeout,
+    )
+
+
+def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False, text=True
+    )
+
+
+def _dist_direct_url() -> str | None:
+    try:
+        return importlib.metadata.distribution(_DIST_NAME).read_text("direct_url.json")
+    except Exception:
+        return None
+
+
+def _receipt_path() -> pathlib.Path:
+    tools_dir = os.environ.get("UV_TOOL_DIR") or str(
+        pathlib.Path.home() / ".local" / "share" / "uv" / "tools"
+    )
+    return pathlib.Path(tools_dir) / _DIST_NAME / "uv-receipt.toml"
+
+
+# ---------------------------------------------------------------------------
+# installed rev — PEP 610 direct_url.json (git commit or the checkout itself),
+# else the uv tool receipt; a direct_url never defers to the receipt, which
+# describes a different environment and must not be attributed to this one
+# ---------------------------------------------------------------------------
+
+
+def _valid_sha(value: object) -> bool:
+    return isinstance(value, str) and bool(_SHA_RE.fullmatch(value))
+
+
+def _local_checkout_rev(path: str | None) -> str | None:
+    """``git rev-parse HEAD`` of an editable/local install — local-only, best-effort.
+
+    Runs outside the network deadline but is a <20ms operation on any sane
+    filesystem; the 0.3s cap keeps a wedged mount from adding meaningfully to
+    the ~2s budget.
+    """
+
+    if not path or not pathlib.Path(path).is_dir():
+        return None
+    try:
+        completed = _run(["git", "-C", path, "rev-parse", "HEAD"], timeout=0.3)
+    except Exception:
+        return None
+    rev = completed.stdout.strip() if completed.returncode == 0 else ""
+    return rev if _valid_sha(rev) else None
+
+
+def _direct_url_rev() -> tuple[str, str | None] | None:
+    """("git", rev) | ("dir", checkout path) | ("other", None); None = no direct_url."""
+
+    raw = _dist_direct_url()
+    if raw is None:
+        return None
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        return ("other", None)
+    if not isinstance(info, dict):
+        return ("other", None)
+    rev = (info.get("vcs_info") or {}).get("commit_id")
+    if _valid_sha(rev):
+        return ("git", rev)
+    dir_info = info.get("dir_info")
+    if isinstance(dir_info, dict):
+        path = urllib.parse.unquote(urllib.parse.urlsplit(info.get("url") or "").path)
+        return ("dir", path or None)
+    return ("other", None)
+
+
+def _receipt_rev() -> str | None:
+    try:
+        data = tomllib.loads(_receipt_path().read_text())
+    except Exception:
+        return None
+    requirements = data.get("tool", {}).get("requirements") if isinstance(data, dict) else None
+    for requirement in requirements or []:
+        if not isinstance(requirement, dict) or requirement.get("name") != _DIST_NAME:
+            continue
+        git = requirement.get("git")
+        if not git:
+            continue
+        revs = urllib.parse.parse_qs(urllib.parse.urlsplit(git).query).get("rev")
+        if revs and _valid_sha(revs[0]):
+            return revs[0]
+    return None
+
+
+def _installed_rev() -> str | None:
+    direct = _direct_url_rev()
+    if direct is None:
+        return _receipt_rev()
+    kind, value = direct
+    if kind == "git":
+        return value
+    if kind == "dir":
+        return _local_checkout_rev(value)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# origin/main probe — bounded by the caller's deadline
+# ---------------------------------------------------------------------------
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - _monotonic())
+
+
+def _api_head_rev(deadline: float) -> str | None:
+    timeout = _remaining(deadline)
+    if timeout <= 0:
+        return None
+    try:
+        data = _get_json(f"{_API}/repos/{REPO}/commits/main", timeout=timeout)
+    except Exception:
+        return None
+    sha = data.get("sha") if isinstance(data, dict) else None
+    return sha if _valid_sha(sha) else None
+
+
+def _lsremote_head_rev(deadline: float) -> str | None:
+    timeout = _remaining(deadline)
+    if timeout <= 0:
+        return None
+    try:
+        completed = _run(
+            ["git", "ls-remote", f"https://github.com/{REPO}.git", "refs/heads/main"],
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    fields = completed.stdout.split()
+    return fields[0] if fields and _valid_sha(fields[0]) else None
+
+
+def _origin_rev(deadline: float) -> str | None:
+    return _api_head_rev(deadline) or _lsremote_head_rev(deadline)
+
+
+def _commits_ahead(installed: str, head: str, deadline: float) -> int | None:
+    """Commits on origin/main the install lacks (compare.ahead_by); None when unknown."""
+
+    if not (_valid_sha(installed) and _valid_sha(head)):
+        return None
+    timeout = _remaining(deadline)
+    if timeout <= 0:
+        return None
+    try:
+        data = _get_json(f"{_API}/repos/{REPO}/compare/{installed}...{head}", timeout=timeout)
+    except Exception:
+        return None
+    ahead = data.get("ahead_by") if isinstance(data, dict) else None
+    return int(ahead) if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0 else None
+
+
+# ---------------------------------------------------------------------------
+# verdict cache — TTL keeps the hot path a file read
+# ---------------------------------------------------------------------------
+
+
+def _cache_path() -> pathlib.Path:
+    return cache_dir() / "stale_build.json"
+
+
+def _read_cache() -> dict[str, Any] | None:
+    try:
+        data = json.loads(_cache_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) and data.get("schema") == _CACHE_SCHEMA else None
+
+
+def _write_cache(entry: dict[str, Any]) -> None:
+    path = _cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entry))
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    except OSError:
+        pass  # a cache write failure must not break the check
+
+
+def _cache_verdict(cached: dict[str, Any]) -> Verdict | None:
+    status = cached.get("status")
+    if status not in (_STATUS_BEHIND, _STATUS_REV_UNKNOWN):
+        return None
+    origin_rev = cached.get("origin_rev")
+    installed_rev = cached.get("installed_rev")
+    behind = cached.get("behind")
+    return Verdict(
+        status=status,
+        installed_rev=installed_rev if isinstance(installed_rev, str) else None,
+        origin_rev=origin_rev if isinstance(origin_rev, str) else None,
+        behind=behind if isinstance(behind, int) and not isinstance(behind, bool) else None,
+    )
+
+
+def _disabled() -> bool:
+    return os.environ.get(DISABLE_ENV, "").strip().lower() in {"0", "off", "false", "no"}
+
+
+def _check() -> Verdict | None:
+    now = _now()
+    installed = _installed_rev()
+    cached = _read_cache()
+    try:
+        fresh = cached is not None and now - float(cached.get("checked_at") or 0) < CHECK_TTL_S
+    except (TypeError, ValueError):
+        fresh = False
+    if fresh and cached.get("installed_rev") == installed:
+        # The install did not move since the probe — the cached verdict stands.
+        # (A changed installed rev re-probes: a fresh install must not inherit
+        # the old rev's "behind" warning.)
+        return _cache_verdict(cached)
+
+    deadline = _monotonic() + PROBE_BUDGET_S
+    head = _origin_rev(deadline)
+    if head is None:
+        _write_cache(
+            {
+                "schema": _CACHE_SCHEMA,
+                "checked_at": now,
+                "installed_rev": installed,
+                "origin_rev": None,
+                "behind": None,
+                "status": _STATUS_SKIPPED,
+            }
+        )
+        return None
+
+    verdict: Verdict | None
+    status: str
+    if installed is None:
+        status = _STATUS_REV_UNKNOWN
+        verdict = Verdict(status, None, head, None)
+    elif installed == head:
+        status = _STATUS_CURRENT
+        verdict = None
+    else:
+        behind = _commits_ahead(installed, head, deadline)
+        if behind == 0:
+            # Installed strictly ahead of main (e.g. an unreleased local build
+            # installed by rev) — ahead, never behind: no warning.
+            status = _STATUS_CURRENT
+            verdict = None
+        else:
+            status = _STATUS_BEHIND
+            verdict = Verdict(status, installed, head, behind)
+
+    _write_cache(
+        {
+            "schema": _CACHE_SCHEMA,
+            "checked_at": now,
+            "installed_rev": installed,
+            "origin_rev": head,
+            "behind": verdict.behind if verdict else 0,
+            "status": status,
+        }
+    )
+    return verdict
+
+
+def warning() -> Verdict | None:
+    """The stale-build verdict when a warning should print, else None.
+
+    Never raises: the disabled flag, every cache read, and every probe call
+    funnel through here so a broken check degrades to silence rather than
+    breaking the command that hosts it.
+    """
+    if _disabled():
+        return None
+    try:
+        return _check()
+    except Exception:
+        return None
