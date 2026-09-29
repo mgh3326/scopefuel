@@ -341,24 +341,22 @@ def _write_cache(entry: dict[str, Any]) -> None:
     try:
         # Serialize before mkstemp so an unserializable entry fails before any
         # temp file exists (a dumps error is a TypeError, not an OSError).
-        payload = json.dumps(entry)
+        payload = json.dumps(entry).encode()  # dumps output is ASCII
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(dir=path.parent, prefix="stale_build.", suffix=".tmp")
         tmp = pathlib.Path(name)
         try:
-            fh = os.fdopen(fd, "w")
-        except OSError:
-            # fdopen may already have closed the mkstemp fd — close it only if
-            # it is still open; a blind os.close could hit a reused fd number.
-            try:
-                os.fstat(fd)
-            except OSError:
-                pass
-            else:
-                os.close(fd)
-            raise
-        with fh:
-            fh.write(payload)
+            # The raw fd has a single owner: no fdopen wrapper may take it, so
+            # nothing else can close it first and the finally below closes it
+            # exactly once — a second close could hit a reused fd number.
+            view = memoryview(payload)
+            while view:
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError("os.write made no progress")
+                view = view[n:]
+        finally:
+            os.close(fd)
         tmp.chmod(0o600)  # defensive: mkstemp already creates 0600
         os.replace(tmp, path)
     except OSError:
