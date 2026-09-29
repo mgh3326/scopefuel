@@ -1545,3 +1545,167 @@ def test_tail_cut_mid_line_still_parses_whole_lines_after_it(tmp_path):
 
     assert [kind for _, kind, _ in hits] == ["weekly"]
     assert hits[0][0] != fallback  # timestamp read from the record, not the fallback
+
+
+# ------------------------------------------------------------------ #977
+# --explain names the error by allowlist, not by shape.  A well-formed but
+# unlisted errorName= token — including one smuggled past the quote strip by
+# look-alike delimiters (#966 round-4) — prints the fixed context marker,
+# never the token.  Synthetic record lines only.
+
+OTHER_LISTED_NAMES = ["APIError", "AuthenticationError", "PermissionDeniedError", "RateLimitError"]
+
+# Look-alike delimiters around a bare errorName=<token>: none are ASCII
+# quotes, so the quoted-field strip and the leftover-quote check both pass —
+# only the allowlist stops the token (#966 round-4, report-r4 RISKS 1).
+R4_LOOKALIKE_QUOTES = {
+    "curly-double": ("“", "”"),
+    "curly-single": ("‘", "’"),
+    "fullwidth": ("＂", "＂"),
+    "guillemets": ("«", "»"),
+    "backtick": ("`", "`"),
+}
+R4_SENTINEL = "SENTINEL977R4"
+
+
+def _isolate_kimi_homes(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Every scan root is synthetic — no real home, clone home or config."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    for env, _dirname in kimi._CLONE_HOME_ENVS:
+        monkeypatch.setenv(env, str(tmp_path / "no-such-clone"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+
+
+def test_allowlist_fixture_name_prints_end_to_end(tmp_path, monkeypatch, capsys):
+    """AC1 — the real-format fixture still prints error=APIStatusError
+    through `scopefuel --only kimi --explain` with a synthetic home."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(tmp_path, _session_log_at(now - dt.timedelta(hours=1)) + "\n", when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "error=APIStatusError" in out.err
+    assert "decision: exhausted weekly" in out.err
+
+
+@pytest.mark.parametrize("name", OTHER_LISTED_NAMES)
+def test_allowlist_other_sdk_names_print_themselves(tmp_path, monkeypatch, name):
+    """AC2 — every other allowlisted status-error class name in an otherwise
+    valid weekly 403 line prints as itself."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorName={name} "
+        'errorMessage="403 weekly usage limit" statusCode=403\n',
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert "hit weekly" in text
+    assert f"error={name}" in text
+
+
+@pytest.mark.parametrize("name", ["CustomLimitError", "A" * 64], ids=["unlisted", "64-char-token"])
+def test_allowlist_unlisted_name_prints_the_fixed_marker(tmp_path, monkeypatch, name):
+    """AC3 — a well-formed but unlisted name fails closed to the fixed
+    context marker; the token itself never reaches the output."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorName={name} "
+        'errorMessage="403 weekly usage limit" statusCode=403\n',
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert "hit weekly" in text
+    assert "error=statusCode=403" in text  # fixed context marker, not the token
+    assert name not in text
+
+
+@pytest.mark.parametrize("case", list(R4_LOOKALIKE_QUOTES))
+def test_allowlist_r4_lookalike_delimiters_never_print(tmp_path, monkeypatch, case):
+    """AC4 — the #966 round-4 look-alike delimiters: the token still matches
+    the shape rule after the strip, so only the allowlist stops it.  The
+    lockout itself is still detected (weekly locked)."""
+    open_q, close_q = R4_LOOKALIKE_QUOTES[case]
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorBody={open_q} errorName={R4_SENTINEL} {close_q} "
+        'errorMessage="403 weekly usage limit" statusCode=403\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    _assert_weekly_locked_out(checked, now)
+    assert "hit weekly" in text
+    assert R4_SENTINEL not in text
+
+
+def test_allowlist_r4_lookalikes_end_to_end(tmp_path, monkeypatch, capsys):
+    """AC4 — all five look-alike quoting shapes in one file, through
+    cli.main: the sentinel is absent from stdout AND stderr."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    body = "".join(
+        f"{ts}Z WARN  llm request failed  errorBody={open_q} errorName={R4_SENTINEL} {close_q} "
+        'errorMessage="403 weekly usage limit" statusCode=403\n'
+        for open_q, close_q in R4_LOOKALIKE_QUOTES.values()
+    )
+    _write_session_log(tmp_path, body, when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "hit weekly" in out.err
+    assert R4_SENTINEL not in out.out
+    assert R4_SENTINEL not in out.err
+
+
+def test_allowlist_quoted_fake_name_does_not_hide_the_real_field(tmp_path, monkeypatch):
+    """AC5 — a quoted errorName=APIStatusError inside errorMessage is record
+    content: the strip still decides the field, so the real unquoted
+    errorName=RateLimitError prints.  Mutant guard — searching the raw line
+    instead of the stripped rest prints APIStatusError here (M2)."""
+    _isolate_kimi_homes(tmp_path, monkeypatch)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  "
+        'errorMessage="403 weekly usage limit errorName=APIStatusError " '
+        "errorName=RateLimitError statusCode=403\n",
+        when=now,
+    )
+
+    text = kimi.explain_lockout_scan(
+        kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now), now=now
+    )
+
+    assert "hit weekly" in text
+    assert "error=RateLimitError" in text
+    assert "error=APIStatusError" not in text
