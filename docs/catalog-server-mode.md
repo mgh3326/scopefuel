@@ -86,7 +86,10 @@ floor existed can hold a partial canon; it keeps serving under the same
 staleness rules, and `bench catalog status` still lists its uncovered
 profiles. The bundled snapshot is now only the no-cache floor — a host with no
 cache at all is the one place `catalog=stale (snapshot)` still means
-"reviewed-at-merge-time placements".
+"reviewed-at-merge-time placements". And a rejected server catalog is not
+negative-cached — `fetched_at` is never refreshed on a rejection — so every
+process refetches the canon on every call until the server is fixed; each call
+prints one warning line and still completes.
 
 ## Switching a host to server mode
 
@@ -110,7 +113,7 @@ $ scopefuel bench catalog status
 backend=handoffkeep reason=auto-credentials
 credentials url=found token=found (env or /home/…/.config/handoffkeep/config.env)
 catalog_ttl_s=3600 catalog_stale_max_s=86400
-catalog=server
+catalog=server (age 0.0h)
 rows=59 profiles=37
 ```
 
@@ -175,7 +178,7 @@ $ scopefuel bench push-catalog --emit-seed \
 
 # 2. review it, then write it
 $ HANDOFFKEEP_TOKEN="$HANDOFFKEEP_TOKEN_operator" scopefuel bench push-catalog /tmp/catalog-seed.json
-catalog rows written: 49
+catalog rows written: 59
 
 # 3. confirm
 $ scopefuel bench catalog status
@@ -184,6 +187,14 @@ $ scopefuel bench catalog list | head
 
 `decided_by` is required caller-supplied provenance on this route — the server
 rejects a blank one rather than filling it in.
+
+Ordering matters on every later release too: the validity floor requires the
+server canon to mention every profile the bundled snapshot places. A scopefuel
+release that *adds* a snapshot profile therefore makes upgraded hosts reject
+the server canon until its row exists — push-catalog the new rows **before**
+installing such a release (or upgraded hosts degrade to `catalog=stale` with
+`server catalog rejected: N rows, missing 1 snapshot profile` until the push
+lands).
 
 ## Post-merge: record opus at S+ (absorbs #591 AC4)
 

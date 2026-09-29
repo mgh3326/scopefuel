@@ -2857,7 +2857,13 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
                 "stale: running on the bundled snapshot — server placements are NOT in effect; "
                 "non-default gates require --operator-request until the canon is readable"
             )
-    uncovered = sorted(snapshot_profiles() - view.profiles()) if not view.stale else []
+    # Disclosure applies to every served source but the snapshot: a snapshot
+    # view has nothing uncovered by definition, while a cache-stale view —
+    # stale like the snapshot but still carrying the last-good rows — must
+    # keep listing the profiles its (possibly pre-floor, partial) canon omits.
+    uncovered = (
+        sorted(snapshot_profiles() - view.profiles()) if view.source != CATALOG_SOURCE_SNAPSHOT else []
+    )
     if uncovered:
         lines.append("uncovered (snapshot-only, catalog has no row): " + ", ".join(uncovered))
     return "\n".join(lines)
