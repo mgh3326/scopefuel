@@ -10,10 +10,12 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import os
 import pathlib
 import subprocess
 import threading
 import time
+import types
 
 import pytest
 
@@ -643,3 +645,276 @@ def test_checked_at_within_skew_tolerance_is_still_fresh(stale_on, monkeypatch):
     verdict = stale_build.warning()
     assert verdict is not None and verdict.behind == 3  # restored from cache
     assert stale_on["json"] == [] and stale_on["run"] == []  # no probe
+
+
+# ---------------------------------------------------------------------------
+# task #971 — one cache writer per check: only the calling thread writes
+# ---------------------------------------------------------------------------
+
+
+def _fast_budget(monkeypatch, budget: float = 0.3, grace: float = 0.05) -> None:
+    monkeypatch.setattr(stale_build, "PROBE_BUDGET_S", budget)
+    monkeypatch.setattr(stale_build, "_PROBE_GRACE_S", grace)
+
+
+def _log_writes(monkeypatch) -> list[tuple[str, str]]:
+    """Wrap _write_cache so every call records (writing thread, entry status)."""
+    log: list[tuple[str, str]] = []
+    real_write = stale_build._write_cache
+
+    def logging_write(entry):
+        real_write(entry)
+        who = "main" if threading.current_thread() is threading.main_thread() else "worker"
+        log.append((who, entry["status"]))
+
+    monkeypatch.setattr(stale_build, "_write_cache", logging_write)
+    return log
+
+
+def test_fast_probe_writes_the_cache_once_on_the_calling_thread(stale_on, monkeypatch):
+    """AC1: a normal fast probe — exactly one write, by the caller."""
+    _set_installed(monkeypatch, INSTALLED)
+    _net(monkeypatch, stale_on, ahead_by=3)
+    log = _log_writes(monkeypatch)
+    assert stale_build.warning() is not None
+    assert log == [("main", "behind")], log
+
+
+def test_expired_probe_writes_skipped_once_and_the_worker_adds_nothing(stale_on, monkeypatch):
+    """AC1: a probe that overruns the budget — the caller writes skipped once;
+    the abandoned worker finishing late adds no second write."""
+    _set_installed(monkeypatch, INSTALLED)
+    _fast_budget(monkeypatch, budget=0.2, grace=0.05)
+    release = threading.Event()
+
+    def hang(url: str, timeout: float):
+        release.wait(10)
+        return {"sha": HEAD}
+
+    monkeypatch.setattr(stale_build, "_get_json", hang)
+    log = _log_writes(monkeypatch)
+    assert stale_build.warning() is None
+    assert log == [("main", "skipped")], log
+    release.set()
+    time.sleep(0.5)
+    assert log == [("main", "skipped")], log
+    assert stale_build._read_cache()["status"] == "skipped"
+
+
+def _install_race_harness(monkeypatch, *, mode: str) -> list[tuple[str, str]]:
+    """Force an ordering inside the join-timeout / expired.set() window.
+
+    mode="A": the worker completes its whole probe — a real verdict — in the
+              gap between the caller's join timeout and ``expired.set()``
+              taking effect.
+    mode="B": the worker passes its first ``expired.is_set()`` check (reads
+              False), then the caller sets the flag and writes ``skipped``
+              while the worker is still mid-probe.
+    Returns the ordered write log [(thread, status)].
+    """
+    _fast_budget(monkeypatch)
+    release = threading.Event()
+    worker_checked = threading.Event()
+    caller_done = threading.Event()
+    worker_done = threading.Event()
+    log: list[tuple[str, str]] = []
+
+    def blocking_get_json(url: str, timeout: float):
+        if url.endswith("/commits/main"):
+            release.wait(10)
+            return {"sha": HEAD}
+        return {"ahead_by": 4}
+
+    monkeypatch.setattr(stale_build, "_get_json", blocking_get_json)
+
+    real_write = stale_build._write_cache
+
+    def logging_write(entry):
+        real_write(entry)
+        who = "main" if threading.current_thread() is threading.main_thread() else "worker"
+        log.append((who, entry["status"]))
+        if who == "main":
+            caller_done.set()
+
+    monkeypatch.setattr(stale_build, "_write_cache", logging_write)
+
+    real_probe = stale_build._probe
+
+    def probe_spy(*args):
+        try:
+            return real_probe(*args)
+        finally:
+            worker_done.set()
+
+    monkeypatch.setattr(stale_build, "_probe", probe_spy)
+
+    class HookEvent(threading.Event):
+        def set(self):
+            release.set()
+            if mode == "A":
+                worker_done.wait(10)
+            else:
+                worker_checked.wait(10)
+            super().set()
+
+        def is_set(self):
+            r = super().is_set()
+            if mode == "B" and threading.current_thread() is not threading.main_thread() and not r:
+                worker_checked.set()
+                caller_done.wait(10)
+            return r
+
+    monkeypatch.setattr(
+        stale_build, "threading", types.SimpleNamespace(Event=HookEvent, Thread=threading.Thread)
+    )
+    return log
+
+
+def test_race_A_worker_finishing_in_the_expired_gap_still_writes_nothing(stale_on, monkeypatch):
+    """AC1 (race A restated): the worker completes a real probe between the
+    caller's join timeout and expired.set() — the skipped record is the only
+    write and the late result is discarded."""
+    _set_installed(monkeypatch, INSTALLED)
+    log = _install_race_harness(monkeypatch, mode="A")
+    assert stale_build.warning() is None
+    assert log == [("main", "skipped")], log
+    assert stale_build._read_cache()["status"] == "skipped"
+
+
+def test_race_B_worker_past_its_check_when_skipped_lands_writes_nothing(stale_on, monkeypatch):
+    """AC1 (race B restated — the #956 xfail, now passing): the worker already
+    read ``expired`` as False when the caller writes skipped; with the write
+    owned by the calling thread there is no second write and the cache stays
+    skipped."""
+    _set_installed(monkeypatch, INSTALLED)
+    log = _install_race_harness(monkeypatch, mode="B")
+    assert stale_build.warning() is None
+    time.sleep(0.3)
+    assert log == [("main", "skipped")], log
+    assert stale_build._read_cache()["status"] == "skipped"
+
+
+def test_expired_probe_that_later_succeeds_never_overwrites_skipped(stale_on, monkeypatch):
+    """AC2: the abandoned worker eventually gets a *real* answer (behind) —
+    the cache must stay skipped. Worker-side ``is_set`` is pinned False so the
+    probe runs its full sequence to a real verdict — exactly the interleaving
+    the old check-then-write lost."""
+    _set_installed(monkeypatch, INSTALLED)
+    _fast_budget(monkeypatch, budget=0.2, grace=0.05)
+
+    def slow_then_ok(url: str, timeout: float):
+        time.sleep(0.6)
+        if url.endswith("/commits/main"):
+            return {"sha": HEAD}
+        return {"ahead_by": 4}
+
+    monkeypatch.setattr(stale_build, "_get_json", slow_then_ok)
+    # deadline passed by the time the sleep ends: keep _remaining positive so
+    # the worker can complete the sequence and reach a real verdict
+    monkeypatch.setattr(
+        stale_build,
+        "_remaining",
+        lambda deadline: 0.2 if threading.current_thread() is threading.main_thread() else 5.0,
+    )
+
+    class BlindEvent(threading.Event):
+        def is_set(self):
+            if threading.current_thread() is not threading.main_thread():
+                return False
+            return super().is_set()
+
+    monkeypatch.setattr(
+        stale_build, "threading", types.SimpleNamespace(Event=BlindEvent, Thread=threading.Thread)
+    )
+    assert stale_build.warning() is None
+    assert stale_build._read_cache()["status"] == "skipped"
+    time.sleep(1.5)  # the worker has now finished both calls
+    assert stale_build._read_cache()["status"] == "skipped"
+
+
+def test_in_bound_probe_caches_current(stale_on, monkeypatch):
+    """AC3: a timely probe that finds the install current caches 'current'."""
+    _set_installed(monkeypatch, HEAD)
+    _net(monkeypatch, stale_on, ahead_by=0)
+    assert stale_build.warning() is None
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["status"] == "current"
+    assert cached["installed_rev"] == HEAD and cached["origin_rev"] == HEAD
+
+
+def test_in_bound_probe_caches_behind_with_the_count(stale_on, monkeypatch):
+    """AC3: a timely behind verdict lands in the cache with its distance."""
+    _set_installed(monkeypatch, INSTALLED)
+    _net(monkeypatch, stale_on, ahead_by=4)
+    assert stale_build.warning().behind == 4
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["status"] == "behind" and cached["behind"] == 4
+
+
+def test_in_bound_probe_caches_rev_unknown(stale_on, monkeypatch):
+    """AC3: an unknown installed rev lands in the cache as 'rev_unknown'."""
+    _net(monkeypatch, stale_on)
+    assert stale_build.warning().status == "rev_unknown"
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["status"] == "rev_unknown"
+    assert cached["installed_rev"] is None and cached["origin_rev"] == HEAD
+
+
+def test_write_cache_uses_a_unique_temp_file_per_write(stale_on, monkeypatch):
+    """AC4: two consecutive writes must not share a temp path — concurrent
+    scopefuel processes can otherwise interleave on stale_build.tmp."""
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        seen.append(str(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    entry = {"schema": stale_build._CACHE_SCHEMA, "checked_at": 1.0, "status": "skipped"}
+    stale_build._write_cache(entry)
+    stale_build._write_cache(entry)
+    cache_dir = stale_build._cache_path().parent
+    assert len(seen) == 2 and seen[0] != seen[1], seen
+    assert all(pathlib.Path(name).parent == cache_dir for name in seen)
+    assert all(name.endswith(".tmp") for name in seen)
+    assert stale_build._cache_path().stat().st_mode & 0o777 == 0o600
+    assert list(cache_dir.glob("*.tmp")) == []
+
+
+def test_write_cache_failure_cleans_the_temp_file(stale_on, monkeypatch):
+    """AC4: a failed os.replace must not break the check or leave a temp file."""
+    seen: list[str] = []
+
+    def boom(src, dst):
+        seen.append(str(src))
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(os, "replace", boom)
+    stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "status": "skipped"})
+    cache_dir = stale_build._cache_path().parent
+    assert seen, "the write must have reached os.replace"
+    assert list(cache_dir.glob("*.tmp")) == []
+    assert not stale_build._cache_path().exists()
+
+
+@pytest.mark.parametrize("bad", ["abc", None, True, [], {}, "12x", int("1" + "0" * 400)])
+def test_unusable_checked_at_reprobes(stale_on, monkeypatch, bad):
+    """AC5: an unparsable checked_at — including an integer too big for a
+    float (OverflowError) — is not fresh: the probe runs exactly once."""
+    _set_installed(monkeypatch, INSTALLED)
+    stale_build._write_cache(
+        {
+            "schema": stale_build._CACHE_SCHEMA,
+            "checked_at": bad,
+            "installed_rev": INSTALLED,
+            "origin_rev": HEAD,
+            "behind": 3,
+            "status": "behind",
+        }
+    )
+    _net(monkeypatch, stale_on, ahead_by=8)
+    verdict = stale_build.warning()
+    assert stale_on["json"], f"checked_at={bad!r} must trigger a probe"
+    assert len(stale_on["json"]) == 2  # one probe: head + compare
+    assert verdict is not None and verdict.behind == 8
