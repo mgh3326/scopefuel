@@ -38,10 +38,12 @@ import struct
 import subprocess
 import termios
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .. import proctrack
 from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope, _parse_reset, _window_seconds
+from ..policy import load_config
 
 BINARY = os.environ.get("SCOPEFUEL_KIMI_BIN") or "kimi"
 TIMEOUT_S = 30.0
@@ -110,6 +112,55 @@ def _sessions_dir() -> Path:
     return _kimi_home() / "sessions"
 
 
+# task #966 — clone homes.  wrk 의 effort 고정 kimi 프로필(kimi-k3-low 등)은
+# bin/kimi-clone-home 이 만든 복제 홈을 KIMI_CODE_HOME 으로 받아 실행되므로, 그
+# 실행의 403 은 복제 홈의 sessions/ 에 남고 ~/.kimi-code 스캔은 못 본다 — M1 에서
+# 게이트를 통과시킨 바로 그 사각이다.  복제 홈의 기본 위치는
+# ${XDG_DATA_HOME:-~/.local/share}/kimi-code-{low,high,max} 이고
+# KIMI_CODE_{LOW,HIGH,MAX}_HOME 으로 옮길 수 있다.
+_CLONE_HOME_ENVS = (
+    ("KIMI_CODE_LOW_HOME", "kimi-code-low"),
+    ("KIMI_CODE_HIGH_HOME", "kimi-code-high"),
+    ("KIMI_CODE_MAX_HOME", "kimi-code-max"),
+)
+
+
+def _data_home() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base).expanduser()
+
+
+def _clone_homes() -> list[Path]:
+    homes = []
+    for env, dirname in _CLONE_HOME_ENVS:
+        override = os.environ.get(env)
+        homes.append(Path(override).expanduser() if override else _data_home() / dirname)
+    return homes
+
+
+def _extra_homes() -> list[Path]:
+    """``[kimi] extra_homes`` (config.toml) — 추가로 스캔할 kimi 홈들 (각 홈 아래 sessions/)."""
+    section = load_config().get("kimi")
+    homes = section.get("extra_homes") if isinstance(section, dict) else None
+    if not isinstance(homes, list):
+        return []
+    return [Path(home).expanduser() for home in homes if isinstance(home, str) and home.strip()]
+
+
+def _scan_roots() -> list[Path]:
+    """모든 kimi 홈의 sessions/ 루트 — 없는 디렉터리는 스캔부가 조용히 건너뛴다."""
+    roots = [_sessions_dir()] + [home / "sessions" for home in (*_clone_homes(), *_extra_homes())]
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = os.path.normpath(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
 _SESSION_LOG_MAX_AGE_S = 32 * 86400  # a lockout cannot outlive its 30d window
 _SESSION_LOG_TAIL_BYTES = 1_048_576
 _SESSION_LIMIT_ERR = re.compile(r"usage\s+limit", re.IGNORECASE)
@@ -119,6 +170,8 @@ _SESSION_LOG_ERR = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.
 _SESSION_LOG_ERR_CTX = re.compile(r"errorName=APIStatusError|provider\.auth_error|statusCode=403")
 # errorMessage may embed the JSON 403 body escaped — keep consuming escapes.
 _SESSION_ERRMSG = re.compile(r'errorMessage="(?P<msg>(?:[^"\\]|\\.)*)"')
+# ``--explain`` 진단에 실리는 오류 이름 — 본문이 아니라 필드 이름만.
+_SESSION_ERR_NAME = re.compile(r"errorName=(?P<name>[A-Za-z0-9_.]+)")
 # Window names are taken only from the error message itself, word-bounded —
 # a bare "7d" substring appears in hex traceIds and classifies wrong.
 _LOCKOUT_MONTHLY = re.compile(r"\bmonth", re.IGNORECASE)
@@ -559,14 +612,15 @@ def parse(text: str) -> ProviderResult:
     )
 
 
-def _wire_lockout(line: str) -> tuple[str, dt.datetime | None] | None:
+def _wire_lockout(line: str) -> tuple[str, dt.datetime | None, str] | None:
     """Structured auth_error record from a wire.jsonl line, or None.
 
     Transcript and tool-output records quote the same words — only the
     protocol's error fields count: ``error.code == "provider.auth_error"`` or
     a top-level message that starts with ``[provider.auth_error]``.  The
     timestamp comes from the record's ``time`` field, never from ISO text
-    embedded mid-blob.
+    embedded mid-blob.  The third element is the error *name* only —
+    record contents never leave this function.
     """
     try:
         record = json.loads(line)
@@ -591,18 +645,21 @@ def _wire_lockout(line: str) -> tuple[str, dt.datetime | None] | None:
             ts = dt.datetime.fromtimestamp(raw_time / 1000, dt.UTC)
         except (OSError, OverflowError, ValueError):
             ts = None
-    return message, ts
+    return message, ts, "provider.auth_error"
 
 
-def _log_lockout(line: str) -> tuple[str, dt.datetime | None] | None:
+def _log_lockout(line: str) -> tuple[str, dt.datetime | None, str] | None:
     """A provider quota failure from a kimi-code.log line, or None.
 
     Requires the anchored ``<ISO>Z WARN/ERROR`` record shape plus an auth/403
     context marker, and reads the window only from the ``errorMessage`` value —
-    text quoted elsewhere in the file cannot qualify.
+    text quoted elsewhere in the file cannot qualify.  The third element is the
+    error *name* only (errorName= value or the matched context marker) —
+    record contents never leave this function.
     """
     head = _SESSION_LOG_ERR.match(line)
-    if head is None or not _SESSION_LOG_ERR_CTX.search(line):
+    ctx = _SESSION_LOG_ERR_CTX.search(line) if head is not None else None
+    if head is None or ctx is None:
         return None
     msg_match = _SESSION_ERRMSG.search(line)
     message = msg_match["msg"] if msg_match else ""
@@ -612,7 +669,8 @@ def _log_lockout(line: str) -> tuple[str, dt.datetime | None] | None:
         ts: dt.datetime | None = dt.datetime.fromisoformat(head["ts"] + "+00:00")
     except ValueError:
         ts = None
-    return message, ts
+    name = _SESSION_ERR_NAME.search(line)
+    return message, ts, name["name"] if name else ctx.group(0)
 
 
 def _lockout_window(message: str) -> str | None:
@@ -627,8 +685,8 @@ def _lockout_window(message: str) -> str | None:
     return None
 
 
-def _scan_quota_errors(path: Path, *, fallback_ts: dt.datetime) -> list[tuple[dt.datetime, str | None]]:
-    """(timestamp, window-kind) pairs for provider usage-limit errors in one file."""
+def _scan_quota_errors(path: Path, *, fallback_ts: dt.datetime) -> list[tuple[dt.datetime, str | None, str]]:
+    """(timestamp, window-kind, error-name) tuples for usage-limit errors in one file."""
     try:
         with path.open("rb") as fh:
             if path.stat().st_size > _SESSION_LOG_TAIL_BYTES:
@@ -642,36 +700,98 @@ def _scan_quota_errors(path: Path, *, fallback_ts: dt.datetime) -> list[tuple[dt
         hit = extractor(line)
         if hit is None:
             continue
-        message, ts = hit
-        hits.append((ts or fallback_ts, _lockout_window(message)))
+        message, ts, err = hit
+        hits.append((ts or fallback_ts, _lockout_window(message), err))
     return hits
+
+
+@dataclass
+class _RootScan:
+    """한 sessions 루트의 스캔 결과 — 경로·개수·시각만, 기록 본문은 절대 없다."""
+
+    root: Path
+    exists: bool
+    files: int = 0  # 패턴에 맞은 기록 파일 수
+    scanned: int = 0  # 그중 신선도 창(_SESSION_LOG_MAX_AGE_S) 안의 파일 수
+    newest_mtime: dt.datetime | None = None
+
+
+@dataclass
+class _LockoutHit:
+    """창 종류별 최신 관측 — 시각과 오류 이름뿐, 본문 없음."""
+
+    ts: dt.datetime
+    error: str
+
+
+def _lockout_scan(now: dt.datetime) -> tuple[list[_RootScan], dict[str | None, _LockoutHit]]:
+    """모든 kimi 홈의 sessions/ 를 스캔해 루트별 결과와 창별 최신 hit 을 돌려준다."""
+    min_mtime = now.timestamp() - _SESSION_LOG_MAX_AGE_S
+    roots: list[_RootScan] = []
+    latest: dict[str | None, _LockoutHit] = {}
+    for root in _scan_roots():
+        rep = _RootScan(root=root, exists=root.is_dir())
+        roots.append(rep)
+        if not rep.exists:
+            continue
+        for pattern in ("*/*/logs/kimi-code.log", "*/*/agents/*/wire.jsonl"):
+            for path in root.glob(pattern):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                rep.files += 1
+                mtime = dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC)
+                if rep.newest_mtime is None or mtime > rep.newest_mtime:
+                    rep.newest_mtime = mtime
+                if stat.st_mtime < min_mtime:
+                    continue
+                rep.scanned += 1
+                for ts, kind, err in _scan_quota_errors(path, fallback_ts=mtime):
+                    cur = latest.get(kind)
+                    if cur is None or ts > cur.ts:
+                        latest[kind] = _LockoutHit(ts=ts, error=err)
+    return roots, latest
 
 
 def _observed_lockouts(now: dt.datetime) -> dict[str | None, dt.datetime]:
     """Latest observed provider usage-limit error per window kind.
 
     Reads only the timestamped records the CLI already writes (never
-    credentials or config).  Files untouched for longer than the longest
-    lockout window cannot describe a current window and are skipped.
+    credentials or config) — across every kimi home this host may have run
+    under (primary, clone homes, configured extras).  Files untouched for
+    longer than the longest lockout window cannot describe a current window
+    and are skipped.
     """
-    root = _sessions_dir()
-    if not root.is_dir():
-        return {}
-    min_mtime = now.timestamp() - _SESSION_LOG_MAX_AGE_S
-    latest: dict[str | None, dt.datetime] = {}
-    for pattern in ("*/*/logs/kimi-code.log", "*/*/agents/*/wire.jsonl"):
-        for path in root.glob(pattern):
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if stat.st_mtime < min_mtime:
-                continue
-            fallback = dt.datetime.fromtimestamp(stat.st_mtime, dt.UTC)
-            for ts, kind in _scan_quota_errors(path, fallback_ts=fallback):
-                if kind not in latest or ts > latest[kind]:
-                    latest[kind] = ts
-    return latest
+    return {kind: hit.ts for kind, hit in _lockout_scan(now)[1].items()}
+
+
+def _classify_lockout(
+    kind: str | None, ts: dt.datetime, buckets: list[Bucket], now: dt.datetime
+) -> tuple[str, Bucket | None]:
+    """한 관측 오류의 처분 — _apply_observed_lockouts 와 --explain 이 같은 규칙을 공유한다.
+
+    ``exhausted`` — 현재 창 안의 잠금(덮어쓸 bucket 과 함께).
+    ``stale`` — 이미 리셋된 지난 창의 잠금, 무시.
+    ``unmeasurable`` — 현재일 수 있는데 패널이 창을 못 잡는다, 실패 폐쇄.
+    ``ignored`` — 창 이름이 없고 현재 창일 수 없는(24h 이상 지난) 오류.
+    """
+    window = _LOCKOUT_WINDOW.get(kind or "")
+    if window is None:
+        # The error text does not name a window — if it is plausibly
+        # current the whole reading is unmeasurable rather than guessed.
+        return ("unmeasurable", None) if ts >= now - dt.timedelta(hours=24) else ("ignored", None)
+    bucket = next((b for b in buckets if b.window == window), None)
+    window_s = _window_seconds(window) or 0.0
+    reset_dt = _parse_reset(bucket.resets_at) if bucket is not None else None
+    if reset_dt is not None and bucket is not None:
+        window_start = reset_dt - dt.timedelta(seconds=window_s)
+        # stale: the 403 belongs to a window that already reset
+        return ("stale", bucket) if ts < window_start else ("exhausted", bucket)
+    if ts >= now - dt.timedelta(seconds=window_s):
+        # The panel cannot bound the window this error belongs to.
+        return "unmeasurable", bucket
+    return "stale", bucket
 
 
 def _apply_observed_lockouts(result: ProviderResult, *, now: dt.datetime | None = None) -> ProviderResult:
@@ -703,29 +823,63 @@ def _apply_observed_lockouts(result: ProviderResult, *, now: dt.datetime | None 
         )
 
     for kind, ts in sorted(observed.items(), key=lambda item: str(item[0])):
-        window = _LOCKOUT_WINDOW.get(kind or "")
-        if window is None:
-            # The error text does not name a window — if it is plausibly
-            # current the whole reading is unmeasurable rather than guessed.
-            if ts >= now - dt.timedelta(hours=24):
-                return unmeasurable(kind, ts)
-            continue
-        bucket = next((b for b in result.buckets if b.window == window), None)
-        window_s = _window_seconds(window) or 0.0
-        reset_dt = _parse_reset(bucket.resets_at) if bucket is not None else None
-        if reset_dt is not None and bucket is not None:
-            window_start = reset_dt - dt.timedelta(seconds=window_s)
-            if ts < window_start:
-                continue  # stale: the 403 belongs to a window that already reset
-            bucket.used_pct = 100.0
-            bucket.note = (
-                (bucket.note + " · ") if bucket.note else ""
-            ) + f"provider 'usage limit' 오류 관측 {ts.isoformat()} — 패널 수치 대신 소진 처리"
-            continue
-        if ts >= now - dt.timedelta(seconds=window_s):
-            # The panel cannot bound the window this error belongs to.
+        decision, bucket = _classify_lockout(kind, ts, result.buckets, now)
+        if decision == "unmeasurable":
             return unmeasurable(kind, ts)
+        if decision != "exhausted" or bucket is None:
+            continue
+        # task #966 — 덮어쓴 창은 locked 표시를 얻어 소진 판정이 severity·verdict·
+        # gate 까지 같은 답으로 전파된다(spend 풀의 고사용 면제를 건너뛴다).
+        # 패널의 'used N%' 노트는 거짓이므로 관측 문장으로 대체하고
+        # 'resets in …' 힌트만 남긴다 — 'used 0%' 옆의 소진 표기는 또 다른 오독이다.
+        bucket.used_pct = 100.0
+        bucket.locked = True
+        _head, sep, tail = (bucket.note or "").partition(";")
+        bucket.note = f"provider 'usage limit' 오류 관측 {ts.isoformat()} — 패널 수치 대신 소진 처리" + (
+            sep + tail if sep else ""
+        )
     return result
+
+
+def explain_lockout_scan(result: ProviderResult | None = None, *, now: dt.datetime | None = None) -> str:
+    """``kimi lockout scan`` 진단 블록 (--explain).
+
+    각 스캔 루트(경로·존재·파일 수·최신 mtime), 창별 최신 hit 의 ISO 시각과
+    오류 이름, 그리고 판정 결과를 보여준다. 세션 기록 본문은 어떤 형태로도
+    출력하지 않는다 — 데스크가 '왜 못 잡았나'를 답하는 명령이므로.
+    """
+    now = now or dt.datetime.now(dt.UTC)
+    roots, hits = _lockout_scan(now)
+    lines = ["kimi lockout scan"]
+    for rep in roots:
+        if not rep.exists:
+            lines.append(f"  root {rep.root} exists=no")
+            continue
+        newest = rep.newest_mtime.isoformat() if rep.newest_mtime is not None else "-"
+        lines.append(f"  root {rep.root} exists=yes files={rep.files} scanned={rep.scanned} newest={newest}")
+    if not hits:
+        lines.append("  decision: no usage-limit records")
+        return "\n".join(lines)
+    # 판정은 현재 읽힌 결과의 창에 대해 재계산한다 — hit 시각·창 규칙은 같다.
+    buckets = result.buckets if result is not None and result.error is None else []
+    decisions: list[tuple[str | None, str]] = []
+    for kind, hit in sorted(hits.items(), key=lambda item: str(item[0])):
+        decision, _bucket = _classify_lockout(kind, hit.ts, buckets, now)
+        decisions.append((kind, decision))
+        lines.append(
+            f"  hit {kind or 'unknown'} newest={hit.ts.isoformat()} error={hit.error} decision={decision}"
+        )
+    first_block = next(
+        (f"unmeasurable ({kind or 'unknown'})" for kind, d in decisions if d == "unmeasurable"),
+        None,
+    )
+    if first_block is not None:
+        lines.append(f"  decision: {first_block}")
+    elif exhausted := [str(kind) for kind, d in decisions if d == "exhausted"]:
+        lines.append(f"  decision: exhausted {', '.join(exhausted)}")
+    else:
+        lines.append("  decision: no current lockout")
+    return "\n".join(lines)
 
 
 def _clean(text: str) -> str:

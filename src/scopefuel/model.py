@@ -126,6 +126,10 @@ class Bucket:
     scope: Scope = field(default_factory=lambda: Scope("account"))
     horizon: Horizon = "week"
     note: str | None = None
+    # task #966 — 세션 기록에서 관측된 provider 잠금(403 usage limit).
+    # '사용률이 높다'가 아니라 'provider 가 거부한다'이므로 spend 풀의 고사용
+    # 면제(severity/mark ok, exhausted 비움)를 타지 않고 실소진으로 전파된다.
+    locked: bool = False
 
     @property
     def remaining_pct(self) -> float | None:
@@ -136,7 +140,7 @@ class Bucket:
 
     @property
     def mark(self) -> Mark:
-        return mark_for(self.used_pct)
+        return "crit" if self.locked else mark_for(self.used_pct)
 
     @property
     def pace(self) -> Pace:
@@ -148,7 +152,7 @@ class Bucket:
     def as_dict(self, pool_class: PoolClass = "preserve", *, now: dt.datetime | None = None) -> dict:
         pace = self.pace_at(now)
         used = self.used_pct if _is_valid_used_pct(self.used_pct) else None
-        return {
+        out = {
             "label": self.label,
             "window": self.window,
             "horizon": self.horizon,
@@ -159,9 +163,14 @@ class Bucket:
             "full_use_rate_unit": pace.full_use_rate_unit,
             "resets_at": self.resets_at,
             "scope": self.scope.as_dict(),
-            "severity": mark_for(used, pool_class),
+            "severity": "crit" if self.locked else mark_for(used, pool_class),
             "note": self.note,
         }
+        if self.locked:
+            # 소진 근거(관측 잠금)는 캐시/공유 스냅샷을 넘어도 살아 있어야 한다 —
+            # rederive 되는 severity/mark 와 같은 payload 에 실어 보낸다.
+            out["locked"] = True
+        return out
 
 
 @dataclass
@@ -488,13 +497,25 @@ def verdict_for(
         pool = [b.used_pct or 0.0 for b in known if b.horizon == horizon and b.scope.kind != "model"]
         return max(pool) if pool else None
 
-    exhausted = (
-        []
-        if pool_class == "spend"
-        else [b for b in known if b.scope.kind != "account" and (b.used_pct or 0.0) >= CRIT_PCT]
-    )
+    # task #966 — 관측된 provider 잠금(locked)은 실소진이다. spend 풀의
+    # '고사용은 차단이 아니다' 면제는 사용률 규칙이지 거부 규칙이 아니므로,
+    # 잠긴 bucket 은 class·scope 무관하게 exhausted 에 오른다.
+    locked = [b for b in known if b.locked]
+    exhausted = list(locked)
+    if pool_class != "spend":
+        exhausted += [
+            b for b in known if not b.locked and b.scope.kind != "account" and (b.used_pct or 0.0) >= CRIT_PCT
+        ]
     waste, waste_advice = waste_for(buckets, pool_class, now=now)
-    usage_mark = mark_for(blocking, pool_class)
+    # 차단 기준 스코프가 전부 잠기면 사용률 축도 소진(crit)이다 — 계정 잠금은
+    # 그 창의 모든 요청 거부이고, 모든 그룹이 잠긴 독립-그룹 풀도 마찬가지다.
+    if basis == "account":
+        blocking_locked = any(b.scope.kind == "account" for b in locked)
+    elif basis == "group":
+        blocking_locked = bool(groups) and {b.scope.label for b in locked} >= set(groups)
+    else:
+        blocking_locked = False
+    usage_mark: Mark = "crit" if blocking_locked else mark_for(blocking, pool_class)
     return Verdict(
         now_pct=axis("now"),
         week_pct=axis("week"),
