@@ -1014,3 +1014,77 @@ def test_expired_worker_makes_no_compare_call_after_release(stale_on, monkeypatc
     time.sleep(0.4)
     assert [u for u in urls if "/compare/" in u] == [], urls
     assert stale_build._read_cache()["status"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# task #990 — each expired check is pinned by its own test; a failed fdopen
+# may already have closed the mkstemp fd
+# ---------------------------------------------------------------------------
+
+
+def test_expired_at_the_head_check_records_skipped(stale_on, monkeypatch):
+    """SHOULD-1 (outer check): a worker that finds ``expired`` already set when
+    the head resolves reports skipped — without that check the abandoned
+    probe's late result lands in the cache as a real verdict."""
+    _set_installed(monkeypatch, INSTALLED)
+    _net(monkeypatch, stale_on, ahead_by=9)
+    real_probe = stale_build._probe
+
+    class Expired:
+        def is_set(self) -> bool:
+            return True
+
+        def set(self) -> None:
+            pass
+
+    monkeypatch.setattr(stale_build, "_probe", lambda inst, dl, ev: real_probe(inst, dl, Expired()))
+    assert stale_build.warning() is None
+    assert stale_build._read_cache()["status"] == "skipped"
+
+
+def test_expired_between_the_checks_never_calls_compare(stale_on, monkeypatch):
+    """SHOULD-1 (inner check), adopted from the #981 tester's window test:
+    ``expired.is_set`` reads False at the head check but True by the compare
+    guard — the sequence must stop before the compare call."""
+    _set_installed(monkeypatch, INSTALLED)
+    _net(monkeypatch, stale_on, ahead_by=9)
+    real_probe = stale_build._probe
+
+    class Flip:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def is_set(self) -> bool:
+            self.n += 1
+            return self.n >= 2  # head check reads False, compare guard True
+
+        def set(self) -> None:
+            pass
+
+    monkeypatch.setattr(stale_build, "_probe", lambda inst, dl, ev: real_probe(inst, dl, Flip()))
+    stale_build.warning()
+    assert [url for url, _ in stale_on["json"] if "/compare/" in url] == [], stale_on["json"]
+
+
+def test_fdopen_that_closed_the_fd_is_not_closed_again(stale_on, monkeypatch):
+    """#990: when the failed fdopen already closed the mkstemp fd, the error
+    path must not os.close it again — the number could name a reused fd."""
+    closed: list[int] = []
+    real_close = os.close
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def closing_fdopen(fd: int, mode: str = "r"):
+        real_close(fd)  # fdopen took ownership, then failed
+        raise OSError("fdopen")
+
+    monkeypatch.setattr(os, "fdopen", closing_fdopen)
+    monkeypatch.setattr(os, "close", tracking_close)
+    before = _open_fds()
+    stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "status": "skipped"})
+    assert closed == [], f"mkstemp fd closed again after fdopen released it: {closed}"
+    assert _open_fds() == before
+    assert list(stale_build._cache_path().parent.glob("*.tmp")) == []
+    assert not stale_build._cache_path().exists()

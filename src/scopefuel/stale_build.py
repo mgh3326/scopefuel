@@ -348,18 +348,25 @@ def _write_cache(entry: dict[str, Any]) -> None:
         try:
             fh = os.fdopen(fd, "w")
         except OSError:
-            # fdopen never took ownership of the mkstemp fd — close it here.
-            os.close(fd)
+            # fdopen may already have closed the mkstemp fd — close it only if
+            # it is still open; a blind os.close could hit a reused fd number.
+            try:
+                os.fstat(fd)
+            except OSError:
+                pass
+            else:
+                os.close(fd)
             raise
         with fh:
             fh.write(payload)
-        tmp.chmod(0o600)
+        tmp.chmod(0o600)  # defensive: mkstemp already creates 0600
         os.replace(tmp, path)
     except OSError:
         if tmp is not None:
             with contextlib.suppress(OSError):
                 tmp.unlink()
         # a cache write failure must not break the check
+        # (a directory at path cannot be replaced — every command re-probes)
 
 
 def _cache_verdict(cached: dict[str, Any]) -> Verdict | None:
