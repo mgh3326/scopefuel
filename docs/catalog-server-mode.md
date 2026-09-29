@@ -117,13 +117,17 @@ rows=59 profiles=37
 The same report doubles as the fleet machine check:
 
 ```console
-$ scopefuel bench catalog status --check   # rc 0 only when the served view is catalog=server
+$ scopefuel bench catalog status --check   # rc 0 when the served view is the canon
 ```
 
-`--check` exits 0 only when the served view's source is `server`, and exits 2
-— printing the label that names the state — for a local backend, `cache`,
-`cache-stale`, `snapshot` or `unsupported`. A host silently left in local mode
-is a red line, not a quiet default.
+`--check` exits 0 when the served view's source is `server`, or `cache`
+inside `catalog_ttl_s` with an empty `detail` — a healthy host answers from
+the cache between refetches without contacting the server at all, so a fresh
+clean cache *is* the canon for the fleet check. It exits 2 — printing the
+label that names the state — for a local backend, `cache-stale`, `snapshot`,
+`unsupported`, and any cache serving only because the server refused its
+catalog or was unreachable (a `detail`-carrying or TTL-expired cache). A host
+silently left in local mode is a red line, not a quiet default.
 
 Opt a host out with an explicit `[bench] backend = "local"`.
 

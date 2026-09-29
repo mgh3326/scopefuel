@@ -1035,3 +1035,52 @@ def test_catalog_status_check_exits_two_on_a_rejected_catalog(catalog_server, ca
     assert rc == 2
     assert "server catalog rejected" in captured.out
     assert "check failed: catalog=stale (server catalog rejected:" in captured.err
+
+
+def test_catalog_status_check_exits_zero_on_a_fresh_cache(catalog_server, capsys):
+    """AC5 (corrected): a healthy host answers from the cache between
+    refetches — source ``cache`` inside ``catalog_ttl_s`` with nothing
+    degraded about it is the canon as far as the fleet check cares."""
+
+    bench.read_catalog()  # prime the cache, then drop the memo
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "catalog=cache" in captured.out
+
+
+def test_catalog_status_check_exits_two_on_a_rejection_served_cache(catalog_server, capsys):
+    """AC5 (corrected): a cache serving only because the server refused its
+    catalog carries the rejection on ``detail`` — degraded, not canon."""
+
+    _, fake = catalog_server
+    bench.read_catalog()  # prime with the full seed
+    _age_catalog_cache(3601)  # past the 1h TTL, inside the 24h stale ceiling
+    fake.catalog = [_row("opus", "high", "claude-opus-5-5", "claude", "S+")]
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "server catalog rejected" in captured.out
+    assert "check failed: catalog=cache" in captured.err
+    assert "server catalog rejected" in captured.err
+
+
+def test_catalog_status_check_exits_two_on_an_unreachable_served_cache(catalog_server, capsys):
+    """AC5 (corrected): a cache older than the TTL is served only because the
+    server is unreachable — empty ``detail`` still fails the check on age."""
+
+    _, fake = catalog_server
+    bench.read_catalog()
+    _age_catalog_cache(3601)
+    fake.offline = True
+    bench.reset_catalog_memo()
+
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "catalog=cache (age 1.0h)" in captured.out
+    assert "check failed: catalog=cache (age 1.0h)" in captured.err

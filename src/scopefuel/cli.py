@@ -288,8 +288,8 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     catalog_status.add_argument(
         "--check",
         action="store_true",
-        help="기계 판정 — served catalog source 가 server 일 때만 rc 0, 그 외 rc 2 "
-        "(local backend·cache·cache-stale·snapshot·unsupported)",
+        help="기계 판정 — served view 가 server 이거나 catalog_ttl_s 이내의 깨끗한 cache 일 때만 rc 0, "
+        "그 외 rc 2 (local backend·degraded cache·cache-stale·snapshot·unsupported)",
     )
 
     reps_parser = subparsers.add_parser("reps", help="실측 대표 실행 기록")
@@ -1355,11 +1355,22 @@ def _bench_command(args: argparse.Namespace) -> int:
             print(bench.catalog_status_report())
             if not args.check:
                 return 0
-            # Machine check: only a view actually served by the canon passes —
-            # a local backend, a cache (fresh or stale), the snapshot or an
-            # unsupported route all mean this host is not reading the canon.
+            # Machine check: only a view the canon may as well have served
+            # passes — a live fetch (server) or a fresh clean cache, since a
+            # healthy host answers from the cache inside catalog_ttl_s without
+            # contacting the server at all. Every degraded state fails: a
+            # local backend, cache-stale, the snapshot, an unsupported route,
+            # and any cache carried only because the server refused its
+            # catalog or was unreachable (detail set, or aged past the TTL).
             view = bench.read_catalog()
             if view.source == bench.CATALOG_SOURCE_SERVER:
+                return 0
+            if (
+                view.source == bench.CATALOG_SOURCE_CACHE
+                and not view.detail
+                and view.age_s is not None
+                and view.age_s < bench.bench_backend(use="catalog").catalog_ttl_s
+            ):
                 return 0
             print(f"check failed: {view.label}", file=sys.stderr)
             return 2
