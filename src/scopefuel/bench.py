@@ -24,7 +24,7 @@ from dataclasses import dataclass, replace
 from typing import TextIO
 
 from .http import HttpError, request_json
-from .policy import load_config
+from .policy import config_path, config_problem, load_config
 
 AA_API_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 API_KEY_ENV = "ARTIFICIAL_ANALYSIS_API_KEY"
@@ -2722,10 +2722,21 @@ def _catalog_rows_from_json(payload: object) -> list[CatalogEntry]:
     return [_catalog_from_wire(row) for row in rows]
 
 
-def push_catalog(source: pathlib.Path | str, *, path: pathlib.Path | str | None = None) -> int:
-    """Write catalog rows to handoffkeep (operator token) and refresh the cache."""
+def push_catalog(
+    source: pathlib.Path | str,
+    *,
+    path: pathlib.Path | str | None = None,
+    allow_plaintext_http: bool = False,
+) -> int:
+    """Write catalog rows to handoffkeep (operator token) and refresh the cache.
 
-    backend = bench_backend(use="catalog")
+    ``allow_plaintext_http`` is the same per-call, non-persistent opt-in
+    ``reps migrate`` carries (task #1024): it lets a desk seed the catalog over
+    a private plaintext tunnel before the persistent ``allow_plaintext_catalog``
+    config key exists, and it is never written anywhere.
+    """
+
+    backend = bench_backend(use="catalog", allow_plaintext_http=allow_plaintext_http)
     if backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchError(
             "bench push-catalog requires the handoffkeep backend "
@@ -2839,6 +2850,12 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
             f"note: HANDOFFKEEP_CONFIG points at {override}, which does not exist; "
             "the default ~/.config/handoffkeep/config.env is NOT consulted while it is set"
         )
+    # #1024: a broken config.toml silently drops every [bench] key on the host
+    # (backend pin, TTLs, plaintext opt-ins) — the load warns once on stderr,
+    # and this line is the report's own copy so `status` cannot look healthy.
+    problem = config_problem()
+    if problem is not None:
+        lines.append(f"blocked: {config_path()} {problem}: every setting in it is ignored until it is fixed")
     if backend.reason == "auto-local-insecure-url":
         lines.append(
             "blocked: handoffkeep credentials exist but the URL is plaintext http to a "
