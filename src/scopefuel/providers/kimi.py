@@ -182,6 +182,22 @@ _SESSION_ERR_NAME = re.compile(r"(?<!\S)errorName=(?P<name>[A-Za-z0-9_.]{1,64})(
 # _SESSION_ERRMSG 와 같은 본문 규칙). errorMessage 만이 아니라 어떤 따옴표
 # 필드든 같은 삽입 경로가 된다 (#966 fix round 2, tester BLOCKER 1a).
 _SESSION_QUOTED_FIELD = re.compile(r'\w+="(?:[^"\\]|\\.)*"')
+# --explain error= allowlist, not a shape rule: even a perfectly
+# token-shaped errorName= value prints only when it is a name a kimi 403 /
+# usage-limit record is known to carry (#966 round-4: look-alike quote
+# delimiters still let an arbitrary token through the shape check).  A new
+# name enters this set only from a real record seen by the operator, added
+# by PR — never widened speculatively.
+_SESSION_ERR_NAMES = frozenset(
+    {
+        "APIStatusError",  # tests/fixtures/kimi_session_weekly_lockout_log.txt
+        # the other status-error class names of the same SDK family
+        "APIError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "RateLimitError",
+    }
+)
 # Window names are taken only from the error message itself, word-bounded —
 # a bare "7d" substring appears in hex traceIds and classifies wrong.
 _LOCKOUT_MONTHLY = re.compile(r"\bmonth", re.IGNORECASE)
@@ -691,7 +707,10 @@ def _log_lockout(line: str) -> tuple[str, dt.datetime | None, str] | None:
     # name cannot be trusted, so the fixed context marker applies.
     rest = _SESSION_QUOTED_FIELD.sub("", line)
     name = None if ('"' in rest or "'" in rest) else _SESSION_ERR_NAME.search(rest)
-    return message, ts, name["name"] if name else ctx.group(0)
+    # Round 4 (allowlist): a well-formed but unknown name fails closed to the
+    # fixed context marker exactly like a non-match — the shape of the token
+    # is never what lets it print.
+    return message, ts, name["name"] if name and name["name"] in _SESSION_ERR_NAMES else ctx.group(0)
 
 
 def _lockout_window(message: str) -> str | None:
