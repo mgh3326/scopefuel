@@ -1415,3 +1415,133 @@ def test_r3_worst_end_to_end_unterminated_after_msg(tmp_path, monkeypatch, capsy
     assert rc == 0
     assert SMUGGLE_SENTINEL not in out.out
     assert SMUGGLE_SENTINEL not in out.err
+
+
+# ------------------------------------------------------------------ #978
+# _scan_quota_errors splits a session record file on LF only.  str.splitlines()
+# also breaks on CR, VT, FF, NEL, U+2028, U+2029 and U+001C-U+001E — a real 403
+# whose errorMessage carried one raw (the provider body echoed unescaped) was
+# cut in two, its quoted message span left unterminated, and the weekly
+# lockout was missed.  Synthetic record lines only — never a real record.
+
+# Every str.splitlines() break besides LF — none may split a record it sits in.
+EMBEDDED_SEPARATORS = ["\u2028", "\u2029", "\u0085", "\x0c", "\x0b", "\x1c", "\x1d", "\x1e", "\r"]
+EMBEDDED_SEPARATOR_IDS = ["U+" + format(ord(c), "04X") for c in EMBEDDED_SEPARATORS[:-1]] + ["CR"]
+
+
+@pytest.mark.parametrize("sep", EMBEDDED_SEPARATORS, ids=EMBEDDED_SEPARATOR_IDS)
+def test_separator_inside_error_message_does_not_hide_log_lockout(tmp_path, monkeypatch, sep):
+    """AC1 — a separator raw inside a log record's errorMessage must not cut
+    the record: under splitlines() the line broke in two, the quoted span went
+    unterminated, and a real weekly lockout was missed."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    _write_session_log(
+        tmp_path,
+        f"{ts}Z WARN  llm request failed  errorName=APIStatusError "
+        f'errorMessage="403 You\'ve reached your weekly (7-day) usage{sep}limit." statusCode=403\n',
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    _assert_weekly_locked_out(checked, now)
+
+
+@pytest.mark.parametrize("sep", EMBEDDED_SEPARATORS, ids=EMBEDDED_SEPARATOR_IDS)
+def test_separator_inside_wire_message_does_not_hide_lockout(tmp_path, monkeypatch, sep):
+    """AC2 — the same through the wire.jsonl extractor.  The record is emitted
+    the way a real JSONL writer emits it (json.dumps, ensure_ascii=False): the
+    U+2028/U+2029/U+0085 separators land in the file raw — exactly the bytes
+    splitlines() used to cut — while the ASCII control separators are escaped
+    by any conforming writer (a truly raw one is unparseable JSON, fail-closed
+    under either split rule), so the message string still carries the char."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ms = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    path = tmp_path / "wd_test" / "session_x" / "agents" / "main"
+    path.mkdir(parents=True)
+    (path / "wire.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "turn.ended",
+                "agentId": "main",
+                "turnId": 0,
+                "reason": "failed",
+                "error": {
+                    "code": "provider.auth_error",
+                    "message": f"403 You've reached your weekly{sep}(7-day) usage limit.",
+                },
+                "time": ms,
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [(b.label, b.used_pct) for b in checked.buckets] == [("5h", 0.0), ("weekly", 100.0)]
+
+
+def test_wire_line_with_raw_control_separator_stays_unparseable(tmp_path, monkeypatch):
+    """Fail-closed boundary of AC2: a truly raw ASCII control separator inside
+    a wire record's JSON string can never be a parseable record — strict
+    json.loads refuses it, so the scan misses it under split('\\n') exactly as
+    it did under splitlines().  Nothing is resurrected and nothing crashes."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ms = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    path = tmp_path / "wd_test" / "session_x" / "agents" / "main"
+    path.mkdir(parents=True)
+    (path / "wire.jsonl").write_bytes(
+        (
+            '{"type":"turn.ended","error":{"code":"provider.auth_error",'
+            '"message":"403 weekly \x0busage limit."},"time":' + str(ms) + "}\n"
+        ).encode()
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+
+    assert checked.error is None
+    assert [b.used_pct for b in checked.buckets] == [0.0, 0.0]
+    assert all(not b.locked for b in checked.buckets)
+
+
+def test_crlf_and_lf_log_files_scan_identically(tmp_path):
+    """AC3 — CRLF termination scans exactly like LF: splitting on LF and
+    stripping one trailing CR keeps each record whole, so both files yield
+    the same (timestamp, window, error-name) tuples."""
+    now = dt.datetime.now(dt.UTC)
+    line = _session_log_at(now - dt.timedelta(hours=1))
+    lf_file = tmp_path / "kimi-lf.log"
+    crlf_file = tmp_path / "kimi-crlf.log"
+    lf_file.write_bytes((line + "\n").encode())
+    crlf_file.write_bytes((line + "\r\n").encode())
+    fallback = dt.datetime.fromtimestamp(lf_file.stat().st_mtime, dt.UTC)
+
+    lf_hits = kimi._scan_quota_errors(lf_file, fallback_ts=fallback)
+    crlf_hits = kimi._scan_quota_errors(crlf_file, fallback_ts=fallback)
+
+    assert lf_hits == crlf_hits
+    assert [kind for _, kind, _ in lf_hits] == ["weekly"]
+
+
+def test_tail_cut_mid_line_still_parses_whole_lines_after_it(tmp_path):
+    """AC4 — a file bigger than the tail window starts reading mid-line: the
+    fragment is inert and every whole line after the cut parses exactly as
+    before, so the lockout record at the tail is still found."""
+    now = dt.datetime.now(dt.UTC)
+    lockout = _session_log_at(now - dt.timedelta(hours=1))
+    filler = "x" * kimi._SESSION_LOG_TAIL_BYTES
+    path = tmp_path / "kimi-code.log"
+    path.write_bytes((filler + "\n" + lockout + "\n").encode())
+    fallback = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.UTC)
+
+    hits = kimi._scan_quota_errors(path, fallback_ts=fallback)
+
+    assert [kind for _, kind, _ in hits] == ["weekly"]
+    assert hits[0][0] != fallback  # timestamp read from the record, not the fallback

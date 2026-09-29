@@ -717,8 +717,13 @@ def _scan_quota_errors(path: Path, *, fallback_ts: dt.datetime) -> list[tuple[dt
         return []
     extractor = _wire_lockout if path.name == "wire.jsonl" else _log_lockout
     hits = []
-    for line in data.splitlines():
-        hit = extractor(line)
+    # LF is the only record boundary.  str.splitlines() would also cut on CR,
+    # VT, FF, NEL, U+2028/U+2029 and U+001C-U+001E — a raw one inside a
+    # record's quoted message span left it unterminated and the whole record
+    # no longer qualified, hiding a real lockout (#978).  One trailing CR is
+    # stripped so a CRLF file scans exactly like the LF version.
+    for line in data.split("\n"):
+        hit = extractor(line.removesuffix("\r"))
         if hit is None:
             continue
         message, ts, err = hit
