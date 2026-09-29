@@ -1315,3 +1315,103 @@ def test_r2_realpath_dedupe_shapes(tmp_path, monkeypatch):
     assert sum("exists=yes files=1" in ln for ln in root_lines) == 1
     assert sum("does-not-exist" in ln for ln in root_lines) == 1
     assert any(str(dangling / "sessions") in ln and "exists=no" in ln for ln in root_lines)
+
+
+# --- #966 fix round 3 — unterminated/single-quoted quoting shapes fail
+# closed to the fixed context marker (tester BLOCKER 1c).
+
+R3_CASES = {
+    # escaped quote inside another quoted field, then errorName=
+    "escaped-quote-other-field": '{ts}Z WARN  x  errorBody="a \\" errorName={s}" '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    # unterminated quote BEFORE the message (strip swallows up to errorMessage=")
+    "unterminated-before-msg": '{ts}Z WARN  x  errorBody="a errorName={s} '
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    # unterminated quote AFTER a valid message span: line still qualifies
+    "unterminated-after-msg-eol": '{ts}Z WARN  x  errorMessage="403 weekly usage limit" '
+    'statusCode=403 errorBody="a errorName={s}\n',
+    "unterminated-after-msg-mid": '{ts}Z WARN  x  errorMessage="403 weekly usage limit" '
+    'statusCode=403 errorBody="a errorName={s} tail\n',
+    # single-quoted field (brief shape, then with inner spaces)
+    "single-quoted": "{ts}Z WARN  x  errorBody='errorName={s}' "
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    "single-quoted-spaced": "{ts}Z WARN  x  errorBody='a errorName={s} b' "
+    'errorMessage="403 weekly usage limit" statusCode=403\n',
+    # JSON-style field inside the message
+    "json-style-in-msg": '{ts}Z WARN  x  errorMessage="403 weekly usage limit {{\\"errorName\\":\\"{s}\\"}}" '
+    "statusCode=403\n",
+}
+
+
+@pytest.mark.parametrize("case", list(R3_CASES))
+def test_r3_error_name_probes(tmp_path, monkeypatch, case):
+    """#966 fix 3 — a leftover quote after the quoted-field strip means an
+    unparseable quoting shape: the error name fails closed to the fixed
+    context marker. The record still qualifies as a weekly hit."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R3_CASES[case].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+        ),
+        when=now,
+    )
+
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    text = kimi.explain_lockout_scan(checked, now=now)
+
+    assert "hit weekly" in text
+    assert SMUGGLE_SENTINEL not in text
+
+
+def test_r3_worst_end_to_end(tmp_path, monkeypatch, capsys):
+    """#966 fix 3 — the worst quoting shapes in one file, through cli.main."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    ts = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    body = "".join(
+        R3_CASES[c].format(ts=ts, s=SMUGGLE_SENTINEL)
+        for c in (
+            "escaped-quote-other-field",
+            "unterminated-before-msg",
+            "single-quoted",
+            "json-style-in-msg",
+        )
+    )
+    _write_session_log(tmp_path, body, when=now)
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "kimi lockout scan" in out.err
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err
+
+
+def test_r3_worst_end_to_end_unterminated_after_msg(tmp_path, monkeypatch, capsys):
+    """#966 fix 3 — BLOCKER 1c repro: the unterminated quote after a valid
+    message span must not leak through cli.main."""
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", tmp_path)
+    now = dt.datetime.now(dt.UTC)
+    _write_session_log(
+        tmp_path,
+        R3_CASES["unterminated-after-msg-eol"].format(
+            ts=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            s=SMUGGLE_SENTINEL,
+        ),
+        when=now,
+    )
+    checked = kimi._apply_observed_lockouts(kimi.parse(PANEL_LOCKOUT), now=now)
+    monkeypatch.setattr(cli, "registry", lambda: {"kimi": FetcherWrapper(lambda: checked, "spend")})
+
+    rc = cli.main(["--only", "kimi", "--explain", "--no-cache"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert SMUGGLE_SENTINEL not in out.out
+    assert SMUGGLE_SENTINEL not in out.err

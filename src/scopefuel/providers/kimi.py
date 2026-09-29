@@ -686,7 +686,11 @@ def _log_lockout(line: str) -> tuple[str, dt.datetime | None, str] | None:
     # error name).  Every key="..." span is cut before the search; an
     # over-long or quoted value cannot match at all, so the fixed context
     # marker applies — a truncated prefix is never printed.
-    name = _SESSION_ERR_NAME.search(_SESSION_QUOTED_FIELD.sub("", line))
+    # Round 3 (fail closed): a leftover quote after the strip means the line's
+    # quoting is unparseable (unterminated or single-quoted) — then the error
+    # name cannot be trusted, so the fixed context marker applies.
+    rest = _SESSION_QUOTED_FIELD.sub("", line)
+    name = None if ('"' in rest or "'" in rest) else _SESSION_ERR_NAME.search(rest)
     return message, ts, name["name"] if name else ctx.group(0)
 
 
