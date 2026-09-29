@@ -70,7 +70,12 @@ def _kill_recorded_child_group(pid_file: Path, sleep_s: int) -> None:
     raw = pid_file.read_text().strip()
     if not raw:
         return
-    pid = int(raw)
+    try:
+        pid = int(raw)
+    except ValueError:
+        # A torn write can leave non-integer bytes in the pid file — this
+        # helper runs inside test finally blocks, so nothing may escape it.
+        return
     if not _pid_is_sleep_child(pid, sleep_s):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -108,20 +113,25 @@ def test_refresh_lock_is_nonblocking_and_kernel_released_after_sigkill(monkeypat
         text=True,
         start_new_session=True,
     )
-    assert holder.stdout is not None
-    assert holder.stdout.readline().strip() == "True"
-    started = time.monotonic()
-    assert refresh.run_worker({"grok": lambda: _result("grok")}, "grok") == 0
-    assert time.monotonic() - started < 1.0
-    holder.send_signal(signal.SIGKILL)
-    holder.wait(timeout=SUBPROCESS_DEADLINE_S)
-    capsys.readouterr()  # drop the contended run's "skipped" line
-    assert refresh.run_worker({"grok": lambda: _result("grok", 40)}, "grok") == 0
-    # A lock skip also returns 0 — only the update line proves this run
-    # acquired the kernel-released lock and fetched.
-    assert "refresh: pool=grok updated" in capsys.readouterr().out
-    data = json.loads((tmp_path / "snapshots.json").read_text())
-    assert data["grok"]["result"]["buckets"][0]["used_pct"] == 40
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "True"
+        started = time.monotonic()
+        assert refresh.run_worker({"grok": lambda: _result("grok")}, "grok") == 0
+        assert time.monotonic() - started < 1.0
+        holder.send_signal(signal.SIGKILL)
+        holder.wait(timeout=SUBPROCESS_DEADLINE_S)
+        capsys.readouterr()  # drop the contended run's "skipped" line
+        assert refresh.run_worker({"grok": lambda: _result("grok", 40)}, "grok") == 0
+        # A lock skip also returns 0 — only the update line proves this run
+        # acquired the kernel-released lock and fetched.
+        assert "refresh: pool=grok updated" in capsys.readouterr().out
+        data = json.loads((tmp_path / "snapshots.json").read_text())
+        assert data["grok"]["result"]["buckets"][0]["used_pct"] == 40
+    finally:
+        # A failed early assertion must not leave the sleep-30 holder
+        # holding the lock — kill its session group if it is still alive.
+        _kill_session_group(holder)
 
 
 def test_concurrent_refresh_requests_fetch_once(tmp_path):
@@ -184,6 +194,12 @@ def test_concurrent_refresh_requests_fetch_once(tmp_path):
         release.touch()
         holder = running[0]
         assert holder.wait(timeout=SUBPROCESS_DEADLINE_S) == 0
+        # The drained holder is the one run that fetched — its stdout must
+        # show the update line, never the contended-skip line the other 7
+        # printed. Deterministic: the lock holder cannot take the skip path.
+        holder_out = holder.stdout.read() if holder.stdout is not None else ""
+        assert "refresh: pool=grok updated" in holder_out
+        assert "already in progress" not in holder_out
         assert counter.read_text() == "1"
     finally:
         # Helpers run in dedicated sessions — kill each surviving group so a
@@ -280,15 +296,37 @@ def test_refresh_timeout_kills_registered_probe_child_in_other_session(tmp_path)
 
 
 def test_kill_recorded_child_group_skips_pid_that_is_not_our_sleep(monkeypatch, tmp_path):
-    """A stale pid file must never trigger killpg — after the child exits its
-    pid may already belong to an unrelated process group."""
+    """A live pid whose command line is not our sleep must never trigger
+    killpg — a stale pid file may already point at a recycled, unrelated
+    process. A dead pid would pass even if the guard always said "ours",
+    so the decoy has to be alive at check time."""
     pid_file = tmp_path / "child.pid"
-    exited = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
-    exited.wait(timeout=SUBPROCESS_DEADLINE_S)
-    pid_file.write_text(str(exited.pid))
+    other = subprocess.Popen(["sleep", "31"], start_new_session=True)
+    try:
+        pid_file.write_text(str(other.pid))
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+        _kill_recorded_child_group(pid_file, sleep_s=30)
+        assert calls == []
+    finally:
+        # killpg is stubbed for the whole test — reap the real decoy directly.
+        other.kill()
+        other.wait()
+
+
+def test_kill_recorded_child_group_skips_non_integer_pid_file(monkeypatch, tmp_path):
+    """A torn write can leave non-integer bytes in the pid file — the helper
+    must skip the kill, not raise ValueError out of a test finally block."""
+    pid_file = tmp_path / "child.pid"
+    pid_file.write_text("not-a-pid")
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
-    _kill_recorded_child_group(pid_file, sleep_s=int(SUBPROCESS_DEADLINE_S * 3))
+    caught: ValueError | None = None
+    try:
+        _kill_recorded_child_group(pid_file, sleep_s=30)
+    except ValueError as exc:
+        caught = exc
+    assert caught is None, "non-integer pid file must skip the kill, not raise"
     assert calls == []
 
 
