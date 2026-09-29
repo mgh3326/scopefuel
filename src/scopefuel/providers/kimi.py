@@ -170,7 +170,12 @@ _SESSION_LIMIT_ERR = re.compile(r"usage\s+limit", re.IGNORECASE)
 # kimi-code.log records provider failures as ``<ISO>Z WARN llm request failed``
 # lines with an errorMessage field — anchored, so quoted text cannot match.
 _SESSION_LOG_ERR = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z\s+(?:WARN|ERROR)\b")
-_SESSION_LOG_ERR_CTX = re.compile(r"errorName=APIStatusError|provider\.auth_error|statusCode=403")
+# ``errorName=APIStatusError`` needs a right boundary: without it a line whose
+# only marker is the look-alike ``errorName=APIStatusErrorX`` qualifies and
+# prints the fixed marker as if it were the record's own name (#992 NICE-3).
+_SESSION_LOG_ERR_CTX = re.compile(
+    r"errorName=APIStatusError(?![A-Za-z0-9_.])|provider\.auth_error|statusCode=403"
+)
 # errorMessage may embed the JSON 403 body escaped — keep consuming escapes.
 _SESSION_ERRMSG = re.compile(r'errorMessage="(?P<msg>(?:[^"\\]|\\.)*)"')
 # ``--explain`` 진단에 실리는 오류 이름 — 본문이 아니라 필드 이름만.
@@ -182,6 +187,7 @@ _SESSION_ERR_NAME = re.compile(r"(?<!\S)errorName=(?P<name>[A-Za-z0-9_.]{1,64})(
 # _SESSION_ERRMSG 와 같은 본문 규칙). errorMessage 만이 아니라 어떤 따옴표
 # 필드든 같은 삽입 경로가 된다 (#966 fix round 2, tester BLOCKER 1a).
 _SESSION_QUOTED_FIELD = re.compile(r'\w+="(?:[^"\\]|\\.)*"')
+# Look-alike quotes are not stripped: a listed name inside them can be the record's field (allowlist label).
 # --explain error= allowlist, not a shape rule: even a perfectly
 # token-shaped errorName= value prints only when it is a name a kimi 403 /
 # usage-limit record is known to carry (#966 round-4: look-alike quote
