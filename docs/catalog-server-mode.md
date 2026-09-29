@@ -16,17 +16,31 @@ flags, `--respect-workspace-trust`, `--dangerously-skip-permissions`, the CLI
 alias `--model opus`, and the per-CLI argv assembly. The server owns four values
 per `(profile, effort)`: `model_id`, the default effort rung, `pool`, `gate`.
 
-## Freshness: three states, never two
+## Freshness: the states, never a bare "fresh?"
 
 | state | condition | behaviour |
 |---|---|---|
-| `server` | fetched this run | canonical |
-| `cache` | `age < catalog_ttl_s` (1h), or older but the server is unreachable and `age < catalog_stale_max_s` (24h) | canonical copy; a warning on the unreachable path |
+| `server` | fetched this run **and passed the validity floor** | canonical |
+| `cache` | `age < catalog_ttl_s` (1h), or older but the server is unreachable (or its catalog refused) and `age < catalog_stale_max_s` (24h) | canonical copy; a warning on the degraded path |
+| `cache-stale` | server unreachable (or its catalog refused) and a cache exists with `age ≥ catalog_stale_max_s` | last-good cache keeps serving, labelled `catalog=cache-stale (age Nh; server unreachable)`. **Stale** — widening stays closed |
 | `unsupported` | the endpoint answered 404 — the deployment has no catalog route | fall through to `/v1/bench/grades`, then the code table. **Not stale** |
-| `snapshot` (stale) | no cache, or `age ≥ catalog_stale_max_s` | bundled snapshot, labelled `catalog=stale` everywhere |
+| `snapshot` (stale) | no cache at all | bundled snapshot, labelled `catalog=stale (snapshot)` |
 
 A local-backend host also reports `snapshot`, but is **not** stale: it has no
 canon to be behind, by configuration.
+
+### The validity floor (#954, the #667 class)
+
+A fetched catalog is checked once, after the schema decode and before it may
+replace the last-good cache. It is **refused as a whole** when it is empty, or
+when any profile the bundled snapshot places is not mentioned in it at all —
+*mentioned* means present as a row, live or retired, so a legitimate
+server-side retirement still passes. A refused catalog is never written to the
+cache; the host degrades exactly as if the server were unreachable (cache if
+one exists, else the snapshot) with the reason on the label, e.g.
+`catalog=stale (server catalog rejected: 1 row, missing 36 snapshot profiles)`.
+Per-profile gaps below this floor stay the launcher's problem — the
+`resolve_launch` snapshot fill-in remains the second line of defence.
 
 Tunables live in `~/.config/scopefuel/config.toml`:
 
@@ -59,16 +73,20 @@ Not fail-open and not fail-closed — the axis is *what the action does*, not
   carries `catalog.source`/`catalog.stale`, and `wrk` stamps `catalog=stale` on
   the spawn brief header. Fail-open without a label is just fail-open.
 
-**Known limit:** a stale host reverts to the snapshot's *placements*. If an
-operator had demoted a profile server-side, an outage restores the pre-demotion
-placement — and `catalog_stale_max_s` does **not** bound how long that lasts. It
-only bounds how long the *cache* is still trusted; past it the host switches to
-the bundled snapshot and stays there for as long as the server is unreachable.
-What the setting buys is that the switch happens, visibly, rather than a stale
-cache being served indefinitely. The snapshot cannot preserve a demotion it never
-saw, so the mitigation is the label, not the timeout: a host reporting
-`catalog=stale` is dispatching from reviewed-at-merge-time placements, and
-restoring the canon is the only thing that restores the demotion.
+**Known limit:** past `catalog_stale_max_s` the host keeps serving the
+last-good cache for as long as the server is unreachable — there is no timeout
+that ever swaps those rows. What the setting bounds now is only the *label*:
+`catalog=cache` becomes `catalog=cache-stale` at the ceiling, and the
+stale rules (non-`default` gates need `--operator-request`) apply throughout.
+That trade is deliberate: the bundled snapshot is older than the cache and
+cannot preserve a server-side demotion it never saw, so reverting to it past
+the ceiling was the one failure mode that *resurrected* placements the canon
+had already retracted. The residual limit: a cache written before the validity
+floor existed can hold a partial canon; it keeps serving under the same
+staleness rules, and `bench catalog status` still lists its uncovered
+profiles. The bundled snapshot is now only the no-cache floor — a host with no
+cache at all is the one place `catalog=stale (snapshot)` still means
+"reviewed-at-merge-time placements".
 
 ## Switching a host to server mode
 
@@ -93,8 +111,19 @@ backend=handoffkeep reason=auto-credentials
 credentials url=found token=found (env or /home/…/.config/handoffkeep/config.env)
 catalog_ttl_s=3600 catalog_stale_max_s=86400
 catalog=server
-rows=49 profiles=34
+rows=59 profiles=37
 ```
+
+The same report doubles as the fleet machine check:
+
+```console
+$ scopefuel bench catalog status --check   # rc 0 only when the served view is catalog=server
+```
+
+`--check` exits 0 only when the served view's source is `server`, and exits 2
+— printing the label that names the state — for a local backend, `cache`,
+`cache-stale`, `snapshot` or `unsupported`. A host silently left in local mode
+is a red line, not a quiet default.
 
 Opt a host out with an explicit `[bench] backend = "local"`.
 

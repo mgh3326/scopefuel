@@ -996,15 +996,18 @@ def degraded_reasons(view: bench.CatalogView, evidence: RepsEvidence) -> list[st
     never that those stores were the canon. The degraded states:
 
     * the catalog came from the bundled snapshot (server unreachable, or a
-      local backend — including the ``auto-local-insecure-url`` fallback), or
-      the server has no catalog route at all and the snapshot stood in;
+      local backend — including the ``auto-local-insecure-url`` fallback), the
+      server has no catalog route at all and the snapshot stood in, or the
+      last-good cache is still being served past ``catalog_stale_max_s``;
     * the reps backend resolved local while handoffkeep credentials exist —
       the per-use insecure-url path leaves the server reps unread;
     * the server rep window came back full, so rows older than the window —
       FAIL evidence included — may be missing from the evaluation.
 
     A server-*cache* catalog is not degraded: it is a copy the canon itself
-    served inside the operator-configured staleness budget.
+    served inside the operator-configured staleness budget. Past that budget
+    (``cache-stale``) it is degraded again — the rows are still canon-derived,
+    but the canon may have moved since.
     """
 
     reasons: list[str] = []
@@ -1012,6 +1015,8 @@ def degraded_reasons(view: bench.CatalogView, evidence: RepsEvidence) -> list[st
         reasons.append(f"catalog source is the bundled snapshot, not the canon ({view.label})")
     elif view.source == bench.CATALOG_SOURCE_UNSUPPORTED:
         reasons.append("server has no catalog route — the bundled snapshot stood in for the canon")
+    elif view.source == bench.CATALOG_SOURCE_CACHE_STALE:
+        reasons.append(f"catalog source is a stale cache past catalog_stale_max_s ({view.label})")
     if evidence.backend == bench.BENCH_BACKEND_LOCAL and evidence.backend_reason == "auto-local-insecure-url":
         reasons.append(
             "reps read the local table only — handoffkeep credentials exist but the "
@@ -1570,7 +1575,8 @@ def evaluate(
     # snapshot/unsupported view every row is already the fallback universe.
     snapshot_profiles = (
         frozenset(entry.profile for entry in entries if entry.profile not in covered)
-        if view.source in (bench.CATALOG_SOURCE_SERVER, bench.CATALOG_SOURCE_CACHE)
+        if view.source
+        in (bench.CATALOG_SOURCE_SERVER, bench.CATALOG_SOURCE_CACHE, bench.CATALOG_SOURCE_CACHE_STALE)
         else frozenset()
     )
     by_key = {entry.key: entry for entry in entries}

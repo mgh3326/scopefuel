@@ -272,7 +272,13 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     catalog_parser = bench_sub.add_parser("catalog", help="정본 카탈로그 조회")
     catalog_sub = catalog_parser.add_subparsers(dest="catalog_command", required=True)
     catalog_sub.add_parser("list", help="카탈로그 행 전체")
-    catalog_sub.add_parser("status", help="backend·카탈로그 출처·stale·미커버 프로필")
+    catalog_status = catalog_sub.add_parser("status", help="backend·카탈로그 출처·stale·미커버 프로필")
+    catalog_status.add_argument(
+        "--check",
+        action="store_true",
+        help="기계 판정 — served catalog source 가 server 일 때만 rc 0, 그 외 rc 2 "
+        "(local backend·cache·cache-stale·snapshot·unsupported)",
+    )
 
     reps_parser = subparsers.add_parser("reps", help="실측 대표 실행 기록")
     reps_sub = reps_parser.add_subparsers(dest="reps_command", required=True)
@@ -1304,7 +1310,16 @@ def _bench_command(args: argparse.Namespace) -> int:
             return 0
         if args.catalog_command == "status":
             print(bench.catalog_status_report())
-            return 0
+            if not args.check:
+                return 0
+            # Machine check: only a view actually served by the canon passes —
+            # a local backend, a cache (fresh or stale), the snapshot or an
+            # unsupported route all mean this host is not reading the canon.
+            view = bench.read_catalog()
+            if view.source == bench.CATALOG_SOURCE_SERVER:
+                return 0
+            print(f"check failed: {view.label}", file=sys.stderr)
+            return 2
         return 2
 
     if args.bench_command == "show":
