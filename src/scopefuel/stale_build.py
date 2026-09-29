@@ -326,7 +326,11 @@ def _cache_path() -> pathlib.Path:
 def _read_cache() -> dict[str, Any] | None:
     try:
         data = json.loads(_cache_path().read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
+        # Every read or parse failure reads as absent — JSONDecodeError and
+        # UnicodeDecodeError are ValueErrors, a >4300-digit int is a plain
+        # ValueError, deep nesting is a RecursionError — so _check re-probes
+        # and the next write replaces the bad file.
         return None
     return data if isinstance(data, dict) and data.get("schema") == _CACHE_SCHEMA else None
 
@@ -335,11 +339,20 @@ def _write_cache(entry: dict[str, Any]) -> None:
     path = _cache_path()
     tmp: pathlib.Path | None = None
     try:
+        # Serialize before mkstemp so an unserializable entry fails before any
+        # temp file exists (a dumps error is a TypeError, not an OSError).
+        payload = json.dumps(entry)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(dir=path.parent, prefix="stale_build.", suffix=".tmp")
         tmp = pathlib.Path(name)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(entry))
+        try:
+            fh = os.fdopen(fd, "w")
+        except OSError:
+            # fdopen never took ownership of the mkstemp fd — close it here.
+            os.close(fd)
+            raise
+        with fh:
+            fh.write(payload)
         tmp.chmod(0o600)
         os.replace(tmp, path)
     except OSError:

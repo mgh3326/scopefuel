@@ -918,3 +918,99 @@ def test_unusable_checked_at_reprobes(stale_on, monkeypatch, bad):
     assert stale_on["json"], f"checked_at={bad!r} must trigger a probe"
     assert len(stale_on["json"]) == 2  # one probe: head + compare
     assert verdict is not None and verdict.behind == 8
+
+
+# ---------------------------------------------------------------------------
+# task #981 — every unreadable cache reads as absent; the write cleans up
+# after itself; an expired probe makes no further network call
+# ---------------------------------------------------------------------------
+
+
+def _plant_cache(content: bytes) -> None:
+    path = stale_build._cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"schema": "%s", "checked_at": 1%s}' % (stale_build._CACHE_SCHEMA.encode(), b"0" * 5000),
+        b"\xff\xfe\x00garbage",
+        b"[" * 100000,
+    ],
+    ids=["int-over-4300-digits", "invalid-utf8", "deep-nesting"],
+)
+def test_unreadable_cache_reprobes_and_rewrites(stale_on, monkeypatch, content):
+    """AC1: a cache file the reader cannot parse — a >4300-digit int
+    (ValueError), invalid UTF-8 (UnicodeDecodeError), 100000-deep nesting
+    (RecursionError) — reads as absent: warning() runs the probe exactly once
+    and the write afterwards replaces the bad file with a valid record."""
+    _set_installed(monkeypatch, INSTALLED)
+    _plant_cache(content)
+    _net(monkeypatch, stale_on, ahead_by=8)
+    verdict = stale_build.warning()
+    assert len(stale_on["json"]) == 2, f"expected exactly one probe (head + compare): {stale_on['json']}"
+    assert verdict is not None and verdict.behind == 8
+    cached = stale_build._read_cache()
+    assert cached is not None and cached["schema"] == stale_build._CACHE_SCHEMA
+    assert cached["status"] == "behind" and cached["behind"] == 8
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+def test_fdopen_failure_leaks_no_fd_and_leaves_no_temp(stale_on, monkeypatch):
+    """AC2: os.fdopen raising must not leak the mkstemp fd — and the temp file
+    is unlinked like every other write failure."""
+
+    def boom(fd: int, mode: str = "r"):
+        raise OSError("fdopen")
+
+    monkeypatch.setattr(os, "fdopen", boom)
+    before = _open_fds()
+    for _ in range(20):
+        stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "status": "skipped"})
+    assert _open_fds() == before, "fd from mkstemp leaked when os.fdopen raises"
+    assert list(stale_build._cache_path().parent.glob("*.tmp")) == []
+
+
+def test_unserializable_entry_raises_before_any_temp_file_exists(stale_on):
+    """AC3: an entry json.dumps cannot serialize raises TypeError *before*
+    mkstemp runs — the cache dir never holds a temp file for it."""
+    cache_dir = stale_build._cache_path().parent
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(TypeError):
+        stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "bad": object()})
+    assert list(cache_dir.iterdir()) == [], "serialization failed after a temp file existed"
+
+
+def test_expired_worker_makes_no_compare_call_after_release(stale_on, monkeypatch):
+    """AC4: once the caller flags the deadline as expired, the abandoned worker
+    cuts the sequence short — it must not issue the compare call whose result
+    nobody will read. (Covering test adopted from the #971 tester.)"""
+    _set_installed(monkeypatch, INSTALLED)
+    _fast_budget(monkeypatch, budget=0.2, grace=0.05)
+    release = threading.Event()
+    urls: list[str] = []
+
+    def get(url: str, timeout: float):
+        urls.append(url)
+        if url.endswith("/commits/main"):
+            release.wait(10)
+            return {"sha": HEAD}
+        return {"ahead_by": 9}
+
+    monkeypatch.setattr(stale_build, "_get_json", get)
+    # keep _remaining positive for the worker so only `expired` can stop it
+    monkeypatch.setattr(
+        stale_build,
+        "_remaining",
+        lambda d: 0.2 if threading.current_thread() is threading.main_thread() else 5.0,
+    )
+    assert stale_build.warning() is None
+    release.set()
+    time.sleep(0.4)
+    assert [u for u in urls if "/compare/" in u] == [], urls
+    assert stale_build._read_cache()["status"] == "skipped"
