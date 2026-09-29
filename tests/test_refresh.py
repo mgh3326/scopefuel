@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -123,32 +124,46 @@ def test_concurrent_refresh_requests_fetch_once(tmp_path):
             )
         )
         time.sleep(0.3)
-    deadline = time.monotonic() + SUBPROCESS_DEADLINE_S
-    while sum(p.poll() is not None for p in processes) < 7 and time.monotonic() < deadline:
-        time.sleep(0.05)
-    exited = [p for p in processes if p.poll() is not None]
-    running = [p for p in processes if p.poll() is None]
-    for p in exited:
-        out = p.stdout.read() if p.stdout is not None else ""
-        assert p.returncode == 0
-        assert "already in progress; skipped" in out
-    assert len(running) == 1, f"expected one lock holder still blocked in fetch, got {len(running)}"
-    release.touch()
-    holder = running[0]
-    assert holder.wait(timeout=SUBPROCESS_DEADLINE_S) == 0
-    assert counter.read_text() == "1"
+    try:
+        deadline = time.monotonic() + SUBPROCESS_DEADLINE_S
+        while sum(p.poll() is not None for p in processes) < 7 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        exited = [p for p in processes if p.poll() is not None]
+        running = [p for p in processes if p.poll() is None]
+        for p in exited:
+            out = p.stdout.read() if p.stdout is not None else ""
+            assert p.returncode == 0
+            assert "already in progress; skipped" in out
+        assert len(running) == 1, f"expected one lock holder still blocked in fetch, got {len(running)}"
+        release.touch()
+        holder = running[0]
+        assert holder.wait(timeout=SUBPROCESS_DEADLINE_S) == 0
+        assert counter.read_text() == "1"
+    finally:
+        # Helpers run in dedicated sessions — kill each surviving group so a
+        # failed assertion cannot leave 8 helpers waiting on the release file.
+        for p in processes:
+            if p.poll() is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
 
 
 def test_refresh_timeout_kills_worker_process_group(tmp_path):
     pid_file = tmp_path / "child.pid"
     helper = tmp_path / "timeout_helper.py"
+    # Longer than any wait in this file — a natural exit can never fit inside
+    # the deadline, so only the timeout handler can end the helper early.
+    sleep_s = int(SUBPROCESS_DEADLINE_S * 3)
     helper.write_text(
         "import os, subprocess, time\n"
         "from scopefuel import refresh\n"
-        f"child = subprocess.Popen(['sh', '-c', 'sleep 30'])\n"
+        f"child = subprocess.Popen(['sh', '-c', 'sleep {sleep_s}'])\n"
         f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
         "os.environ['SCOPEFUEL_REFRESH_TIMEOUT_S'] = '0.2'\n"
-        "raise SystemExit(refresh.run_worker({'grok': lambda: (time.sleep(30), None)[1]}, 'grok'))\n"
+        "def fetch():\n"
+        f" return (time.sleep({sleep_s}), None)[1]\n"
+        "raise SystemExit(refresh.run_worker({'grok': fetch}, 'grok'))\n"
     )
     proc = subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd(), start_new_session=True)
     proc.wait(timeout=SUBPROCESS_DEADLINE_S)
@@ -166,22 +181,47 @@ def test_refresh_timeout_kills_registered_probe_child_in_other_session(tmp_path)
     """타임아웃 핸들러는 레지스트리의 pgid 도 정리한다 — 다른 세션의 자식도 닿는다."""
     pid_file = tmp_path / "probe.pid"
     helper = tmp_path / "registered_helper.py"
+    # Longer than any wait in this file — a natural exit can never fit inside
+    # the deadline, so only the timeout handler can end the helper early.
+    sleep_s = int(SUBPROCESS_DEADLINE_S * 3)
     helper.write_text(
         "import os, subprocess, time\n"
         "from scopefuel import proctrack, refresh\n"
-        "child = subprocess.Popen(['sleep', '30'], start_new_session=True)\n"
+        f"child = subprocess.Popen(['sleep', '{sleep_s}'], start_new_session=True)\n"
         "proctrack.register(child.pid, os.getcwd())\n"
         f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
         "os.environ['SCOPEFUEL_REFRESH_TIMEOUT_S'] = '0.2'\n"
-        "raise SystemExit(refresh.run_worker({'grok': lambda: (time.sleep(30), None)[1]}, 'grok'))\n"
+        "def fetch():\n"
+        f" return (time.sleep({sleep_s}), None)[1]\n"
+        "raise SystemExit(refresh.run_worker({'grok': fetch}, 'grok'))\n"
     )
     proc = subprocess.Popen([sys.executable, str(helper)], cwd=Path.cwd(), start_new_session=True)
-    proc.wait(timeout=SUBPROCESS_DEADLINE_S)
-    child_pid = int(pid_file.read_text())
-    child_state = subprocess.run(
-        ["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True, check=False
-    )
-    assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
+    try:
+        try:
+            returncode = proc.wait(timeout=SUBPROCESS_DEADLINE_S)
+        except subprocess.TimeoutExpired:
+            # The fetch outlives the wait — only a missing timer lets the
+            # helper still be running; the returncode assertion below reports it.
+            returncode = None
+        # SIGKILL is expected because the dedicated worker session is killed
+        # as a whole; the timeout handler cannot return after killing it.
+        assert returncode in (-signal.SIGKILL, 124)
+        child_pid = int(pid_file.read_text())
+        child_state = subprocess.run(
+            ["ps", "-p", str(child_pid), "-o", "stat="], capture_output=True, text=True, check=False
+        )
+        assert not child_state.stdout.strip() or child_state.stdout.strip().startswith("Z")
+    finally:
+        # A live helper or child means the timeout path did not run to
+        # completion — kill both session groups so a failing run leaves
+        # nothing behind. Both are session leaders, so pid == pgid.
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
 
 
 def test_refresh_pools_match_provider_registry():
