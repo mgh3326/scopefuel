@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import subprocess
+import tempfile
 import threading
 import time
 import types
@@ -961,18 +962,37 @@ def _open_fds() -> int:
     return len(os.listdir("/dev/fd"))
 
 
-def test_fdopen_failure_leaks_no_fd_and_leaves_no_temp(stale_on, monkeypatch):
-    """AC2: os.fdopen raising must not leak the mkstemp fd — and the temp file
-    is unlinked like every other write failure."""
+def _spy_mkstemp(monkeypatch) -> list[int]:
+    """Wrap tempfile.mkstemp so os.write/os.close fakes can recognise the
+    cache's own fd and leave every other fd on the real implementation."""
+    made: list[int] = []
+    real_mkstemp = tempfile.mkstemp
 
-    def boom(fd: int, mode: str = "r"):
-        raise OSError("fdopen")
+    def spy(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        made.append(fd)
+        return fd, name
 
-    monkeypatch.setattr(os, "fdopen", boom)
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    return made
+
+
+def test_write_failure_leaks_no_fd_and_leaves_no_temp(stale_on, monkeypatch):
+    """AC2 (#1000 shape): os.write raising must not leak the mkstemp fd — and
+    the temp file is unlinked like every other write failure."""
+    made = _spy_mkstemp(monkeypatch)
+    real_write = os.write
+
+    def boom(fd: int, data) -> int:
+        if fd in made:
+            raise OSError("write")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", boom)
     before = _open_fds()
     for _ in range(20):
         stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "status": "skipped"})
-    assert _open_fds() == before, "fd from mkstemp leaked when os.fdopen raises"
+    assert _open_fds() == before, "fd from mkstemp leaked when os.write raises"
     assert list(stale_build._cache_path().parent.glob("*.tmp")) == []
 
 
@@ -1017,8 +1037,7 @@ def test_expired_worker_makes_no_compare_call_after_release(stale_on, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# task #990 — each expired check is pinned by its own test; a failed fdopen
-# may already have closed the mkstemp fd
+# task #990 — each expired check is pinned by its own test
 # ---------------------------------------------------------------------------
 
 
@@ -1066,25 +1085,99 @@ def test_expired_between_the_checks_never_calls_compare(stale_on, monkeypatch):
     assert [url for url, _ in stale_on["json"] if "/compare/" in url] == [], stale_on["json"]
 
 
-def test_fdopen_that_closed_the_fd_is_not_closed_again(stale_on, monkeypatch):
-    """#990: when the failed fdopen already closed the mkstemp fd, the error
-    path must not os.close it again — the number could name a reused fd."""
+# ---------------------------------------------------------------------------
+# task #1000 — the mkstemp fd has one owner and one close: an os.write loop
+# writes the whole payload, no fdopen/fstat guard exists
+# ---------------------------------------------------------------------------
+
+
+def test_partial_os_write_still_lands_the_full_record(stale_on, monkeypatch):
+    """AC1 (#1000): os.write may return a short count — the write loop must
+    keep going until every byte of the payload is on disk. A mutant that
+    issues a single os.write leaves a truncated, unparseable record."""
+    made = _spy_mkstemp(monkeypatch)
+    real_write = os.write
+
+    def one_byte_at_a_time(fd: int, data) -> int:
+        if fd not in made:
+            return real_write(fd, data)
+        return real_write(fd, data[:1])  # worst-case partial write
+
+    monkeypatch.setattr(os, "write", one_byte_at_a_time)
+    entry = {
+        "schema": stale_build._CACHE_SCHEMA,
+        "checked_at": 1.0,
+        "installed_rev": INSTALLED,
+        "origin_rev": HEAD,
+        "behind": 3,
+        "status": "behind",
+    }
+    stale_build._write_cache(entry)
+    assert stale_build._read_cache() == entry
+
+
+def test_os_write_failure_closes_the_fd_exactly_once(stale_on, monkeypatch):
+    """AC2 (#1000): os.write raising OSError does not escape, leaves no temp
+    file, and the mkstemp fd is closed exactly once — by the finally that
+    owns it, never again in the error path."""
+    made = _spy_mkstemp(monkeypatch)
     closed: list[int] = []
     real_close = os.close
+    real_write = os.write
+
+    def boom_write(fd: int, data) -> int:
+        if fd in made:
+            raise OSError("write denied")
+        return real_write(fd, data)
 
     def tracking_close(fd: int) -> None:
-        closed.append(fd)
+        if fd in made:
+            closed.append(fd)
         real_close(fd)
 
-    def closing_fdopen(fd: int, mode: str = "r"):
-        real_close(fd)  # fdopen took ownership, then failed
-        raise OSError("fdopen")
-
-    monkeypatch.setattr(os, "fdopen", closing_fdopen)
+    monkeypatch.setattr(os, "write", boom_write)
     monkeypatch.setattr(os, "close", tracking_close)
-    before = _open_fds()
     stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "status": "skipped"})
-    assert closed == [], f"mkstemp fd closed again after fdopen released it: {closed}"
-    assert _open_fds() == before
+    assert made, "mkstemp never ran"
+    assert closed == made, f"each mkstemp fd must be closed exactly once: {closed} vs {made}"
     assert list(stale_build._cache_path().parent.glob("*.tmp")) == []
     assert not stale_build._cache_path().exists()
+
+
+def test_reused_fd_number_is_never_closed_by_write_cache(stale_on, monkeypatch):
+    """AC3 (#1000, the #990 reuse scenario restated): with no fdopen there is
+    no seam that can release the mkstemp fd early, so the only os.close runs
+    in the finally while this block still owns it. The tracking close plants
+    a foreign fd on the released number — a stale second close would kill
+    it, and a missed re-check would leave nothing to observe."""
+    made = _spy_mkstemp(monkeypatch)
+    closed: list[int] = []
+    foreign: list[int] = []
+    real_close = os.close
+    real_write = os.write
+
+    def boom_write(fd: int, data) -> int:
+        if fd in made:
+            raise OSError("write denied")
+        return real_write(fd, data)
+
+    def tracking_close(fd: int) -> None:
+        if fd in made:
+            closed.append(fd)
+        real_close(fd)
+        if fd in made:
+            # A foreign fd immediately reuses the released number — any close
+            # by number after this point would hit it.
+            foreign.append(os.open(os.devnull, os.O_RDONLY))
+
+    monkeypatch.setattr(os, "write", boom_write)
+    monkeypatch.setattr(os, "close", tracking_close)
+    stale_build._write_cache({"schema": stale_build._CACHE_SCHEMA, "status": "skipped"})
+    try:
+        assert closed == made, closed
+        assert foreign, "the released number was never reused — harness broken"
+        for f in foreign:
+            os.fstat(f)  # OSError if _write_cache closed the foreign fd
+    finally:
+        for f in foreign:
+            real_close(f)
