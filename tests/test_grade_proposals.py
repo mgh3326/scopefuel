@@ -1485,11 +1485,11 @@ def _excluded(proposal: grades.Proposal, ref: str) -> grades.EvidenceRep:
 
 def test_rep_model_matches_rung_model_counts(tmp_path, isolated_cache):
     """Baseline: rep.model == rung catalog model -> the rep counts."""
-    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6.1-sol"))
     _seed(
         [
-            _rep("t1", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="A+"),
-            _rep("t2", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="A+"),
+            _rep("t1", profile="codex-sol", model_id="gpt-6.1-sol", effort="high", grade="A+"),
+            _rep("t2", profile="codex-sol", model_id="gpt-6.1-sol", effort="high", grade="A+"),
         ]
     )
     result = _result(_propose(view), "codex-sol", "high")
@@ -1500,9 +1500,9 @@ def test_rep_model_matches_rung_model_counts(tmp_path, isolated_cache):
 def test_model_mismatch_reported_never_counted(tmp_path, isolated_cache):
     """The held-proposal defect: a rep recorded as `codex` resolves to the
     codex-sol rung by spelling, but its recorded model is not the rung's
-    gpt-6-sol — mismatch is reported, never counted, so pre-09-22 evidence
+    gpt-6.1-sol — mismatch is reported, never counted, so pre-switch evidence
     cannot promote the new-generation rung."""
-    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6.1-sol"))
     _seed(
         [
             _rep("t1", profile="codex", model_id="codex", effort="high", grade="S"),
@@ -1520,11 +1520,42 @@ def test_model_mismatch_reported_never_counted(tmp_path, isolated_cache):
 
 
 def test_older_generation_never_equivalent(tmp_path, isolated_cache):
-    """gpt-5.6-sol is an older generation of the same line — not equivalent."""
-    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
-    _seed([_rep("t1", profile="codex-sol", model_id="gpt-5.6-sol", effort="high", grade="S")])
-    row = _excluded(_propose(view), "local:1")
-    assert "model mismatch" in row.excluded and "model-mismatch" in row.exclusion_tags
+    """gpt-6-sol and gpt-5.6-sol are superseded generations of the same line —
+    not equivalent to the post-#1026 gpt-6.1-sol rung."""
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6.1-sol"))
+    _seed(
+        [
+            _rep("t1", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="S"),
+            _rep("t2", profile="codex-sol", model_id="gpt-5.6-sol", effort="high", grade="S"),
+        ]
+    )
+    proposal = _propose(view)
+    for ref in ("local:1", "local:2"):
+        row = _excluded(proposal, ref)
+        assert "model mismatch" in row.excluded and "model-mismatch" in row.exclusion_tags
+
+
+def test_sol61_rungs_count_only_gpt61_sol_reps(tmp_path, isolated_cache):
+    """#1026 AC2: on the real snapshot the codex-sol rungs carry gpt-6.1-sol,
+    so a gpt-6.1-sol rep counts while pre-switch gpt-6-sol (and older
+    gpt-5.6-sol) reps resolve to the rung and read as model mismatches."""
+    view = bench.CatalogView(
+        entries=bench.catalog_snapshot(),
+        source="server",
+        backend="handoffkeep",
+    )
+    _seed(
+        [
+            _rep("cur", profile="codex-sol", model_id="gpt-6.1-sol", effort="max", grade="S+"),
+            _rep("pre", profile="codex-sol", model_id="gpt-6-sol", effort="max", grade="S+"),
+            _rep("older", profile="codex-sol", model_id="gpt-5.6-sol", effort="max", grade="S+"),
+        ]
+    )
+    proposal = _propose(view)
+    rows = {row.rep.task_ref: row for row in proposal.evidence.rows}
+    assert "model mismatch" in rows["pre"].excluded, "6 Sol reps never count on the 6.1 rungs"
+    assert "model mismatch" in rows["older"].excluded, "6 Sol reps never count on the 6.1 rungs"
+    assert rows["cur"].rung == ("codex-sol", "max") and rows["cur"].excluded == ""
 
 
 def test_model_equivalence_declared_rename_counts(tmp_path, isolated_cache):
@@ -2076,12 +2107,12 @@ def test_apply_accepts_clean_proposal_with_anomalies_present(tmp_path, isolated_
 def test_render_prints_evidence_summary_and_patterns(tmp_path, isolated_cache):
     """Every proposal ends with the counted/excluded tally by reason — the
     audit summary the operator asked for."""
-    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6-sol"))
+    view = _view(_entry("codex-sol", "high", "C", model_id="gpt-6.1-sol"))
     _seed(
         [
-            _rep("B0X-US-SLOT1", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="S"),
+            _rep("B0X-US-SLOT1", profile="codex-sol", model_id="gpt-6.1-sol", effort="high", grade="S"),
             _rep("mismatch", profile="codex-sol", model_id="gpt-5", effort="high", grade="S"),
-            _rep("ok", profile="codex-sol", model_id="gpt-6-sol", effort="high", grade="S"),
+            _rep("ok", profile="codex-sol", model_id="gpt-6.1-sol", effort="high", grade="S"),
         ]
     )
     text = grades.render_proposal(_propose(view), view)

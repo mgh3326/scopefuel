@@ -53,7 +53,8 @@ def test_devin_swe2_medium_is_a_single_a_row_with_provenance():
 
 def test_no_other_grade_table_row_changed():
     """AC1: the delta against the pre-#787 table is this one move plus the
-    #920 Sonnet 5.5 relabel (Sonnet 5 rows replaced by estimated 5.5 rows)."""
+    #920 Sonnet 5.5 relabel (Sonnet 5 rows replaced by estimated 5.5 rows)
+    plus the #1026 Sol 6.1 relabel (the two codex-sol S+ rows relabelled)."""
     pre = json.loads(PRE_787_ROWS.read_text())
     pre_counts = Counter(json.dumps(row, sort_keys=True) for row in pre)
     post_counts = Counter(json.dumps(row, sort_keys=True) for row in _rows(GRADE_TABLE))
@@ -70,6 +71,10 @@ def test_no_other_grade_table_row_changed():
         ("A+", "sonnet", "xhigh"),
         ("C", "sonnet", "high"),
         ("C", "sonnet", "medium"),
+        # #1026 (09-30 operator decision): the codex-sol rows relabelled
+        # gpt-6-sol -> gpt-6.1-sol — same (grade, name, effort) keys.
+        ("S+", "codex-sol", "max"),
+        ("S+", "codex-sol", "xhigh"),
     }
     assert {key(row) for row in removed} == {
         ("C", "devin-swe2-medium", None),
@@ -77,4 +82,35 @@ def test_no_other_grade_table_row_changed():
         ("A+", "sonnet", "xhigh"),
         ("A", "sonnet", "medium"),
         ("A", "sonnet", "low"),
+        ("S+", "codex-sol", "max"),
+        ("S+", "codex-sol", "xhigh"),
     }
+
+
+def test_sol61_switch_changes_no_grade():
+    """#1026 AC1: on each codex-sol row the relabel touched only the identity
+    fields — model, aa ids, estimate_reason. Grade, score, gate, efforts and
+    every annotation are byte-identical to the pre-switch row."""
+    pre = json.loads(PRE_787_ROWS.read_text())
+    post = _rows(GRADE_TABLE)
+    identity_fields = {"model", "aa_agent_model_id", "aa_model_id", "estimate_reason"}
+
+    for pre_row in pre:
+        if pre_row["name"] != "codex-sol":
+            continue
+        post_rows = [
+            row
+            for row in post
+            if (row["grade"], row["name"], row["launcher_effort"])
+            == (pre_row["grade"], pre_row["name"], pre_row["launcher_effort"])
+        ]
+        assert len(post_rows) == 1, "the switch changes no grade"
+        post_row = post_rows[0]
+        for field, pre_value in pre_row.items():
+            if field in identity_fields:
+                continue
+            assert post_row[field] == pre_value, "the switch changes no grade"
+        assert post_row["model"] == f"GPT-6.1 Sol ({pre_row['launcher_effort']})"
+        assert post_row["aa_agent_model_id"] == "gpt-6.1-sol"
+        assert post_row["aa_model_id"] == "gpt-6-1-sol"
+        assert "gpt-6.1-sol" in post_row["estimate_reason"]

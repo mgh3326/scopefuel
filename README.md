@@ -155,8 +155,8 @@ E6(#594, `hk:doc plan/2026-09-25/e6-effort-ladder`)는 한 모델을 여러 effo
 
 | profile | model | effort | pool | 급 |
 |---|---|---|---|---|
-| `codex-sol` | gpt-6-sol | high | codex | C |
-| `codex-sol` | gpt-6-sol | medium | codex | C |
+| `codex-sol` | gpt-6.1-sol | high | codex | C |
+| `codex-sol` | gpt-6.1-sol | medium | codex | C |
 | `kimi-k3` | kimi-k3 | high | kimi | C |
 | `kimi-k3` | kimi-k3 | max | kimi | C |
 | `grok-hi` | grok-4.7 | low | grok | C |

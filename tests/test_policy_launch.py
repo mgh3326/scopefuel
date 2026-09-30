@@ -79,8 +79,8 @@ def test_astra_is_consult_only_and_defaults_to_xhigh(capsys):
     ("profile", "effort", "model_id", "resolved_effort"),
     [
         ("opus", None, "claude-opus-5-5", "high"),
-        ("codex-sol", None, "gpt-6-sol", "max"),
-        ("codex-max", None, "gpt-6-sol", "max"),  # alias resolves to codex-sol
+        ("codex-sol", None, "gpt-6.1-sol", "max"),
+        ("codex-max", None, "gpt-6.1-sol", "max"),  # alias resolves to codex-sol
         ("codex-luna", None, "gpt-6-luna", "medium"),
         ("codex-luna", "high", "gpt-6-luna", "high"),
         ("codex-terra", None, "gpt-5.6-terra", "medium"),
@@ -116,7 +116,7 @@ def test_a_rung_the_catalog_never_placed_inherits_the_default_placement():
     profile's default placement instead of blocking the spawn."""
 
     decision = launch.resolve_launch("codex-sol", effort="high")
-    assert decision.model_id == "gpt-6-sol"
+    assert decision.model_id == "gpt-6.1-sol"
     assert decision.effort == "high"
     # It inherits the *default* rung's gate (max, default), never a higher
     # rung's escalation gate — falling back must not widen and must not narrow.

@@ -294,8 +294,14 @@ OPUS_5_5_ESTIMATE_REASON = (
     "xhigh 67→69(+2) · high 63→67(+4) · medium 62→66(+4) · max 66→69(+3) · low 57→62(+5), "
     "모두 §1이 보고한 effort별 벤더 벤치마크 개선폭을 그대로 반영"
 )
-SOL_GPT6_ESTIMATE_REASON = (
-    "gpt-6-sol: AA-agent 미발표 — gpt-5.6-sol→6(5.6→6) 세대 전환의 AA-model 델타/벤더 근거"
+# #1026 (operator decision 2026-09-30): the codex-sol family launches
+# gpt-6.1-sol now — grades, scores, gates and efforts are carried over from
+# gpt-6-sol unchanged pending the #1026 effort sweep, and vendor charts are
+# not evidence. The carried-over curve stays the ROB-591 estimate.
+SOL_GPT6_1_ESTIMATE_REASON = (
+    "gpt-6.1-sol: AA-agent 미발표 — 2026-09-30 운영자 결정(#1026)으로 급·점수·effort 를 "
+    "gpt-6-sol 에서 그대로 이월(effort sweep 판정 전 — 벤더 차트는 근거가 아님). "
+    "이월된 곡선의 원 추정 근거: gpt-5.6-sol→6(5.6→6) 세대 전환의 AA-model 델타/벤더 근거"
     "(hk:doc note/2026-09-23/model-refresh-opus55-gpt6-grok47 §1)를 5.6 실측 곡선에 동일 오프셋으로 "
     "적용한 추정치 — 점수/effort 는 5.6 실측 값 이월"
 )
@@ -576,14 +582,14 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         Profile(
             "codex-sol",
-            "GPT-6 Sol (max)",
+            "GPT-6.1 Sol (max)",
             67.0,
             benchmark_effort="max",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=SOL_GPT6_ESTIMATE_REASON,
+            estimate_reason=SOL_GPT6_1_ESTIMATE_REASON,
             launcher_effort="max",
-            aa_agent_model_id="gpt-6-sol",
-            aa_model_id="gpt-6-sol",
+            aa_agent_model_id="gpt-6.1-sol",
+            aa_model_id="gpt-6-1-sol",
         ),
         # ROB-591: opus --effort high must physically precede xhigh/medium below so
         # the pool-tie-break (identical quota score, identical value_order) makes it
@@ -636,16 +642,16 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         ),
         Profile(
             "codex-sol",
-            "GPT-6 Sol (xhigh)",
+            "GPT-6.1 Sol (xhigh)",
             65.0,
             gate="escalation",
             gate_reason=CODEX_SOL_XHIGH_ESCALATION_REASON,
             benchmark_effort="xhigh",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=SOL_GPT6_ESTIMATE_REASON,
+            estimate_reason=SOL_GPT6_1_ESTIMATE_REASON,
             launcher_effort="xhigh",
-            aa_agent_model_id="gpt-6-sol",
-            aa_model_id="gpt-6-sol",
+            aa_agent_model_id="gpt-6.1-sol",
+            aa_model_id="gpt-6-1-sol",
         ),
     ],
     "S": [
@@ -1167,19 +1173,19 @@ def _e6_arm_profile(name: str, model: str, effort: str, reference: str, **kwargs
 E6_ARM_RUNGS: tuple[Profile, ...] = (
     _e6_arm_profile(
         "codex-sol",
-        "GPT-6 Sol (high)",
+        "GPT-6.1 Sol (high)",
         "high",
         "gpt-6-sol AA-model intelligence high 42.8",
-        aa_agent_model_id="gpt-6-sol",
-        aa_model_id="gpt-6-sol",
+        aa_agent_model_id="gpt-6.1-sol",
+        aa_model_id="gpt-6-1-sol",
     ),
     _e6_arm_profile(
         "codex-sol",
-        "GPT-6 Sol (medium)",
+        "GPT-6.1 Sol (medium)",
         "medium",
         "gpt-6-sol AA-model intelligence high 42.8(medium 미저장)",
-        aa_agent_model_id="gpt-6-sol",
-        aa_model_id="gpt-6-sol",
+        aa_agent_model_id="gpt-6.1-sol",
+        aa_model_id="gpt-6-1-sol",
     ),
     _e6_arm_profile(
         "kimi-k3",
