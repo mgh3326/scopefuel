@@ -28,6 +28,7 @@ import datetime as dt
 import os
 import pathlib
 import re
+import sys
 import tomllib
 from dataclasses import dataclass
 from typing import Literal
@@ -45,13 +46,67 @@ def config_path() -> pathlib.Path:
     return pathlib.Path(base) / "scopefuel" / "config.toml"
 
 
+# task #1024 — an unparseable or unreadable config.toml used to fail silent:
+# load_config returned {} and every setting on the host (including the #712 B
+# plaintext opt-ins) was dropped with nothing saying why. The file keeps being
+# ignored — commands that do not need config must keep working — but the
+# reason is now loud: one stderr warning per process, and a ``blocked:`` line
+# on ``bench catalog status``. The dedup set is keyed on the resolved path so
+# a test (or embedder) pointing XDG_CONFIG_HOME at a different file still gets
+# its own warning.
+_WARNED_CONFIG_PATHS: set[pathlib.Path] = set()
+
+
+def _describe_config_problem(exc: OSError | tomllib.TOMLDecodeError) -> str:
+    if isinstance(exc, tomllib.TOMLDecodeError):
+        return f"could not be parsed ({exc})"
+    reason = exc.strerror or str(exc)
+    return f"could not be read ({reason})"
+
+
+def config_problem(path: pathlib.Path | None = None) -> str | None:
+    """Why the config file is being ignored, or None when it is not.
+
+    Three outcomes are deliberately distinct: a missing file is not a problem
+    (most hosts run on defaults and stay silent), a parse error reports the
+    TOML detail with line and column, and an unreadable existing file reports
+    the OS reason. ``bench catalog status`` prints this and ``--check`` fails
+    on it, so a broken config can never pass the fleet check by looking empty.
+    """
+
+    target = path if path is not None else config_path()
+    try:
+        tomllib.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return _describe_config_problem(exc)
+    return None
+
+
+def _warn_config_problem(path: pathlib.Path, problem: str) -> None:
+    if path in _WARNED_CONFIG_PATHS:
+        return
+    _WARNED_CONFIG_PATHS.add(path)
+    print(
+        f"scopefuel: warning: {path} {problem}: every setting in it is ignored until it is fixed",
+        file=sys.stderr,
+    )
+
+
 def load_config() -> dict:
     path = config_path()
     try:
-        return tomllib.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    except (OSError, tomllib.TOMLDecodeError):
+    except OSError as exc:
+        _warn_config_problem(path, _describe_config_problem(exc))
+        return {}
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        _warn_config_problem(path, _describe_config_problem(exc))
         return {}
 
 

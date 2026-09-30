@@ -188,6 +188,11 @@ $ scopefuel bench catalog list | head
 `decided_by` is required caller-supplied provenance on this route — the server
 rejects a blank one rather than filling it in.
 
+When the seeding host's tunnel endpoint is plaintext http and the persistent
+`allow_plaintext_catalog` opt-in is not written yet, `push-catalog` takes a
+per-call `--allow-plaintext-http` (the same opt-in `reps migrate` carries): it
+applies to that invocation only and is never recorded to the config file.
+
 Ordering matters on every later release too: the validity floor requires the
 server canon to mention every profile the bundled snapshot places. A scopefuel
 release that *adds* a snapshot profile therefore makes upgraded hosts reject
