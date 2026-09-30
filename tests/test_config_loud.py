@@ -204,3 +204,79 @@ def test_push_catalog_plaintext_auto_mode_still_refuses_without_the_flag(tmp_pat
     assert cli.main(["bench", "push-catalog", str(seed)]) == 2
     assert "requires the handoffkeep backend" in capsys.readouterr().err
     assert fake.hits[("PUT", "catalog")] == 0
+
+
+# --- task #1028 — undecodable config (CodeRabbit Major 4139034399) ------------
+#
+# A config.toml that is not valid UTF-8 used to raise UnicodeDecodeError out of
+# load_config — a crash, not a warning. It is a broken config like any other:
+# one stderr warning per process naming the file and the failing byte's
+# position, every command keeps running on {}, and --check exits 2.
+
+# A lone 0xe9 ("é" in latin-1) inside an otherwise fine file — invalid UTF-8.
+LATIN1_CONFIG = '[bench]\nbackend = "local"\nname = "café"\n'.encode("latin-1")
+UTF16_CONFIG = '[bench]\nbackend = "local"\n'.encode("utf-16")  # BOM + 2-byte units
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [LATIN1_CONFIG, UTF16_CONFIG],
+    ids=["latin1-byte-e9", "utf-16-with-bom"],
+)
+def test_undecodable_config_warns_once_and_stdout_is_unchanged(tmp_path, capsys, blob):
+    """AC (M3): "an undecodable config is never a crash".
+
+    The mutant drops the UnicodeDecodeError branch: load_config raises out of
+    the read and this test is RED.
+    """
+
+    config = _config_file(tmp_path)
+
+    # Baseline: an empty config — the same {} an undecodable one yields.
+    config.write_text("", encoding="utf-8")
+    assert cli.main(["bench", "catalog", "list"]) == 0
+    assert cli.main(["policy", "launch", "opus", "--json"]) == 0
+    baseline = capsys.readouterr()
+    assert _warnings(baseline.err) == []
+
+    config.write_bytes(blob)
+    for _ in range(3):
+        assert policy.load_config() == {}
+    # Commands that do not need config keep working on the ignored file.
+    assert cli.main(["bench", "catalog", "list"]) == 0
+    assert cli.main(["policy", "launch", "opus", "--json"]) == 0
+    after = capsys.readouterr()
+
+    warnings = _warnings(after.err)
+    assert len(warnings) == 1, "an undecodable config is never a crash, and it warns once per process"
+    warning = warnings[0]
+    assert str(config) in warning
+    assert "could not be decoded as UTF-8" in warning
+    # The codec detail names the failing byte's position — never .strerror,
+    # which UnicodeDecodeError does not have.
+    assert "position" in warning
+    assert "every setting in it is ignored until it is fixed" in warning
+    assert after.out == baseline.out
+
+
+def test_catalog_status_check_fails_on_an_undecodable_config(tmp_path, monkeypatch, capsys):
+    """AC: ``--check`` exits 2 with the decode reason, like a parse error."""
+
+    _set_backend(tmp_path, monkeypatch)
+    fake = FakeHandoffkeep()
+    fake.catalog = _seed_rows()
+    monkeypatch.setattr(bench, "request_json", fake.request_json)
+    bench.reset_catalog_memo()
+    config = tmp_path / "config" / "scopefuel" / "config.toml"
+
+    # The written config is valid — the check passes first.
+    assert cli.main(["bench", "catalog", "status", "--check"]) == 0
+    capsys.readouterr()
+
+    config.write_bytes(UTF16_CONFIG)
+    assert "could not be decoded as UTF-8" in policy.config_problem()
+    rc = cli.main(["bench", "catalog", "status", "--check"])
+    captured = capsys.readouterr()
+    assert rc == 2, "--check never passes on a config it cannot decode"
+    assert "check failed:" in captured.err
+    assert "could not be decoded as UTF-8" in captured.err

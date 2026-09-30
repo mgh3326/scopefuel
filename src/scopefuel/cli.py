@@ -1334,6 +1334,17 @@ def _seed_catalog_json(args: argparse.Namespace) -> int:
         row["decided_by"] = entry.decided_by or decided_by
         row["deviation_ref"] = entry.deviation_ref or deviation_ref
         rows.append(row)
+    # #1028: the server decodes these into Go time.Time — strict RFC3339 with
+    # a zone — so a bare date stored in the bundled snapshot (the #781
+    # override's "2026-09-27") is emitted at day-start UTC, not as-is; that
+    # date-only value is what 400'd the #955 step-2 PUT.
+    try:
+        for row in rows:
+            for field in ("decided_at", "retired_at"):
+                row[field] = bench.catalog_wire_timestamp(row.get(field), field)
+    except bench.BenchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps({"catalog": rows}, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
