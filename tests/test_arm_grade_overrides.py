@@ -36,6 +36,9 @@ from scopefuel.recommend import (
 OVERRIDE_KEY = ("devin-swe2-medium", "")
 DECIDED_BY = "operator:2026-09-27 via operator-desk"
 DECIDED_AT = "2026-09-27"
+# #1028: the stored value stays the bare decision date; the wire form is what
+# --emit-seed puts in the JSON (the server's time.Time needs RFC3339).
+DECIDED_AT_WIRE = "2026-09-27T00:00:00Z"
 DEVIATION_REF = "hk:doc 5177 item 2 (evidence srv:973, srv:976, srv:988)"
 
 TODAY = dt.date(2026, 9, 27)
@@ -117,7 +120,7 @@ def test_the_seed_emit_keeps_the_rows_own_decision_provenance(capsys):
     row = rows[OVERRIDE_KEY]
     assert row["grade"] == "A"
     assert row["decided_by"] == DECIDED_BY
-    assert row["decided_at"] == DECIDED_AT
+    assert row["decided_at"] == DECIDED_AT_WIRE
     assert row["deviation_ref"] == DEVIATION_REF
     # Rows without their own provenance still take the generic seed stamp.
     other = rows[("devin-swe2-max", "")]

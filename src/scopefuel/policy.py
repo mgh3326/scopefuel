@@ -46,7 +46,8 @@ def config_path() -> pathlib.Path:
     return pathlib.Path(base) / "scopefuel" / "config.toml"
 
 
-# task #1024 — an unparseable or unreadable config.toml used to fail silent:
+# task #1024 — an unparseable, undecodable (#1028), or unreadable config.toml
+# used to fail silent:
 # load_config returned {} and every setting on the host (including the #712 B
 # plaintext opt-ins) was dropped with nothing saying why. The file keeps being
 # ignored — commands that do not need config must keep working — but the
@@ -57,9 +58,13 @@ def config_path() -> pathlib.Path:
 _WARNED_CONFIG_PATHS: set[pathlib.Path] = set()
 
 
-def _describe_config_problem(exc: OSError | tomllib.TOMLDecodeError) -> str:
+def _describe_config_problem(exc: OSError | tomllib.TOMLDecodeError | UnicodeDecodeError) -> str:
     if isinstance(exc, tomllib.TOMLDecodeError):
         return f"could not be parsed ({exc})"
+    if isinstance(exc, UnicodeDecodeError):
+        # #1028: not an OSError — it has no .strerror. Name the codec detail,
+        # which carries the failing byte's position.
+        return f"could not be decoded as UTF-8 ({exc})"
     reason = exc.strerror or str(exc)
     return f"could not be read ({reason})"
 
@@ -69,9 +74,10 @@ def config_problem(path: pathlib.Path | None = None) -> str | None:
 
     Three outcomes are deliberately distinct: a missing file is not a problem
     (most hosts run on defaults and stay silent), a parse error reports the
-    TOML detail with line and column, and an unreadable existing file reports
-    the OS reason. ``bench catalog status`` prints this and ``--check`` fails
-    on it, so a broken config can never pass the fleet check by looking empty.
+    TOML detail with line and column, and an unreadable or undecodable
+    existing file reports the OS reason or the codec failure's byte position.
+    ``bench catalog status`` prints this and ``--check`` fails on it, so a
+    broken config can never pass the fleet check by looking empty.
     """
 
     target = path if path is not None else config_path()
@@ -79,7 +85,7 @@ def config_problem(path: pathlib.Path | None = None) -> str | None:
         tomllib.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         return _describe_config_problem(exc)
     return None
 
@@ -100,7 +106,7 @@ def load_config() -> dict:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         _warn_config_problem(path, _describe_config_problem(exc))
         return {}
     try:

@@ -191,7 +191,10 @@ rejects a blank one rather than filling it in.
 When the seeding host's tunnel endpoint is plaintext http and the persistent
 `allow_plaintext_catalog` opt-in is not written yet, `push-catalog` takes a
 per-call `--allow-plaintext-http` (the same opt-in `reps migrate` carries): it
-applies to that invocation only and is never recorded to the config file.
+applies to that invocation only and is never recorded to the config file. The
+flag does not make the hop safe — the bearer token crosses it in the clear, so
+use it only over a trusted private tunnel (WireGuard/Tailscale), never a
+public network path.
 
 Ordering matters on every later release too: the validity floor requires the
 server canon to mention every profile the bundled snapshot places. A scopefuel

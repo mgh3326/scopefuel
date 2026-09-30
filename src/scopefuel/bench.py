@@ -2380,6 +2380,46 @@ def _catalog_score(value: object) -> float | None:
     return score
 
 
+# task #1028 — handoffkeep decodes decided_at/retired_at into Go time.Time:
+# strict RFC3339 with a zone, nothing else, so the bare "2026-09-27" the
+# bundled snapshot stores (#781 ArmGradeOverride) is the value that 400'd the
+# #955 step-2 seed PUT. Every catalog timestamp that leaves the process — the
+# emitted seed or a pushed JSON file — goes through catalog_wire_timestamp: a
+# bare ISO date means that day at 00:00:00Z, and anything that is neither
+# RFC3339 nor a real date is refused before the wire write.
+_DATE_ONLY_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_RFC3339_ZONED_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+
+def catalog_wire_timestamp(value: object, field: str) -> str | None:
+    """Normalize one catalog timestamp field to the server's RFC3339 contract.
+
+    ``None`` stays ``None`` — the server stamps a zero ``decided_at`` itself
+    and a null ``retired_at`` is a live row. A bare ISO date is that day at
+    day-start UTC. Anything else must already be RFC3339 with a zone, because
+    the server would refuse the whole batch on it.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if _DATE_ONLY_RE.fullmatch(text):
+        try:
+            dt.date.fromisoformat(text)
+        except ValueError:
+            raise BenchError(f"catalog {field} is not a real date: {text!r}") from None
+        return f"{text}T00:00:00Z"
+    if _RFC3339_ZONED_RE.fullmatch(text):
+        try:
+            dt.datetime.fromisoformat(text)
+        except ValueError:
+            pass
+        else:
+            return text
+    raise BenchError(f"catalog {field} must be RFC3339 with a zone (e.g. 2026-09-27T00:00:00Z), got {text!r}")
+
+
 def _catalog_from_wire(value: object) -> CatalogEntry:
     if not isinstance(value, dict):
         raise BenchError("invalid handoffkeep catalog row")
@@ -2750,7 +2790,24 @@ def push_catalog(
         payload = json.loads(raw)
     except ValueError as exc:
         raise BenchError("catalog JSON is not valid JSON") from exc
-    entries = _catalog_rows_from_json(payload)
+    rows = _catalog_rows_from_json(payload)
+    # #1028: normalize timestamps before anything leaves the process — a bare
+    # date becomes T00:00:00Z (the seed emit applies the same rule, so a
+    # reviewed hand-corrected file keeps working) and anything the server's
+    # time.Time decode would refuse is a local error naming its row, not a
+    # remote 400 on the whole batch.
+    entries = []
+    for entry in rows:
+        try:
+            entries.append(
+                replace(
+                    entry,
+                    decided_at=catalog_wire_timestamp(entry.decided_at, "decided_at"),
+                    retired_at=catalog_wire_timestamp(entry.retired_at, "retired_at"),
+                )
+            )
+        except BenchError as exc:
+            raise BenchError(f"{entry.profile}/{entry.effort or '-'}: {exc}") from None
     for entry in entries:
         if not entry.decided_by:
             raise BenchError(
