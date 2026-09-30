@@ -104,6 +104,13 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
 # entry added here silently removes a profile from the canon's reach.
 WRK_CATALOG_EXEMPT: dict[str, str] = {
     "codex-sol56": "rollback pin to the pre-refresh gpt-5.6-sol",
+    # #1026 (09-30 operator decision): codex-sol launches gpt-6.1-sol; these
+    # rollback spellings hold the superseded gpt-6-sol literally, never from
+    # the canon — the same pattern codex-sol56 established. builder-sol6 still
+    # consults the catalog grade at codex-sol@high for the gate; only the
+    # model id is exempt.
+    "codex-sol6": "rollback pin to the pre-6.1 gpt-6-sol",
+    "builder-sol6": "rollback pin to the pre-6.1 gpt-6-sol (gate still consults codex-sol@high)",
     "codex-luna56": "rollback pin to the pre-refresh gpt-5.6-luna",
     "grok45": "rollback pin to grok-4.5",
     "grok45-med": "rollback pin to grok-4.5",
@@ -153,12 +160,15 @@ WRK_CATALOG_EXEMPT: dict[str, str] = {
     "oc-solar4": "ditto",
 }
 
-# The values bin/wrk hardcoded before #593. The migration must reproduce them
-# exactly on day one — a drift here is a profile silently re-pointed.
+# The values bin/wrk's fallback table must reproduce when the canon cannot
+# answer (the pre-#593 hardcoded set, moved forward by each model refresh —
+# #1026 switched the codex-sol family to gpt-6.1-sol on 2026-09-30). A drift
+# here is a profile silently re-pointed: an unreachable canon must launch the
+# same model the canon would have answered.
 WRK_PRE_593_RESOLUTION: dict[str, tuple[str, str]] = {
-    "codex": ("gpt-6-sol", "high"),
-    "codex-sol": ("gpt-6-sol", "max"),
-    "codex-max": ("gpt-6-sol", "max"),
+    "codex": ("gpt-6.1-sol", "high"),
+    "codex-sol": ("gpt-6.1-sol", "max"),
+    "codex-max": ("gpt-6.1-sol", "max"),
     "codex-terra": ("gpt-5.6-terra", "medium"),
     "codex-terra-max": ("gpt-5.6-terra", "max"),
     "codex-luna": ("gpt-6-luna", "medium"),

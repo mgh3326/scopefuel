@@ -59,6 +59,10 @@ WRK_BUILDER_SPELLINGS: dict[str, tuple[str, str]] = {
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     "builder-sol-medium": ("codex-sol", "medium"),
+    # #1026: the gpt-6-sol rollback builder seat — catalog-exempt on the wrk
+    # side (literal gpt-6-sol argv) but it gates at codex-sol@high, so its
+    # reps resolve there and read as model mismatches.
+    "builder-sol6": ("codex-sol", "high"),
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
     "builder-terra-high": ("codex-terra", "high"),
@@ -349,6 +353,77 @@ def test_kimi_k3_low_is_its_own_profile(tmp_path, isolated_cache):
     row = _counted(proposal, "t1")
     assert row.rung == ("kimi-k3-low", "")
     assert row.row_key == ("kimi-k3-low", "")
+
+
+# ---------------------------------------------------------------------------
+# #1026 rollback spellings — resolve to the live rungs, read as mismatches
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_spellings_resolve_and_read_as_model_mismatches(tmp_path, isolated_cache):
+    """#1026 AC2: the codex-sol rungs carry gpt-6.1-sol, so the rollback
+    spellings' reps (pinned literal gpt-6-sol / gpt-5.6-sol) resolve onto the
+    live rungs and report as model mismatches — never unrung, never counted."""
+    view = _view(
+        _entry("codex-sol", "high", "C", model_id="gpt-6.1-sol"),
+        _entry("codex-sol", "max", "S+", model_id="gpt-6.1-sol"),
+    )
+    _seed(
+        [
+            _rep("b6", profile="builder-sol6", model_id="gpt-6-sol", grade="S"),
+            _rep("s6", profile="codex-sol6", model_id="gpt-6-sol", grade="S"),
+            _rep("s56", profile="codex-sol56", model_id="gpt-5.6-sol", grade="S"),
+        ]
+    )
+    proposal = _propose(view)
+    assert proposal.unrung == []
+
+    builder_row = _counted(proposal, "b6")
+    # builder-sol6 consults the same rung builder-sol does (codex-sol@high).
+    assert builder_row.rung == ("codex-sol", "high")
+    assert builder_row.resolution == "builder map"
+    assert "model mismatch" in builder_row.excluded
+    assert "model-mismatch" in builder_row.exclusion_tags
+
+    sol6_row = _counted(proposal, "s6")
+    assert sol6_row.rung == ("codex-sol", "max")
+    assert sol6_row.resolution == "alias"
+    assert "model mismatch" in sol6_row.excluded
+    assert "model-mismatch" in sol6_row.exclusion_tags
+
+    # codex-sol56 gets the same treatment: the older Sol generation resolves
+    # onto the live rows and mismatches there too.
+    sol56_row = _counted(proposal, "s56")
+    assert sol56_row.rung == ("codex-sol", "max")
+    assert sol56_row.resolution == "alias"
+    assert "model mismatch" in sol56_row.excluded
+
+
+def test_rollback_rep_recorded_effort_still_wins(tmp_path, isolated_cache):
+    """A codex-sol6 rep recorded at a named effort resolves that exact rung —
+    the pin is the fallback for reps that recorded none."""
+    view = _view(
+        _entry("codex-sol", "high", "C", model_id="gpt-6.1-sol"),
+        _entry("codex-sol", "max", "S+", model_id="gpt-6.1-sol"),
+    )
+    _seed([_rep("t1", profile="codex-sol6", model_id="gpt-6-sol", effort="high", grade="S")])
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-sol", "high")
+    assert "model mismatch" in row.excluded
+
+
+def test_current_model_rep_on_codex_sol_still_counts(tmp_path, isolated_cache):
+    """Positive control: a gpt-6.1-sol rep on codex-sol@max counts — only the
+    superseded ids read as mismatches."""
+    view = _view(_entry("codex-sol", "max", "S+", model_id="gpt-6.1-sol"))
+    _seed([_rep("t1", profile="codex-sol", model_id="gpt-6.1-sol", effort="max", grade="S+")])
+    proposal = _propose(view)
+    row = _counted(proposal, "t1")
+    assert row.rung == ("codex-sol", "max")
+    assert row.row_key == ("codex-sol", "max")
+    assert row.excluded == ""
+    assert row.resolution == "direct"
 
 
 # ---------------------------------------------------------------------------

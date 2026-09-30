@@ -160,11 +160,11 @@ def test_catalog_model_id_change_reaches_the_launcher_without_a_grade_change(cat
     """
 
     _, fake = catalog_server
-    assert launch.resolve_launch("codex-sol").model_id == "gpt-6-sol"
+    assert launch.resolve_launch("codex-sol").model_id == "gpt-6.1-sol"
 
-    fake.catalog = _seed_rows_with("codex-sol", "max", model_id="gpt-6-1-sol")
+    fake.catalog = _seed_rows_with("codex-sol", "max", model_id="gpt-6.2-sol")
     _age_catalog_cache(3601)
-    assert launch.resolve_launch("codex-sol").model_id == "gpt-6-1-sol"
+    assert launch.resolve_launch("codex-sol").model_id == "gpt-6.2-sol"
 
 
 # --- T2/T3: additions and removals both land -------------------------------
@@ -207,7 +207,7 @@ def test_a_profile_the_catalog_never_mentions_is_kept_not_deleted(catalog_server
     view = bench.CatalogView(
         entries=(
             bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),
-            bench.CatalogEntry("codex-sol", "max", "gpt-6-sol", "codex", "S+"),
+            bench.CatalogEntry("codex-sol", "max", "gpt-6.1-sol", "codex", "S+"),
         ),
         source="server",
         backend="handoffkeep",
@@ -416,6 +416,29 @@ def test_emit_seed_produces_rows_the_server_route_accepts(catalog_server, capsys
     payload = tmp_path / "seed.json"
     payload.write_text(json.dumps(seed), encoding="utf-8")
     assert bench.push_catalog(payload) == len(seed["catalog"])
+
+
+def test_sol61_switch_snapshot_and_seed_carry_gpt61(capsys):
+    """#1026 AC1: every codex-sol row in the snapshot and the emitted seed
+    carries gpt-6.1-sol — grades, scores, gates and efforts unchanged.
+    kiro-sol stays on gpt-5.6-sol."""
+    snapshot = {entry.effort: entry for entry in bench.catalog_snapshot() if entry.profile == "codex-sol"}
+    assert set(snapshot) == {"max", "xhigh", "high", "medium"}
+    for entry in snapshot.values():
+        assert entry.model_id == "gpt-6.1-sol"
+    placements = {effort: (row.grade, row.score, row.gate) for effort, row in snapshot.items()}
+    assert placements == {
+        "max": ("S+", 67.0, "default"),
+        "xhigh": ("S+", 65.0, "escalation"),
+        "high": ("C", None, "default"),
+        "medium": ("C", None, "default"),
+    }, "the switch changes no grade"
+
+    assert cli.main(["bench", "push-catalog", "--emit-seed", "--decided-by", "operator-desk"]) == 0
+    seed = {(row["profile"], row["effort"]): row for row in json.loads(capsys.readouterr().out)["catalog"]}
+    for effort in ("max", "xhigh", "high", "medium"):
+        assert seed[("codex-sol", effort)]["model_id"] == "gpt-6.1-sol"
+    assert seed[("kiro-sol", "")]["model_id"] == "gpt-5.6-sol"
 
 
 # --- the pre-#593 database still works -------------------------------------
@@ -805,7 +828,7 @@ def test_every_recommended_profile_in_a_partly_seeded_catalog_can_be_launched():
     view = bench.CatalogView(
         entries=(
             bench.CatalogEntry("opus", "high", "claude-opus-5-5", "claude", "S+"),
-            bench.CatalogEntry("codex-sol", "max", "gpt-6-sol", "codex", "S+"),
+            bench.CatalogEntry("codex-sol", "max", "gpt-6.1-sol", "codex", "S+"),
         ),
         source="server",
         backend="handoffkeep",

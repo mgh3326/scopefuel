@@ -2016,7 +2016,7 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
 
     scores = [
         ModelScore(
-            model_id="gpt-6-sol",
+            model_id="gpt-6.1-sol",
             effort="max",
             harness="codex",
             source="AA-agent",
@@ -2026,7 +2026,7 @@ def test_rob1191_one_effort_bench_cells_and_kimi_default_is_exact():
             captured_at="2026-08-01T00:00:00+00:00",
         ),
         ModelScore(
-            model_id="gpt-6-sol",
+            model_id="gpt-6.1-sol",
             effort="high",
             harness="codex",
             source="AA-agent",

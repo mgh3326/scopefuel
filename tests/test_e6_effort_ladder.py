@@ -42,8 +42,8 @@ NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
 # #920: sonnet@max left this table — the Sonnet 5.5 refresh placed the rung at
 # S (estimated vendor TB4 70.6, one step below its raw S+ read).
 NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
-    ("codex-sol", "high"): ("codex", "gpt-6-sol", "high 42.8"),
-    ("codex-sol", "medium"): ("codex", "gpt-6-sol", "medium 미저장"),
+    ("codex-sol", "high"): ("codex", "gpt-6.1-sol", "high 42.8"),
+    ("codex-sol", "medium"): ("codex", "gpt-6.1-sol", "medium 미저장"),
     ("kimi-k3", "high"): ("kimi", "kimi-k3", "default 61.0"),
     ("kimi-k3", "max"): ("kimi", "kimi-k3", "max 43.6"),
     # #737 (decision 4088): the grok E6 arms — builder-grok-low/-medium/-xhigh.
@@ -186,7 +186,12 @@ def test_a_canon_silent_about_the_rung_resolves_the_bundled_row_for_this_profile
                 profile="kimi-k3", effort="", model_id="kimi-k3", pool="kimi", grade="S", score=61.0
             ),
             bench.CatalogEntry(
-                profile="codex-sol", effort="max", model_id="gpt-6-sol", pool="codex", grade="S+", score=67.0
+                profile="codex-sol",
+                effort="max",
+                model_id="gpt-6.1-sol",
+                pool="codex",
+                grade="S+",
+                score=67.0,
             ),
         ),
         source="server",
@@ -296,7 +301,7 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
         return bench.CatalogEntry(
             profile=profile,
             effort=effort,
-            model_id="claude-sonnet-5-5" if profile == "sonnet" else "gpt-6-sol",
+            model_id="claude-sonnet-5-5" if profile == "sonnet" else "gpt-6.1-sol",
             pool="claude" if profile == "sonnet" else "codex",
             grade=grade,
             benchmark_annotation=E6_ARM_ANNOTATION,
@@ -566,7 +571,7 @@ def test_an_unmarked_request_keeps_the_default_placement():
     """`wrk -m codex` pins codex-sol@high; the C row must not answer for it."""
 
     decision = launch.resolve_launch("codex-sol", effort="high")
-    assert decision.model_id == "gpt-6-sol"
+    assert decision.model_id == "gpt-6.1-sol"
     assert decision.effort == "high"
     assert decision.gate == "default"
     assert decision.grade == "S+"

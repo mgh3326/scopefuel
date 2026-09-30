@@ -33,8 +33,9 @@ row printed with its reason:
     CLI spellings and older generations never equate). A rep with no recorded
     model, or one recorded on a rung whose catalog row carries no model id,
     cannot be matched and never counts. Mismatches are reported, never counted:
-    this is the guard that keeps an August ``codex``/``gpt-5`` rep off the
-    post-09-22 ``gpt-6-sol`` rungs.
+    this is the guard that keeps an August ``codex``/``gpt-5`` rep — and every
+    pre-switch ``gpt-6-sol`` rep — off the post-09-30 ``gpt-6.1-sol`` rungs
+    (#1026: the 09-30 operator decision moved codex-sol to gpt-6.1-sol).
 *   **Non-coding tasks** — reps whose ``task_ref`` matches a non-coding pattern
     (``NON_CODING_TASK_PATTERNS`` defaults such as the B0X-* trading slots,
     plus ``[grades].non_coding_task_patterns`` in config.toml and any
@@ -142,11 +143,13 @@ GRADE_STRENGTH = {grade: index for index, grade in enumerate(GRADE_LADDER)}
 #
 # Deliberately NOT equivalent: floating CLI spellings (``opus``, ``claude``,
 # ``sonnet``, ``codex``, ``codex-sol``, ``codex-luna``, ``grok``, ``kimi-code``
-# alone) and older generations (``gpt-5*``, ``gpt-5.6-sol``, ``grok-4.6``,
-# ``claude-opus-5``) — the 2026-09-27 operator decision named the August
-# ``codex -> codex-sol`` mapping that let pre-09-22 gpt-5-era reps land on the
-# gpt-6-sol rungs. Those reps report as model mismatches, never count, and the
-# operator reviews the mismatch list to extend this table.
+# alone) and older generations (``gpt-5*``, ``gpt-5.6-sol``, ``gpt-6-sol``,
+# ``grok-4.6``, ``claude-opus-5``) — the 2026-09-27 operator decision named the
+# August ``codex -> codex-sol`` mapping that let pre-09-22 gpt-5-era reps land
+# on the then-current Sol rungs, and the #1026 switch (2026-09-30 operator
+# decision) makes every gpt-6-sol rep the same kind of mismatch on the
+# gpt-6.1-sol rungs. Those reps report as model mismatches, never count, and
+# the operator reviews the mismatch list to extend this table.
 # ---------------------------------------------------------------------------
 
 MODEL_EQUIVALENCE: dict[str, frozenset[str]] = {
@@ -286,6 +289,11 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     "builder-sol-medium": ("codex-sol", "medium"),
+    # #1026: builder-sol6 is the gpt-6-sol rollback builder seat — it consults
+    # the same rung as builder-sol (codex-sol@high), but its literal gpt-6-sol
+    # model id now reads as a model mismatch on the 6.1 rungs rather than
+    # leaving the rep unrung.
+    "builder-sol6": ("codex-sol", "high"),
     # #633: builder-luna is codex-luna admitted under --role builder at the
     # #594 E3 rung (xhigh).
     "builder-luna": ("codex-luna", "xhigh"),
@@ -328,6 +336,13 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
 _SPELLING_ALIASES: dict[str, tuple[str, str]] = {
     # wrk worker spellings (resolve_catalog_profile)
     "codex": ("codex-sol", "high"),
+    # #1026 rollback spellings (ROB-591 pattern): the launcher pins the
+    # superseded model id literally and gates at the codex-sol default rung
+    # (max). Mapping them onto codex-sol lets their reps resolve to the live
+    # rungs and read as model mismatches (gpt-5.6-sol / gpt-6-sol vs
+    # gpt-6.1-sol) instead of going unrung — they still never count.
+    "codex-sol56": ("codex-sol", "max"),
+    "codex-sol6": ("codex-sol", "max"),
     "codex-med": ("codex-terra", "medium"),
     "codex-luna-hi": ("codex-luna", "high"),
     "sonnet-med": ("sonnet", ""),
