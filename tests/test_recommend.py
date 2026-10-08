@@ -15,7 +15,6 @@ from scopefuel.recommend import (
     GRADE_BOUNDARIES,
     GRADE_DISCRIM,
     GRADE_TABLE,
-    HAIKU_ESTIMATE_ANNOTATION,
     MODEL_ONLY_ANNOTATION,
     MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
     MODEL_ONLY_INTERPOLATED_ANNOTATION,
@@ -498,12 +497,26 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     #920: alias sonnet serves claude-sonnet-5-5 since 2026-09-29 — the sonnet
     rows' aa_model_id is the new exact model id, so v1.1 rep matching never
     folds pre-refresh claude-sonnet-5 reps into Sonnet 5.5 rungs.
+    #1269: alias haiku serves claude-haiku-5-5 since 2026-10-08 — same story
+    for pre-refresh claude-haiku-4.5 reps.
     """
     sonnet_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "sonnet"]
     assert len(sonnet_rows) == 4  # S max, A+ xhigh, C high/medium — low has no vendor point
     assert {p.launcher_effort for p in sonnet_rows} == {"max", "xhigh", "high", "medium"}
     for profile in sonnet_rows:
         assert profile.aa_model_id == "claude-sonnet-5-5"
+
+    # #1269: the vendor TB4 curve gives a point at every launchable rung —
+    # all five land at C, with max escalation-gated until real reps exist.
+    haiku_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "haiku"]
+    assert len(haiku_rows) == 5
+    assert {p.launcher_effort for p in haiku_rows} == {"low", "medium", "high", "xhigh", "max"}
+    assert {p.benchmark for p in haiku_rows} == {12.8, 20.3, 25.0, 31.5, 39.2}
+    assert all(p.aa_model_id == "claude-haiku-5-5" for p in haiku_rows)
+    assert all(p in GRADE_TABLE["C"] for p in haiku_rows)
+    (haiku_max,) = [p for p in haiku_rows if p.launcher_effort == "max"]
+    assert haiku_max.gate == "escalation"
+    assert all(p.gate == "default" for p in haiku_rows if p.launcher_effort != "max")
 
     ds41 = next(p for p in GRADE_TABLE["A+"] if p.name == "devin-ds41")
     assert ds41.aa_model_id == "deepseek-v4-1-flash"
@@ -735,15 +748,12 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
 
     b_output = recommend(providers, "B", today=TODAY, now=NOW)
     assert "codex-luna --effort medium" in b_output
-    assert "haiku --effort low" not in b_output
-    # ROB-1202: Haiku high (extrapolated/unmeasured estimate) belongs to B; Grok low relocated here too.
-    assert any(line[:1].isdigit() and "haiku --effort high" in line for line in b_output.splitlines())
-    assert "haiku --effort medium" not in b_output
+    # #1269: the Haiku 5.5 refresh demotes every haiku rung to C — the old
+    # high-B (44.0) row was an over-estimate (vendor TB4 puts 4.5 at 0.0).
+    assert "haiku --effort" not in b_output
     assert any(line[:1].isdigit() and "grok --effort low" in line for line in b_output.splitlines())
-    assert f"벤치 44.0({HAIKU_ESTIMATE_ANNOTATION})" in b_output
 
     c_output = recommend(providers, "C", today=TODAY, now=NOW)
-    assert f"벤치 35.0({HAIKU_ESTIMATE_ANNOTATION})" in c_output
     assert "codex-luna --effort low" in c_output
     assert "미측정" in c_output
     assert "codex-luna --effort medium" not in c_output
@@ -754,6 +764,16 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert "벤치 43.0(추정(외삽))" in c_output
     assert "벤치 29.0(추정(외삽))" in c_output
     assert "보수 배치(C; raw 43.0 은 B 구간" in c_output
+    # #1269: Haiku 5.5 vendor-TB4 estimates — the whole launchable curve lands
+    # at C (raws already at the floor); max shows as the escalation rung.
+    for rung, score in (("low", 12.8), ("medium", 20.3), ("high", 25.0), ("xhigh", 31.5)):
+        assert any(
+            line[:1].isdigit() and f"haiku --effort {rung}" in line for line in c_output.splitlines()
+        ), rung
+        assert f"벤치 {score}(추정(외삽))" in c_output
+    assert "haiku --effort max" in c_output
+    assert "벤치 39.2(추정(외삽))" not in c_output
+    assert not any(line[:1].isdigit() and "haiku --effort max" in line for line in c_output.splitlines())
 
     all_profiles = {profile.name for profiles in GRADE_TABLE.values() for profile in profiles}
     assert "gpt-5.4-mini" not in all_profiles
@@ -807,10 +827,12 @@ def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
 def test_rob1204_existing_top_rank_intent_remains_for_claude_only_inputs():
     # #920: sonnet's ranked claude candidate moved from A+ (Sonnet 5 high) to C
     # (Sonnet 5.5 high, vendor TB4 43.0 one step below its raw B read).
+    # #1269: haiku left B entirely — every Haiku 5.5 rung sits at C, so the
+    # claude-only B output has no ranked row left at all.
     c = recommend([_result("claude", 10.0, pool_class="preserve")], "C", today=TODAY, now=NOW)
     b = recommend([_result("claude", 10.0, pool_class="preserve")], "B", today=TODAY, now=NOW)
     assert next(line for line in c.splitlines() if line[:1].isdigit()).startswith("1. sonnet --effort high")
-    assert next(line for line in b.splitlines() if line[:1].isdigit()).startswith("1. haiku --effort high")
+    assert not any(line[:1].isdigit() for line in b.splitlines())
 
 
 def test_rob1193_model_only_profiles_use_registered_coding_index_metric():

@@ -190,7 +190,8 @@ WRK_PRE_593_RESOLUTION: dict[str, tuple[str, str]] = {
     # spellings are catalog-exempt on the wrk side (see WRK_CATALOG_EXEMPT).
     # #920: the alias serves claude-sonnet-5-5 since 2026-09-29.
     "sonnet": ("claude-sonnet-5-5", "high"),
-    "haiku": ("claude-haiku-4.5", "low"),
+    # #1269: the alias serves claude-haiku-5-5 since 2026-10-08.
+    "haiku": ("claude-haiku-5-5", "low"),
     "fable": ("claude-fable-5-1", ""),
 }
 

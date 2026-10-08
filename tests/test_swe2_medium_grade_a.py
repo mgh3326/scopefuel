@@ -54,7 +54,9 @@ def test_devin_swe2_medium_is_a_single_a_row_with_provenance():
 def test_no_other_grade_table_row_changed():
     """AC1: the delta against the pre-#787 table is this one move plus the
     #920 Sonnet 5.5 relabel (Sonnet 5 rows replaced by estimated 5.5 rows)
-    plus the #1026 Sol 6.1 relabel (the two codex-sol S+ rows relabelled)."""
+    plus the #1026 Sol 6.1 relabel (the two codex-sol S+ rows relabelled)
+    plus the #1269 Haiku 5.5 refresh (the two Haiku 4.5 rows replaced by five
+    estimated C-rung rows)."""
     pre = json.loads(PRE_787_ROWS.read_text())
     pre_counts = Counter(json.dumps(row, sort_keys=True) for row in pre)
     post_counts = Counter(json.dumps(row, sort_keys=True) for row in _rows(GRADE_TABLE))
@@ -75,6 +77,13 @@ def test_no_other_grade_table_row_changed():
         # gpt-6-sol -> gpt-6.1-sol — same (grade, name, effort) keys.
         ("S+", "codex-sol", "max"),
         ("S+", "codex-sol", "xhigh"),
+        # #1269 (10-08 Haiku 5.5 refresh): all five launchable rungs land at C
+        # on the vendor TB4 curve.
+        ("C", "haiku", "low"),
+        ("C", "haiku", "medium"),
+        ("C", "haiku", "high"),
+        ("C", "haiku", "xhigh"),
+        ("C", "haiku", "max"),
     }
     assert {key(row) for row in removed} == {
         ("C", "devin-swe2-medium", None),
@@ -84,6 +93,10 @@ def test_no_other_grade_table_row_changed():
         ("A", "sonnet", "low"),
         ("S+", "codex-sol", "max"),
         ("S+", "codex-sol", "xhigh"),
+        # #1269: the two pre-refresh Haiku 4.5 rows are replaced — high is
+        # demoted B -> C on purpose (vendor TB4 says 4.5 scored 0.0).
+        ("B", "haiku", "high"),
+        ("C", "haiku", "low"),
     }
 
 
