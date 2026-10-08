@@ -436,7 +436,12 @@ def test_push_catalog_normalizes_a_date_only_timestamp(tmp_path, monkeypatch):
     payload = tmp_path / "catalog.json"
     payload.write_text(
         json.dumps(
-            {"catalog": [_row("opus", "high", "claude-opus-5-5", "claude", "A", decided_at="2026-09-27")]}
+            {
+                "catalog": [
+                    # fresh profile — a one-rung merged ladder is always monotonic
+                    _row("push-fresh", "high", "claude-opus-5-5", "claude", "A", decided_at="2026-09-27")
+                ]
+            }
         ),
         encoding="utf-8",
     )

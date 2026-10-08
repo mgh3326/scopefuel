@@ -20,6 +20,16 @@ only the named recorded changes are written, and every other change in the
 verified artifact is reported as not applied (operator not approved) rather
 than refused or silently dropped.
 
+Effort monotonicity (task #1298): the canon refuses a catalog write that
+leaves any touched profile's effort ladder non-monotonic — handoffkeep
+``checkBenchCatalogMonotonicity``, answered 400 ``bench_catalog_not_monotonic``.
+propose never offers such a change as applyable: it is printed and recorded
+in the JSON as blocked-by-monotonicity, naming the conflicting rung. A pair
+of changes on one profile that is monotonic together is still offered — each
+rung on its own evidence — and apply re-checks the exact set being stamped
+against the merged catalog, so an ``--only`` subset that drops one half of a
+valid pair is refused locally before anything is written.
+
 The rule v1.2 (operator decisions 2026-09-27 — the v1.1 rule plus the #777
 effort-exactness fix; tunable via ``--min-passes``, ``--demote-window`` and
 ``--demote-rate``):
@@ -105,6 +115,7 @@ import json
 import re
 import socket
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from . import bench, launch
@@ -1172,6 +1183,11 @@ class RungResult:
     # profile the canon never mentions — labelled so a snapshot placement is
     # never indistinguishable from a canon row.
     snapshot_row: bool = False
+    # Set when the change itself measures fine but writing it would leave the
+    # profile's merged catalog ladder non-monotonic — the server refuses such
+    # a write with 400 bench_catalog_not_monotonic, so it is never offered as
+    # applyable (see _apply_monotonicity_blocks).
+    monotonicity_block: MonotonicityBlock | None = None
 
     def label(self) -> str:
         return f"{self.key[0]}{'@' + self.key[1] if self.key[1] else ''}"
@@ -1413,6 +1429,14 @@ class Proposal:
     def changes(self) -> list[RungResult]:
         return [r for r in self.results if r.action in ("promote", "demote") and r.target != r.row.grade]
 
+    def applyable_changes(self) -> list[RungResult]:
+        """Changes the canon accepts — a blocked change is still a measured
+        result, it is just never part of a write the server would take."""
+        return [r for r in self.changes() if r.monotonicity_block is None]
+
+    def blocked_changes(self) -> list[RungResult]:
+        return [r for r in self.changes() if r.monotonicity_block is not None]
+
 
 def _same_run_key(rep: bench.RepRecord) -> tuple | None:
     """Identity of one measured run, regardless of profile spelling.
@@ -1624,8 +1648,214 @@ def evaluate(
         catalog_entries=entries,
         snapshot_profiles=snapshot_profiles,
     )
+    _apply_monotonicity_blocks(proposal)
     proposal.digest = _input_digest(proposal)
     return proposal
+
+
+# ---------------------------------------------------------------------------
+# Per-profile effort monotonicity (task #1298)
+#
+# handoffkeep rejects a catalog write that leaves any touched profile's
+# effort ladder non-monotonic: ``checkBenchCatalogMonotonicity`` in
+# internal/store/store.go, answered as 400 ``bench_catalog_not_monotonic``
+# (internal/api/api.go). The rule, mirrored here exactly: for every profile
+# the write touches, walk the merged catalog — the rows the canon holds plus
+# the write itself — lowest effort first (low < medium < high < xhigh < max);
+# retired rows, the effort "" profile-default row, and unknown effort strings
+# do not participate; grades must not worsen as effort rises (S+ best, C
+# worst, and the first rung is compared against C).
+#
+# propose marks a change the merged state cannot take as
+# blocked-by-monotonicity — printed and recorded, never applyable. apply
+# re-checks the exact set being stamped, so an --only subset that drops one
+# half of a valid pair is refused locally before any write.
+# ---------------------------------------------------------------------------
+
+# benchEffortRanks and benchGradeRank, verbatim order.
+MONO_EFFORT_RANKS: dict[str, int] = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+_MONO_GRADE_RANKS: dict[str, int] = {"S+": 0, "S": 1, "A+": 2, "A": 3, "B": 4}
+
+
+def _mono_grade_rank(grade: str) -> int:
+    """benchGradeRank — S+ best .. B, anything else (incl. C) worst 5."""
+    return _MONO_GRADE_RANKS.get(grade, 5)
+
+
+@dataclass(frozen=True)
+class MonotonicityViolation:
+    """The first rung of a touched profile whose merged grade is worse than a
+    lower rung's — the server's error names exactly (profile, effort, grade)."""
+
+    profile: str
+    effort: str
+    grade: str
+    # The lower rung whose grade the violated rung sits below — the adjacent
+    # ladder rung when the walk stopped, so the strongest grade beneath.
+    lower_effort: str
+    lower_grade: str
+
+
+@dataclass(frozen=True)
+class MonotonicityBlock:
+    """A proposed change the canon would refuse: applying it leaves the
+    profile's merged ladder non-monotonic. ``profile``/``effort``/``grade``
+    name the conflicting rung with its merged-state grade; ``direction`` says
+    on which side of the blocked rung it sits ("higher" | "lower")."""
+
+    profile: str
+    effort: str
+    grade: str
+    direction: str
+    reason: str
+
+
+def catalog_monotonicity_violations(
+    entries: Iterable[bench.CatalogEntry],
+    changed_grades: Mapping[tuple[str, str], str],
+) -> list[MonotonicityViolation]:
+    """checkBenchCatalogMonotonicity applied to a merged catalog state.
+
+    ``entries`` is the current catalog view; ``changed_grades`` is the write
+    set about to be applied as ``(profile, effort) -> new grade``. Only
+    profiles the write touches are checked — the server checks nothing else.
+    Returns the first violation the effort walk reaches for each touched
+    profile, sorted by profile: the server aborts the batch on the first, so
+    this is exactly what re-trying the write one profile at a time would hit.
+    """
+
+    violations: list[MonotonicityViolation] = []
+    for profile in sorted({p for p, _ in changed_grades}):
+        merged: dict[str, str] = {}
+        for entry in entries:
+            if entry.profile == profile and not entry.retired_at and entry.effort in MONO_EFFORT_RANKS:
+                merged[entry.effort] = entry.grade
+        for (p, effort), grade in changed_grades.items():
+            if p == profile and effort in MONO_EFFORT_RANKS:
+                merged[effort] = grade
+        best = _mono_grade_rank("C")
+        lower_effort, lower_grade = "", "C"
+        for effort in sorted(merged, key=MONO_EFFORT_RANKS.__getitem__):
+            grade = merged[effort]
+            rank = _mono_grade_rank(grade)
+            if rank > best:
+                violations.append(
+                    MonotonicityViolation(
+                        profile=profile,
+                        effort=effort,
+                        grade=grade,
+                        lower_effort=lower_effort,
+                        lower_grade=lower_grade,
+                    )
+                )
+                break
+            best = rank
+            lower_effort, lower_grade = effort, grade
+    return violations
+
+
+def _monotonicity_canon_entries(proposal: Proposal) -> list[bench.CatalogEntry]:
+    """The merged-state base the server checks: its own catalog rows only.
+
+    Bundled-snapshot stand-ins are not canon rows — a write for a profile the
+    canon never mentions creates only the stamped rungs, so a stand-in
+    sibling can never constrain the write.
+    """
+    return [e for e in proposal.catalog_entries if e.profile not in proposal.snapshot_profiles]
+
+
+def _apply_monotonicity_blocks(proposal: Proposal) -> None:
+    """Mark every proposed change the canon's monotonicity rule would refuse.
+
+    The offered write set — every proposed change — must keep each touched
+    profile's merged ladder monotonic, exactly as the server demands of the
+    apply payload. While a violation stands, the change behind it is marked
+    blocked-by-monotonicity and leaves the offered set: the violating rung's
+    own change first when reverting it restores the rung (a demotion), else
+    every promoted lower rung whose grade rose above it. A pair of changes
+    that is monotonic together survives intact — this pass never invents a
+    change and never splits evidence — and ``apply`` re-checks the stamped
+    subset, so a partial pair still cannot be written.
+    """
+
+    changes = proposal.changes()
+    if not changes:
+        return
+    by_key = {result.key: result for result in changes}
+    entries = _monotonicity_canon_entries(proposal)
+    offered = {result.key: result.target for result in changes}
+    while True:
+        violations = catalog_monotonicity_violations(entries, offered)
+        if not violations:
+            return
+        progress = False
+        for v in violations:
+            key = (v.profile, v.effort)
+            result = by_key.get(key)
+            if (
+                result is not None
+                and key in offered
+                and _mono_grade_rank(result.row.grade) <= _mono_grade_rank(v.lower_grade)
+            ):
+                # The violating rung's own demotion caused it — reverting
+                # that change restores the rung's prior grade and clears it.
+                result.monotonicity_block = MonotonicityBlock(
+                    profile=v.profile,
+                    effort=v.lower_effort,
+                    grade=v.lower_grade,
+                    direction="lower",
+                    reason=(
+                        f"would sit below lower effort {v.profile}@{v.lower_effort} grade {v.lower_grade}"
+                    ),
+                )
+                del offered[key]
+                progress = True
+                continue
+            # The violating rung stays: every promoted lower rung whose
+            # merged grade now outranks it is an independent cause — each
+            # must leave the offered set for the violation to clear.
+            culprits = [
+                k
+                for k, target in offered.items()
+                if k[0] == v.profile
+                and k[1] in MONO_EFFORT_RANKS
+                and MONO_EFFORT_RANKS[k[1]] < MONO_EFFORT_RANKS[v.effort]
+                and _mono_grade_rank(target) < _mono_grade_rank(v.grade)
+            ]
+            if not culprits:
+                # Neither side of the violated pair is a proposed change —
+                # the profile's canon ladder already violates, and the
+                # server checks every touched profile, so nothing may be
+                # written for it at all.
+                culprits = [k for k in offered if k[0] == v.profile]
+                for k in culprits:
+                    rank_k = MONO_EFFORT_RANKS.get(k[1])
+                    rank_v = MONO_EFFORT_RANKS[v.effort]
+                    by_key[k].monotonicity_block = MonotonicityBlock(
+                        profile=v.profile,
+                        effort=v.effort,
+                        grade=v.grade,
+                        direction=("higher" if rank_k is not None and rank_v > rank_k else "lower"),
+                        reason=(
+                            f"profile ladder already non-monotonic at {v.profile}@{v.effort} "
+                            f"grade {v.grade} below lower effort {v.lower_effort} ({v.lower_grade})"
+                        ),
+                    )
+                    del offered[k]
+                progress = True
+                continue
+            for k in culprits:
+                by_key[k].monotonicity_block = MonotonicityBlock(
+                    profile=v.profile,
+                    effort=v.effort,
+                    grade=v.grade,
+                    direction="higher",
+                    reason=f"would leave {v.profile}@{v.effort} grade {v.grade} below lower effort",
+                )
+                del offered[k]
+                progress = True
+        if not progress:  # defensive — a violation always has a culprit
+            return
 
 
 def _input_digest(proposal: Proposal) -> str:
@@ -1830,11 +2060,13 @@ def render_proposal(
             lines.append(f"  {_fmt_evidence(row)}  [excluded: {row.excluded}]")
 
     changes = proposal.changes()
+    applyable = proposal.applyable_changes()
+    blocked = proposal.blocked_changes()
     changed_keys = {r.key for r in changes}
     holds = [r for r in proposal.results if r.key not in changed_keys]
-    if changes:
+    if applyable:
         lines.append("proposals:")
-        for r in changes:
+        for r in applyable:
             lines.append(
                 f"  {r.action} {r.label()} {r.row.grade} -> {r.target}"
                 f"{_unsubscribed_tag(r.key[0], r.row.pool)}"
@@ -1849,6 +2081,24 @@ def render_proposal(
                 lines.append(f"    excluded {item.ref} ({item.excluded})")
     else:
         lines.append("proposals: none")
+
+    if blocked:
+        lines.append(
+            "proposals blocked by effort monotonicity (not applyable — the canon would refuse the write):"
+        )
+        for r in blocked:
+            block = r.monotonicity_block
+            lines.append(
+                f"  {r.action} {r.label()} {r.row.grade} -> {r.target}"
+                f"{_unsubscribed_tag(r.key[0], r.row.pool)}"
+                f"{' [snapshot-placement]' if r.snapshot_row else ''}"
+                f" — blocked-by-monotonicity: {block.reason}"
+            )
+            lines.append(f"    rule: {r.note}")
+            for item in r.counted:
+                lines.append(f"    evidence {_fmt_evidence(item)}")
+            for item in r.excluded:
+                lines.append(f"    excluded {item.ref} ({item.excluded})")
 
     if holds:
         lines.append("rungs with evidence but no change:")
@@ -1970,6 +2220,27 @@ def proposal_to_json(proposal: Proposal, view: bench.CatalogView) -> dict:
         ],
         "results": [r.as_dict() for r in proposal.results],
         "unrung": [_fmt_evidence(item) for item in proposal.unrung],
+        # Additive since #1298 — old readers ignore the key. The per-rung
+        # "results" records stay byte-identical (and inside the digest), so a
+        # blocked change is disclosed here rather than by rewriting the
+        # result the evidence produced.
+        "monotonicity": {
+            "blocked": [
+                {
+                    "profile": r.key[0],
+                    "effort": r.key[1],
+                    "action": r.action,
+                    "current": r.row.grade,
+                    "target": r.target,
+                    "status": "blocked-by-monotonicity",
+                    "conflict": {"profile": b.profile, "effort": b.effort, "grade": b.grade},
+                    "direction": b.direction,
+                    "reason": b.reason,
+                }
+                for r in proposal.blocked_changes()
+                if (b := r.monotonicity_block) is not None
+            ],
+        },
     }
 
 
@@ -2208,8 +2479,17 @@ def apply_proposals(
             )
 
     changed = {r.key: r for r in live.changes()}
+    # Changes the canon would refuse are marked by the live re-evaluation —
+    # the same pass propose ran. A blocked change is never stamped: it drops
+    # out of the approved set and is reported, not written (a pre-#1298
+    # artifact loses only the rungs the server would refuse).
+    mono_blocked = {
+        key: result.monotonicity_block
+        for key, result in changed.items()
+        if result.monotonicity_block is not None
+    }
     if only is None:
-        approved = set(changed)
+        approved = set(changed) - set(mono_blocked)
     else:
         # #788: --only approves a subset of the artifact's recorded changes.
         # Every named rung must be a live-verified change — an absent rung or
@@ -2242,6 +2522,32 @@ def apply_proposals(
                 f"proposal artifact: {'; '.join(not_changes)} — only recorded "
                 "promote/demote changes can be applied"
             )
+        named_blocked = [key for key in only if key in mono_blocked]
+        if named_blocked:
+            detail = "; ".join(
+                f"{key[0]}{'@' + key[1] if key[1] else ''} — {mono_blocked[key].reason}"
+                for key in named_blocked
+            )
+            raise bench.BenchError(
+                f"grades apply --only names change(s) blocked-by-monotonicity: {detail}. "
+                "A blocked change is never stamped; rerun `grades propose`"
+            )
+    # The server checks every profile the write touches over the merged
+    # catalog — re-check the exact approved set the same way, so an --only
+    # subset that drops half of a valid pair is refused here, before anything
+    # is written (handoffkeep checkBenchCatalogMonotonicity).
+    stamped = {key: changed[key].target for key in approved}
+    violations = catalog_monotonicity_violations(_monotonicity_canon_entries(live), stamped)
+    if violations:
+        detail = "; ".join(
+            f"{v.profile} effort {v.effort} grade {v.grade} below lower effort {v.lower_effort}"
+            for v in violations
+        )
+        raise bench.BenchError(
+            f"grades apply refused: bench_catalog_not_monotonic — {detail}. "
+            "The approved write set breaks per-profile effort monotonicity in "
+            "the merged catalog; approve the paired change(s) or drop the rung."
+        )
     now = bench._utc_now()
     entries: list[bench.CatalogEntry] = []
     # The evaluated universe, not only the backend's rows: a promote/demote on

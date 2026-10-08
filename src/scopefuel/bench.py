@@ -2733,6 +2733,53 @@ def _fetch_catalog(backend: BenchBackend) -> list[CatalogEntry]:
     return _catalog_from_payload(_handoffkeep_request(backend, "catalog"))
 
 
+def _catalog_entry_exact(value: object) -> CatalogEntry:
+    """Decode one destination catalog row preserving identity verbatim.
+
+    The server stores and compares profile/effort exactly as sent —
+    whitespace and case are significant, and an effort string that is not
+    exactly a known rung is exempt from its monotonicity check. The normal
+    wire reader strips strings, folding " p" into p and " high" into high —
+    which can both hide a real destination rung (unsafe) and invent one
+    (overblocking). Only the fields the monotonicity preflight reads are
+    decoded; the entry never leaves that check.
+    """
+    if not isinstance(value, dict):
+        raise BenchError("invalid handoffkeep catalog row")
+    profile = value.get("profile")
+    effort = value.get("effort")
+    grade = value.get("grade")
+    if not isinstance(profile, str) or not profile:
+        raise BenchError("invalid handoffkeep catalog row")
+    if effort is not None and not isinstance(effort, str):
+        raise BenchError("invalid handoffkeep catalog row")
+    if not isinstance(grade, str):
+        raise BenchError("invalid handoffkeep catalog row")
+    retired_at = value.get("retired_at")
+    return CatalogEntry(
+        profile=profile,
+        effort=effort or "",
+        model_id="",
+        pool="",
+        grade=grade,
+        retired_at=retired_at if isinstance(retired_at, str) and retired_at else None,
+    )
+
+
+def _fetch_catalog_exact(backend: BenchBackend) -> list[CatalogEntry]:
+    """The destination catalog with row identities preserved verbatim.
+
+    Used only by the push_catalog preflight — the monotonicity check must see
+    the same (profile, effort) keys the server will compare, not stripped
+    aliases. Everywhere else keeps the normal _text normalization.
+    """
+    payload = _handoffkeep_request(backend, "catalog")
+    rows = payload.get("catalog")
+    if not isinstance(rows, list):
+        raise BenchBackendError("handoffkeep returned invalid catalog data")
+    return [_catalog_entry_exact(row) for row in rows]
+
+
 def _server_catalog_rejection(entries: list[CatalogEntry]) -> str | None:
     """The validity floor a fetched catalog must pass before it may be canon.
 
@@ -3086,6 +3133,51 @@ def push_catalog(
                 f"{entry.profile}/{entry.effort or '-'}: decided_by is required caller-supplied "
                 "provenance on the catalog route"
             )
+    # #1298 B1: the ladder the server checks is the destination's own merged
+    # catalog — the view apply evaluated can be a snapshot or a stale cache
+    # missing rungs the canon holds. Read the destination over this same
+    # authenticated client, merge the exact payload rows in, and run the same
+    # rule the server will run before anything is sent. An unreadable
+    # destination fails closed: no flag or provenance stamp may send a write
+    # whose merged state is unknown.
+    _backend_url(backend, "catalog")  # policy refusals keep their own name
+    try:
+        destination = _fetch_catalog_exact(backend)
+    except BenchError as exc:
+        raise BenchError(
+            "bench push-catalog refused: bench_catalog_unreadable — the "
+            "destination catalog could not be read to verify effort "
+            "monotonicity, so the write is not sent"
+        ) from exc
+    from . import grades
+
+    merged = {entry.key: entry for entry in destination}
+    for entry in entries:
+        merged[entry.key] = entry
+    # The server checks every profile the write touches — including effort ""
+    # and unknown-effort rows, which mark the profile while contributing no
+    # grade. The write set is the final per-key row — the server's batch
+    # upsert is last-wins, so a later retired row must not be resurrected by
+    # an earlier active twin. A profile touched only by retiring a rung is
+    # still checked: mark it on the exempt "" rung so the check walks that
+    # ladder without resurrecting the retired row.
+    final = {entry.key: entry for entry in entries}
+    write = {key: entry.grade for key, entry in final.items() if not entry.retired_at}
+    for entry in final.values():
+        if entry.retired_at and not any(key[0] == entry.profile for key in write):
+            write[(entry.profile, "")] = entry.grade
+    violations = grades.catalog_monotonicity_violations(list(merged.values()), write)
+    if violations:
+        detail = "; ".join(
+            f"{v.profile}@{v.effort} grade {v.grade} "
+            f"below lower effort {v.lower_effort} grade {v.lower_grade}"
+            for v in violations
+        )
+        raise BenchError(
+            f"bench push-catalog refused: bench_catalog_not_monotonic — {detail}. "
+            "The merged destination catalog would break per-profile effort "
+            "monotonicity; nothing was sent."
+        )
     response = _handoffkeep_request(
         backend,
         "catalog",
