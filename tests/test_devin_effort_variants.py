@@ -4,7 +4,9 @@ devin keys effort into the model id (``--model swe-2-max``), so each rung is its
 own profile. The variants start unmeasured: the high rung's grade is a
 reference, never an inherited placement — #594 E6 settles them. #787 moved
 ``devin-swe2-medium`` to A on the operator-approved reps measurement
-(hk:doc 5177 item 2, 2026-09-27); the other two variants stay unmeasured C.
+(hk:doc 5177 item 2, 2026-09-27); #1296 promoted ``devin-swe2-max``'s max rung
+to A+ (hk:task/1296, 2026-10-08) while its profile-default row stays
+unmeasured C; devin-ds41-max stays unmeasured C.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from scopefuel import cli, launch
 from scopefuel.providers import devin
 from scopefuel.recommend import (
     DEVIN_EFFORT_VARIANT_ANNOTATION,
+    DEVIN_SWE2_MAX_GRADE_ANNOTATION,
     DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
     GRADE_TABLE,
     profile_pool,
@@ -48,7 +51,8 @@ def _placements(name: str) -> list[str]:
 
 # #787: placement + annotation per variant. devin-swe2-medium carries the
 # reps-measured A row (hk:doc 5177 item 2); the others keep the #635
-# unmeasured-variant row at C.
+# unmeasured-variant row at C — except devin-swe2-max, whose #1296-promoted
+# max rung is an ordinary A+ row alongside the C default row.
 PLACEMENT: dict[str, tuple[str, str]] = {
     "devin-swe2-medium": ("A", DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION),
     "devin-swe2-max": ("C", DEVIN_EFFORT_VARIANT_ANNOTATION),
@@ -59,7 +63,13 @@ PLACEMENT: dict[str, tuple[str, str]] = {
 @pytest.mark.parametrize("name", sorted(VARIANTS))
 def test_variant_row_is_unmeasured_with_high_reference(name):
     grade, annotation = PLACEMENT[name]
-    assert _placements(name) == [grade]
+    placements = _placements(name)
+    if name == "devin-swe2-max":
+        # #1296: the promoted max rung is an A+ placement; the effort-less
+        # default row keeps the unmeasured-variant row at C.
+        assert placements == ["A+", "C"]
+    else:
+        assert placements == [grade]
     (profile,) = [p for p in GRADE_TABLE[grade] if p.name == name]
     assert profile.benchmark is None
     assert profile.benchmark_source is None
@@ -69,14 +79,28 @@ def test_variant_row_is_unmeasured_with_high_reference(name):
     assert profile_pool(name) == ("devin", None)
 
 
+def test_swe2_max_rung_row_is_the_promoted_placement():
+    """#1296: devin-swe2-max@max is an ordinary A+ row with the 1296 provenance."""
+
+    (rung,) = [p for p in GRADE_TABLE["A+"] if p.name == "devin-swe2-max"]
+    assert rung.launcher_effort == "max"
+    assert rung.benchmark is None
+    assert rung.benchmark_source is None
+    assert rung.gate == "default"
+    assert rung.benchmark_annotation == DEVIN_SWE2_MAX_GRADE_ANNOTATION
+    assert "hk:task/1296" in DEVIN_SWE2_MAX_GRADE_ANNOTATION
+    override = launch.ARM_GRADE_OVERRIDES[("devin-swe2-max", "max")]
+    assert override.grade == "A+"
+
+
 def test_variant_annotation_is_unmeasured_and_cites_high_only_as_reference():
     assert DEVIN_EFFORT_VARIANT_ANNOTATION.startswith("미측정")
     assert "high A+ 참조" in DEVIN_EFFORT_VARIANT_ANNOTATION
     assert "#594 E6" in DEVIN_EFFORT_VARIANT_ANNOTATION
 
 
-# #781+#787: devin-swe2-medium's bundled row carries the approved arm grade
-# (A) — the other variants stay unmeasured C.
+# #781+#787+#1296: decided rungs carry their approved grade; effort-less
+# default rows keep the unmeasured-variant C row.
 CATALOG_GRADE: dict[str, str] = {
     "devin-swe2-medium": "A",
     "devin-swe2-max": "C",
@@ -87,8 +111,13 @@ CATALOG_GRADE: dict[str, str] = {
 @pytest.mark.parametrize("name", sorted(VARIANTS))
 def test_variant_snapshot_and_launch_carry_the_devin_model_id(name):
     rows = [entry for entry in launch.snapshot_entries() if entry.profile == name]
-    assert len(rows) == 1
-    (row,) = rows
+    if name == "devin-swe2-max":
+        # #1296: two rows — the promoted A+ max rung and the C default row.
+        assert {(row.effort, row.grade) for row in rows} == {("max", "A+"), ("", "C")}
+        (row,) = [row for row in rows if row.effort == ""]
+    else:
+        assert len(rows) == 1
+        (row,) = rows
     assert row.model_id == VARIANTS[name]
     assert row.pool == "devin"
     assert row.grade == CATALOG_GRADE[name]
@@ -98,7 +127,10 @@ def test_variant_snapshot_and_launch_carry_the_devin_model_id(name):
     decision = launch.resolve_launch(name)
     assert decision.model_id == VARIANTS[name]
     assert decision.pool == "devin"
-    assert decision.effort == ""
+    # #1296: devin-swe2-max's catalog default followed the canon onto the A+
+    # max rung; the other variants still launch their "" row.
+    assert decision.effort == ("max" if name == "devin-swe2-max" else "")
+    assert decision.grade == ("A+" if name == "devin-swe2-max" else CATALOG_GRADE[name])
 
 
 def test_swe2_variant_model_ids_are_real_devin_model_uids(fixture_text):
@@ -154,11 +186,16 @@ def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, 
 
 def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_text):
     providers = [devin.parse(_models_list(fixture_text))]
-    # Measured placements are A (medium) and C (max rungs) — nowhere else.
-    for grade in ("S+", "S", "A+", "B"):
+    # Measured placements are A (medium), A+ (swe2-max's promoted max rung) and
+    # C (the effort-less max rungs) — nowhere else.
+    for grade in ("S+", "S", "B"):
         out = recommend(providers, grade, explain=True)
         for name in VARIANTS:
             assert name not in out, (grade, name, out)
+    aplus = recommend(providers, "A+", explain=True)
+    assert "devin-swe2-medium" not in aplus
+    assert "devin-ds41-max" not in aplus
+    assert any(line[:1].isdigit() and "devin-swe2-max --effort max" in line for line in aplus.splitlines())
 
 
 def test_recommend_c_lists_only_the_still_unmeasured_variants(fixture_text):

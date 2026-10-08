@@ -37,15 +37,16 @@ def test_profile_pool_oc_solar4():
 
 
 def test_oc_solar4_grade_exposure_and_placement_note():
+    # #1297: operator 2026-10-08 (hk:task/1296) promoted oc-solar4 B -> A.
     names = {grade: [p.name for p in profiles] for grade, profiles in GRADE_TABLE.items()}
-    assert "oc-solar4" in names["B"]
+    assert "oc-solar4" in names["A"]
     assert "oc-solar4" not in names["S+"]
     assert "oc-solar4" not in names["S"]
     assert "oc-solar4" not in names["A+"]
-    assert "oc-solar4" not in names["A"]
+    assert "oc-solar4" not in names["B"]
     assert "oc-solar4" not in names["C"]
 
-    profile = next(p for p in GRADE_TABLE["B"] if p.name == "oc-solar4")
+    profile = next(p for p in GRADE_TABLE["A"] if p.name == "oc-solar4")
     assert profile.placement_note == UPSTAGE_SOLAR4_PLACEMENT_NOTE
     assert "T1 한정" in profile.placement_note
     assert "tester 금지" in profile.placement_note

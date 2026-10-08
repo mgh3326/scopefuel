@@ -41,6 +41,8 @@ NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
 # (profile, effort) -> (pool, catalog model id, the AA number scopefuel stores)
 # #920: sonnet@max left this table — the Sonnet 5.5 refresh placed the rung at
 # S (estimated vendor TB4 70.6, one step below its raw S+ read).
+# #1296: grok-hi@xhigh, devin-swe2@high and devin-swe2-max@max left too — the
+# 10-08 operator decision promoted them to ordinary placements (A / A+ / A+).
 NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
     ("codex-sol", "high"): ("codex", "gpt-6.1-sol", "high 42.8"),
     ("codex-sol", "medium"): ("codex", "gpt-6.1-sol", "medium 미저장"),
@@ -49,15 +51,11 @@ NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
     # #737 (decision 4088): the grok E6 arms — builder-grok-low/-medium/-xhigh.
     ("grok-hi", "low"): ("grok", "grok-4.7", "high 46.3"),
     ("grok-hi", "medium"): ("grok", "grok-4.7", "high 46.3"),
-    ("grok-hi", "xhigh"): ("grok", "grok-4.7", "high 46.3"),
-    # #1284: the devin rungs builder-devin-max / builder-devin reps record. No
-    # AA data exists for SWE-2, so the reference says so instead of a number.
-    ("devin-swe2-max", "max"): ("devin", "swe-2-max", "SWE-2 AA 미측정"),
-    ("devin-swe2", "high"): ("devin", "swe-2", "SWE-2 AA 미측정"),
 }
 # #1284: rungs whose model has no AA measurement at all — the row must say so
-# rather than carry an AA mapping it does not have.
-NO_AA_RUNGS: frozenset[tuple[str, str]] = frozenset({("devin-swe2-max", "max"), ("devin-swe2", "high")})
+# rather than carry an AA mapping it does not have. Empty since #1296 (the two
+# no-AA devin rungs graduated to ordinary placements); kept for the next arm.
+NO_AA_RUNGS: frozenset[tuple[str, str]] = frozenset()
 # The rungs the E6 arms use that the catalog already placed — no new row may
 # appear for these, or the existing spelling's resolution would change.
 EXISTING_RUNGS: dict[tuple[str, str], str] = {
@@ -73,6 +71,10 @@ EXISTING_RUNGS: dict[tuple[str, str], str] = {
     ("codex-terra", "high"): "A+",
     ("codex-terra", "xhigh"): "A+",
     ("grok", "medium"): "A+",
+    # #1296: graduated arm rungs, now ordinary placements.
+    ("devin-swe2", "high"): "A+",
+    ("devin-swe2-max", "max"): "A+",
+    ("grok-hi", "xhigh"): "A",
 }
 
 
@@ -241,8 +243,9 @@ def test_an_unmarked_default_never_falls_onto_a_c_row():
     assert decision.grade == "S"
     assert decision.e6_arm is None
 
-    # The canon retires the profile-default row: the answer is the canon's
-    # statement, not the leftover C measurement row.
+    # The canon retires the profile-default row: the walk falls to the best
+    # remaining ordinary row — since #1296 that is the promoted xhigh A
+    # placement, never the leftover C arm rows (low/medium).
     retired_view = bench.CatalogView(
         entries=tuple(
             replace(entry, retired_at="2026-09-25T00:00:00Z") if entry.effort == "" else entry
@@ -251,8 +254,10 @@ def test_an_unmarked_default_never_falls_onto_a_c_row():
         source="cache",
         backend="handoffkeep",
     )
-    with pytest.raises(launch.LaunchError, match="retired"):
-        launch.resolve_launch("grok-hi", view=retired_view)
+    decision = launch.resolve_launch("grok-hi", view=retired_view)
+    assert decision.effort == "xhigh"
+    assert decision.grade == "A"
+    assert decision.e6_arm is None
 
 
 def test_a_marker_does_not_revive_a_rung_the_canon_retired(monkeypatch, capsys):
@@ -320,7 +325,7 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
 
     view = bench.CatalogView(
         entries=tuple(entry(profile, effort, "C") for profile, effort in NEW_RUNGS)
-        + (entry("sonnet", "high", "C"),),
+        + (entry("sonnet", "high", "B"),),
         source="server",
         backend="handoffkeep",
     )
@@ -523,8 +528,9 @@ def test_a_retired_e6_rung_is_not_revived_by_the_marker():
 def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
     """sonnet@high is a placement: the marker neither opens nor closes anything.
 
-    #920: sonnet@high is the Sonnet 5.5 C row (vendor TB4 43.0, one step below
-    its raw B read) — the marker still changes nothing about the judgement."""
+    #1297: sonnet@high is the Sonnet 5.5 B row (operator decision 2026-10-08;
+    the estimate's raw 43.0 reads B) — the marker still changes nothing about
+    the judgement."""
 
     result = gate_check(
         [_provider("claude", pool_class="spend")],
@@ -535,7 +541,7 @@ def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
         now=NOW,
     )
     assert result.ok is True
-    assert result.grade == "C"
+    assert result.grade == "B"
     assert result.e6_arm is None
     assert "E6 arm" not in result.reason
 
@@ -589,11 +595,13 @@ def test_an_unmarked_request_keeps_the_default_placement():
     assert decision.e6_arm is None
 
 
-def test_builder_grok_pin_still_resolves_without_a_marker():
+def test_builder_grok_pin_resolves_the_promoted_rung_without_a_marker():
+    """#1296: grok-hi@xhigh is an ordinary A placement now — no marker needed."""
+
     decision = launch.resolve_launch("grok-hi", effort="xhigh")
     assert decision.model_id == "grok-4.7"
     assert decision.effort == "xhigh"
-    assert decision.grade == "S"
+    assert decision.grade == "A"
     assert decision.e6_arm is None
 
 
@@ -614,7 +622,7 @@ def test_the_marker_does_not_change_a_request_that_names_no_rung(monkeypatch, ca
     assert cli.main(["policy", "launch", "sonnet", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["effort"] == "high"
-    assert payload["grade"] == "C"
+    assert payload["grade"] == "B"  # #1297: the promoted sonnet@high row
     assert payload["e6_arm"] is None
 
 

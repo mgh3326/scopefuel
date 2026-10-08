@@ -9,7 +9,7 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 - the explicitly registered remaining ``oc-*`` profiles route to their listed pools;
   unknown ``oc-*`` spellings are fail-closed as unknown
 - ``devin-swe2`` routes to ``devin`` (account; SWE-2 Free tag only)
-- ``oc-solar4`` routes to ``upstage`` (account; B 보수 배치, T1 한정, tester 금지)
+- ``oc-solar4`` routes to ``upstage`` (account; A 운영자 배치 #1297, T1 한정, tester 금지)
 """
 
 from __future__ import annotations
@@ -242,7 +242,20 @@ SONNET_5_5_ESTIMATE_REASON = (
     "실측 reps 전까지 각 런그는 점수가 가리키는 급의 한 단계 아래에 배치"
 )
 SONNET_5_5_MEDIUM_PLACEMENT_NOTE = "raw 29.0 은 이미 최하위 급(C) — 낮출 급이 없어 C 유지"
-SONNET_5_5_HIGH_PLACEMENT_NOTE = "보수 배치(C; raw 43.0 은 B 구간 — 실측 reps 전 1단계 보수)"
+# #1297 — operator 2026-10-08 via operator-desk (hk:task/1297): sonnet@high
+# promoted C -> B on the served canon (desk grades apply --only sonnet@high,
+# decided_at 2026-10-08T11:52:05.815922Z; promote evidence reps srv:1224 ·
+# 1228 · 1230 · 1238 · 1248 · 1288 · 1291 · 1298 · 1343 · 1357). The bundled
+# placement row follows the approved grade — the #787 devin-swe2-medium
+# pattern — so a future bench push-catalog --emit-seed cannot silently
+# revert the operator decision. A reps-decided grade like
+# DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION; the displayed 43.0 stays the vendor
+# TB4 estimate (SONNET_5_5_ESTIMATE_REASON).
+SONNET_5_5_HIGH_GRADE_ANNOTATION = (
+    "급 실측(B; evidence reps srv:1224, srv:1228, srv:1230, srv:1238, srv:1248, "
+    "srv:1288, srv:1291, srv:1298, srv:1343, srv:1357 · operator 2026-10-08 "
+    "via operator-desk · hk:task/1297) · 표기 점수는 벤더 TB4 추정 43.0"
+)
 SONNET_5_5_XHIGH_PLACEMENT_NOTE = "보수 배치(A+; raw 61.0 은 S 구간 — 실측 reps 전 1단계 보수)"
 SONNET_5_5_MAX_PLACEMENT_NOTE = "보수 배치(S; raw 70.6 은 S+ 구간 — 실측 reps 전 1단계 보수)"
 SONNET_5_5_MAX_ESCALATION_REASON = "최상위 effort 추정 런그 — 실측 reps 전 운영자 명시 요청 시에만"
@@ -297,6 +310,14 @@ GROK_LOW_ESTIMATE_REASON = (
     "GROK_HI_ESTIMATE_REASON과 동일(§1)"
 )
 GROK_LOW_PLACEMENT_NOTE = "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)"
+# #1297 — hk:task/1296, operator 2026-10-08 via operator-desk (same decision):
+# grok-hi@xhigh promoted to A on the served canon (promote evidence reps
+# srv:1396·1397). Was an unmeasured E6 arm rung (#737) — graduated to an
+# ordinary placement like devin-swe2@high above.
+GROK_HI_XHIGH_GRADE_ANNOTATION = (
+    "급 실측(A; evidence reps srv:1396, srv:1397 · operator 2026-10-08 "
+    "via operator-desk · hk:task/1296) · AA-agent 점수 미측정"
+)
 
 OPUS_5_5_ESTIMATE_REASON = (
     "claude-opus-5-5: AA-agent 미발표 — claude-opus-5→5.5 세대 전환의 벤더 릴리스 노트 AA "
@@ -352,6 +373,27 @@ DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION = (
     "급 실측(A; reps PASS srv:988, srv:976, srv:973 + srv:995, srv:1076 · "
     "operator 2026-09-27 · hk:doc 5177 item 2) · AA-agent 점수 미측정"
 )
+# #1297 — hk:task/1296, operator 2026-10-08 via operator-desk (decided_at
+# 2026-10-08T13:03:23.617077Z): devin-swe2@high promoted to A+ on the served
+# canon (promote evidence reps srv:686·687·693·730·733·737·738·745·750·759·
+# 828). The rung was an unmeasured E6 arm row (#1284) — a measured rung is an
+# ordinary placement, so it graduates out of E6_ARM_RUNGS into GRADE_TABLE
+# (the #920 sonnet@max graduation shape) and the bundled catalog row carries
+# the decision provenance via launch.ARM_GRADE_OVERRIDES.
+DEVIN_SWE2_HIGH_GRADE_ANNOTATION = (
+    "급 실측(A+; evidence reps srv:686, srv:687, srv:693, srv:730, srv:733, srv:737, "
+    "srv:738, srv:745, srv:750, srv:759, srv:828 · operator 2026-10-08 "
+    "via operator-desk · hk:task/1296) · AA-agent 점수 미측정"
+)
+# #1297 — hk:task/1296, operator 2026-10-08 via operator-desk (same decision):
+# devin-swe2-max@max promoted to A+ on the served canon (promote evidence
+# reps srv:1225·1300·1306·1321·1375·1383). Same E6-arm graduation as
+# devin-swe2@high above.
+DEVIN_SWE2_MAX_GRADE_ANNOTATION = (
+    "급 실측(A+; evidence reps srv:1225, srv:1300, srv:1306, srv:1321, srv:1375, "
+    "srv:1383 · operator 2026-10-08 via operator-desk · hk:task/1296) · "
+    "AA-agent 점수 미측정"
+)
 
 # task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
 # opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
@@ -359,7 +401,16 @@ UPSTAGE_SOLAR4_ESTIMATE_REASON = (
     "AA Intelligence Index 42(모델지수, 08-06 발표) — oc-dsflash(A) 대비 지수 10 낮은 "
     "단일 기준점 투사, opencode 하네스 AA-agent 실측 없음, 환각률 24%"
 )
-UPSTAGE_SOLAR4_PLACEMENT_NOTE = "보수 배치(B; T1 한정 · tester 금지 · reps 3건 전)"
+# #1297 — hk:task/1296, operator 2026-10-08 via operator-desk (same decision):
+# oc-solar4 promoted B -> A on the served canon (promote evidence reps
+# srv:705·707). The displayed 42.0 stays the AA-model index estimate
+# (UPSTAGE_SOLAR4_ESTIMATE_REASON); only the grade is reps-decided. The T1
+# scope/tester-ban disclosure moves to the placement note verbatim.
+OC_SOLAR4_GRADE_ANNOTATION = (
+    "급 실측(A; evidence reps srv:705, srv:707 · operator 2026-10-08 "
+    "via operator-desk · hk:task/1296) · 표기 점수는 AA-model 지수 추정 42.0"
+)
+UPSTAGE_SOLAR4_PLACEMENT_NOTE = "운영자 승격 배치(A; T1 한정 · tester 금지 · hk:task/1296)"
 
 
 def _devin_swe2_profile() -> Profile:
@@ -842,6 +893,31 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             # namespace (launch.LAUNCH_MODEL_IDS).
             aa_model_id="deepseek-v4-1-flash",
         ),
+        # #1297 — operator 2026-10-08 via operator-desk, hk:task/1296: the two
+        # devin E6 rungs promoted to A+ on the served canon (devin-swe2@high
+        # evidence srv:686·687·693·730·733·737·738·745·750·759·828;
+        # devin-swe2-max@max evidence srv:1225·1300·1306·1321·1375·1383).
+        # Measured E6 rungs are ordinary placements — they graduate out of
+        # E6_ARM_RUNGS into this table (the #920 sonnet@max graduation), and
+        # launch.ARM_GRADE_OVERRIDES stamps the decision provenance on the
+        # bundled catalog rows. The effort-less devin-swe2 rows above stay —
+        # they emit the still-served ("devin-swe2","") row.
+        Profile(
+            "devin-swe2",
+            "SWE-2 (high)",
+            None,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=DEVIN_SWE2_HIGH_GRADE_ANNOTATION,
+        ),
+        Profile(
+            "devin-swe2-max",
+            "SWE-2 (max)",
+            None,
+            launcher_effort="max",
+            benchmark_effort="max",
+            benchmark_annotation=DEVIN_SWE2_MAX_GRADE_ANNOTATION,
+        ),
     ],
     "A": [
         # ROB-1251: AA v1.3 실측 55@codex(max) — 내삽 44.7을 대체. $0.14/M 최저가.
@@ -934,6 +1010,32 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             None,
             benchmark_annotation=DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
         ),
+        # #1297 — operator 2026-10-08 via operator-desk, hk:task/1296:
+        # grok-hi@xhigh promoted to A on the served canon (evidence srv:1396·
+        # 1397) — the #737 E6 arm rung graduates to an ordinary placement like
+        # the devin rungs above; the effort-less grok-hi S row is untouched.
+        Profile(
+            "grok-hi",
+            "Grok 4.7 (xhigh)",
+            None,
+            launcher_effort="xhigh",
+            benchmark_effort="xhigh",
+            benchmark_annotation=GROK_HI_XHIGH_GRADE_ANNOTATION,
+            aa_agent_model_id="grok-4.7",
+            aa_model_id="grok-4-7",
+        ),
+        # #1297 — same decision: oc-solar4 promoted B -> A (evidence
+        # srv:705·707). Score stays the AA-model index estimate 42.0 — only
+        # the grade moved.
+        Profile(
+            "oc-solar4",
+            "Solar Pro 4",
+            42.0,
+            benchmark_annotation=OC_SOLAR4_GRADE_ANNOTATION,
+            model_only=True,
+            estimate_reason=UPSTAGE_SOLAR4_ESTIMATE_REASON,
+            placement_note=UPSTAGE_SOLAR4_PLACEMENT_NOTE,
+        ),
     ],
     "B": [
         # ROB-1201: measured Luna medium (42) belongs to B (40–47).
@@ -1003,14 +1105,24 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # refresh below measures every launchable rung at C on the vendor TB4
         # curve.
         _devin_swe2_profile(),
+        # #1297 — operator 2026-10-08 via operator-desk, hk:task/1297:
+        # sonnet@high promoted C -> B on the served canon (evidence reps
+        # srv:1224·1228·1230·1238·1248·1288·1291·1298·1343·1357); this row
+        # makes the placement canon agree so a full seed push cannot revert
+        # the decision. Score stays the vendor TB4 estimate 43.0 — the
+        # launch.ARM_GRADE_OVERRIDES entry stamps the decision provenance on
+        # the bundled catalog row exactly as #781/#787 did for swe2-medium.
+        # oc-solar4 left this bucket for A on the same-day hk:task/1296
+        # decision (see the A bucket).
         Profile(
-            "oc-solar4",
-            "Solar Pro 4",
-            42.0,
-            benchmark_annotation=MODEL_ONLY_EXTRAPOLATED_ANNOTATION,
-            model_only=True,
-            estimate_reason=UPSTAGE_SOLAR4_ESTIMATE_REASON,
-            placement_note=UPSTAGE_SOLAR4_PLACEMENT_NOTE,
+            "sonnet",
+            "Sonnet 5.5 (high)",
+            43.0,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=SONNET_5_5_HIGH_GRADE_ANNOTATION,
+            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
+            aa_model_id="claude-sonnet-5-5",
         ),
     ],
     "C": [
@@ -1034,20 +1146,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="claude-sonnet-4.6",
             aa_model_id="claude-sonnet-4-6",
         ),
-        # #920: Sonnet 5.5 high/medium — 벤더 TB4 곡선(medium 29.0 · high 43.0)을
-        # 추정 점수로 표기하고 실측 reps 전까지 한 단계 보수. high 의 raw 43.0 은
-        # B 구간 → C 배치; medium 의 raw 29.0 은 이미 최하위 급이라 C 유지.
-        Profile(
-            "sonnet",
-            "Sonnet 5.5 (high)",
-            43.0,
-            launcher_effort="high",
-            benchmark_effort="high",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
-            placement_note=SONNET_5_5_HIGH_PLACEMENT_NOTE,
-            aa_model_id="claude-sonnet-5-5",
-        ),
+        # #920: Sonnet 5.5 medium — 벤더 TB4 곡선 추정 점수로 표기. high 런그는
+        # #1297 운영자 승격(C -> B)으로 위 B 버킷으로 이동; medium 의 raw 29.0 은
+        # 이미 최하위 급이라 C 유지.
         Profile(
             "sonnet",
             "Sonnet 5.5 (medium)",
@@ -1166,7 +1267,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         Profile("devin-swe17", "SWE-1.7", None, benchmark_annotation=UNMEASURED_ANNOTATION),
         # #635: effort 변형 rung. 모델 id 는 launch.LAUNCH_MODEL_IDS.
         # #787: devin-swe2-medium 은 hk:doc 5177 item 2(operator 2026-09-27)의
-        # A 승급으로 위 A 행으로 이동했다. swe2-max·ds41-max 는 계속 미측정 C.
+        # A 승급으로 위 A 행으로 이동했다. ds41-max 는 계속 미측정 C — swe2-max 는
+        # #1297 로 A+ 의 max 런그 행을 얻었다(effort-less 행은 아래 그대로).
         Profile(
             "devin-swe2-max",
             "SWE-2 (max)",
@@ -1276,32 +1378,11 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         aa_agent_model_id="grok-4.7",
         aa_model_id="grok-4-7",
     ),
-    _e6_arm_profile(
-        "grok-hi",
-        "Grok 4.7 (xhigh)",
-        "xhigh",
-        "grok-4-7 AA-model intelligence high 46.3 · max 46.4(xhigh 미저장)",
-        aa_agent_model_id="grok-4.7",
-        aa_model_id="grok-4-7",
-    ),
-    # #1284 (operator 10-08): the rungs builder-devin-max / builder-devin reps
-    # record (effort max / high). Without an exact-effort row they are unrung
-    # under v1.2; these rows let them count — the grade moves only through
-    # grades propose/apply. Same launch as the profile's effort-less row (the
-    # devin launcher takes no effort flag; the model id is
-    # launch.LAUNCH_MODEL_IDS by profile). No AA data exists for SWE-2.
-    _e6_arm_profile(
-        "devin-swe2-max",
-        "SWE-2 (max)",
-        "max",
-        "없음(SWE-2 AA 미측정 · Cognition 자체 발표만)",
-    ),
-    _e6_arm_profile(
-        "devin-swe2",
-        "SWE-2 (high)",
-        "high",
-        "없음(SWE-2 AA 미측정 · Cognition 자체 발표만)",
-    ),
+    # #1297 (operator 2026-10-08 via operator-desk, hk:task/1296): grok-hi@xhigh
+    # and the two #1284 devin rungs (devin-swe2@high, devin-swe2-max@max) left
+    # the E6 table — the served canon places them at A / A+ / A+, and measured
+    # rungs are ordinary GRADE_TABLE placements now (the #920 sonnet@max
+    # graduation shape).
 )
 
 E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
