@@ -217,9 +217,57 @@ def _no_secret(text: str) -> None:
         assert value not in text
 
 
+def _exception_graph(exc: BaseException) -> str:
+    """Everything reachable from ``exc``, printed or not (#1280 B2).
+
+    ``raise ... from None`` only hides ``__context__`` from the traceback
+    printer; the original stays attached. Walk every nested exception through
+    ``__cause__``, ``__context__``, ``args`` and instance attributes, and render
+    each value both ways.
+    """
+    seen: set[int] = set()
+    parts: list[str] = []
+
+    def walk(obj, depth=0):
+        if obj is None or id(obj) in seen or depth > 12:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, (str, bytes, int, float, bool)):
+            parts.append(repr(obj))
+            return
+        try:
+            parts.append(repr(obj))
+            parts.append(str(obj))
+        except Exception:
+            pass
+        if isinstance(obj, BaseException):
+            for arg in obj.args:
+                walk(arg, depth + 1)
+            walk(obj.__cause__, depth + 1)
+            walk(obj.__context__, depth + 1)
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            for item in obj:
+                walk(item, depth + 1)
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                walk(key, depth + 1)
+                walk(value, depth + 1)
+        if isinstance(obj, BaseException):
+            for value in vars(obj).values():
+                walk(value, depth + 1)
+
+    walk(exc)
+    return "\n".join(parts)
+
+
 def _exc_text(exc: BaseException) -> str:
-    """The message and the whole printable traceback chain of ``exc``."""
-    return str(exc) + "\n" + "".join(traceback.format_exception(exc))
+    """The message, the printable traceback chain and the whole exception graph."""
+    return str(exc) + "\n" + "".join(traceback.format_exception(exc)) + "\n" + _exception_graph(exc)
+
+
+def _assert_no_retained_exception(exc: BaseException) -> None:
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
 
 
 def _catalog_backend():
@@ -650,9 +698,11 @@ def test_malformed_location_is_refused_without_echo(hk, monkeypatch, location):
     _no_secret(_exc_text(err))
     assert len(hk.received) == 1
     # The transport itself refuses it with fixed text, before any parser speaks.
+    # (Shared request_json keeps main's printable-only contract and its chain;
+    # the full-graph guarantee is the hk helper's, asserted above.)
     with pytest.raises(HttpError) as info:
         request_json(f"{hk.base_url}/x")
-    _no_secret(_exc_text(info.value))
+    _no_secret(str(info.value) + "".join(traceback.format_exception(info.value)))
 
 
 # ------------------------------------------------------------ AC4 HTML
@@ -722,7 +772,7 @@ def test_send_reraises_http_errors_without_body_or_chain(hk, monkeypatch, status
         bench._handoffkeep_send(f"{hk.base_url}/v1/documents/k", token=FIX_TOKEN)
     exc = info.value
     assert (exc.status, exc.body, str(exc)) == (status, "", f"HTTP {status}")
-    assert exc.__cause__ is None and exc.__suppress_context__
+    _assert_no_retained_exception(exc)
     _no_secret(_exc_text(exc))
 
 
@@ -879,7 +929,7 @@ def test_broken_http_framing_is_a_fixed_backend_error(raw_server, monkeypatch, c
     with pytest.raises(bench.BenchBackendError) as info:
         REQUEST_KINDS[kind]()
     assert str(info.value) == "handoffkeep request failed"
-    assert info.value.__cause__ is None and info.value.__suppress_context__
+    _assert_no_retained_exception(info.value)
     _no_secret(_exc_text(info.value))
     assert len(server.requests) == 1
 
@@ -1045,3 +1095,363 @@ def test_real_cli_status_reports_cf_access_configured(make_server, cli_env):
     assert " cf_access=configured " in proc.stdout
     _no_secret(proc.stdout + proc.stderr)
     assert hk.received and hk.received[0][2]["user-agent"] == UA
+
+
+# ------------------------------------------------------------ round 3 (tester BLOCKERs B1-B5)
+
+IGNORED_NOTE = (
+    "cf_access=absent (config.env CF keys ignored because HANDOFFKEEP_URL/TOKEN come from the environment)"
+)
+
+
+@pytest.fixture
+def stored_cf(tmp_path, monkeypatch):
+    """A config.env holding the full endpoint and the CF pair; the env starts clean."""
+
+    def _write(url):
+        _dotenv(
+            tmp_path,
+            monkeypatch,
+            f"HANDOFFKEEP_URL={url}\nHANDOFFKEEP_TOKEN={FIX_TOKEN}\n{CF_ID_KEY}={FIX_ID}\n{CF_SECRET_KEY}={FIX_SECRET}\n",
+        )
+
+    monkeypatch.setattr(bench, "_WARNED_CF_ACCESS_STORED_IGNORED", False)
+    return _write
+
+
+# B1 (a): a whitespace-only env URL or TOKEN is unset, for the endpoint and the CF rule alike.
+@pytest.mark.parametrize(
+    "blank_keys", [("HANDOFFKEEP_URL",), ("HANDOFFKEEP_TOKEN",), ("HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN")]
+)
+def test_b1_whitespace_env_endpoint_is_unset(hk, stored_cf, monkeypatch, capsys, blank_keys):
+    stored_cf(hk.base_url)
+    for key in blank_keys:
+        monkeypatch.setenv(key, " \t ")
+    assert bench._handoffkeep_credentials() == (hk.base_url, FIX_TOKEN)
+    assert bench._handoffkeep_cf_access_resolve() == ((FIX_ID, FIX_SECRET), False)
+    bench._fetch_catalog(_catalog_backend())
+    ((_, _, headers),) = hk.received
+    assert headers["cf-access-client-secret"] == FIX_SECRET
+    assert headers["authorization"] == f"Bearer {FIX_TOKEN}"
+    assert "ignored" not in capsys.readouterr().err
+
+
+# B1 (b): the rule skipping a stored CF pair is said, once, never silently.
+# Supersedes the tester's test_contract_mixed_endpoint_does_not_discard_file_cf
+# (builder ruling, round 3): the stored pair stays unused, and now says so.
+@pytest.mark.parametrize(
+    "env_keys", [("HANDOFFKEEP_URL",), ("HANDOFFKEEP_TOKEN",), ("HANDOFFKEEP_URL", "HANDOFFKEEP_TOKEN")]
+)
+def test_b1_status_says_stored_cf_keys_are_ignored(hk, stored_cf, monkeypatch, env_keys):
+    stored_cf(hk.base_url)
+    values = {"HANDOFFKEEP_URL": hk.base_url, "HANDOFFKEEP_TOKEN": FIX_TOKEN}
+    for key in env_keys:
+        monkeypatch.setenv(key, values[key])
+    assert bench._handoffkeep_cf_access_resolve() == (None, True)
+    report = bench.catalog_status_report()
+    assert f" {IGNORED_NOTE} " in report
+    assert report.count("CF keys ignored") == 1
+    _no_secret(report)
+
+
+def test_b1_first_hk_request_says_it_once_on_stderr(hk, stored_cf, monkeypatch, capsys):
+    """Same endpoint in env and file — the tester's mixed case: no CF headers, one note."""
+    stored_cf(hk.base_url)
+    monkeypatch.setenv("HANDOFFKEEP_URL", hk.base_url)
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", FIX_TOKEN)
+    bench._fetch_catalog(_catalog_backend())
+    bench._fetch_grades(_catalog_backend())
+    quota_share._request("GET", "fixture-key")
+    err = capsys.readouterr().err
+    assert err.count(IGNORED_NOTE) == 1
+    assert err.strip() == f"note: {IGNORED_NOTE}"
+    _no_secret(err)
+    assert len(hk.received) == 3
+    for _method, _path, headers in hk.received:
+        assert not [name for name in headers if name.startswith("cf-")]
+
+
+def test_b1_no_note_when_nothing_was_skipped(hk, stored_cf, tmp_path, monkeypatch, capsys):
+    # env carries the whole CF pair: config.env's pair would lose anyway.
+    stored_cf(hk.base_url)
+    _env(monkeypatch, hk.base_url)
+    assert bench._handoffkeep_cf_access_resolve() == ((FIX_ID, FIX_SECRET), False)
+    assert "ignored" not in bench.catalog_status_report()
+    # config.env has no CF keys at all.
+    _dotenv(tmp_path, monkeypatch, f"HANDOFFKEEP_URL={hk.base_url}\n", name="plain.env")
+    monkeypatch.delenv(CF_ID_KEY)
+    monkeypatch.delenv(CF_SECRET_KEY)
+    assert bench._handoffkeep_cf_access_resolve() == (None, False)
+    bench._fetch_catalog(_catalog_backend())
+    assert "ignored" not in capsys.readouterr().err
+
+
+# B1 (c): an env id with the secret only in the ignored config.env is the incomplete-pair error.
+@pytest.mark.parametrize(
+    ("env_key", "env_value", "missing"),
+    [(CF_ID_KEY, FIX_ID, CF_SECRET_KEY), (CF_SECRET_KEY, FIX_SECRET, CF_ID_KEY)],
+)
+def test_b1_env_half_with_stored_half_is_incomplete(hk, stored_cf, monkeypatch, env_key, env_value, missing):
+    stored_cf(hk.base_url)
+    monkeypatch.setenv("HANDOFFKEEP_URL", hk.base_url)
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", FIX_TOKEN)
+    monkeypatch.setenv(env_key, env_value)
+    with pytest.raises(bench.BenchCfAccessError) as info:
+        bench._fetch_catalog(_catalog_backend())
+    assert info.value.reason == "cf_access_config_incomplete"
+    message = str(info.value)
+    assert message.startswith(f"{missing} is missing")
+    assert message.endswith(
+        "(config.env CF keys ignored because HANDOFFKEEP_URL/TOKEN come from the environment)"
+    )
+    _no_secret(_exc_text(info.value))
+    assert hk.received == []
+    assert f"blocked: {missing} is missing" in bench.catalog_status_report()
+
+
+# B1 (d) and the visible-ASCII note: the README states both.
+def test_b1_readme_states_the_isolation_rule_and_the_charset():
+    readme = (pathlib.Path(bench.__file__).parents[2] / "README.md").read_text(encoding="utf-8")
+    assert "**격리 규칙.**" in readme
+    assert IGNORED_NOTE in readme
+    assert "보이는 ASCII(0x21–0x7E" in readme
+
+
+# B2: no retained exception anywhere on the hk path, not merely a hidden one.
+B2_RAW = {
+    "malformed status line": BROKEN_FRAMING["malformed status line"],
+    "invalid chunk size": BROKEN_FRAMING["truncated chunked body"],
+    "truncated body": BROKEN_FRAMING["truncated body"],
+}
+
+
+@pytest.mark.parametrize("case", sorted(B2_RAW))
+def test_b2_send_failure_graph_is_empty(raw_server, monkeypatch, case):
+    server = raw_server(B2_RAW[case])
+    _env(monkeypatch, server.base_url)
+    with pytest.raises(bench.BenchBackendError) as info:
+        bench._handoffkeep_send(server.base_url, token=FIX_TOKEN)
+    assert str(info.value) == "handoffkeep request failed"
+    _assert_no_retained_exception(info.value)
+    _no_secret(_exception_graph(info.value))
+
+
+@pytest.mark.parametrize("kind", HK_ONLY_KINDS)
+def test_b2_hostile_500_body_graph_is_empty_at_every_site(hk, monkeypatch, kind):
+    _env(monkeypatch, hk.base_url)
+    hk.action = echo_status(500)
+    with pytest.raises(bench.BenchBackendError) as info:
+        REQUEST_KINDS[kind]()
+    _assert_no_retained_exception(info.value)
+    _no_secret(_exc_text(info.value))
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda: redirect(302, f"https://TEAM.CLOUDFLAREACCESS.COM./login?s={FIX_SECRET}"),
+        lambda: echo_status(200, "text/html"),
+        lambda: echo_status(404),
+    ],
+    ids=["login redirect", "html", "404"],
+)
+def test_b2_named_errors_retain_nothing(hk, monkeypatch, action):
+    _env(monkeypatch, hk.base_url)
+    hk.action = action()
+    with pytest.raises(bench.BenchBackendError) as info:
+        bench._handoffkeep_request(_catalog_backend(), "catalog")
+    _assert_no_retained_exception(info.value)
+    _no_secret(_exc_text(info.value))
+
+
+# B3: a valid JSON answer whose fields carry the canaries.
+def json_answer(payload):
+    def _action(handler, headers):
+        handler.send_json(200, payload)
+
+    return _action
+
+
+_STAMP = "2026-10-08T00:00:00Z"
+B3_ROWS = {
+    "scores source": (
+        "scores GET",
+        {
+            "scores": [
+                {
+                    "model_id": "m",
+                    "source": FIX_SECRET,
+                    "metric": "intelligence",
+                    "score": 1,
+                    "captured_at": _STAMP,
+                }
+            ]
+        },
+        "handoffkeep returned invalid score data (row 0 field source)",
+    ),
+    "scores captured_at": (
+        "scores GET",
+        {
+            "scores": [
+                {
+                    "model_id": "m",
+                    "source": "AA-model",
+                    "metric": "intelligence",
+                    "score": 1,
+                    "captured_at": _STAMP,
+                },
+                {
+                    "model_id": "m",
+                    "source": "AA-model",
+                    "metric": "intelligence",
+                    "score": 1,
+                    "captured_at": FIX_TOKEN,
+                },
+            ]
+        },
+        "handoffkeep returned invalid score data (row 1 field captured_at)",
+    ),
+    "grades grade": (
+        "grades GET",
+        {"grades": [{"profile": FIX_ID, "grade": FIX_SECRET, "deviation_ref": FIX_TOKEN}]},
+        "handoffkeep returned invalid grade data (row 0 field grade)",
+    ),
+    "catalog gate": (
+        "catalog GET",
+        {"catalog": [{"profile": "p", "grade": "A"}, {"profile": FIX_ID, "grade": "A", "gate": FIX_SECRET}]},
+        "handoffkeep returned invalid catalog data (row 1 field gate)",
+    ),
+    "catalog score": (
+        "catalog GET",
+        {"catalog": [{"profile": FIX_ID, "grade": "A", "score": FIX_TOKEN}]},
+        "handoffkeep returned invalid catalog data (row 0 field score)",
+    ),
+    "reps recorded_at": (
+        "reps GET (list)",
+        {"reps": [{"id": 1, "origin_id": 1, "profile": FIX_ID, "recorded_at": FIX_SECRET}]},
+        "handoffkeep returned invalid rep data (row 0 field recorded_at)",
+    ),
+    "reps rounds": (
+        "reps GET (list)",
+        {"reps": [{"id": 1, "origin_id": 1, "profile": FIX_ID, "recorded_at": _STAMP, "rounds": FIX_TOKEN}]},
+        "handoffkeep returned invalid rep data (row 0 field rounds)",
+    ),
+    "reps row not an object": (
+        "reps GET (list)",
+        {"reps": [FIX_SECRET]},
+        "handoffkeep returned invalid rep data (row 0)",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(B3_ROWS))
+def test_b3_decoder_errors_name_the_field_never_the_value(hk, monkeypatch, case):
+    kind, payload, expected = B3_ROWS[case]
+    _env(monkeypatch, hk.base_url)
+    hk.action = json_answer(payload)
+    with pytest.raises(bench.BenchBackendError) as info:
+        REQUEST_KINDS[kind]()
+    assert str(info.value) == expected
+    _assert_no_retained_exception(info.value)
+    _no_secret(_exc_text(info.value))
+
+
+def test_b3_captured_at_retains_no_parser_error():
+    with pytest.raises(bench.BenchError) as info:
+        bench._captured_at(f"not-a-date-{FIX_SECRET}")
+    assert str(info.value) == "captured_at must be ISO-8601"
+    _assert_no_retained_exception(info.value)
+    _no_secret(_exc_text(info.value))
+
+
+def test_b3_read_catalog_falls_back_on_a_rejected_row(hk, monkeypatch, capsys):
+    _env(monkeypatch, hk.base_url)
+    hk.action = json_answer({"catalog": [{"profile": FIX_ID, "grade": FIX_SECRET}]})
+    bench.reset_catalog_memo()
+    assert bench.read_catalog().source == bench.CATALOG_SOURCE_SNAPSHOT
+    captured = capsys.readouterr()
+    _no_secret(captured.out + captured.err)
+
+
+# B4: the login diagnosis is made before (and without) reading a broken body.
+_LOGIN = "https://TEAM.CLOUDFLAREACCESS.COM./login"
+B4_RAW = {
+    "truncated Content-Length": (
+        f"HTTP/1.1 302 Found\r\nLocation: {_LOGIN}\r\nContent-Length: 4096\r\n"
+        f"Connection: close\r\n\r\n{_ECHO}"
+    ).encode(),
+    "invalid chunk framing": (
+        f"HTTP/1.1 302 Found\r\nLocation: {_LOGIN}\r\nTransfer-Encoding: chunked\r\n"
+        f"Connection: close\r\n\r\nzz{_ECHO}\r\n"
+    ).encode(),
+}
+
+
+@pytest.mark.parametrize("case", sorted(B4_RAW))
+def test_b4_login_redirect_with_a_broken_body_keeps_its_name(raw_server, monkeypatch, case):
+    server = raw_server(B4_RAW[case])
+    _env(monkeypatch, server.base_url)
+    with pytest.raises(bench.BenchCfAccessError) as info:
+        bench._handoffkeep_send(server.base_url, token=FIX_TOKEN)
+    assert info.value.reason == "cf_access_login_redirect"
+    _assert_no_retained_exception(info.value)
+    _no_secret(_exc_text(info.value))
+    with pytest.raises(bench.BenchCfAccessError) as info:
+        bench._fetch_catalog(_catalog_backend())
+    assert info.value.reason == "cf_access_login_redirect"
+
+
+@pytest.mark.parametrize("framing", ["truncated", "chunked"])
+def test_b4_generic_refused_redirect_with_a_broken_body_is_classified_first(raw_server, framing):
+    location = "http://127.0.0.1:9/elsewhere"
+    if framing == "truncated":
+        wire = (
+            f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 4096\r\n\r\n{_ECHO}"
+        )
+    else:
+        wire = (
+            f"HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nTransfer-Encoding: chunked\r\n"
+            f"\r\nzz{_ECHO}\r\n"
+        )
+    server = raw_server(wire.encode())
+    with pytest.raises(HttpError) as info:
+        request_json(server.base_url, classify_cf_login=True)
+    assert type(info.value) is HttpError
+    assert str(info.value) == "HTTP 307: cross-origin redirect refused"
+
+
+# B5: providers see main's refusal for a login-host Location, unchanged.
+MAIN_REFUSAL = ("HttpError", "HTTP 302: cross-origin redirect refused")
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://TEAM.CLOUDFLAREACCESS.COM/login",
+        "https://TEAM.CLOUDFLAREACCESS.COM./login",
+        "https://team.cloudflareaccess.com/cdn-cgi/access/login",
+        "//team.cloudflareaccess.com/login",
+    ],
+)
+def test_b5_provider_login_redirect_matches_main(hk, tmp_path, monkeypatch, location):
+    from scopefuel.providers import codex
+
+    _env(monkeypatch, hk.base_url)  # CF keys present: still nothing CF-specific for a provider
+    auth = tmp_path / "codex-home" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text('{"tokens": {"access_token": "provider-token"}}', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(auth.parent))
+    monkeypatch.setattr(codex, "USAGE_URL", f"{hk.base_url}/provider")
+    hk.action = redirect(302, location)
+    try:
+        codex.fetch()
+        outcome = ("ok", "")
+    except Exception as exc:
+        outcome = (type(exc).__name__, str(exc))
+    assert outcome == MAIN_REFUSAL
+    # The shared transport without the hk flag, directly.
+    with pytest.raises(HttpError) as info:
+        request_json(f"{hk.base_url}/provider")
+    assert (type(info.value).__name__, str(info.value)) == MAIN_REFUSAL
+    for _method, _path, headers in hk.received:
+        assert not [name for name in headers if name.startswith("cf-")]

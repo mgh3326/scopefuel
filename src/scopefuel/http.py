@@ -86,13 +86,21 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     않는 scheme 의 redirect 를 Location 전체가 든 메시지로 거부하고, 파서는 깨진
     호스트 조각을 예외 메시지에 싣는다 — 둘 다 거치기 전에 고정 문구로 거부한다.
     redirect_request 는 CPython 이 최종 해석한 URL 로 한 번 더 판정한다.
+
+    ``classify_cf_login`` 은 handoffkeep 경로만 켠다: Cloudflare Access 로그인 호스트를
+    별도 사유로 분류하는 것은 hk 서비스 토큰 진단이라, provider 호출은 다른 거부와
+    똑같은 "cross-origin redirect refused" 를 받는다(main 과 동일).
     """
+
+    def __init__(self, *, classify_cf_login: bool = False):
+        super().__init__()
+        self.classify_cf_login = classify_cf_login
 
     def http_error_302(self, req, fp, code, msg, headers):
         location = headers.get("location") or headers.get("uri")
         if location is not None:
             target, host = _location_target(req.full_url, location)
-            if is_cf_access_login_host(host):
+            if self.classify_cf_login and is_cf_access_login_host(host):
                 raise _CfAccessRedirectRefused(
                     req.full_url, code, "redirect to a Cloudflare Access login refused", headers, fp
                 )
@@ -188,6 +196,7 @@ def request_json(
     insecure: bool = False,
     status_out: list[int] | None = None,
     reject_html: bool = False,
+    classify_cf_login: bool = False,
 ) -> dict:
     """JSON 요청/응답. insecure=True 는 localhost 자체서명 인증서 전용.
 
@@ -197,6 +206,11 @@ def request_json(
     ``reject_html`` (task #1280): 2xx 응답의 Content-Type 이 HTML 이면 본문을 읽지
     않고 UnexpectedHtmlResponse 를 던진다 — 빈 HTML 본문이 ``{}`` 성공으로 접히지
     않게 한다. 응답 헤더를 엄격히 지키지 않는 provider 가 있어 기본은 끈다.
+
+    ``classify_cf_login`` (task #1280, hk 경로 전용): Cloudflare Access 로그인으로의
+    redirect 를 CfAccessLoginRedirect 로 분류하고, 거부된 redirect 는 본문을 읽기 전에
+    판정한다 — 잘린 본문·깨진 chunk 가 이미 정해진 진단을 지우지 않는다. 끄면(기본)
+    redirect 처리는 이 옵션이 없던 때와 같다.
     """
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
@@ -205,7 +219,9 @@ def request_json(
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    handlers: list[urllib.request.BaseHandler] = [_SameOriginRedirectHandler()]
+    handlers: list[urllib.request.BaseHandler] = [
+        _SameOriginRedirectHandler(classify_cf_login=classify_cf_login)
+    ]
     if ctx is not None:
         handlers.append(urllib.request.HTTPSHandler(context=ctx))
     opener = urllib.request.build_opener(*handlers)
@@ -219,9 +235,14 @@ def request_json(
     except urllib.error.HTTPError as exc:  # 상태코드를 보존해 401/429를 구분한다
         if status_out is not None:
             status_out.append(exc.code)
+        if classify_cf_login and isinstance(exc, _RedirectRefused):
+            # 거부 판정 자체가 진단의 전부다 — 본문은 필요 없으니 읽지 않는다.
+            retry_after = _retry_after_seconds(exc)
+            exc.close()
+            if isinstance(exc, _CfAccessRedirectRefused):
+                raise CfAccessLoginRedirect(exc.code) from exc
+            raise HttpError(exc.code, "cross-origin redirect refused", retry_after) from exc
         body_text = exc.read().decode("utf-8", "replace")
-        if isinstance(exc, _CfAccessRedirectRefused):
-            raise CfAccessLoginRedirect(exc.code) from exc
         if 300 <= exc.code < 400:
             # 거부된 redirect 의 본문에는 Location 목적지(URL 쿼리 포함)가 들어갈 수 있다.
             # 사유 표식은 거부 판정과 1:1 인 _RedirectRefused 에만 붙는다 — 같은
