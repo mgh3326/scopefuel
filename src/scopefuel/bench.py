@@ -2733,6 +2733,53 @@ def _fetch_catalog(backend: BenchBackend) -> list[CatalogEntry]:
     return _catalog_from_payload(_handoffkeep_request(backend, "catalog"))
 
 
+def _catalog_entry_exact(value: object) -> CatalogEntry:
+    """Decode one destination catalog row preserving identity verbatim.
+
+    The server stores and compares profile/effort exactly as sent —
+    whitespace and case are significant, and an effort string that is not
+    exactly a known rung is exempt from its monotonicity check. The normal
+    wire reader strips strings, folding " p" into p and " high" into high —
+    which can both hide a real destination rung (unsafe) and invent one
+    (overblocking). Only the fields the monotonicity preflight reads are
+    decoded; the entry never leaves that check.
+    """
+    if not isinstance(value, dict):
+        raise BenchError("invalid handoffkeep catalog row")
+    profile = value.get("profile")
+    effort = value.get("effort")
+    grade = value.get("grade")
+    if not isinstance(profile, str) or not profile:
+        raise BenchError("invalid handoffkeep catalog row")
+    if effort is not None and not isinstance(effort, str):
+        raise BenchError("invalid handoffkeep catalog row")
+    if not isinstance(grade, str):
+        raise BenchError("invalid handoffkeep catalog row")
+    retired_at = value.get("retired_at")
+    return CatalogEntry(
+        profile=profile,
+        effort=effort or "",
+        model_id="",
+        pool="",
+        grade=grade,
+        retired_at=retired_at if isinstance(retired_at, str) and retired_at else None,
+    )
+
+
+def _fetch_catalog_exact(backend: BenchBackend) -> list[CatalogEntry]:
+    """The destination catalog with row identities preserved verbatim.
+
+    Used only by the push_catalog preflight — the monotonicity check must see
+    the same (profile, effort) keys the server will compare, not stripped
+    aliases. Everywhere else keeps the normal _text normalization.
+    """
+    payload = _handoffkeep_request(backend, "catalog")
+    rows = payload.get("catalog")
+    if not isinstance(rows, list):
+        raise BenchBackendError("handoffkeep returned invalid catalog data")
+    return [_catalog_entry_exact(row) for row in rows]
+
+
 def _server_catalog_rejection(entries: list[CatalogEntry]) -> str | None:
     """The validity floor a fetched catalog must pass before it may be canon.
 
@@ -3095,7 +3142,7 @@ def push_catalog(
     # whose merged state is unknown.
     _backend_url(backend, "catalog")  # policy refusals keep their own name
     try:
-        destination = _fetch_catalog(backend)
+        destination = _fetch_catalog_exact(backend)
     except BenchError as exc:
         raise BenchError(
             "bench push-catalog refused: bench_catalog_unreadable — the "

@@ -850,32 +850,41 @@ def test_push_catalog_generated_payloads_property(tmp_path, monkeypatch, isolate
     every refusal makes no PUT."""
     rng = random.Random(1298)
     accepted = refused = 0
+    # Legal non-canonical identities: a whitespace-prefixed profile is a
+    # distinct profile on the server, and a padded effort spelling is an
+    # unknown exempt effort — stripping either would alias it onto a real
+    # rung, hiding violations or inventing them.
+    profiles = ("p", "q", " p", " q")
+    efforts = _EFFORT_ORDER + (" high", "low ", "turbo", "")
     for case in range(80):
         destination = [
-            _entry(profile, effort, rng.choice(_LADDER))
-            for profile in ("p", "q")
-            for effort in _EFFORT_ORDER
-            if rng.randrange(3)
+            _entry(profile, effort, rng.choice(_LADDER), retired_at=RET if rng.randrange(8) == 0 else None)
+            for profile in profiles
+            for effort in efforts
+            if rng.randrange(4)
         ]
         touched = [e.key for e in destination if rng.randrange(2)]
         if rng.randrange(4) == 0:
-            touched.append(("p", rng.choice(_EFFORT_ORDER)))
+            touched.append(("p", rng.choice(efforts)))
         if not touched:
             continue
-        rows = [
+        file_dicts = [
             _entry(
                 profile,
                 effort,
                 rng.choice(_LADDER),
                 decided_by="operator:test",
                 retired_at=RET if rng.randrange(12) == 0 else None,
-            )
+            ).as_dict()
             for profile, effort in touched
         ]
         payload = tmp_path / f"case-{case}.json"
-        payload.write_text(json.dumps({"catalog": [r.as_dict() for r in rows]}))
+        payload.write_text(json.dumps({"catalog": file_dicts}))
         dest_dicts = [e.as_dict() for e in destination]
-        write_dicts = [r.as_dict() for r in rows]
+        # The oracle judges the rows the PUT sends — decoded exactly as
+        # push_catalog decodes the file; the client's own input parse (which
+        # strips) is part of the wire contract.
+        write_dicts = [r.as_dict() for r in bench._catalog_rows_from_json({"catalog": file_dicts})]
         expected = _server_oracle(dest_dicts, write_dicts)
         calls = _send_site(monkeypatch, dest_dicts)
         if expected:
@@ -887,3 +896,87 @@ def test_push_catalog_generated_payloads_property(tmp_path, monkeypatch, isolate
             bench.push_catalog(payload)
             accepted += 1
     assert accepted and refused
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — R2-B1: the preflight must see exact destination identities.
+#
+# The server stores and compares profile/effort verbatim — " p" is a
+# different profile from p and " high" is an exempt unknown effort, not the
+# high rung. The normal wire reader strips strings, which would fold the
+# padded rows into the real keys: a padded row can hide a real rung (unsafe)
+# or invent one (overblocking, including refusing the full bundled seed).
+# The destination read uses a strict verbatim decoder; the payload rows are
+# already exactly what the PUT sends (file decode is the one place the
+# client's own normalization applies, and the wire shows that same text).
+# ---------------------------------------------------------------------------
+
+
+def _push_payload(tmp_path, name: str, wire_rows: list[dict]) -> pathlib.Path:
+    """A push-catalog input file carrying the given wire rows."""
+    payload = tmp_path / name
+    payload.write_text(json.dumps({"catalog": wire_rows}), encoding="utf-8")
+    return payload
+
+
+def test_push_preflight_padded_profile_does_not_mask_a_real_rung(tmp_path, monkeypatch, isolated_cache):
+    """Unsafe profile collision: destination ' p'@low C is a distinct
+    profile, not p@low — stripping it would hide p@low S+ and let p@high S
+    reach a server that rejects it."""
+    destination = [
+        _entry("p", "low", "S+").as_dict(),
+        _entry(" p", "low", "C").as_dict(),
+    ]
+    calls = _send_site(monkeypatch, destination)
+    payload = _push_payload(tmp_path, "c.json", [_entry("p", "high", "S", decided_by="op").as_dict()])
+    with pytest.raises(bench.BenchError, match="bench_catalog_not_monotonic"):
+        bench.push_catalog(payload)
+    assert "PUT" not in [method for method, _ in calls]
+
+
+def test_push_preflight_padded_profile_does_not_overblock(tmp_path, monkeypatch, isolated_cache):
+    """Destination ' p'@low S+ is untouched by a p@high C write — the server
+    accepts; a stripped read would invent p@low S+ and refuse."""
+    destination = [_entry(" p", "low", "S+").as_dict()]
+    calls = _send_site(monkeypatch, destination)
+    payload = _push_payload(tmp_path, "c.json", [_entry("p", "high", "C", decided_by="op").as_dict()])
+    assert bench.push_catalog(payload) == 1
+    assert [method for method, _ in calls].count("PUT") == 1
+
+
+def test_push_preflight_padded_effort_does_not_mask_a_real_rung(tmp_path, monkeypatch, isolated_cache):
+    """Unsafe effort collision: p@' high' C is an unknown effort, exempt on
+    the server — stripping it to 'high' would hide p@high S+ and let p@max S
+    reach a server that rejects it."""
+    destination = [
+        _entry("p", "high", "S+").as_dict(),
+        _entry("p", " high", "C").as_dict(),
+    ]
+    calls = _send_site(monkeypatch, destination)
+    payload = _push_payload(tmp_path, "c.json", [_entry("p", "max", "S", decided_by="op").as_dict()])
+    with pytest.raises(bench.BenchError, match="bench_catalog_not_monotonic"):
+        bench.push_catalog(payload)
+    assert "PUT" not in [method for method, _ in calls]
+
+
+def test_push_preflight_padded_effort_does_not_overblock(tmp_path, monkeypatch, isolated_cache):
+    """p@' high' S+ is an exempt unknown effort, not the high rung — the
+    server accepts p@max C; a stripped read would invent high S+."""
+    destination = [_entry("p", " high", "S+").as_dict()]
+    calls = _send_site(monkeypatch, destination)
+    payload = _push_payload(tmp_path, "c.json", [_entry("p", "max", "C", decided_by="op").as_dict()])
+    assert bench.push_catalog(payload) == 1
+    assert [method for method, _ in calls].count("PUT") == 1
+
+
+def test_push_preflight_full_seed_ignores_a_padded_profile(tmp_path, monkeypatch, capsys, isolated_cache):
+    """The real --emit-seed catalog pushed at a destination holding only
+    ' codex-sol'@low S+ — a distinct profile that must not constrain the
+    seed's own codex-sol ladder."""
+    assert cli.main(["bench", "push-catalog", "--emit-seed", "--decided-by", "operator-desk"]) == 0
+    seed = json.loads(capsys.readouterr().out)
+    payload = _push_payload(tmp_path, "seed.json", seed["catalog"])
+    destination = [_entry(" codex-sol", "low", "S+").as_dict()]
+    calls = _send_site(monkeypatch, destination)
+    assert bench.push_catalog(payload) == len(seed["catalog"])
+    assert [method for method, _ in calls].count("PUT") == 1
