@@ -121,12 +121,27 @@ def echo_status(status, content_type="text/plain"):
     return _action
 
 
+class _CountingServer(http.server.ThreadingHTTPServer):
+    """Counts accepted connections, including ones that never form a request.
+
+    A redirect followed into a scheme change (http -> https on the same port)
+    dies in the TLS handshake before any request line exists, so ``received``
+    alone cannot see it; the connection count can. Every urllib request opens
+    its own connection, so one connection means nothing was re-sent.
+    """
+
+    def process_request(self, request, client_address):
+        self.connections += 1
+        super().process_request(request, client_address)
+
+
 @pytest.fixture
 def make_server():
     servers = []
 
     def _make(tls_context=None):
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        httpd = _CountingServer(("127.0.0.1", 0), _Handler)
+        httpd.connections = 0
         httpd.received = []
         httpd.action = None
         httpd.action_path = None
@@ -515,9 +530,11 @@ def test_foreign_redirect_is_refused_and_the_target_gets_nothing(make_server, mo
     assert result is None
     assert isinstance(err, bench.BenchBackendError)
     assert not isinstance(err, bench.BenchCfAccessError)
-    # Only the original request reached any socket: nothing was re-sent.
+    # Only the original request reached any socket: nothing was re-sent, not
+    # even a connection attempt that died before its request line.
     assert len(hk.received) == 1
     assert other.received == []
+    assert (hk.connections, other.connections) == (1, 0)
     _no_secret(_exc_text(err))
 
 
@@ -693,6 +710,19 @@ def test_json_routes_still_succeed_and_providers_still_accept_html_labelled_json
 
 
 # ------------------------------------------------------------ AC5 leak (in-process)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500, 503])
+def test_send_reraises_http_errors_without_body_or_chain(hk, monkeypatch, status):
+    """The hk helper's own HttpError: status only, no echoed body, no chain to one."""
+    _env(monkeypatch, hk.base_url)
+    hk.action = echo_status(status)
+    with pytest.raises(HttpError) as info:
+        bench._handoffkeep_send(f"{hk.base_url}/v1/documents/k", token=FIX_TOKEN)
+    exc = info.value
+    assert (exc.status, exc.body, str(exc)) == (status, "", f"HTTP {status}")
+    assert exc.__cause__ is None and exc.__suppress_context__
+    _no_secret(_exc_text(exc))
 
 
 LEAK_ACTIONS = {
