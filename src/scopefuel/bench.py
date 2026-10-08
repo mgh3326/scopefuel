@@ -3086,6 +3086,51 @@ def push_catalog(
                 f"{entry.profile}/{entry.effort or '-'}: decided_by is required caller-supplied "
                 "provenance on the catalog route"
             )
+    # #1298 B1: the ladder the server checks is the destination's own merged
+    # catalog — the view apply evaluated can be a snapshot or a stale cache
+    # missing rungs the canon holds. Read the destination over this same
+    # authenticated client, merge the exact payload rows in, and run the same
+    # rule the server will run before anything is sent. An unreadable
+    # destination fails closed: no flag or provenance stamp may send a write
+    # whose merged state is unknown.
+    _backend_url(backend, "catalog")  # policy refusals keep their own name
+    try:
+        destination = _fetch_catalog(backend)
+    except BenchError as exc:
+        raise BenchError(
+            "bench push-catalog refused: bench_catalog_unreadable — the "
+            "destination catalog could not be read to verify effort "
+            "monotonicity, so the write is not sent"
+        ) from exc
+    from . import grades
+
+    merged = {entry.key: entry for entry in destination}
+    for entry in entries:
+        merged[entry.key] = entry
+    # The server checks every profile the write touches — including effort ""
+    # and unknown-effort rows, which mark the profile while contributing no
+    # grade. The write set is the final per-key row — the server's batch
+    # upsert is last-wins, so a later retired row must not be resurrected by
+    # an earlier active twin. A profile touched only by retiring a rung is
+    # still checked: mark it on the exempt "" rung so the check walks that
+    # ladder without resurrecting the retired row.
+    final = {entry.key: entry for entry in entries}
+    write = {key: entry.grade for key, entry in final.items() if not entry.retired_at}
+    for entry in final.values():
+        if entry.retired_at and not any(key[0] == entry.profile for key in write):
+            write[(entry.profile, "")] = entry.grade
+    violations = grades.catalog_monotonicity_violations(list(merged.values()), write)
+    if violations:
+        detail = "; ".join(
+            f"{v.profile}@{v.effort} grade {v.grade} "
+            f"below lower effort {v.lower_effort} grade {v.lower_grade}"
+            for v in violations
+        )
+        raise BenchError(
+            f"bench push-catalog refused: bench_catalog_not_monotonic — {detail}. "
+            "The merged destination catalog would break per-profile effort "
+            "monotonicity; nothing was sent."
+        )
     response = _handoffkeep_request(
         backend,
         "catalog",

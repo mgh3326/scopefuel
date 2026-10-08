@@ -1740,6 +1740,31 @@ def _grades_command(args: argparse.Namespace) -> int:
             r.key for r in changes if r.monotonicity_block is None and (only is None or r.key in set(only))
         }
         skipped = [r for r in changes if r.key not in applied_rows]
+        if not applied_rows:
+            # #1298 S1: nothing is stamped — every recorded change is
+            # blocked-by-monotonicity (an --only naming a blocked rung is
+            # already refused inside apply_proposals). This is a no-op:
+            # disclose each withheld change, write no empty catalog file —
+            # push-catalog would refuse it anyway — and print no propagation
+            # hint.
+            print(
+                "grades apply: nothing written — every recorded change is "
+                "blocked-by-monotonicity (the canon would refuse the write)"
+            )
+            for result in changes:
+                block = result.monotonicity_block
+                assert block is not None
+                print(
+                    f"  not applied (blocked-by-monotonicity): {result.action} "
+                    f"{result.label()} {result.row.grade} -> {result.target} "
+                    f"(evidence: {', '.join(result.evidence_refs)}) — {block.reason}"
+                )
+            if degraded:
+                print(
+                    f"grades apply: proceeded over degraded input under --allow-degraded "
+                    f"({override_reason}) — {'; '.join(degraded)}"
+                )
+            return 0
         payload = {
             "catalog": [e.as_dict() for e in entries if e.key in applied_rows],
             "snapshot": [e.as_dict() for e in entries],
@@ -1771,9 +1796,18 @@ def _grades_command(args: argparse.Namespace) -> int:
         )
         print(f"grades apply: wrote {args.out} changed={len(applied_rows)} rows={len(entries)}")
         if only is not None:
+            blocked_n = sum(1 for r in skipped if r.monotonicity_block is not None)
+            withheld = ", ".join(
+                part
+                for part in (
+                    f"{blocked_n} blocked-by-monotonicity" if blocked_n else "",
+                    f"{len(skipped) - blocked_n} operator not approved" if len(skipped) > blocked_n else "",
+                )
+                if part
+            )
             print(
                 f"grades apply: --only approved {len(applied_rows)} of {len(changes)} "
-                f"recorded change(s); {len(skipped)} not applied (operator not approved)"
+                f"recorded change(s); {len(skipped)} not applied" + (f" ({withheld})" if withheld else "")
             )
         if degraded:
             print(

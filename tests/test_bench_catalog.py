@@ -387,15 +387,17 @@ def test_recommend_always_prints_the_catalog_provenance(catalog_server, monkeypa
 def test_push_catalog_writes_rows_and_refreshes_the_cache(catalog_server, tmp_path):
     _, fake = catalog_server
     payload = tmp_path / "catalog.json"
+    # A fresh profile: a single-rung merged ladder is always monotonic — the
+    # #1298 preflight refuses a payload the destination canon would reject.
     payload.write_text(
-        json.dumps({"catalog": [_row("opus", "high", "claude-opus-5-5", "claude", "A")]}),
+        json.dumps({"catalog": [_row("push-fresh", "high", "claude-opus-5-5", "claude", "A")]}),
         encoding="utf-8",
     )
     assert bench.push_catalog(payload) == 1
     assert fake.put_bodies[-1][0] == "catalog"
     # The write invalidates the memo, so the next read sees the new placement
     # without waiting out the TTL.
-    assert any(e.grade == "A" for e in bench.read_catalog().entries if e.profile == "opus")
+    assert any(e.grade == "A" for e in bench.read_catalog().entries if e.profile == "push-fresh")
 
 
 def test_push_catalog_refuses_a_row_without_decided_by(catalog_server, tmp_path):

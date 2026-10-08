@@ -15,6 +15,8 @@ half of a valid pair is refused locally.
 from __future__ import annotations
 
 import json
+import pathlib
+import random
 
 import pytest
 
@@ -502,8 +504,9 @@ def test_cli_apply_only_half_pair_refused(tmp_path, monkeypatch, capsys, isolate
 
 
 def test_cli_apply_reports_blocked_change(tmp_path, monkeypatch, capsys, isolated_cache):
-    """A proposal whose only change is blocked writes an audit artifact —
-    nothing is stamped, the block is disclosed."""
+    """S1: a proposal whose every change is blocked is a no-op — apply says
+    so, writes no empty catalog file push-catalog would refuse, and prints no
+    propagation hint. The block is still disclosed per change."""
     view = _canon_view(
         _entry("kimi-k3", "high", "C"),
         _entry("kimi-k3", "max", "C"),
@@ -528,13 +531,53 @@ def test_cli_apply_reports_blocked_change(tmp_path, monkeypatch, capsys, isolate
         )
         == 0
     )
-    payload = json.loads(out_file.read_text())
-    assert payload["catalog"] == []
-    withheld = payload["not_applied"]
-    assert len(withheld) == 1 and withheld[0]["effort"] == "high"
-    assert "blocked-by-monotonicity" in withheld[0]["status"]
+    assert not out_file.exists()
     out = capsys.readouterr().out
-    assert "not applied (blocked-by-monotonicity)" in out
+    assert "nothing written" in out
+    assert "not applied (blocked-by-monotonicity): promote kimi-k3@high C -> S" in out
+    assert "would leave kimi-k3@max grade C" in out
+    assert "propagate with" not in out
+
+
+def test_cli_apply_only_summary_labels_blocked_changes(tmp_path, monkeypatch, capsys, isolated_cache):
+    """S1: an --only subset that skips a blocked change labels it
+    blocked-by-monotonicity in the summary — never 'operator not approved'."""
+    view = _kimi_view()
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: view)
+    _seed(
+        [
+            _kimi_rep("k1", "high", "S"),
+            _kimi_rep("k2", "high", "S"),
+            _rep("g1", effort="xhigh", grade="A+"),
+            _rep("g2", effort="xhigh", grade="A+"),
+        ]
+    )
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    assert (
+        cli.main(
+            [
+                "grades",
+                "apply",
+                "--proposal",
+                str(artifact),
+                "--out",
+                str(out_file),
+                "--decided-by",
+                "operator:test",
+                "--only",
+                "grok-hi@xhigh",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(out_file.read_text())
+    assert [r["effort"] for r in payload["catalog"]] == ["xhigh"]
+    assert "blocked-by-monotonicity" in payload["not_applied"][0]["status"]
+    out = capsys.readouterr().out
+    assert "1 not applied (1 blocked-by-monotonicity)" in out
+    assert "operator not approved" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -611,3 +654,236 @@ def test_invariant_exempt_rows_never_participate(isolated_cache):
         _entry("p", "high", "B", retired_at=RET),
     ]
     assert grades.catalog_monotonicity_violations(entries, {("p", "low"): "S"}) == []
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — B1: the real send site re-checks the DESTINATION catalog.
+#
+# The apply-side check validates the merged state of the view it evaluated —
+# which --allow-degraded lets be a bundled snapshot or a stale cache, either
+# of which can be missing rungs the server holds. push-catalog therefore
+# reads the destination over the same authenticated client, merges the exact
+# payload rows in, and runs the same rule before the PUT; a violation is a
+# local bench_catalog_not_monotonic refusal, and an unreadable destination
+# fails closed. The oracle below is an independent transliteration of
+# checkBenchCatalogMonotonicity — the tests judge a PUT with it, never with
+# the function under test.
+# ---------------------------------------------------------------------------
+
+_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+_GRADE_RANK = {"S+": 0, "S": 1, "A+": 2, "A": 3, "B": 4}
+_LADDER = ("C", "B", "A", "A+", "S", "S+")
+
+
+def _server_oracle(catalog_rows: list[dict], write_rows: list[dict]) -> list[tuple]:
+    """What checkBenchCatalogMonotonicity answers for the merged state: every
+    written row's profile is touched; the walk skips retired, effort '' and
+    unknown-effort rows; the first rung is compared against C."""
+    merged = {(r["profile"], r["effort"] or ""): dict(r) for r in catalog_rows}
+    touched = set()
+    for row in write_rows:
+        merged[(row["profile"], row["effort"] or "")] = dict(row)
+        touched.add(row["profile"])
+    bad = []
+    for profile in sorted(touched):
+        rows = [
+            r
+            for r in merged.values()
+            if r["profile"] == profile and not r.get("retired_at") and r["effort"] in _EFFORT_ORDER
+        ]
+        rows.sort(key=lambda r: _EFFORT_ORDER.index(r["effort"]))
+        previous = 5
+        for r in rows:
+            rank = _GRADE_RANK.get(r["grade"], 5)
+            if rank > previous:
+                bad.append((profile, r["effort"], r["grade"]))
+                break
+            previous = rank
+    return bad
+
+
+def _send_site(monkeypatch, destination_rows: list[dict]) -> list:
+    """A fake transport at request_json on the real push-catalog path. GET
+    serves the destination catalog; a PUT is landed only after the
+    independent oracle clears it — reaching the wire with a rejected payload
+    fails right there."""
+    backend = bench.BenchBackend(
+        name=bench.BENCH_BACKEND_HANDOFFKEEP,
+        cache_ttl_s=1,
+        url="https://hk.invalid",
+        token="fake-only",
+        endpoint_id="fake",
+    )
+    monkeypatch.setattr(bench, "bench_backend", lambda **kw: backend)
+    monkeypatch.setattr(bench, "_commit_catalog_cache", lambda **kw: None)
+    calls: list = []
+
+    def transport(url, **kw):
+        method = kw.get("method", "GET")
+        calls.append((method, kw.get("body")))
+        if method == "PUT":
+            writes = kw["body"]["catalog"]
+            rejected = _server_oracle(destination_rows, writes)
+            assert rejected == [], f"HTTP PUT would be rejected by server: {rejected}; writes={writes}"
+            return {"upserted": len(writes)}
+        return {"catalog": [dict(r) for r in destination_rows]}
+
+    monkeypatch.setattr(bench, "request_json", transport)
+    return calls
+
+
+def _degraded_artifact(
+    tmp_path, monkeypatch, source: str, view_rows: list, rep_rows: list[dict]
+) -> pathlib.Path:
+    """propose + apply --allow-degraded over a snapshot/cache-stale view —
+    the file an offline desk produces, ready for push-catalog."""
+    view = bench.CatalogView(
+        entries=tuple(view_rows),
+        source=source,
+        backend=bench.BENCH_BACKEND_HANDOFFKEEP,
+        reason="configured",
+        age_s=0.0,
+    )
+    monkeypatch.setattr(bench, "read_catalog", lambda **kw: view)
+    _seed(rep_rows)
+    artifact = tmp_path / "proposal.json"
+    out_file = tmp_path / "catalog.json"
+    assert cli.main(["grades", "propose", "--json", "--out", str(artifact)]) == 0
+    rc = cli.main(
+        [
+            "grades",
+            "apply",
+            "--proposal",
+            str(artifact),
+            "--out",
+            str(out_file),
+            "--decided-by",
+            "operator:test",
+            "--allow-degraded",
+            "offline fixture",
+        ]
+    )
+    assert rc == 0
+    assert out_file.exists()
+    return out_file
+
+
+@pytest.mark.parametrize("source", [bench.CATALOG_SOURCE_SNAPSHOT, bench.CATALOG_SOURCE_CACHE_STALE])
+def test_push_catalog_rechecks_destination_not_the_degraded_view(
+    tmp_path, monkeypatch, capsys, isolated_cache, source
+):
+    """B1 reproduction: the degraded view holds p@high C, p@max C and the
+    pair high->S, max->S looks monotonic against it — but the destination
+    also holds p@low S+ the view never showed. push-catalog must refuse
+    before the PUT."""
+    out_file = _degraded_artifact(
+        tmp_path,
+        monkeypatch,
+        source,
+        [_entry("p", "high", "C"), _entry("p", "max", "C")],
+        [
+            _rep("ph1", profile="p", model_id="kimi-k3", effort="high", grade="S"),
+            _rep("ph2", profile="p", model_id="kimi-k3", effort="high", grade="S"),
+            _rep("pm1", profile="p", model_id="kimi-k3", effort="max", grade="S"),
+            _rep("pm2", profile="p", model_id="kimi-k3", effort="max", grade="S"),
+        ],
+    )
+    destination = [_entry("p", effort, "S+").as_dict() for effort in ("low", "high", "max")]
+    calls = _send_site(monkeypatch, destination)
+    with pytest.raises(bench.BenchError, match="bench_catalog_not_monotonic"):
+        bench.push_catalog(out_file)
+    assert [method for method, _ in calls] == ["GET"]
+
+
+def test_push_catalog_fails_closed_when_destination_unreadable(tmp_path, monkeypatch, isolated_cache):
+    """B1 fail-closed: a destination read that fails refuses the push with a
+    named error — no write may leave with an unknown merged state."""
+    backend = bench.BenchBackend(
+        name=bench.BENCH_BACKEND_HANDOFFKEEP,
+        cache_ttl_s=1,
+        url="https://hk.invalid",
+        token="fake-only",
+        endpoint_id="fake",
+    )
+    monkeypatch.setattr(bench, "bench_backend", lambda **kw: backend)
+    calls: list = []
+
+    def transport(url, **kw):
+        calls.append(kw.get("method", "GET"))
+        raise OSError("destination unreachable")
+
+    monkeypatch.setattr(bench, "request_json", transport)
+    payload = tmp_path / "catalog.json"
+    payload.write_text(
+        json.dumps({"catalog": [_entry("p", "high", "S", decided_by="operator:test").as_dict()]})
+    )
+    with pytest.raises(bench.BenchError, match="bench_catalog_unreadable"):
+        bench.push_catalog(payload)
+    assert "PUT" not in calls
+
+
+def test_push_catalog_valid_payload_against_richer_destination(tmp_path, monkeypatch, isolated_cache):
+    """The same degraded pair is fine when the destination really is what the
+    view showed — the preflight clears it and the PUT lands."""
+    out_file = _degraded_artifact(
+        tmp_path,
+        monkeypatch,
+        bench.CATALOG_SOURCE_SNAPSHOT,
+        [_entry("p", "high", "C"), _entry("p", "max", "C")],
+        [
+            _rep("ph1", profile="p", model_id="kimi-k3", effort="high", grade="S"),
+            _rep("ph2", profile="p", model_id="kimi-k3", effort="high", grade="S"),
+            _rep("pm1", profile="p", model_id="kimi-k3", effort="max", grade="S"),
+            _rep("pm2", profile="p", model_id="kimi-k3", effort="max", grade="S"),
+        ],
+    )
+    destination = [_entry("p", effort, "C").as_dict() for effort in ("high", "max")]
+    calls = _send_site(monkeypatch, destination)
+    assert bench.push_catalog(out_file) == 2
+    methods = [method for method, _ in calls]
+    assert methods[0] == "GET" and methods.count("PUT") == 1
+
+
+def test_push_catalog_generated_payloads_property(tmp_path, monkeypatch, isolated_cache):
+    """N1 property: generated destination catalogs and payload subsets at the
+    real send site — every PUT that leaves is one the server rule accepts,
+    every refusal makes no PUT."""
+    rng = random.Random(1298)
+    accepted = refused = 0
+    for case in range(80):
+        destination = [
+            _entry(profile, effort, rng.choice(_LADDER))
+            for profile in ("p", "q")
+            for effort in _EFFORT_ORDER
+            if rng.randrange(3)
+        ]
+        touched = [e.key for e in destination if rng.randrange(2)]
+        if rng.randrange(4) == 0:
+            touched.append(("p", rng.choice(_EFFORT_ORDER)))
+        if not touched:
+            continue
+        rows = [
+            _entry(
+                profile,
+                effort,
+                rng.choice(_LADDER),
+                decided_by="operator:test",
+                retired_at=RET if rng.randrange(12) == 0 else None,
+            )
+            for profile, effort in touched
+        ]
+        payload = tmp_path / f"case-{case}.json"
+        payload.write_text(json.dumps({"catalog": [r.as_dict() for r in rows]}))
+        dest_dicts = [e.as_dict() for e in destination]
+        write_dicts = [r.as_dict() for r in rows]
+        expected = _server_oracle(dest_dicts, write_dicts)
+        calls = _send_site(monkeypatch, dest_dicts)
+        if expected:
+            with pytest.raises(bench.BenchError, match="bench_catalog_not_monotonic"):
+                bench.push_catalog(payload)
+            assert "PUT" not in [method for method, _ in calls], f"unsafe write reached the wire: case={case}"
+            refused += 1
+        else:
+            bench.push_catalog(payload)
+            accepted += 1
+    assert accepted and refused
