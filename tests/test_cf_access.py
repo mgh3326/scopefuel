@@ -701,7 +701,7 @@ def test_malformed_location_is_refused_without_echo(hk, monkeypatch, location):
     # (Shared request_json keeps main's printable-only contract and its chain;
     # the full-graph guarantee is the hk helper's, asserted above.)
     with pytest.raises(HttpError) as info:
-        request_json(f"{hk.base_url}/x")
+        request_json(f"{hk.base_url}/x", classify_cf_login=True)
     _no_secret(str(info.value) + "".join(traceback.format_exception(info.value)))
 
 
@@ -1455,3 +1455,35 @@ def test_b5_provider_login_redirect_matches_main(hk, tmp_path, monkeypatch, loca
     assert (type(info.value).__name__, str(info.value)) == MAIN_REFUSAL
     for _method, _path, headers in hk.received:
         assert not [name for name in headers if name.startswith("cf-")]
+
+
+# ------------------------------------------------------------ round 4: provider pre-check gated
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("same-origin", ("ok", {"ok": True, "model": "probe-model"}, 2)),
+        ("javascript", ("HttpError", "HTTP 302", 1)),
+        ("data", ("HttpError", "HTTP 302", 1)),
+        ("file", ("HttpError", "HTTP 302", 1)),
+    ],
+)
+def test_unflagged_handler_follows_provider_redirects_as_main(hk, case, expected):
+    # Without the hk flag the raw Location pre-check is skipped: CPython's own
+    # redirect handling (main's) decides, so a followed redirect is followed and a
+    # disallowed scheme is main's bare 3xx, not the hk refusal text.
+    base = f"http://localhost:{hk.port}"
+    location = {
+        "same-origin": f"http://LOCALHOST:{hk.port}/moved",
+        "javascript": "javascript:alert(1)",
+        "data": "data:text/plain,x",
+        "file": "file:///etc/hosts",
+    }[case]
+    hk.action = redirect(302, location)
+    hk.action_path = "/provider"
+    try:
+        outcome = ("ok", request_json(f"{base}/provider"))
+    except HttpError as exc:
+        outcome = (type(exc).__name__, str(exc))
+    assert (*outcome, len(hk.received)) == expected

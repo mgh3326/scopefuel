@@ -98,7 +98,7 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def http_error_302(self, req, fp, code, msg, headers):
         location = headers.get("location") or headers.get("uri")
-        if location is not None:
+        if self.classify_cf_login and location is not None:
             target, host = _location_target(req.full_url, location)
             if self.classify_cf_login and is_cf_access_login_host(host):
                 raise _CfAccessRedirectRefused(
