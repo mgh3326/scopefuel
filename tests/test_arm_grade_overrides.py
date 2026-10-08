@@ -41,6 +41,22 @@ DECIDED_AT = "2026-09-27"
 DECIDED_AT_WIRE = "2026-09-27T00:00:00Z"
 DEVIATION_REF = "hk:doc 5177 item 2 (evidence srv:973, srv:976, srv:988)"
 
+# #1297 (10-08 operator applies): sonnet@high -> B (hk:task/1297); the four
+# hk:task/1296 promotions — devin-swe2@high and devin-swe2-max@max to A+,
+# grok-hi@xhigh to A, oc-solar4 to A. The first three were unmeasured E6 arm
+# rungs; their promoted rows are ordinary GRADE_TABLE placements whose
+# catalog rows are stamped by these overrides (the #920 graduation pattern).
+DECIDED_BY_1297 = "operator:2026-10-08 via operator-desk"
+# (grade, task ref, decided_at) — sonnet@high was the earlier apply; the four
+# hk:task/1296 rows share the 13:03 apply timestamp.
+OVERRIDES_1297: dict[tuple[str, str], tuple[str, str, str]] = {
+    ("sonnet", "high"): ("B", "hk:task/1297", "2026-10-08T11:52:05.815922Z"),
+    ("devin-swe2", "high"): ("A+", "hk:task/1296", "2026-10-08T13:03:23.617077Z"),
+    ("devin-swe2-max", "max"): ("A+", "hk:task/1296", "2026-10-08T13:03:23.617077Z"),
+    ("grok-hi", "xhigh"): ("A", "hk:task/1296", "2026-10-08T13:03:23.617077Z"),
+    ("oc-solar4", ""): ("A", "hk:task/1296", "2026-10-08T13:03:23.617077Z"),
+}
+
 TODAY = dt.date(2026, 9, 27)
 NOW = dt.datetime(2026, 9, 27, 12, 0, 0, tzinfo=dt.UTC)
 
@@ -71,8 +87,8 @@ def _pre_change(entries_fn):
 # --- AC1: the override table and the single-row delta ------------------------
 
 
-def test_the_override_table_is_exactly_the_decided_entry():
-    assert set(launch.ARM_GRADE_OVERRIDES) == {OVERRIDE_KEY}
+def test_the_override_table_is_exactly_the_decided_entries():
+    assert set(launch.ARM_GRADE_OVERRIDES) == {OVERRIDE_KEY, *OVERRIDES_1297}
     override = launch.ARM_GRADE_OVERRIDES[OVERRIDE_KEY]
     assert override.grade == "A"
     assert override.decided_by == DECIDED_BY
@@ -81,29 +97,41 @@ def test_the_override_table_is_exactly_the_decided_entry():
     for ref in ("srv:973", "srv:976", "srv:988"):
         assert ref in override.deviation_ref
 
+    for key, (grade, task_ref, decided_at) in OVERRIDES_1297.items():
+        entry = launch.ARM_GRADE_OVERRIDES[key]
+        assert entry.grade == grade
+        assert entry.decided_by == DECIDED_BY_1297
+        assert entry.decided_at == decided_at
+        assert task_ref in entry.deviation_ref
 
-def test_only_the_decided_row_differs_from_the_pre_change_snapshot(monkeypatch):
+
+def test_only_the_decided_rows_differ_from_the_pre_change_snapshot(monkeypatch):
     post = bench.catalog_snapshot()
+    overrides = dict(launch.ARM_GRADE_OVERRIDES)
     monkeypatch.setattr(launch, "ARM_GRADE_OVERRIDES", {})
     pre = _pre_change(bench.catalog_snapshot)
 
     assert set(pre) == {entry.key for entry in post}, "the override may not add or drop a row"
     post_by_key = {entry.key: entry.as_dict() for entry in post}
     changed = [key for key in pre if pre[key] != post_by_key[key]]
-    assert changed == [OVERRIDE_KEY]
+    assert set(changed) == {OVERRIDE_KEY, *OVERRIDES_1297}
 
-    # The restated row: grade A with the full decision provenance — and nothing
-    # else on the row moved. #787: GRADE_TABLE carries A too, so the override's
-    # grade restatement is a no-op — without it the row is still A.
-    assert pre[OVERRIDE_KEY]["grade"] == "A"
-    row = post_by_key[OVERRIDE_KEY]
-    assert row["grade"] == "A"
-    assert row["decided_by"] == DECIDED_BY
-    assert row["decided_at"] == DECIDED_AT
-    assert row["deviation_ref"] == DEVIATION_REF
-    for column, value in pre[OVERRIDE_KEY].items():
-        if column not in ("grade", "decided_by", "decided_at", "deviation_ref"):
-            assert row[column] == value, column
+    # The restated rows: the decided grade with the full decision provenance —
+    # and nothing else on a row moved. GRADE_TABLE carries the applied grades
+    # too, so each override's grade restatement is a no-op — without it the
+    # rows keep the same grade and only lose the provenance.
+    expected = {OVERRIDE_KEY: (DECIDED_BY, DECIDED_AT, DEVIATION_REF)}
+    for key in OVERRIDES_1297:
+        override = overrides[key]
+        expected[key] = (override.decided_by, override.decided_at, override.deviation_ref)
+    for key in changed:
+        row = post_by_key[key]
+        assert row["grade"] == pre[key]["grade"] == overrides[key].grade
+        assert (row["decided_by"], row["decided_at"], row["deviation_ref"]) == expected[key]
+        assert not pre[key]["decided_by"] and not pre[key]["deviation_ref"]
+        for column, value in pre[key].items():
+            if column not in ("decided_by", "decided_at", "deviation_ref"):
+                assert row[column] == value, (key, column)
 
 
 def test_every_e6_arm_row_is_unchanged(monkeypatch):
@@ -122,6 +150,12 @@ def test_the_seed_emit_keeps_the_rows_own_decision_provenance(capsys):
     assert row["decided_by"] == DECIDED_BY
     assert row["decided_at"] == DECIDED_AT_WIRE
     assert row["deviation_ref"] == DEVIATION_REF
+    for key, (grade, task_ref, decided_at) in OVERRIDES_1297.items():
+        row = rows[key]
+        assert row["grade"] == grade
+        assert row["decided_by"] == DECIDED_BY_1297
+        assert row["decided_at"] == decided_at  # already RFC3339 on the wire
+        assert task_ref in row["deviation_ref"]
     # Rows without their own provenance still take the generic seed stamp.
     other = rows[("devin-swe2-max", "")]
     assert other["grade"] == "C"
@@ -139,8 +173,9 @@ def test_catalog_list_shows_the_row_at_a_with_provenance():
     assert f"decided_by={DECIDED_BY}" in row
     assert f"decided_at={DECIDED_AT}" in row
     assert "hk:doc 5177" in row
-    # No other bundled row carries decision provenance — nothing else prints it.
-    assert sum("decided_by=" in line for line in text.splitlines()) == 1
+    # Only the decided bundled rows carry decision provenance — #787's one row
+    # plus #1297's five.
+    assert sum("decided_by=" in line for line in text.splitlines()) == 1 + len(OVERRIDES_1297)
 
 
 def test_grades_rung_view_shows_current_a_with_provenance():
@@ -265,22 +300,25 @@ def test_the_e6_arms_stay_marker_gated_on_bundled_hosts():
 
 
 def test_the_not_applied_rungs_keep_their_rows():
-    """The decision reviewed but did NOT apply these — rows unchanged."""
+    """The decisions reviewed but did NOT apply these — rows unchanged."""
 
     rows = {entry.key: entry for entry in bench.catalog_snapshot()}
     assert rows[("codex-terra", "medium")].grade == "A"  # its existing placement
-    assert rows[("kimi-k3", "high")].grade == "C"
-    assert rows[("oc-solar4", "")].grade == "B"
-    for key in (("codex-terra", "medium"), ("kimi-k3", "high"), ("oc-solar4", "")):
+    assert rows[("kimi-k3", "high")].grade == "C"  # 1296: refused (non-monotonic)
+    for key in (("codex-terra", "medium"), ("kimi-k3", "high")):
         assert rows[key].decided_by is None
         assert rows[key].deviation_ref != DEVIATION_REF
 
 
 def test_the_arm_rung_lookup_is_unaffected():
-    """The override never creates an E6 arm — devin-swe2-medium is not one."""
+    """An override never creates an E6 arm — and a graduated rung stops being one."""
 
     assert OVERRIDE_KEY not in E6_ARM_KEYS
     assert e6_arm_rung_for("devin-swe2-medium", "") is None
     # #920: sonnet@max graduated to a placed S row; kimi-k3@max is still an arm.
     assert e6_arm_rung_for("sonnet", "max") is None
+    # #1297: the three promoted arm rungs graduated to ordinary placements.
+    for key in (("devin-swe2", "high"), ("devin-swe2-max", "max"), ("grok-hi", "xhigh")):
+        assert key not in E6_ARM_KEYS
+        assert e6_arm_rung_for(*key) is None
     assert isinstance(e6_arm_rung_for("kimi-k3", "max"), Profile)

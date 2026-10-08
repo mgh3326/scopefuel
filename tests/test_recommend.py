@@ -501,7 +501,7 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     for pre-refresh claude-haiku-4.5 reps.
     """
     sonnet_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "sonnet"]
-    assert len(sonnet_rows) == 4  # S max, A+ xhigh, C high/medium — low has no vendor point
+    assert len(sonnet_rows) == 4  # S max, A+ xhigh, B high, C medium — low has no vendor point
     assert {p.launcher_effort for p in sonnet_rows} == {"max", "xhigh", "high", "medium"}
     for profile in sonnet_rows:
         assert profile.aa_model_id == "claude-sonnet-5-5"
@@ -557,14 +557,15 @@ def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     assert "8.0분" in with_measurement
     assert "8.0분" not in without_measurement
 
-    # #920: Sonnet 5.5 high/medium sit in C right after oc-sonnet46.
+    # #920: Sonnet 5.5 medium sits in C right after oc-sonnet46; #1297 moved
+    # the high rung to B (10-08 operator decision).
     c_names = [profile.model for profile in GRADE_TABLE["C"][:5]]
     assert c_names == [
         "Luna (low)",
         "Qwen3 Coder",
         "Sonnet 4.6",
-        "Sonnet 5.5 (high)",
         "Sonnet 5.5 (medium)",
+        "Claude Haiku 5.5 (low)",
     ]
 
 
@@ -756,18 +757,22 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     # high-B (44.0) row was an over-estimate (vendor TB4 puts 4.5 at 0.0).
     assert "haiku --effort" not in b_output
     assert any(line[:1].isdigit() and "grok --effort low" in line for line in b_output.splitlines())
+    # #1297: the 10-08 operator apply placed the estimated high rung at B —
+    # the row shows the decided grade annotation (score stays the vendor TB4
+    # estimate, cited inside it).
+    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in b_output.splitlines())
+    assert "벤치 43.0(급 실측(B;" in b_output
 
     c_output = recommend(providers, "C", today=TODAY, now=NOW)
     assert "codex-luna --effort low" in c_output
     assert "미측정" in c_output
     assert "codex-luna --effort medium" not in c_output
-    # #920: Sonnet 5.5 vendor-TB4 estimates — high raw 43.0 (B) placed C,
-    # medium raw 29.0 already at the floor, each marked estimate with reason.
-    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines())
+    # #920+#1297: Sonnet 5.5 vendor-TB4 estimates — high promoted to B on the
+    # operator apply; medium raw 29.0 stays at the floor, marked estimate.
+    assert not any(line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines())
     assert any(line[:1].isdigit() and "sonnet --effort medium" in line for line in c_output.splitlines())
-    assert "벤치 43.0(추정(외삽))" in c_output
     assert "벤치 29.0(추정(외삽))" in c_output
-    assert "보수 배치(C; raw 43.0 은 B 구간" in c_output
+    assert "보수 배치(C; raw 43.0 은 B 구간" not in c_output
     # #1269: Haiku 5.5 vendor-TB4 estimates — the whole launchable curve lands
     # at C (raws already at the floor); max is an ordinary ranked row too
     # (10-08 operator decision, option A).
@@ -834,13 +839,12 @@ def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
 
 def test_rob1204_existing_top_rank_intent_remains_for_claude_only_inputs():
     # #920: sonnet's ranked claude candidate moved from A+ (Sonnet 5 high) to C
-    # (Sonnet 5.5 high, vendor TB4 43.0 one step below its raw B read).
-    # #1269: haiku left B entirely — every Haiku 5.5 rung sits at C, so the
-    # claude-only B output has no ranked row left at all.
+    # — #1297 then promoted the high rung to B (10-08 operator apply), so the
+    # claude-only B output's ranked row is it; C's first row is medium.
     c = recommend([_result("claude", 10.0, pool_class="preserve")], "C", today=TODAY, now=NOW)
     b = recommend([_result("claude", 10.0, pool_class="preserve")], "B", today=TODAY, now=NOW)
-    assert next(line for line in c.splitlines() if line[:1].isdigit()).startswith("1. sonnet --effort high")
-    assert not any(line[:1].isdigit() for line in b.splitlines())
+    assert next(line for line in b.splitlines() if line[:1].isdigit()).startswith("1. sonnet --effort high")
+    assert next(line for line in c.splitlines() if line[:1].isdigit()).startswith("1. sonnet --effort medium")
 
 
 def test_rob1193_model_only_profiles_use_registered_coding_index_metric():

@@ -2,10 +2,15 @@
 
 builder-devin-max / builder-devin reps that recorded an effort (max / high)
 resolve to those exact rungs; under rule v1.2 (effort exactness) a rung with
-no catalog row leaves the rep unrung. The two rows are E6 measurement rows —
+no catalog row leaves the rep unrung. The rows began as E6 measurement rows —
 grade C, unmeasured, marker-gated, never placements — so they let the reps
-count without moving any grade: the grade moves only through ``grades
-propose`` / ``apply``.
+count without moving any grade.
+
+#1296 (10-08 operator decision, applied by desk): both rungs were promoted to
+A+ and are now ordinary GRADE_TABLE placements stamped by
+``launch.ARM_GRADE_OVERRIDES`` — the same graduation path #920 used for
+sonnet@max. The E6 marker is inert for them, and a bare
+``policy launch devin-swe2-max`` follows the canon onto the A+ max rung.
 
 The reps here mirror the shapes recorded in the fleet store (profile spelling,
 model id spelling, effort, role, task grade). Each one is a distinct task so
@@ -20,7 +25,7 @@ import pytest
 
 from scopefuel import bench, grades, launch
 from scopefuel.model import Bucket, ProviderResult, Scope
-from scopefuel.recommend import E6_ARM_GRADE, E6_ARM_KEYS, GRADE_TABLE, gate_check, recommend
+from scopefuel.recommend import E6_ARM_KEYS, GRADE_TABLE, gate_check, recommend
 
 HOST = "test-host"
 TODAY = dt.date(2026, 10, 8)
@@ -34,13 +39,14 @@ MISMATCH = "model-mismatch"
 
 # (task, profile, model_id, effort, role, grade) -> (status, judging row key)
 GROUPS: dict[tuple[str, str, str, str, str, str], tuple[str, tuple[str, str]]] = {
-    # builder-devin-max: effort-less reps land on the profile's default row
-    # (effort inferred); max-recorded reps land on the new max row.
-    ("g1", "builder-devin-max", "swe-2-max", "", "impl", "A+"): (COUNTED, ("devin-swe2-max", "")),
-    ("g2", "builder-devin-max", "swe-2-max", "", "orch", "A+"): (COUNTED, ("devin-swe2-max", "")),
+    # builder-devin-max: effort-less reps land on the profile's catalog default
+    # — since #1296 that is the A+ max rung, not the C default row; recorded
+    # max reps keep landing on it directly.
+    ("g1", "builder-devin-max", "swe-2-max", "", "impl", "A+"): (COUNTED, MAX_RUNG),
+    ("g2", "builder-devin-max", "swe-2-max", "", "orch", "A+"): (COUNTED, MAX_RUNG),
     ("g3", "builder-devin-max", "swe-2-max", "max", "impl", "A+"): (COUNTED, MAX_RUNG),
     ("g4", "builder-devin-max", "swe-2-max", "max", "orch", "A+"): (COUNTED, MAX_RUNG),
-    ("g5", "builder-devin-max", "devin-swe2", "", "impl", "A+"): (MISMATCH, ("devin-swe2-max", "")),
+    ("g5", "builder-devin-max", "devin-swe2", "", "impl", "A+"): (MISMATCH, MAX_RUNG),
     ("g6", "builder-devin-max", "devin-swe2", "max", "impl", "A+"): (MISMATCH, MAX_RUNG),
     ("g7", "builder-devin-max", "swe-2", "max", "impl", "A"): (MISMATCH, MAX_RUNG),
     # builder-devin
@@ -51,9 +57,9 @@ GROUPS: dict[tuple[str, str, str, str, str, str], tuple[str, tuple[str, str]]] =
     ("g12", "builder-devin", "devin-swe2", "", "orch", "A"): (COUNTED, ("devin-swe2", "")),
     ("g13", "builder-devin", "devin-swe2", "high", "impl", "A"): (COUNTED, HIGH_RUNG),
     ("g14", "builder-devin", "devin-swe2", "high", "orch", "A"): (COUNTED, HIGH_RUNG),
-    # worker spellings — the profile name itself (direct, default effort)
-    ("g15", "devin-swe2-max", "swe-2-max", "", "impl", "A+"): (COUNTED, ("devin-swe2-max", "")),
-    ("g16", "devin-swe2-max", "swe-2-max", "", "verify", "B"): (COUNTED, ("devin-swe2-max", "")),
+    # worker spellings — the profile name itself (direct, catalog default)
+    ("g15", "devin-swe2-max", "swe-2-max", "", "impl", "A+"): (COUNTED, MAX_RUNG),
+    ("g16", "devin-swe2-max", "swe-2-max", "", "verify", "B"): (COUNTED, MAX_RUNG),
     ("g17", "devin-swe2", "swe-2", "", "impl", "A"): (COUNTED, ("devin-swe2", "")),
 }
 
@@ -109,28 +115,30 @@ def _provider(provider_id: str) -> ProviderResult:
 
 
 @pytest.mark.parametrize(("key", "model_id"), [(MAX_RUNG, "swe-2-max"), (HIGH_RUNG, "swe-2")])
-def test_each_rung_is_an_unmeasured_e6_row_with_the_launch_model_id(key, model_id):
-    assert key in E6_ARM_KEYS
+def test_each_rung_is_a_promoted_ordinary_row_with_the_launch_model_id(key, model_id):
+    # #1296: graduated from E6 arm to an ordinary A+ placement.
+    assert key not in E6_ARM_KEYS
     rows = [entry for entry in bench.catalog_snapshot() if entry.key == key]
     assert len(rows) == 1, rows
     (row,) = rows
-    assert row.grade == E6_ARM_GRADE == "C"
+    assert row.grade == "A+"
     assert row.score is None
     assert row.pool == "devin"
     assert row.gate == "default"
+    assert row.decided_by == "operator:2026-10-08 via operator-desk"
     # the id wrk hands the devin CLI for this profile — what reps record
     assert row.model_id == launch.LAUNCH_MODEL_IDS[key[0]] == model_id
 
 
-def test_the_rows_are_not_placements():
-    """No profile moves grade bucket: the rows stay out of the placement canon."""
+def test_the_rows_are_now_placements():
+    """#1296: the promoted rungs joined the placement canon at A+."""
 
     placement_keys = {entry.key for entry in launch.snapshot_entries()}
-    assert MAX_RUNG not in placement_keys
-    assert HIGH_RUNG not in placement_keys
+    assert MAX_RUNG in placement_keys
+    assert HIGH_RUNG in placement_keys
     placed = {(p.name, p.launcher_effort or "") for profiles in GRADE_TABLE.values() for p in profiles}
-    assert MAX_RUNG not in placed
-    assert HIGH_RUNG not in placed
+    assert MAX_RUNG in placed
+    assert HIGH_RUNG in placed
     rows = {entry.key: entry for entry in launch.snapshot_entries()}
     assert rows[("devin-swe2", "")].grade == "A+"
     assert rows[("devin-swe2-max", "")].grade == "C"
@@ -141,20 +149,24 @@ def test_the_rows_are_not_placements():
     assert devin_buckets == {
         "S+": [],
         "S": [],
-        "A+": ["devin-swe2"],
+        # #1296: devin-swe2 twice — the "" row and the promoted @high rung.
+        "A+": ["devin-swe2", "devin-swe2", "devin-swe2-max"],
         "A": ["devin-swe2"],
         "B": ["devin-swe2"],
         "C": ["devin-swe2-max"],
     }
 
 
-def test_recommend_never_lists_the_new_rungs():
+def test_recommend_lists_the_new_rungs_only_at_their_placement():
     providers = [_provider("devin"), _provider("claude"), _provider("codex")]
-    for grade in ("S+", "S", "A+", "A", "B", "C"):
+    for grade in ("S+", "S", "A", "B", "C"):
         out = recommend(providers, grade, today=TODAY, now=NOW)
         for line in out.splitlines():
             if line[:1].isdigit() and line.split()[1].startswith("devin-swe2"):
                 assert "--effort" not in line, (grade, line)
+    out = recommend(providers, "A+", today=TODAY, now=NOW)
+    assert any(line[:1].isdigit() and "devin-swe2 --effort high" in line for line in out.splitlines())
+    assert any(line[:1].isdigit() and "devin-swe2-max --effort max" in line for line in out.splitlines())
 
 
 # --- AC1: every recorded rep shape, counted or excluded with its reason -------
@@ -204,19 +216,20 @@ def test_a_high_recorded_builder_devin_pass_counts_on_the_high_rung(isolated_cac
 
 
 @pytest.mark.parametrize(
-    ("profile", "model_id", "default_row", "new_row"),
+    ("profile", "model_id", "default_row"),
     [
-        ("builder-devin-max", "swe-2-max", ("devin-swe2-max", ""), MAX_RUNG),
-        ("builder-devin", "swe-2", ("devin-swe2", ""), HIGH_RUNG),
+        # #1296: the promoted max rung is devin-swe2-max's best-graded ordinary
+        # row, so the catalog default IS the max rung now.
+        ("builder-devin-max", "swe-2-max", MAX_RUNG),
+        ("builder-devin", "swe-2", ("devin-swe2", "")),
     ],
 )
-def test_an_effortless_rep_counts_on_the_default_row_never_the_new_rung(
-    isolated_cache, profile, model_id, default_row, new_row
-):
-    """v1.2: an inferred effort lands on the profile's default rung (effort "").
+def test_an_effortless_rep_counts_on_the_catalog_default_rung(isolated_cache, profile, model_id, default_row):
+    """v1.2: an inferred effort lands on the profile's catalog default rung.
 
-    The new rungs are unmeasured E6 rows, which ``_catalog_default_effort``
-    skips — an effort-less rep is never re-read as max/high evidence.
+    The rungs are ordinary placements now, so ``_catalog_default_effort``
+    follows the canon: devin-swe2-max's default is the A+ max rung;
+    devin-swe2 keeps its effort-"" row (tied at A+, the default rung wins).
     """
 
     _add("b1", profile, model_id, "", "impl", "A+")
@@ -225,7 +238,6 @@ def test_an_effortless_rep_counts_on_the_default_row_never_the_new_rung(
     assert row.row_key == default_row, row.resolution_detail
     assert row.effort_inferred is True
     assert row.excluded == ""
-    assert all(r.key != new_row for r in proposal.results)
 
 
 # --- AC5 (c): a non-matching model id stays excluded (no widening) ------------
@@ -259,37 +271,48 @@ def test_the_devin_model_equivalence_is_unchanged():
 # --- AC3: launch -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("profile", ["devin-swe2-max", "devin-swe2"])
-def test_default_launches_are_unchanged(profile):
+@pytest.mark.parametrize(
+    ("profile", "effort", "grade"),
+    [
+        # #1296: the bare devin-swe2-max launch follows the canon onto the A+
+        # max rung (its best-graded ordinary row); devin-swe2 keeps its "" row.
+        ("devin-swe2-max", "max", "A+"),
+        ("devin-swe2", "", "A+"),
+    ],
+)
+def test_default_launches_follow_the_promoted_canon(profile, effort, grade):
     decision = launch.resolve_launch(profile)
     assert decision.model_id == launch.LAUNCH_MODEL_IDS[profile]
-    assert decision.effort == ""
-    assert decision.grade == {"devin-swe2-max": "C", "devin-swe2": "A+"}[profile]
-    assert decision.e6_arm is None
-
-
-@pytest.mark.parametrize(("key", "default_grade"), [(MAX_RUNG, "C"), (HIGH_RUNG, "A+")])
-def test_an_unmarked_effort_launch_keeps_the_default_placement(key, default_grade):
-    profile, effort = key
-    decision = launch.resolve_launch(profile, effort=effort)
-    assert decision.model_id == launch.LAUNCH_MODEL_IDS[profile]
     assert decision.effort == effort
-    assert decision.grade == default_grade
+    assert decision.grade == grade
     assert decision.e6_arm is None
 
 
 @pytest.mark.parametrize("key", [MAX_RUNG, HIGH_RUNG])
-def test_a_marked_effort_launch_resolves_the_rung(key):
+def test_an_unmarked_effort_launch_resolves_the_promoted_rung(key):
+    profile, effort = key
+    decision = launch.resolve_launch(profile, effort=effort)
+    assert decision.model_id == launch.LAUNCH_MODEL_IDS[profile]
+    assert decision.effort == effort
+    assert decision.grade == "A+"
+    assert decision.e6_arm is None
+
+
+@pytest.mark.parametrize("key", [MAX_RUNG, HIGH_RUNG])
+def test_a_marker_on_a_graduated_rung_is_inert(key):
+    """#1296: the marker once admitted the E6 arm; the rung is an ordinary
+    placement now, so it resolves the same with or without the marker."""
+
     profile, effort = key
     decision = launch.resolve_launch(profile, effort=effort, e6_arm=f"{profile}@{effort}")
     assert decision.model_id == launch.LAUNCH_MODEL_IDS[profile]
     assert decision.effort == effort
-    assert decision.grade == "C"
-    assert decision.e6_arm == f"{profile}@{effort}"
+    assert decision.grade == "A+"
+    assert decision.e6_arm is None
 
 
-@pytest.mark.parametrize(("profile", "grade"), [("devin-swe2-max", "C"), ("devin-swe2", "A+")])
-def test_the_bare_gate_is_unchanged(profile, grade):
+@pytest.mark.parametrize(("profile", "grade"), [("devin-swe2-max", "A+"), ("devin-swe2", "A+")])
+def test_the_bare_gate_judges_the_default_rung(profile, grade):
     """wrk passes no --effort to the gate — the bare spawn judges the default row."""
 
     result = gate_check([_provider("devin")], profile, today=TODAY, now=NOW)

@@ -247,12 +247,58 @@ class ArmGradeOverride:
 # non-candidates; a server-canonical host places a stamped row at its grade
 # (``bench._catalog_grade_table`` filters only unmeasured-C arm rows — the
 # measured->ordinary transition).
+#
+# #1297 (operator 2026-10-08 via operator-desk): five more rows the desk applied
+# on the served canon get the same stamp so a full seed push cannot revert the
+# decisions — sonnet@high C -> B (hk:task/1297, decided_at
+# 2026-10-08T11:52:05.815922Z), and hk:task/1296's four (decided_at
+# 2026-10-08T13:03:23.617077Z): devin-swe2@high and devin-swe2-max@max to A+,
+# grok-hi@xhigh to A, oc-solar4 B -> A. The three E6 rungs graduated out of
+# ``E6_ARM_RUNGS`` into ``recommend.GRADE_TABLE`` — measured rungs are ordinary
+# placements — so every grade restatement here is again a no-op; the entries
+# carry the decision provenance exactly as the applied canon rows do.
 ARM_GRADE_OVERRIDES: dict[tuple[str, str], ArmGradeOverride] = {
     ("devin-swe2-medium", ""): ArmGradeOverride(
         grade="A",
         decided_by="operator:2026-09-27 via operator-desk",
         decided_at="2026-09-27",
         deviation_ref="hk:doc 5177 item 2 (evidence srv:973, srv:976, srv:988)",
+    ),
+    ("sonnet", "high"): ArmGradeOverride(
+        grade="B",
+        decided_by="operator:2026-10-08 via operator-desk",
+        decided_at="2026-10-08T11:52:05.815922Z",
+        deviation_ref=(
+            "hk:task/1297 (evidence srv:1224, srv:1228, srv:1230, srv:1238, srv:1248, "
+            "srv:1288, srv:1291, srv:1298, srv:1343, srv:1357)"
+        ),
+    ),
+    ("devin-swe2", "high"): ArmGradeOverride(
+        grade="A+",
+        decided_by="operator:2026-10-08 via operator-desk",
+        decided_at="2026-10-08T13:03:23.617077Z",
+        deviation_ref=(
+            "hk:task/1296 (evidence srv:686, srv:687, srv:693, srv:730, srv:733, "
+            "srv:737, srv:738, srv:745, srv:750, srv:759, srv:828)"
+        ),
+    ),
+    ("devin-swe2-max", "max"): ArmGradeOverride(
+        grade="A+",
+        decided_by="operator:2026-10-08 via operator-desk",
+        decided_at="2026-10-08T13:03:23.617077Z",
+        deviation_ref="hk:task/1296 (evidence srv:1225, srv:1300, srv:1306, srv:1321, srv:1375, srv:1383)",
+    ),
+    ("grok-hi", "xhigh"): ArmGradeOverride(
+        grade="A",
+        decided_by="operator:2026-10-08 via operator-desk",
+        decided_at="2026-10-08T13:03:23.617077Z",
+        deviation_ref="hk:task/1296 (evidence srv:1396, srv:1397)",
+    ),
+    ("oc-solar4", ""): ArmGradeOverride(
+        grade="A",
+        decided_by="operator:2026-10-08 via operator-desk",
+        decided_at="2026-10-08T13:03:23.617077Z",
+        deviation_ref="hk:task/1296 (evidence srv:705, srv:707)",
     ),
 }
 

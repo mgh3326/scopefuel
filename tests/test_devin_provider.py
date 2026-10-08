@@ -929,6 +929,7 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
     # #635 effort variants are unmeasured C rows of their own (high rung is only
     # a reference) — except devin-swe2-medium, which #787 moved to an unscored
     # A row on the operator-approved reps measurement (hk:doc 5177 item 2).
+    # devin-swe2-max's effort-less row stays C; its @max rung was #1296-promoted.
     expected |= {"devin-swe2-max", "devin-ds41-max"}
     actual = {p.name for p in GRADE_TABLE["C"] if p.benchmark is None}
     assert actual == expected
@@ -937,7 +938,8 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
     snapshot = {
         entry.profile: entry
         for entry in launch.snapshot_entries()
-        if entry.profile in expected and (entry.effort == "low" if entry.profile == "codex-luna" else True)
+        if entry.profile in expected
+        and (entry.effort == "low" if entry.profile == "codex-luna" else entry.effort == "")
     }
     assert set(snapshot) == expected
     assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())

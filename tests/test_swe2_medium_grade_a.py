@@ -56,7 +56,9 @@ def test_no_other_grade_table_row_changed():
     #920 Sonnet 5.5 relabel (Sonnet 5 rows replaced by estimated 5.5 rows)
     plus the #1026 Sol 6.1 relabel (the two codex-sol S+ rows relabelled)
     plus the #1269 Haiku 5.5 refresh (the two Haiku 4.5 rows replaced by five
-    estimated C-rung rows)."""
+    estimated C-rung rows) plus #1297's five-row apply (sonnet@high -> B;
+    devin-swe2@high and devin-swe2-max@max E6-graduated to A+; grok-hi@xhigh
+    E6-graduated to A; oc-solar4 B -> A)."""
     pre = json.loads(PRE_787_ROWS.read_text())
     pre_counts = Counter(json.dumps(row, sort_keys=True) for row in pre)
     post_counts = Counter(json.dumps(row, sort_keys=True) for row in _rows(GRADE_TABLE))
@@ -71,7 +73,6 @@ def test_no_other_grade_table_row_changed():
         ("A", "devin-swe2-medium", None),
         ("S", "sonnet", "max"),
         ("A+", "sonnet", "xhigh"),
-        ("C", "sonnet", "high"),
         ("C", "sonnet", "medium"),
         # #1026 (09-30 operator decision): the codex-sol rows relabelled
         # gpt-6-sol -> gpt-6.1-sol — same (grade, name, effort) keys.
@@ -84,6 +85,12 @@ def test_no_other_grade_table_row_changed():
         ("C", "haiku", "high"),
         ("C", "haiku", "xhigh"),
         ("C", "haiku", "max"),
+        # #1297 (10-08 operator applies, hk:task/1296 + hk:task/1297).
+        ("B", "sonnet", "high"),
+        ("A+", "devin-swe2", "high"),
+        ("A+", "devin-swe2-max", "max"),
+        ("A", "grok-hi", "xhigh"),
+        ("A", "oc-solar4", None),
     }
     assert {key(row) for row in removed} == {
         ("C", "devin-swe2-medium", None),
@@ -97,6 +104,8 @@ def test_no_other_grade_table_row_changed():
         # demoted B -> C on purpose (vendor TB4 says 4.5 scored 0.0).
         ("B", "haiku", "high"),
         ("C", "haiku", "low"),
+        # #1297: oc-solar4's B row is replaced by the promoted A row.
+        ("B", "oc-solar4", None),
     }
 
 
