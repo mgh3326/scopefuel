@@ -50,7 +50,14 @@ NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
     ("grok-hi", "low"): ("grok", "grok-4.7", "high 46.3"),
     ("grok-hi", "medium"): ("grok", "grok-4.7", "high 46.3"),
     ("grok-hi", "xhigh"): ("grok", "grok-4.7", "high 46.3"),
+    # #1284: the devin rungs builder-devin-max / builder-devin reps record. No
+    # AA data exists for SWE-2, so the reference says so instead of a number.
+    ("devin-swe2-max", "max"): ("devin", "swe-2-max", "SWE-2 AA 미측정"),
+    ("devin-swe2", "high"): ("devin", "swe-2", "SWE-2 AA 미측정"),
 }
+# #1284: rungs whose model has no AA measurement at all — the row must say so
+# rather than carry an AA mapping it does not have.
+NO_AA_RUNGS: frozenset[tuple[str, str]] = frozenset({("devin-swe2-max", "max"), ("devin-swe2", "high")})
 # The rungs the E6 arms use that the catalog already placed — no new row may
 # appear for these, or the existing spelling's resolution would change.
 EXISTING_RUNGS: dict[tuple[str, str], str] = {
@@ -138,7 +145,11 @@ def test_each_new_rung_keeps_the_profile_pool_and_aa_mapping(key):
     assert row is not None
     assert profile_pool(profile) == (NEW_RUNGS[key][0], None)
     assert row.benchmark is None
-    assert row.aa_model_id or row.aa_agent_model_id
+    if key in NO_AA_RUNGS:
+        assert not (row.aa_model_id or row.aa_agent_model_id)
+        assert "AA 미측정" in row.benchmark_annotation
+    else:
+        assert row.aa_model_id or row.aa_agent_model_id
 
 
 def test_new_rungs_stay_out_of_the_placement_snapshot():

@@ -1284,6 +1284,24 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         aa_agent_model_id="grok-4.7",
         aa_model_id="grok-4-7",
     ),
+    # #1284 (operator 10-08): the rungs builder-devin-max / builder-devin reps
+    # record (effort max / high). Without an exact-effort row they are unrung
+    # under v1.2; these rows let them count — the grade moves only through
+    # grades propose/apply. Same launch as the profile's effort-less row (the
+    # devin launcher takes no effort flag; the model id is
+    # launch.LAUNCH_MODEL_IDS by profile). No AA data exists for SWE-2.
+    _e6_arm_profile(
+        "devin-swe2-max",
+        "SWE-2 (max)",
+        "max",
+        "없음(SWE-2 AA 미측정 · Cognition 자체 발표만)",
+    ),
+    _e6_arm_profile(
+        "devin-swe2",
+        "SWE-2 (high)",
+        "high",
+        "없음(SWE-2 AA 미측정 · Cognition 자체 발표만)",
+    ),
 )
 
 E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
