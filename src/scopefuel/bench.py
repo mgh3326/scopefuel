@@ -329,6 +329,11 @@ AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     # (hk:doc report/2026-09-29/sonnet55-catalog-and-reps-status). The AA-synced
     # price table does not carry the new id yet; a synced row wins when it lands.
     ModelPrice("claude-sonnet-5-5", 4.0, 2.0, 10.0, "2026-09-29T00:00:00+00:00"),
+    # #1269: claude-haiku-5-5 vendor list price (<=100k prompt tier) input
+    # $0.10 / output $0.50 per 1M, blended $0.20 by the same 3:1 formula #920
+    # used (hk:doc brief/2026-10-08/haiku55-scopefuel-catalog). The AA-synced
+    # price table does not carry the new id yet; a synced row wins when it lands.
+    ModelPrice("claude-haiku-5-5", 0.20, 0.10, 0.50, "2026-10-08T00:00:00+00:00"),
 )
 
 

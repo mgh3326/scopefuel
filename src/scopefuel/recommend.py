@@ -247,8 +247,19 @@ SONNET_5_5_XHIGH_PLACEMENT_NOTE = "보수 배치(A+; raw 61.0 은 S 구간 — �
 SONNET_5_5_MAX_PLACEMENT_NOTE = "보수 배치(S; raw 70.6 은 S+ 구간 — 실측 reps 전 1단계 보수)"
 SONNET_5_5_MAX_ESCALATION_REASON = "최상위 effort 추정 런그 — 실측 reps 전 운영자 명시 요청 시에만"
 KIRO_HAIKU_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 대조 가능한 기준점 없이 단일 추정"
-HAIKU_LOW_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — 단일 추정, 미측정"
-HAIKU_HIGH_ESTIMATE_REASON = "Haiku 계열 AA-agent 실측 전무 — low 추정치에서 상방으로 투사, 미측정"
+# #1269: Claude Code 별칭 haiku 는 2026-10-08 기준 claude-haiku-5-5 를 서빙한다
+# (hk:doc brief/2026-10-08/haiku55-scopefuel-catalog). AA-agent 미발표 — 벤더
+# 발표 Terminal-Bench 4 effort 곡선을 추정 점수로 그대로 표기한다. 같은 표에서
+# Haiku 4.5 의 TB4 점수는 0.0 — ROB-1201/ROB-1202 가 싣던 44/35 추정은 과대였다.
+HAIKU_5_5_ESTIMATE_REASON = (
+    "claude-haiku-5-5: AA-agent 미발표 — 벤더 발표 Terminal-Bench 4 effort 곡선 "
+    "(low 12.8 · medium 20.3 · high 25.0 · xhigh 31.5 · max 39.2)을 추정 점수로 표기; "
+    "FrontierCode 1.1 46.4는 다른 벤치라 교차 확인용 "
+    "(hk:doc brief/2026-10-08/haiku55-scopefuel-catalog). "
+    "실측 reps 전까지 각 런그는 점수가 가리키는 급의 한 단계 아래에 배치 — "
+    "전 런그 raw 가 이미 최하위 급이라 C 유지"
+)
+HAIKU_5_5_PLACEMENT_NOTE = "raw 점수는 이미 최하위 급(C) — 낮출 급이 없어 C 유지"
 KIMI_K3_LOW_ESTIMATE_REASON = (
     "AA-model coding_index 72.0(kimi-k3/low, bench.db 실측)을 kimi-k3 default 앵커"
     "(76.2→61.0, AA-agent 실측) / glm-5.2 앵커(68.8→43.0, _MODEL_ONLY_ANCHORS) 사이에서 내삽: "
@@ -988,16 +999,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="grok-4.7",
             aa_model_id="grok-4-7",
         ),
-        # ROB-1202: extrapolated/unmeasured Haiku high estimate — not a Haiku medium placement.
-        Profile(
-            "haiku",
-            "Claude Haiku 4.5",
-            44.0,
-            launcher_effort="high",
-            benchmark_effort="high",
-            benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
-            estimate_reason=HAIKU_HIGH_ESTIMATE_REASON,
-        ),
+        # #1269: the B-tier Haiku high estimate (44.0) is gone — the Haiku 5.5
+        # refresh below measures every launchable rung at C on the vendor TB4
+        # curve.
         _devin_swe2_profile(),
         Profile(
             "oc-solar4",
@@ -1055,15 +1059,68 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             placement_note=SONNET_5_5_MEDIUM_PLACEMENT_NOTE,
             aa_model_id="claude-sonnet-5-5",
         ),
-        # ROB-1201: estimated Haiku low is a C-tier exception, not a B candidate.
+        # #1269: Haiku 5.5 — 벤더 TB4 곡선(low 12.8 · medium 20.3 · high 25.0 ·
+        # xhigh 31.5 · max 39.2)을 추정 점수로 표기한다. 전 런그 raw 가 이미
+        # 최하위 급(C)라 한 단계 보수도 C 유지 — 기존 high B(44.0) 행의 강등은
+        # 의도된 교정이다. launch.py 의 effort 어휘(CATALOG_EFFORT_RANKS)가
+        # haiku 의 다섯 런그를 전부 받으므로 행도 다섯 개다. low 를 첫 행으로
+        # 둬 프로필 기본 배치가 런처 기본 런그(low)와 일치하게 한다.
         Profile(
             "haiku",
-            "Claude Haiku 4.5",
-            35.0,
+            "Claude Haiku 5.5 (low)",
+            12.8,
             launcher_effort="low",
             benchmark_effort="low",
-            benchmark_annotation=HAIKU_ESTIMATE_ANNOTATION,
-            estimate_reason=HAIKU_LOW_ESTIMATE_REASON,
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
+            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
+            aa_model_id="claude-haiku-5-5",
+        ),
+        Profile(
+            "haiku",
+            "Claude Haiku 5.5 (medium)",
+            20.3,
+            launcher_effort="medium",
+            benchmark_effort="medium",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
+            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
+            aa_model_id="claude-haiku-5-5",
+        ),
+        Profile(
+            "haiku",
+            "Claude Haiku 5.5 (high)",
+            25.0,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
+            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
+            aa_model_id="claude-haiku-5-5",
+        ),
+        Profile(
+            "haiku",
+            "Claude Haiku 5.5 (xhigh)",
+            31.5,
+            launcher_effort="xhigh",
+            benchmark_effort="xhigh",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
+            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
+            aa_model_id="claude-haiku-5-5",
+        ),
+        # #1269 (10-08 operator decision, option A): haiku@max 도 다른 네 런그와
+        # 같은 평범한 C 행 — 게이트를 두지 않는다.
+        Profile(
+            "haiku",
+            "Claude Haiku 5.5 (max)",
+            39.2,
+            launcher_effort="max",
+            benchmark_effort="max",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
+            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
+            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
+            aa_model_id="claude-haiku-5-5",
         ),
         Profile(
             "oc-qwen37-max",

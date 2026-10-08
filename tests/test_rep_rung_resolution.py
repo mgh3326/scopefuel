@@ -426,6 +426,37 @@ def test_current_model_rep_on_codex_sol_still_counts(tmp_path, isolated_cache):
     assert row.resolution == "direct"
 
 
+def test_pre_refresh_haiku45_rep_stays_off_the_haiku55_rungs(tmp_path, isolated_cache):
+    """#1269 AC4: the haiku rows carry claude-haiku-5-5, so a pre-refresh
+    claude-haiku-4.5 rep resolves to the rung but reads as a model mismatch —
+    exact match keeps old-model reps attributed to the old id, never counted."""
+    view = _view(
+        _entry("haiku", "low", "C", model_id="claude-haiku-5-5"),
+        _entry("haiku", "high", "C", model_id="claude-haiku-5-5"),
+    )
+    _seed(
+        [
+            _rep("t1", profile="haiku", model_id="claude-haiku-4.5", effort="high", grade="B"),
+            _rep("t2", profile="haiku", model_id="claude-haiku-5-5", effort="high", grade="B"),
+        ]
+    )
+    proposal = _propose(view)
+    assert proposal.unrung == []
+
+    old_row = _counted(proposal, "t1")
+    assert old_row.rung == ("haiku", "high")
+    assert old_row.resolution == "direct"
+    assert "model mismatch" in old_row.excluded
+    assert "model-mismatch" in old_row.exclusion_tags
+
+    # Positive control: the same rung counts a rep recorded on the new id.
+    new_row = _counted(proposal, "t2")
+    assert new_row.rung == ("haiku", "high")
+    assert new_row.excluded == ""
+    result = next(r for r in proposal.results if r.key == ("haiku", "high"))
+    assert [item.rep.task_ref for item in result.counted] == ["t2"]
+
+
 # ---------------------------------------------------------------------------
 # unrung (AC1d) — reported, never counted
 # ---------------------------------------------------------------------------

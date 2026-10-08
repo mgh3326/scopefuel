@@ -76,7 +76,11 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     # follows the served model so new reps land under the exact new id while
     # pre-refresh claude-sonnet-5 reps stay attributed to the old model.
     "sonnet": "claude-sonnet-5-5",
-    "haiku": "claude-haiku-4.5",
+    # #1269: alias haiku serves claude-haiku-5-5 since 2026-10-08 (hk:doc
+    # brief/2026-10-08/haiku55-scopefuel-catalog) — the same refresh as #920
+    # sonnet: new reps land under the exact new id while pre-refresh
+    # claude-haiku-4.5 reps stay attributed to the old model.
+    "haiku": "claude-haiku-5-5",
     "devin-swe2": "swe-2",
     "devin-glm52": "glm-5-2",
     "devin-swe17": "swe-1-7",
