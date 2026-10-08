@@ -287,6 +287,33 @@ allow_plaintext_reps = true         # reps add/list
 플래그 `allow_plaintext_url`은 세 용도 전부를 켜는 deprecated 별칭으로 계속
 동작하며, 켜져 있으면 경고 한 줄을 출력합니다.
 
+### Cloudflare Access 뒤의 handoffkeep (task #1280)
+
+handoffkeep 엔드포인트가 Cloudflare Access 뒤에 있으면 서비스 토큰 두 키를 설정합니다.
+둘 다 있으면 모든 handoffkeep 요청(catalog·scores·grades·reps·quota share·push-catalog)에
+`CF-Access-Client-Id`/`CF-Access-Client-Secret` 헤더가 실립니다. provider 호출(claude·codex·agy·
+clinepass·Artificial Analysis 등)에는 절대 실리지 않습니다.
+
+```sh
+# 환경변수, 또는 ~/.config/handoffkeep/config.env (HANDOFFKEEP_CONFIG 로 경로 지정)
+HANDOFFKEEP_CF_ACCESS_CLIENT_ID=<service token client id>
+HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET=<service token client secret>
+```
+
+- 읽는 순서는 URL/TOKEN과 같습니다: 키마다 환경변수가 먼저, 다음이 같은 config.env.
+  단 `HANDOFFKEEP_URL`/`HANDOFFKEEP_TOKEN`을 환경변수로 덮어쓴 동안에는 config.env를 아예 읽지
+  않습니다 — 환경변수로 다른 호스트를 가리켜 저장된 CF secret을 그쪽으로 보내는 일이 없게 합니다.
+- 값의 앞뒤 공백은 잘라내고, 공백뿐인 값은 없는 것으로 봅니다. 둘 중 하나만 있으면 빠진 키 이름을
+  말하는 설정 오류이며(값은 출력하지 않음), 요청은 보내지 않습니다.
+- 키가 없으면 동작은 이전과 같고, 모든 handoffkeep 요청에 `User-Agent: scopefuel/<version>`이
+  붙는 것만 다릅니다.
+- redirect는 같은 origin(scheme·host·port; host는 대소문자 무시·끝 점 무시) 안에서만 따라갑니다.
+  scheme 변경은 http→https 승격까지 포함해 거부합니다. `*.cloudflareaccess.com` 로그인으로의
+  redirect는 `cf_access_login_redirect`, JSON 호출에 온 2xx HTML은 `unexpected_html_response`
+  오류가 되며, 둘 다 "서비스 토큰이 없거나 허용되지 않음"을 알립니다.
+- 토큰·CF id·secret·Location 값은 어떤 오류 메시지·경고·상태 출력에도 나오지 않습니다.
+  `scopefuel bench catalog status`는 `cf_access=configured|absent`만 보여 줍니다.
+
 로컬 SQLite는 캐시가 되며, 읽기 실패는 캐시와 나이를 표시해 계속 동작하고, 쓰기 실패는
 종료코드 2로 끝납니다. `scopefuel bench push-local`은 기존 로컬 점수·reps를 지우지 않고 한 번
 이관할 때 사용합니다. 급 배치는 `scopefuel bench grades set`에서 deviation reference를 반드시

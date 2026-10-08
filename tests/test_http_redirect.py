@@ -312,7 +312,8 @@ def test_refused_redirect_does_not_leak_location_in_error(make_server):
         ("http://a.com:0", "http://a.com", False),  # 포트 0 은 기본 포트가 아니다
         ("https://a.com", "http://a.com", False),  # downgrade
         ("http://a.com@evil.com/", "http://a.com/", False),  # userinfo 로 host 위장
-        ("http://a.com.", "http://a.com", False),  # trailing dot — fail-closed
+        ("http://a.com.", "http://a.com", True),  # #1280: trailing dot 은 같은 호스트(FQDN 표기)
+        ("http://A.COM.", "http://a.com", True),
         ("http://bücher.ch", "http://xn--bcher-kva.ch", False),  # IDN — fail-closed
         ("https://a.com", "https://b.com", False),
     ],

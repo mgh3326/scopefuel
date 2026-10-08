@@ -44,6 +44,10 @@ def isolated_cache(tmp_path, monkeypatch):
     # test write to production hk — delete it; tests opt in with their own fake.
     monkeypatch.delenv("HANDOFFKEEP_URL", raising=False)
     monkeypatch.delenv("HANDOFFKEEP_TOKEN", raising=False)
+    # task #1280: an inherited Cloudflare Access service token would ride along
+    # on every fake hk request; tests opt in with fixture values.
+    monkeypatch.delenv("HANDOFFKEEP_CF_ACCESS_CLIENT_ID", raising=False)
+    monkeypatch.delenv("HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET", raising=False)
     # task #654: claude reads ~/.claude/.credentials.json and ~/.claude.json —
     # point both at absent paths so no test observes the developer's real
     # account fingerprint or tokens. Tests opt in via CLAUDE_CONFIG_DIR or by

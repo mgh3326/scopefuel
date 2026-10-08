@@ -23,7 +23,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TextIO
 
-from .http import HttpError, request_json
+from . import __version__
+from .http import CfAccessLoginRedirect, HttpError, UnexpectedHtmlResponse, request_json
 from .policy import config_path, config_problem, load_config
 
 AA_API_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
@@ -229,6 +230,20 @@ class BenchError(ValueError):
 
 class BenchBackendError(BenchError):
     """A handoffkeep operation failed without changing the local cache."""
+
+
+class BenchCfAccessError(BenchBackendError):
+    """handoffkeep sits behind Cloudflare Access and this request did not get through.
+
+    ``reason`` names the case (``cf_access_login_redirect``,
+    ``unexpected_html_response``, ``cf_access_config_incomplete``,
+    ``cf_access_config_invalid``). The message is fixed text plus key names:
+    never a Location, a query string or a header value.
+    """
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 class BenchRouteMissing(BenchBackendError):
@@ -1025,6 +1040,47 @@ def handoffkeep_dotenv_path() -> pathlib.Path:
     return pathlib.Path(base) / "handoffkeep" / "config.env"
 
 
+HANDOFFKEEP_CF_ACCESS_CLIENT_ID = "HANDOFFKEEP_CF_ACCESS_CLIENT_ID"
+HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET = "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET"
+_HANDOFFKEEP_DOTENV_KEYS = frozenset(
+    {
+        "HANDOFFKEEP_URL",
+        "HANDOFFKEEP_TOKEN",
+        HANDOFFKEEP_CF_ACCESS_CLIENT_ID,
+        HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET,
+    }
+)
+# A header value http.client accepts without complaint. Anything else would make
+# it raise an exception whose message repeats the value — so the value is
+# refused here, by key name, before a request is ever built.
+_HEADER_VALUE_RE = re.compile(r"[\x21-\x7e]+")
+_HANDOFFKEEP_USER_AGENT = f"scopefuel/{__version__}"
+
+
+def _handoffkeep_dotenv_values() -> dict[str, str]:
+    """The handoffkeep keys in config.env: first non-empty value per key wins."""
+
+    values: dict[str, str] = {}
+    try:
+        raw = handoffkeep_dotenv_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return values
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if value and key in _HANDOFFKEEP_DOTENV_KEYS and key not in values:
+            values[key] = value
+    return values
+
+
+def _handoffkeep_env_override() -> bool:
+    return bool(os.environ.get("HANDOFFKEEP_URL") or os.environ.get("HANDOFFKEEP_TOKEN"))
+
+
 def _handoffkeep_credentials() -> tuple[str | None, str | None]:
     """Resolve the handoffkeep endpoint, environment first, then the CLI's config.
 
@@ -1035,34 +1091,120 @@ def _handoffkeep_credentials() -> tuple[str | None, str | None]:
     wins, so a shell can point one command at a different endpoint.
     """
 
-    env_url = os.environ.get("HANDOFFKEEP_URL")
-    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
-    if env_url or env_token:
+    if _handoffkeep_env_override():
         # An environment override is all-or-nothing. Completing a half-set pair
         # from config.env would send the stored bearer token to whatever host the
         # environment named — setting one variable would be enough to redirect
         # the credential (CWE-522). An incomplete pair resolves to local instead,
         # and ``bench catalog status`` says which half is missing.
-        return env_url, env_token
-    url: str | None = None
-    token: str | None = None
-    try:
-        raw = handoffkeep_dotenv_path().read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return url, token
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip().strip("'\"")
+        return os.environ.get("HANDOFFKEEP_URL"), os.environ.get("HANDOFFKEEP_TOKEN")
+    values = _handoffkeep_dotenv_values()
+    return values.get("HANDOFFKEEP_URL"), values.get("HANDOFFKEEP_TOKEN")
+
+
+def _handoffkeep_cf_access() -> tuple[str, str] | None:
+    """The Cloudflare Access service token for handoffkeep, or None when unset.
+
+    #1280: each key is read like HANDOFFKEEP_URL/TOKEN — the environment first,
+    then the same config.env (HANDOFFKEEP_CONFIG honoured). config.env is
+    consulted only when the endpoint itself comes from config.env: under an
+    environment URL/TOKEN override it is not read at all, exactly as for the
+    token, so pointing HANDOFFKEEP_URL at another host can never carry the
+    stored CF secret there (CWE-522). Values are trimmed and a whitespace-only
+    value is absent. Exactly one of the two keys set, or a value no HTTP header
+    can carry, raises BenchCfAccessError naming the key — never the value.
+    """
+
+    stored = {} if _handoffkeep_env_override() else _handoffkeep_dotenv_values()
+    found: dict[str, str] = {}
+    for key in (HANDOFFKEEP_CF_ACCESS_CLIENT_ID, HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET):
+        value = (os.environ.get(key) or "").strip() or (stored.get(key) or "").strip()
         if not value:
             continue
-        if key.strip() == "HANDOFFKEEP_URL" and not url:
-            url = value
-        elif key.strip() == "HANDOFFKEEP_TOKEN" and not token:
-            token = value
-    return url, token
+        if not _HEADER_VALUE_RE.fullmatch(value):
+            raise BenchCfAccessError(
+                "cf_access_config_invalid",
+                f"{key} contains characters an HTTP header cannot carry (visible ASCII only)",
+            )
+        found[key] = value
+    if not found:
+        return None
+    if len(found) == 1:
+        missing = (
+            HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET
+            if HANDOFFKEEP_CF_ACCESS_CLIENT_ID in found
+            else HANDOFFKEEP_CF_ACCESS_CLIENT_ID
+        )
+        raise BenchCfAccessError(
+            "cf_access_config_incomplete",
+            f"{missing} is missing: set both {HANDOFFKEEP_CF_ACCESS_CLIENT_ID} and "
+            f"{HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET}, or neither",
+        )
+    return found[HANDOFFKEEP_CF_ACCESS_CLIENT_ID], found[HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET]
+
+
+def _handoffkeep_headers(token: str, *, json_body: bool) -> dict[str, str]:
+    """The headers of every handoffkeep request — the only place CF Access headers are added."""
+
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": _HANDOFFKEEP_USER_AGENT}
+    cf_access = _handoffkeep_cf_access()
+    if cf_access is not None:
+        headers["CF-Access-Client-Id"], headers["CF-Access-Client-Secret"] = cf_access
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+_CF_ACCESS_HINT = (
+    "the Cloudflare Access service token is missing or not allowed for this application "
+    f"(set {HANDOFFKEEP_CF_ACCESS_CLIENT_ID} and {HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET})"
+)
+
+
+def _handoffkeep_send(
+    url: str,
+    *,
+    token: str,
+    method: str = "GET",
+    body: dict | None = None,
+    timeout: float = 20.0,
+    fetch: Callable[..., object] | None = None,
+) -> object:
+    """Send one handoffkeep request: the one helper every hk call site goes through.
+
+    Builds the headers (bearer, User-Agent, CF Access service token when
+    configured) and asks the transport to refuse an HTML answer. Nothing a
+    server or a parser returned reaches the raised error: an HttpError is
+    re-raised with its status only (no body), transport and parse failures
+    become a fixed BenchBackendError, and every chain is cut (``from None``) so
+    not even a traceback carries an echoed credential or a Location.
+
+    ``fetch`` lets a call site keep its own transport seam (quota_share's
+    module-level ``request_json``); it defaults to this module's.
+    """
+
+    headers = _handoffkeep_headers(token, json_body=body is not None)
+    call = fetch or request_json
+    try:
+        return call(url, method=method, headers=headers, body=body, timeout=timeout, reject_html=True)
+    except CfAccessLoginRedirect:
+        raise BenchCfAccessError(
+            "cf_access_login_redirect",
+            "handoffkeep redirected to a Cloudflare Access login (cf_access_login_redirect): "
+            f"{_CF_ACCESS_HINT}",
+        ) from None
+    except UnexpectedHtmlResponse:
+        raise BenchCfAccessError(
+            "unexpected_html_response",
+            "handoffkeep answered with an HTML page instead of JSON (unexpected_html_response): "
+            f"{_CF_ACCESS_HINT}",
+        ) from None
+    except HttpError as exc:
+        raise HttpError(exc.status, "", exc.retry_after) from None
+    except BenchBackendError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise BenchBackendError("handoffkeep request failed") from None
 
 
 def _backend_url(backend: BenchBackend, scope: str) -> str:
@@ -1091,23 +1233,12 @@ def _handoffkeep_request(
     url = _backend_url(backend, scope)
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
-    headers = {"Authorization": f"Bearer {backend.token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
     try:
-        payload = request_json(
-            url,
-            method=method,
-            headers=headers,
-            body=body,
-            timeout=20.0,
-        )
+        payload = _handoffkeep_send(url, token=backend.token or "", method=method, body=body, timeout=20.0)
     except HttpError as exc:
         if exc.status == 404:
-            raise BenchRouteMissing(f"handoffkeep has no /v1/bench/{scope} route") from exc
-        raise BenchBackendError("handoffkeep request failed") from exc
-    except (OSError, TypeError, ValueError) as exc:
-        raise BenchBackendError("handoffkeep request failed") from exc
+            raise BenchRouteMissing(f"handoffkeep has no /v1/bench/{scope} route") from None
+        raise BenchBackendError("handoffkeep request failed") from None
     if not isinstance(payload, dict):
         raise BenchBackendError("handoffkeep returned an invalid response")
     return payload
@@ -2681,6 +2812,10 @@ def _read_catalog_uncached(
             backend=backend.name,
             reason=backend.reason,
         )
+    except BenchCfAccessError as exc:
+        # #1280: a Cloudflare Access refusal is a configuration fault on this
+        # host, not an outage — say so once instead of a bare "unreachable".
+        print(f"warning: {exc}", file=sys.stderr)
     except (BenchBackendError, sqlite3.Error, OSError, ValueError):
         pass
 
@@ -2885,10 +3020,17 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     # backend kept — "token missing" on a host that has one sends the reader to
     # the wrong problem.
     found_url, found_token = _handoffkeep_credentials()
+    # #1280: yes/no only — never a CF Access value, not even a prefix.
+    try:
+        cf_access_state = "configured" if _handoffkeep_cf_access() is not None else "absent"
+        cf_access_problem = None
+    except BenchCfAccessError as exc:
+        cf_access_state, cf_access_problem = "absent", str(exc)
     lines = [
         f"backend={backend.name} reason={backend.reason}",
         f"credentials url={'found' if found_url else 'none'} "
         f"token={'found' if found_token else 'none'} "
+        f"cf_access={cf_access_state} "
         f"(env or {handoffkeep_dotenv_path()})",
         f"catalog_ttl_s={backend.catalog_ttl_s:g} catalog_stale_max_s={backend.catalog_stale_max_s:g}",
         view.label,
@@ -2918,6 +3060,8 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     problem = config_problem()
     if problem is not None:
         lines.append(f"blocked: {config_path()} {problem}: every setting in it is ignored until it is fixed")
+    if cf_access_problem is not None:
+        lines.append(f"blocked: {cf_access_problem}; handoffkeep requests fail until it is fixed")
     if backend.reason == "auto-local-insecure-url":
         lines.append(
             "blocked: handoffkeep credentials exist but the URL is plaintext http to a "

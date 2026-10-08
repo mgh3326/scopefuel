@@ -118,7 +118,7 @@ class FakeHandoffkeep:
                 return scope
         raise AssertionError(f"unexpected URL: {url}")
 
-    def request_json(self, url, *, method="GET", headers=None, body=None, timeout=20.0):
+    def request_json(self, url, *, method="GET", headers=None, body=None, timeout=20.0, **_kw):
         assert headers is not None
         assert headers["Authorization"] == "Bearer test-token"
         assert timeout == 20.0
