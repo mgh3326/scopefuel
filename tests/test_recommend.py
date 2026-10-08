@@ -507,16 +507,20 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
         assert profile.aa_model_id == "claude-sonnet-5-5"
 
     # #1269: the vendor TB4 curve gives a point at every launchable rung —
-    # all five land at C, with max escalation-gated until real reps exist.
+    # all five land at C as ordinary default-gate rows (10-08 operator
+    # decision, option A). The rung -> score mapping is pinned by equality:
+    # swapping two scores fails.
     haiku_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "haiku"]
-    assert len(haiku_rows) == 5
-    assert {p.launcher_effort for p in haiku_rows} == {"low", "medium", "high", "xhigh", "max"}
-    assert {p.benchmark for p in haiku_rows} == {12.8, 20.3, 25.0, 31.5, 39.2}
+    assert {p.launcher_effort: p.benchmark for p in haiku_rows} == {
+        "low": 12.8,
+        "medium": 20.3,
+        "high": 25.0,
+        "xhigh": 31.5,
+        "max": 39.2,
+    }
     assert all(p.aa_model_id == "claude-haiku-5-5" for p in haiku_rows)
     assert all(p in GRADE_TABLE["C"] for p in haiku_rows)
-    (haiku_max,) = [p for p in haiku_rows if p.launcher_effort == "max"]
-    assert haiku_max.gate == "escalation"
-    assert all(p.gate == "default" for p in haiku_rows if p.launcher_effort != "max")
+    assert all(p.gate == "default" and p.gate_reason is None for p in haiku_rows)
 
     ds41 = next(p for p in GRADE_TABLE["A+"] if p.name == "devin-ds41")
     assert ds41.aa_model_id == "deepseek-v4-1-flash"
@@ -765,15 +769,19 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert "벤치 29.0(추정(외삽))" in c_output
     assert "보수 배치(C; raw 43.0 은 B 구간" in c_output
     # #1269: Haiku 5.5 vendor-TB4 estimates — the whole launchable curve lands
-    # at C (raws already at the floor); max shows as the escalation rung.
-    for rung, score in (("low", 12.8), ("medium", 20.3), ("high", 25.0), ("xhigh", 31.5)):
+    # at C (raws already at the floor); max is an ordinary ranked row too
+    # (10-08 operator decision, option A).
+    for rung, score in (
+        ("low", 12.8),
+        ("medium", 20.3),
+        ("high", 25.0),
+        ("xhigh", 31.5),
+        ("max", 39.2),
+    ):
         assert any(
             line[:1].isdigit() and f"haiku --effort {rung}" in line for line in c_output.splitlines()
         ), rung
         assert f"벤치 {score}(추정(외삽))" in c_output
-    assert "haiku --effort max" in c_output
-    assert "벤치 39.2(추정(외삽))" not in c_output
-    assert not any(line[:1].isdigit() and "haiku --effort max" in line for line in c_output.splitlines())
 
     all_profiles = {profile.name for profiles in GRADE_TABLE.values() for profile in profiles}
     assert "gpt-5.4-mini" not in all_profiles

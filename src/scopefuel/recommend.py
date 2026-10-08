@@ -260,7 +260,6 @@ HAIKU_5_5_ESTIMATE_REASON = (
     "전 런그 raw 가 이미 최하위 급이라 C 유지"
 )
 HAIKU_5_5_PLACEMENT_NOTE = "raw 점수는 이미 최하위 급(C) — 낮출 급이 없어 C 유지"
-HAIKU_5_5_MAX_ESCALATION_REASON = "최상위 effort 추정 런그 — 실측 reps 전 운영자 명시 요청 시에만"
 KIMI_K3_LOW_ESTIMATE_REASON = (
     "AA-model coding_index 72.0(kimi-k3/low, bench.db 실측)을 kimi-k3 default 앵커"
     "(76.2→61.0, AA-agent 실측) / glm-5.2 앵커(68.8→43.0, _MODEL_ONLY_ANCHORS) 사이에서 내삽: "
@@ -1110,14 +1109,12 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             placement_note=HAIKU_5_5_PLACEMENT_NOTE,
             aa_model_id="claude-haiku-5-5",
         ),
-        # #1269: 최상위 effort 추정 런그 — #920 sonnet@max 와 같은 규칙으로
-        # 실측 reps 전까지 운영자 명시 요청으로만 연다.
+        # #1269 (10-08 operator decision, option A): haiku@max 도 다른 네 런그와
+        # 같은 평범한 C 행 — 게이트를 두지 않는다.
         Profile(
             "haiku",
             "Claude Haiku 5.5 (max)",
             39.2,
-            gate="escalation",
-            gate_reason=HAIKU_5_5_MAX_ESCALATION_REASON,
             launcher_effort="max",
             benchmark_effort="max",
             benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
