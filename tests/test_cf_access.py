@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -786,6 +787,156 @@ def test_status_names_the_missing_half_without_values(hk, monkeypatch):
     assert " cf_access=absent " in report
     assert f"blocked: {CF_ID_KEY} is missing" in report
     _no_secret(report)
+
+
+# ------------------------------------------------------------ round 2: broken HTTP framing
+
+
+class _RawServer:
+    """A loopback socket that answers each connection with fixed raw bytes.
+
+    http.server cannot emit a malformed status line or lie about
+    Content-Length, so this one writes the bytes itself. It still reads the
+    request head first, and records it, so the test can tell a request was made.
+    """
+
+    def __init__(self, response: bytes):
+        self.response = response
+        self.requests: list[bytes] = []
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.sock.settimeout(0.05)
+        self.port = self.sock.getsockname()[1]
+        self.base_url = f"http://127.0.0.1:{self.port}"
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            with conn:
+                conn.settimeout(2.0)
+                head = b""
+                try:
+                    while b"\r\n\r\n" not in head:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        head += chunk
+                    self.requests.append(head)
+                    conn.sendall(self.response)
+                except OSError:
+                    pass
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self.sock.close()
+
+
+@pytest.fixture
+def raw_server():
+    servers = []
+
+    def _make(response: bytes):
+        server = _RawServer(response)
+        servers.append(server)
+        return server
+
+    yield _make
+    for server in servers:
+        server.close()
+
+
+_ECHO = f"{FIX_TOKEN} {FIX_ID} {FIX_SECRET}"
+BROKEN_FRAMING = {
+    # http.client.BadStatusLine carries a repr of the line the server sent.
+    "malformed status line": f"HTTP/1.1 2x0 {_ECHO}\r\nContent-Length: 0\r\n\r\n".encode(),
+    "non-HTTP status line": f"SSH-2.0 {_ECHO}\r\n\r\n".encode(),
+    "bad HTTP version": f"HTTP/9 200 {_ECHO}\r\n\r\n".encode(),
+    # http.client.IncompleteRead: Content-Length promises more than arrives.
+    "truncated body": (
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n"
+        f'Connection: close\r\n\r\n{{"catalog": "{_ECHO}'
+    ).encode(),
+    "truncated chunked body": (
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+        f"Connection: close\r\n\r\nzz{_ECHO}\r\n"
+    ).encode(),
+}
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN_FRAMING))
+@pytest.mark.parametrize("kind", HK_ONLY_KINDS)
+def test_broken_http_framing_is_a_fixed_backend_error(raw_server, monkeypatch, case, kind):
+    server = raw_server(BROKEN_FRAMING[case])
+    _env(monkeypatch, server.base_url)
+    with pytest.raises(bench.BenchBackendError) as info:
+        REQUEST_KINDS[kind]()
+    assert str(info.value) == "handoffkeep request failed"
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+    _no_secret(_exc_text(info.value))
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN_FRAMING))
+def test_quota_share_folds_broken_framing_fail_open(raw_server, monkeypatch, case):
+    server = raw_server(BROKEN_FRAMING[case])
+    _env(monkeypatch, server.base_url)
+    assert quota_share._request("GET", "fixture-key") is None
+    assert quota_share._request("PUT", "fixture-key", {"document": {}}) is None
+    assert len(server.requests) == 2
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN_FRAMING))
+def test_read_catalog_falls_back_to_the_snapshot_on_broken_framing(raw_server, monkeypatch, capsys, case):
+    server = raw_server(BROKEN_FRAMING[case])
+    _env(monkeypatch, server.base_url)
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == bench.CATALOG_SOURCE_SNAPSHOT
+    assert view.stale
+    captured = capsys.readouterr()
+    _no_secret(captured.out + captured.err)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN_FRAMING))
+def test_read_catalog_falls_back_to_the_cache_on_broken_framing(
+    raw_server, tmp_path, monkeypatch, capsys, case
+):
+    server = raw_server(BROKEN_FRAMING[case])
+    _env(monkeypatch, server.base_url)
+    config = tmp_path / "config" / "scopefuel" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("[bench]\ncatalog_ttl_s = 0\n", encoding="utf-8")  # always re-read the server
+    bench._commit_catalog_cache(path=None, entries=list(bench.catalog_snapshot()), backend=_catalog_backend())
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == bench.CATALOG_SOURCE_CACHE
+    assert len(view.entries) == len(bench.catalog_snapshot())
+    captured = capsys.readouterr()
+    _no_secret(captured.out + captured.err)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("case", sorted(BROKEN_FRAMING))
+def test_real_cli_survives_broken_framing_without_echo(raw_server, cli_env, case):
+    server = raw_server(BROKEN_FRAMING[case])
+    for name, argv in CLI_COMMANDS.items():
+        before = len(server.requests)
+        proc = _run_cli(cli_env, server.base_url, argv)
+        _no_secret(proc.stdout)
+        _no_secret(proc.stderr)
+        assert "Traceback" not in proc.stderr, (name, proc.stderr[-400:])
+        assert len(server.requests) > before, name
+    proc = _run_cli(cli_env, server.base_url, ["bench", "catalog", "status"])
+    assert proc.returncode == 0, proc.stderr[-400:]
 
 
 def test_read_catalog_warns_once_with_the_named_reason(hk, monkeypatch, capsys):

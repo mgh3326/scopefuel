@@ -21,6 +21,7 @@ import tomllib
 import urllib.parse
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from http.client import HTTPException
 from typing import TextIO
 
 from . import __version__
@@ -1175,8 +1176,9 @@ def _handoffkeep_send(
     Builds the headers (bearer, User-Agent, CF Access service token when
     configured) and asks the transport to refuse an HTML answer. Nothing a
     server or a parser returned reaches the raised error: an HttpError is
-    re-raised with its status only (no body), transport and parse failures
-    become a fixed BenchBackendError, and every chain is cut (``from None``) so
+    re-raised with its status only (no body), transport, framing
+    (http.client.HTTPException) and parse failures become a fixed
+    BenchBackendError, and every chain is cut (``from None``) so
     not even a traceback carries an echoed credential or a Location.
 
     ``fetch`` lets a call site keep its own transport seam (quota_share's
@@ -1203,7 +1205,10 @@ def _handoffkeep_send(
         raise HttpError(exc.status, "", exc.retry_after) from None
     except BenchBackendError:
         raise
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, HTTPException):
+        # HTTPException: urllib wraps only OSError from sending the request;
+        # a broken status line, protocol or body from getresponse()/read()
+        # escapes raw (BadStatusLine repeats the server-sent line).
         raise BenchBackendError("handoffkeep request failed") from None
 
 
