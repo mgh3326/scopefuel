@@ -1736,13 +1736,15 @@ def _grades_command(args: argparse.Namespace) -> int:
         # on every row it PUTs) — under --only that is the approved subset.
         # The full post-apply catalog rides along under "snapshot" for the
         # audit record, and "not_applied" records every withheld change.
-        applied_rows = {r.key for r in changes if only is None or r.key in set(only)}
-        skipped = [r for r in changes if only is not None and r.key not in set(only)]
+        applied_rows = {
+            r.key for r in changes if r.monotonicity_block is None and (only is None or r.key in set(only))
+        }
+        skipped = [r for r in changes if r.key not in applied_rows]
         payload = {
             "catalog": [e.as_dict() for e in entries if e.key in applied_rows],
             "snapshot": [e.as_dict() for e in entries],
         }
-        if only is not None:
+        if only is not None or skipped:
             payload["not_applied"] = [
                 {
                     "profile": r.key[0],
@@ -1751,7 +1753,11 @@ def _grades_command(args: argparse.Namespace) -> int:
                     "current": r.row.grade,
                     "target": r.target,
                     "evidence": list(r.evidence_refs),
-                    "status": "not applied (operator not approved)",
+                    "status": (
+                        f"not applied (blocked-by-monotonicity: {r.monotonicity_block.reason})"
+                        if r.monotonicity_block is not None
+                        else "not applied (operator not approved)"
+                    ),
                 }
                 for r in skipped
             ]
@@ -1782,6 +1788,8 @@ def _grades_command(args: argparse.Namespace) -> int:
             )
             if result.key in applied_rows:
                 print(f"  {line}")
+            elif result.monotonicity_block is not None:
+                print(f"  not applied (blocked-by-monotonicity): {line} — {result.monotonicity_block.reason}")
             else:
                 print(f"  not applied (operator not approved): {line}")
         print("propagate with: scopefuel bench push-catalog <out> (operator token)")
