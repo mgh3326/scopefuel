@@ -117,16 +117,17 @@ def _request(method: str, key: str, document: dict | None = None) -> dict | None
     if endpoint is None:
         return None
     url, token = endpoint
-    headers = {"Authorization": f"Bearer {token}"}
-    if document is not None:
-        headers["Content-Type"] = "application/json"
     try:
-        payload = request_json(
+        # task #1280: headers (bearer, User-Agent, CF Access service token) and
+        # the HTML refusal come from bench's one hk helper; this module keeps its
+        # own transport seam so its fakes still intercept.
+        payload = bench._handoffkeep_send(
             f"{url}{_DOC_PREFIX}{urllib.parse.quote(key, safe='')}",
+            token=token,
             method=method,
-            headers=headers,
             body=document,
             timeout=REQUEST_TIMEOUT_S,
+            fetch=request_json,
         )
     except Exception:
         return None

@@ -21,9 +21,11 @@ import tomllib
 import urllib.parse
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from http.client import HTTPException
 from typing import TextIO
 
-from .http import HttpError, request_json
+from . import __version__
+from .http import CfAccessLoginRedirect, HttpError, UnexpectedHtmlResponse, request_json
 from .policy import config_path, config_problem, load_config
 
 AA_API_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
@@ -229,6 +231,20 @@ class BenchError(ValueError):
 
 class BenchBackendError(BenchError):
     """A handoffkeep operation failed without changing the local cache."""
+
+
+class BenchCfAccessError(BenchBackendError):
+    """handoffkeep sits behind Cloudflare Access and this request did not get through.
+
+    ``reason`` names the case (``cf_access_login_redirect``,
+    ``unexpected_html_response``, ``cf_access_config_incomplete``,
+    ``cf_access_config_invalid``). The message is fixed text plus key names:
+    never a Location, a query string or a header value.
+    """
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 class BenchRouteMissing(BenchBackendError):
@@ -825,13 +841,18 @@ def _rank(value: object) -> int | None:
     return value
 
 
-def _captured_at(value: object) -> str:
-    result = _text(value, "captured_at")
+def _captured_at(value: object, field: str = "captured_at") -> str:
+    result = _text(value, field)
     assert result is not None
+    valid = True
     try:
         dt.datetime.fromisoformat(result.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise BenchError("captured_at must be ISO-8601") from exc
+    except ValueError:
+        valid = False
+    if not valid:
+        # Raised outside the except block: the parser's message repeats the
+        # value, and server rows reach here (#1280 B3).
+        raise BenchError(f"{field} must be ISO-8601")
     return result
 
 
@@ -1025,6 +1046,54 @@ def handoffkeep_dotenv_path() -> pathlib.Path:
     return pathlib.Path(base) / "handoffkeep" / "config.env"
 
 
+HANDOFFKEEP_CF_ACCESS_CLIENT_ID = "HANDOFFKEEP_CF_ACCESS_CLIENT_ID"
+HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET = "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET"
+_HANDOFFKEEP_DOTENV_KEYS = frozenset(
+    {
+        "HANDOFFKEEP_URL",
+        "HANDOFFKEEP_TOKEN",
+        HANDOFFKEEP_CF_ACCESS_CLIENT_ID,
+        HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET,
+    }
+)
+# A header value http.client accepts without complaint. Anything else would make
+# it raise an exception whose message repeats the value — so the value is
+# refused here, by key name, before a request is ever built.
+_HEADER_VALUE_RE = re.compile(r"[\x21-\x7e]+")
+_HANDOFFKEEP_USER_AGENT = f"scopefuel/{__version__}"
+
+
+def _handoffkeep_dotenv_values() -> dict[str, str]:
+    """The handoffkeep keys in config.env: first non-empty value per key wins."""
+
+    values: dict[str, str] = {}
+    try:
+        raw = handoffkeep_dotenv_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return values
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if value and key in _HANDOFFKEEP_DOTENV_KEYS and key not in values:
+            values[key] = value
+    return values
+
+
+def _handoffkeep_env_value(key: str) -> str | None:
+    """An environment value, or None when unset or whitespace-only (#1280 B1)."""
+
+    value = os.environ.get(key)
+    return value if value and value.strip() else None
+
+
+def _handoffkeep_env_override() -> bool:
+    return bool(_handoffkeep_env_value("HANDOFFKEEP_URL") or _handoffkeep_env_value("HANDOFFKEEP_TOKEN"))
+
+
 def _handoffkeep_credentials() -> tuple[str | None, str | None]:
     """Resolve the handoffkeep endpoint, environment first, then the CLI's config.
 
@@ -1032,37 +1101,177 @@ def _handoffkeep_credentials() -> tuple[str | None, str | None]:
     every host that runs ``handoffkeep`` — but in ``config.env``, not in the
     process environment. Reading the same file is what lets a host switch to the
     canonical catalog with no per-host scopefuel edit. The environment still
-    wins, so a shell can point one command at a different endpoint.
+    wins, so a shell can point one command at a different endpoint. A
+    whitespace-only variable counts as unset (#1280).
     """
 
-    env_url = os.environ.get("HANDOFFKEEP_URL")
-    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
-    if env_url or env_token:
+    if _handoffkeep_env_override():
         # An environment override is all-or-nothing. Completing a half-set pair
         # from config.env would send the stored bearer token to whatever host the
         # environment named — setting one variable would be enough to redirect
         # the credential (CWE-522). An incomplete pair resolves to local instead,
         # and ``bench catalog status`` says which half is missing.
-        return env_url, env_token
-    url: str | None = None
-    token: str | None = None
-    try:
-        raw = handoffkeep_dotenv_path().read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return url, token
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip().strip("'\"")
+        return _handoffkeep_env_value("HANDOFFKEEP_URL"), _handoffkeep_env_value("HANDOFFKEEP_TOKEN")
+    values = _handoffkeep_dotenv_values()
+    return values.get("HANDOFFKEEP_URL"), values.get("HANDOFFKEEP_TOKEN")
+
+
+_CF_ACCESS_KEYS = (HANDOFFKEEP_CF_ACCESS_CLIENT_ID, HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET)
+CF_ACCESS_STORED_IGNORED_NOTE = (
+    "config.env CF keys ignored because HANDOFFKEEP_URL/TOKEN come from the environment"
+)
+_WARNED_CF_ACCESS_STORED_IGNORED = False
+
+
+def _handoffkeep_cf_access_resolve() -> tuple[tuple[str, str] | None, bool]:
+    """(the CF Access service token or None, whether config.env CF keys were ignored).
+
+    #1280: each key is read like HANDOFFKEEP_URL/TOKEN — the environment first,
+    then the same config.env (HANDOFFKEEP_CONFIG honoured). The isolation rule
+    (builder ruling, round 3): while HANDOFFKEEP_URL or HANDOFFKEEP_TOKEN come
+    from the environment, the CF keys stored in config.env are not used, exactly
+    as the stored token is not, so pointing HANDOFFKEEP_URL at another host can
+    never carry the stored CF secret there (CWE-522). The second value says the
+    rule skipped stored CF keys an environment value did not replace, so the
+    caller can say so instead of going silent.
+
+    Values are trimmed and a whitespace-only value is absent. Exactly one of the
+    two keys set (including an env id whose secret exists only in an ignored
+    config.env), or a value no HTTP header can carry, raises BenchCfAccessError
+    naming the key — never the value.
+    """
+
+    env_override = _handoffkeep_env_override()
+    stored = _handoffkeep_dotenv_values()
+    found: dict[str, str] = {}
+    ignored = False
+    for key in _CF_ACCESS_KEYS:
+        value = (os.environ.get(key) or "").strip()
+        stored_value = (stored.get(key) or "").strip()
+        if not value and stored_value:
+            if env_override:
+                ignored = True
+            else:
+                value = stored_value
         if not value:
             continue
-        if key.strip() == "HANDOFFKEEP_URL" and not url:
-            url = value
-        elif key.strip() == "HANDOFFKEEP_TOKEN" and not token:
-            token = value
-    return url, token
+        if not _HEADER_VALUE_RE.fullmatch(value):
+            raise BenchCfAccessError(
+                "cf_access_config_invalid",
+                f"{key} contains characters an HTTP header cannot carry (visible ASCII only)",
+            )
+        found[key] = value
+    if len(found) == 1:
+        missing = (
+            HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET
+            if HANDOFFKEEP_CF_ACCESS_CLIENT_ID in found
+            else HANDOFFKEEP_CF_ACCESS_CLIENT_ID
+        )
+        note = f" ({CF_ACCESS_STORED_IGNORED_NOTE})" if ignored else ""
+        raise BenchCfAccessError(
+            "cf_access_config_incomplete",
+            f"{missing} is missing: set both {HANDOFFKEEP_CF_ACCESS_CLIENT_ID} and "
+            f"{HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET}, or neither{note}",
+        )
+    if not found:
+        return None, ignored
+    return (found[HANDOFFKEEP_CF_ACCESS_CLIENT_ID], found[HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET]), False
+
+
+def _handoffkeep_cf_access() -> tuple[str, str] | None:
+    """The Cloudflare Access service token for handoffkeep, or None when unset."""
+
+    return _handoffkeep_cf_access_resolve()[0]
+
+
+def _handoffkeep_headers(token: str, *, json_body: bool) -> dict[str, str]:
+    """The headers of every handoffkeep request — the only place CF Access headers are added."""
+
+    global _WARNED_CF_ACCESS_STORED_IGNORED
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": _HANDOFFKEEP_USER_AGENT}
+    cf_access, stored_ignored = _handoffkeep_cf_access_resolve()
+    if cf_access is not None:
+        headers["CF-Access-Client-Id"], headers["CF-Access-Client-Secret"] = cf_access
+    elif stored_ignored and not _WARNED_CF_ACCESS_STORED_IGNORED:
+        _WARNED_CF_ACCESS_STORED_IGNORED = True
+        print(f"note: cf_access=absent ({CF_ACCESS_STORED_IGNORED_NOTE})", file=sys.stderr)
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+_CF_ACCESS_HINT = (
+    "the Cloudflare Access service token is missing or not allowed for this application "
+    f"(set {HANDOFFKEEP_CF_ACCESS_CLIENT_ID} and {HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET})"
+)
+
+
+def _handoffkeep_send(
+    url: str,
+    *,
+    token: str,
+    method: str = "GET",
+    body: dict | None = None,
+    timeout: float = 20.0,
+    fetch: Callable[..., object] | None = None,
+) -> object:
+    """Send one handoffkeep request: the one helper every hk call site goes through.
+
+    Builds the headers (bearer, User-Agent, CF Access service token when
+    configured) and asks the transport to refuse an HTML answer and to name a
+    Cloudflare Access login redirect. Nothing a server or a parser returned
+    reaches the raised error: an HttpError is re-raised with its status only
+    (no body), transport, framing (http.client.HTTPException) and parse
+    failures become a fixed BenchBackendError. Each replacement is built and
+    raised after the ``except`` block, from plain fields captured inside it, so
+    neither ``__cause__`` nor ``__context__`` keeps the original (#1280 B2) —
+    ``from None`` alone would only hide it from the traceback printer.
+
+    ``fetch`` lets a call site keep its own transport seam (quota_share's
+    module-level ``request_json``); it defaults to this module's.
+    """
+
+    headers = _handoffkeep_headers(token, json_body=body is not None)
+    call = fetch or request_json
+    failure: str
+    status = 0
+    retry_after: float | None = None
+    try:
+        return call(
+            url,
+            method=method,
+            headers=headers,
+            body=body,
+            timeout=timeout,
+            reject_html=True,
+            classify_cf_login=True,
+        )
+    except CfAccessLoginRedirect:
+        failure = "cf_access_login_redirect"
+    except UnexpectedHtmlResponse:
+        failure = "unexpected_html_response"
+    except HttpError as exc:
+        failure, status, retry_after = "http", exc.status, exc.retry_after
+    except BenchBackendError:
+        raise
+    except (OSError, TypeError, ValueError, HTTPException):
+        # HTTPException: urllib wraps only OSError from sending the request;
+        # a broken status line, protocol or body from getresponse()/read()
+        # escapes raw (BadStatusLine repeats the server-sent line).
+        failure = "transport"
+    if failure == "cf_access_login_redirect":
+        raise BenchCfAccessError(
+            failure,
+            f"handoffkeep redirected to a Cloudflare Access login ({failure}): {_CF_ACCESS_HINT}",
+        )
+    if failure == "unexpected_html_response":
+        raise BenchCfAccessError(
+            failure,
+            f"handoffkeep answered with an HTML page instead of JSON ({failure}): {_CF_ACCESS_HINT}",
+        )
+    if failure == "http":
+        raise HttpError(status, "", retry_after)
+    raise BenchBackendError("handoffkeep request failed")
 
 
 def _backend_url(backend: BenchBackend, scope: str) -> str:
@@ -1091,23 +1300,16 @@ def _handoffkeep_request(
     url = _backend_url(backend, scope)
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
-    headers = {"Authorization": f"Bearer {backend.token}"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
+    status: int | None = None
     try:
-        payload = request_json(
-            url,
-            method=method,
-            headers=headers,
-            body=body,
-            timeout=20.0,
-        )
+        payload = _handoffkeep_send(url, token=backend.token or "", method=method, body=body, timeout=20.0)
     except HttpError as exc:
-        if exc.status == 404:
-            raise BenchRouteMissing(f"handoffkeep has no /v1/bench/{scope} route") from exc
-        raise BenchBackendError("handoffkeep request failed") from exc
-    except (OSError, TypeError, ValueError) as exc:
-        raise BenchBackendError("handoffkeep request failed") from exc
+        status = exc.status
+    # Raised after the except block so no context is retained (#1280 B2).
+    if status == 404:
+        raise BenchRouteMissing(f"handoffkeep has no /v1/bench/{scope} route")
+    if status is not None:
+        raise BenchBackendError("handoffkeep request failed")
     if not isinstance(payload, dict):
         raise BenchBackendError("handoffkeep returned an invalid response")
     return payload
@@ -1148,14 +1350,87 @@ def _score_from_wire(value: object) -> ModelScore:
     )
 
 
-def _scores_from_payload(payload: dict) -> list[ModelScore]:
-    values = payload.get("scores")
+# #1280 B3: field names a wire-decoder error may name. Server rows reach the
+# validators, whose messages can repeat a field's value; a decoder error names
+# only one of these constants and the row index (an allowlist), never the text.
+_GRADE_WIRE_FIELDS = ("profile", "grade", "boundary_version", "deviation_ref", "decided_at", "decided_by")
+_REP_WIRE_FIELDS = (
+    "id",
+    "origin_id",
+    "profile",
+    "model_id",
+    "task_ref",
+    "tier",
+    "role",
+    "rounds",
+    "blockers_found",
+    "completed",
+    "input_tokens",
+    "output_tokens",
+    "notes",
+    "recorded_at",
+    "effort",
+    "grade",
+    "table_grade",
+    "created_by",
+)
+
+
+def _wire_error_field(message: str, fields: Iterable[str]) -> str | None:
+    """The allowlisted field a validator message is about, or None.
+
+    Only a constant from ``fields`` is ever returned — never a slice of the
+    message. The earliest whole-word match wins, because validators name the
+    field before any value ("unsupported source: <value>").
+    """
+
+    if message.startswith("invalid handoffkeep") and message.endswith(" row"):
+        return None  # the row itself is not an object
+    best: tuple[int, int, str] | None = None
+    for field in fields:
+        match = re.search(rf"(?<![A-Za-z0-9_]){re.escape(field)}(?![A-Za-z0-9_])", message)
+        if match is not None:
+            candidate = (match.start(), -len(field), field)
+            if best is None or candidate < best:
+                best = candidate
+    return None if best is None else best[2]
+
+
+def _decode_wire_rows(
+    payload: dict,
+    key: str,
+    decode: Callable[[object], object],
+    *,
+    fields: Iterable[str],
+    kind: str,
+) -> list:
+    """Decode one server row list; a bad row names its index and field, never a value.
+
+    The replacement error is raised after the except block from an int and an
+    allowlisted constant, so neither its message nor its ``__cause__`` /
+    ``__context__`` carries anything the server sent.
+    """
+
+    values = payload.get(key)
     if not isinstance(values, list):
-        raise BenchBackendError("handoffkeep returned invalid score data")
-    try:
-        return [_score_from_wire(value) for value in values]
-    except BenchError as exc:
-        raise BenchBackendError("handoffkeep returned invalid score data") from exc
+        raise BenchBackendError(f"handoffkeep returned invalid {kind} data")
+    rows: list = []
+    failed_index: int | None = None
+    failed_field: str | None = None
+    for index, value in enumerate(values):
+        try:
+            rows.append(decode(value))
+        except (ValueError, TypeError) as exc:
+            failed_index, failed_field = index, _wire_error_field(str(exc), fields)
+            break
+    if failed_index is not None:
+        where = f"row {failed_index}" + (f" field {failed_field}" if failed_field else "")
+        raise BenchBackendError(f"handoffkeep returned invalid {kind} data ({where})")
+    return rows
+
+
+def _scores_from_payload(payload: dict) -> list[ModelScore]:
+    return _decode_wire_rows(payload, "scores", _score_from_wire, fields=_MODEL_SCORE_COLUMNS, kind="score")
 
 
 def _fetch_scores(backend: BenchBackend) -> list[ModelScore]:
@@ -2078,13 +2353,7 @@ def _grade_from_wire(value: object) -> GradeAssignment:
 
 
 def _grades_from_payload(payload: dict) -> list[GradeAssignment]:
-    values = payload.get("grades")
-    if not isinstance(values, list):
-        raise BenchBackendError("handoffkeep returned invalid grade data")
-    try:
-        return [_grade_from_wire(value) for value in values]
-    except BenchError as exc:
-        raise BenchBackendError("handoffkeep returned invalid grade data") from exc
+    return _decode_wire_rows(payload, "grades", _grade_from_wire, fields=_GRADE_WIRE_FIELDS, kind="grade")
 
 
 def _fetch_grades(backend: BenchBackend) -> list[GradeAssignment]:
@@ -2457,13 +2726,7 @@ def _catalog_from_wire(value: object) -> CatalogEntry:
 
 
 def _catalog_from_payload(payload: dict) -> list[CatalogEntry]:
-    values = payload.get("catalog")
-    if not isinstance(values, list):
-        raise BenchBackendError("handoffkeep returned invalid catalog data")
-    try:
-        return [_catalog_from_wire(value) for value in values]
-    except BenchError as exc:
-        raise BenchBackendError("handoffkeep returned invalid catalog data") from exc
+    return _decode_wire_rows(payload, "catalog", _catalog_from_wire, fields=_CATALOG_COLUMNS, kind="catalog")
 
 
 def _fetch_catalog(backend: BenchBackend) -> list[CatalogEntry]:
@@ -2681,6 +2944,10 @@ def _read_catalog_uncached(
             backend=backend.name,
             reason=backend.reason,
         )
+    except BenchCfAccessError as exc:
+        # #1280: a Cloudflare Access refusal is a configuration fault on this
+        # host, not an outage — say so once instead of a bare "unreachable".
+        print(f"warning: {exc}", file=sys.stderr)
     except (BenchBackendError, sqlite3.Error, OSError, ValueError):
         pass
 
@@ -2885,17 +3152,27 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     # backend kept — "token missing" on a host that has one sends the reader to
     # the wrong problem.
     found_url, found_token = _handoffkeep_credentials()
+    # #1280: yes/no only — never a CF Access value, not even a prefix.
+    try:
+        cf_access, cf_stored_ignored = _handoffkeep_cf_access_resolve()
+        cf_access_state = "configured" if cf_access is not None else "absent"
+        if cf_stored_ignored:
+            cf_access_state += f" ({CF_ACCESS_STORED_IGNORED_NOTE})"
+        cf_access_problem = None
+    except BenchCfAccessError as exc:
+        cf_access_state, cf_access_problem = "absent", str(exc)
     lines = [
         f"backend={backend.name} reason={backend.reason}",
         f"credentials url={'found' if found_url else 'none'} "
         f"token={'found' if found_token else 'none'} "
+        f"cf_access={cf_access_state} "
         f"(env or {handoffkeep_dotenv_path()})",
         f"catalog_ttl_s={backend.catalog_ttl_s:g} catalog_stale_max_s={backend.catalog_stale_max_s:g}",
         view.label,
         f"rows={len(view.entries)} profiles={len(view.profiles())}",
     ]
-    env_url = os.environ.get("HANDOFFKEEP_URL")
-    env_token = os.environ.get("HANDOFFKEEP_TOKEN")
+    env_url = _handoffkeep_env_value("HANDOFFKEEP_URL")
+    env_token = _handoffkeep_env_value("HANDOFFKEEP_TOKEN")
     if bool(env_url) != bool(env_token):
         missing = "HANDOFFKEEP_TOKEN" if env_url else "HANDOFFKEEP_URL"
         lines.append(
@@ -2918,6 +3195,8 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     problem = config_problem()
     if problem is not None:
         lines.append(f"blocked: {config_path()} {problem}: every setting in it is ignored until it is fixed")
+    if cf_access_problem is not None:
+        lines.append(f"blocked: {cf_access_problem}; handoffkeep requests fail until it is fixed")
     if backend.reason == "auto-local-insecure-url":
         lines.append(
             "blocked: handoffkeep credentials exist but the URL is plaintext http to a "
@@ -3310,7 +3589,7 @@ def _remote_rep_from_wire(value: object) -> _RemoteRep:
         input_tokens=_wire_optional_int(value.get("input_tokens"), "input_tokens"),
         output_tokens=_wire_optional_int(value.get("output_tokens"), "output_tokens"),
         notes=_optional_text(value.get("notes"), "notes"),
-        recorded_at=_captured_at(value.get("recorded_at")),
+        recorded_at=_captured_at(value.get("recorded_at"), "recorded_at"),
         effort=_optional_text(value.get("effort"), "effort"),
         grade=_optional_text(value.get("grade"), "grade"),
         table_grade=_optional_text(value.get("table_grade"), "table_grade"),
@@ -3325,13 +3604,7 @@ def _remote_rep_from_wire(value: object) -> _RemoteRep:
 
 
 def _reps_from_payload(payload: dict) -> list[_RemoteRep]:
-    values = payload.get("reps")
-    if not isinstance(values, list):
-        raise BenchBackendError("handoffkeep returned invalid rep data")
-    try:
-        return [_remote_rep_from_wire(value) for value in values]
-    except BenchError as exc:
-        raise BenchBackendError("handoffkeep returned invalid rep data") from exc
+    return _decode_wire_rows(payload, "reps", _remote_rep_from_wire, fields=_REP_WIRE_FIELDS, kind="rep")
 
 
 def _fetch_reps(backend: BenchBackend, *, query: dict[str, object] | None = None) -> list[_RemoteRep]:
