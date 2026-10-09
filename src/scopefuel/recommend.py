@@ -49,6 +49,11 @@ from .policy import (
 
 Grade = Literal["S+", "S", "A+", "A", "B", "C"]
 Gate = Literal["default", "escalation"]
+# #1340 (dr-1340-1): the billing class of a launch — "free" rides a no-budget
+# lane (the devin models-list Free tag), "paid" draws a real budget, and
+# "unknown" is the default. "unknown" sorts exactly like "free" — neutral —
+# so a row never moves without data behind it.
+Billing = Literal["free", "paid", "unknown"]
 
 # AA-agent 지수(33~67)의 새 급 경계: S+ / S / A+ / A / B / C.
 GRADE_BOUNDARIES: dict[Grade, int] = {"S+": 65, "S": 61, "A+": 55, "A": 48, "B": 40}
@@ -204,6 +209,14 @@ class Profile:
     catalog_annotation: str | None = None
     catalog_deviation_ref: str | None = None
     catalog_decided_by: str | None = None
+    # #1340 (dr-1340-1): the row's launch billing class. The bundled table is
+    # the single source — there is no wire column, so a catalog-built profile
+    # for a name with no bundled row (``bench._profile_from_catalog``) keeps
+    # the "unknown" default, while a canon re-placement of a bundled row
+    # inherits its flag through the template. The recommend rank key sinks
+    # "paid" rows below same-pool free/unknown rows at equal quota and boost
+    # standing; "unknown" is neutral so unmarked rows never move.
+    billing: Billing = "unknown"
 
 
 _HARNESS_LABELS = {
@@ -444,6 +457,9 @@ def _devin_swe2_profile() -> Profile:
         benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
         estimate_reason=DEVIN_SWE2_ESTIMATE_REASON,
         placement_note=DEVIN_SWE2_PLACEMENT_NOTE,
+        # #1340 (dr-1340-1): swe-2 carries the Free tag in devin models list —
+        # launches on it draw no paid budget.
+        billing="free",
     )
 
 
@@ -907,6 +923,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             # Devin-side launch id deepseek-v4-1-flash-high is a different
             # namespace (launch.LAUNCH_MODEL_IDS).
             aa_model_id="deepseek-v4-1-flash",
+            # #1340 (dr-1340-1): ds41 is not Free — it draws the Devin Pro
+            # budget (ops/2026-10-09/model-routing item 3).
+            billing="paid",
         ),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1296: the two
         # devin E6 rungs promoted to A+ on the served canon (devin-swe2@high
@@ -924,6 +943,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             launcher_effort="high",
             benchmark_effort="high",
             benchmark_annotation=DEVIN_SWE2_HIGH_GRADE_ANNOTATION,
+            billing="free",
         ),
         Profile(
             "devin-swe2-max",
@@ -932,6 +952,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             launcher_effort="max",
             benchmark_effort="max",
             benchmark_annotation=DEVIN_SWE2_MAX_GRADE_ANNOTATION,
+            billing="free",
         ),
     ],
     "A": [
@@ -1024,6 +1045,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "SWE-2 (medium)",
             None,
             benchmark_annotation=DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
+            billing="free",
         ),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1296:
         # grok-hi@xhigh promoted to A on the served canon (evidence srv:1396·
@@ -1281,8 +1303,22 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # 모두 devin 풀에 묶는다(신설 풀 없음). wrk `--model` 매핑은 launch.py.
         # glm52/swe17은 급 실측이 없어 C에 남긴다. ds41은 hk:doc 2227의
         # reps 3/3 A+ 확정에 따라 위 A+ 행으로 이동했다.
-        Profile("devin-glm52", "GLM-5.2", None, benchmark_annotation=UNMEASURED_ANNOTATION),
-        Profile("devin-swe17", "SWE-1.7", None, benchmark_annotation=UNMEASURED_ANNOTATION),
+        # #1340 (dr-1340-1): glm-5-2 and swe-1-7 rows carry the Free tag in
+        # devin models list — same no-budget lane as swe-2.
+        Profile(
+            "devin-glm52",
+            "GLM-5.2",
+            None,
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+            billing="free",
+        ),
+        Profile(
+            "devin-swe17",
+            "SWE-1.7",
+            None,
+            benchmark_annotation=UNMEASURED_ANNOTATION,
+            billing="free",
+        ),
         # #635: effort 변형 rung. 모델 id 는 launch.LAUNCH_MODEL_IDS.
         # #787: devin-swe2-medium 은 hk:doc 5177 item 2(operator 2026-09-27)의
         # A 승급으로 위 A 행으로 이동했다. ds41-max 는 계속 미측정 C — swe2-max 는
@@ -1292,6 +1328,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             "SWE-2 (max)",
             None,
             benchmark_annotation=DEVIN_EFFORT_VARIANT_ANNOTATION,
+            billing="free",
         ),
         Profile(
             "devin-ds41-max",
@@ -3453,7 +3490,7 @@ def _recommend_rank_key(
     value_order: dict[int, int],
     intra_pool_rank: dict[int, int],
     slot: int,
-) -> tuple[int, int, int, int, float, int, int, int, int]:
+) -> tuple[int, int, int, int, float, int, int, int, int, int]:
     """The one total order every included ``--recommend`` candidate sorts by.
 
     #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
@@ -3461,11 +3498,22 @@ def _recommend_rank_key(
     (boost>one-up, one-up>missing, missing>boost) which are unreachable in a
     total order. Field precedence is fixed: unmeasured-last first, then the
     usual quota and boost dimensions in main's order — imminent exhaustion,
-    boost presence and value, continuous score, the value-order slot,
-    intra-pool rank — then exact before one-up as the last tie-break, then
-    the caller's stable slot. Because ``one_up`` sits after the quota dims,
-    a *measured* one-up row may outrank an *unmeasured* exact row (amended
-    AC6); exact rows win only a full quota/boost/score/slot tie.
+    boost presence and value, continuous score — then the #1340 (dr-1340-1)
+    paid-within-pool dimension, then the value-order slot, intra-pool rank —
+    then exact before one-up as the last tie-break, then the caller's stable
+    slot. Because ``one_up`` sits after the quota dims, a *measured* one-up
+    row may outrank an *unmeasured* exact row (amended AC6); exact rows win
+    only a full quota/boost/score/slot tie.
+
+    The billing dimension is a per-row datum (``Profile.billing``), not a
+    pool-scoped comparison: a "paid" row carries 1, "free" and "unknown" both
+    carry 0 — unknown sorts neutral, the same as free, so unmarked rows never
+    move. Rows in a pool holding a single cost class all carry the same
+    value, so their order is byte-identical to main's. The dimension also
+    orders rows *across* pools at an exactly equal quota/boost/score tie — a
+    paid row sinks below another pool's free or unknown row; that cross-pool
+    case is rare (the continuous score term almost never ties) and follows
+    the same cost-first policy direction as the in-pool rule.
     """
     return (
         0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
@@ -3473,6 +3521,7 @@ def _recommend_rank_key(
         0 if candidate.boost is not None else 1,
         candidate.boost if candidate.boost is not None else 0,
         -candidate.score,
+        1 if candidate.profile.billing == "paid" else 0,
         value_order[id(candidate.profile)],
         intra_pool_rank[id(candidate.profile)],
         1 if candidate.one_up else 0,
@@ -4218,6 +4267,9 @@ def recommend_dict(
             "provider": item.provider_id,
             "placed_grade": item.placed_grade,
             "one_up": item.one_up,
+            # #1340: the row's billing class — the sort key's paid-within-pool
+            # dimension. Text rows stay unchanged; JSON gains this marker.
+            "billing": item.profile.billing,
         }
 
     rows: list[dict[str, object]] = []

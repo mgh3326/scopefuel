@@ -46,11 +46,15 @@ def _rows(table) -> list[dict]:
 # #1318-2 round 2: catalog-evidence fields exist only on profiles built from a
 # server/cache catalog — every bundled row keeps the defaults, so they carry no
 # placement information the pre-#787 fixture could compare against.
+# #1340 (dr-1340-1): the fixture predates the billing field entirely — it has
+# no column to compare against, and the values are pinned by
+# test_task1340_free_before_paid.py.
 _RUNTIME_ONLY_FIELDS = {
     "catalog_backed",
     "catalog_annotation",
     "catalog_deviation_ref",
     "catalog_decided_by",
+    "billing",
 }
 
 

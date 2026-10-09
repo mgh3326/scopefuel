@@ -331,10 +331,11 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         # #1318-2 round 3 (director-1 decision C): the ranked list is the
         # exact-grade fold followed by the rep-measured one-up rows; with
         # quota/boost/score all equal the surviving key dims are
-        # (unmeasured-last, then the value-order slot) — one-up rows take
-        # appended slots after the exact rows, so position encodes exact-first,
-        # and an unmeasured exact row sinks below a measured one-up (amended
-        # AC6).
+        # (unmeasured-last, then the #1340 paid-within-pool dim, then the
+        # value-order slot) — one-up rows take appended slots after the exact
+        # rows, so position encodes exact-first, a paid row sinks below free
+        # and unknown rows at equal standing, and an unmeasured exact row
+        # sinks below a measured one-up (amended AC6).
         profiles = [profile for profile in GRADE_TABLE[grade] if profile.gate != "escalation"]
         ordered = [(profile, False) for profile in profiles]
         ordered += [(profile, True) for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)]
@@ -344,6 +345,9 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
                 ordered,
                 key=lambda item: (
                     item[0].benchmark is None,
+                    # #1340: the paid-within-pool dimension — "paid" sinks
+                    # below "free"/"unknown" at equal quota/boost standing.
+                    item[0].billing == "paid",
                     next(
                         index for index, candidate in enumerate(ordered) if candidate[0].name == item[0].name
                     ),
