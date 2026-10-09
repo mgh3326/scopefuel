@@ -122,6 +122,30 @@ DEFAULT_LAUNCH_EFFORTS: dict[str, str] = {
     "cc-glm": "high",
 }
 
+
+def launcher_accepts_effort_flag(profile: str) -> bool:
+    """Whether bin/wrk accepts ``--effort`` for this profile.
+
+    ``DEFAULT_LAUNCH_EFFORTS`` keys exactly the launchers that take an effort
+    flag (wrk's ``EFFORT_SUPPORTED=1``); the devin/kimi/opencode/agy spellings
+    bake the rung into the profile or model id, so wrk rejects the flag
+    outright (``--effort is unsupported for profile '<name>'``).
+    """
+    return profile in DEFAULT_LAUNCH_EFFORTS
+
+
+def launch_spelling(profile: str, effort: str | None) -> str:
+    """The ``wrk spawn -m`` fragment a catalog rung launches as.
+
+    A flag-taking launcher spells a rung ``<name> --effort <rung>``; on a
+    no-flag launcher the rung is already part of the profile name, so the
+    accepted spelling is the bare profile name.
+    """
+    if effort and launcher_accepts_effort_flag(profile):
+        return f"{profile} --effort {effort}"
+    return profile
+
+
 # Launchable profiles that are deliberately absent from ``GRADE_TABLE``: they are
 # never recommendation candidates, but a launcher still has to know their model
 # id, and an explicit operator request still has to be able to start them.
