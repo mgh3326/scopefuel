@@ -112,13 +112,21 @@ def test_kimi_k3_high_stays_an_unapplied_arm():
     assert ("kimi-k3", "high") not in {entry.key for entry in launch.snapshot_entries()}
 
 
-def test_recommend_lists_each_rung_only_at_its_decided_grade():
+def test_recommend_lists_each_rung_at_its_decided_grade_and_one_up():
+    """#1297 decided placements + #1318-2 one-up listing.
+
+    Every promoted rung is rep-measured (its annotation names reps evidence), so
+    under the operator-A rule it also lists exactly one grade below its decided
+    grade — tagged ``[one-up <grade>]`` — and nowhere else.
+    """
+
     providers = [_provider(pid) for pid in ("claude", "devin", "grok", "upstage", "codex")]
     lines_at = {}
     for grade in ("S+", "S", "A+", "A", "B", "C"):
         out = recommend(providers, grade, today=TODAY, now=NOW)
         lines_at[grade] = [line for line in out.splitlines() if line[:1].isdigit()]
 
+    one_below = {"A+": "A", "A": "B", "B": "C"}
     expected_lines = {
         "A+": ["devin-swe2 --effort high", "devin-swe2-max --effort max"],
         "A": ["grok-hi --effort xhigh", "oc-solar4"],
@@ -126,10 +134,19 @@ def test_recommend_lists_each_rung_only_at_its_decided_grade():
     }
     for grade, names in expected_lines.items():
         for name in names:
-            assert any(name in line for line in lines_at[grade]), (grade, name)
+            decided = [line for line in lines_at[grade] if name in line]
+            assert decided and all("[one-up" not in line for line in decided), (grade, name)
             for other in ("S+", "S", "A+", "A", "B", "C"):
-                if other != grade:
-                    assert not any(name in line for line in lines_at[other]), (other, name)
+                if other == grade:
+                    continue
+                hits = [line for line in lines_at[other] if name in line]
+                if other == one_below[grade]:
+                    assert hits and all(f"[one-up {grade}]" in line for line in hits), (
+                        other,
+                        name,
+                    )
+                else:
+                    assert not hits, (other, name)
 
 
 def test_launch_answers_for_each_promoted_row():

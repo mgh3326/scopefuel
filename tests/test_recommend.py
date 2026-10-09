@@ -769,7 +769,12 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert "codex-luna --effort medium" not in c_output
     # #920+#1297: Sonnet 5.5 vendor-TB4 estimates — high promoted to B on the
     # operator apply; medium raw 29.0 stays at the floor, marked estimate.
-    assert not any(line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines())
+    # #1318-2: sonnet@high's B placement is rep-measured (급 실측(B; evidence
+    # reps …)) so the row lists one grade down at C — but only tagged one-up.
+    sonnet_high_c = [
+        line for line in c_output.splitlines() if line[:1].isdigit() and "sonnet --effort high" in line
+    ]
+    assert sonnet_high_c and all("[one-up B]" in line for line in sonnet_high_c)
     assert any(line[:1].isdigit() and "sonnet --effort medium" in line for line in c_output.splitlines())
     assert "벤치 29.0(추정(외삽))" in c_output
     assert "보수 배치(C; raw 43.0 은 B 구간" not in c_output
