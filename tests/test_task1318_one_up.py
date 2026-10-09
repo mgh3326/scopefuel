@@ -8,7 +8,12 @@ and E6 arm rows never move down.
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
+import random
+from dataclasses import replace
+
+import pytest
 
 from scopefuel import bench, cli
 from scopefuel import recommend as recommend_mod
@@ -20,6 +25,8 @@ from scopefuel.recommend import (
     Subscription,
     _alt_candidates,
     _one_up_profiles,
+    _profile_has_benchmark_score,
+    _recommend_rank_key,
     is_rep_measured,
     profile_pool,
     recommend,
@@ -231,9 +238,11 @@ def test_e6_arm_rungs_are_never_one_up_or_ranked():
 # ── ordering (AC6 / AC7c) ────────────────────────────────────────────────────
 
 
-def test_one_up_never_outranks_exact_at_equal_quota_and_boost():
-    """Same pool, same quota, no boost — and the one-up row even has the better
-    가성비 slot. The exact-grade row still lists first."""
+def test_one_up_with_better_value_slot_outranks_exact_at_equal_quota_and_boost():
+    """Same pool, same quota, no boost — and the one-up row has the better
+    가성비 slot. Round 3 (director-1 decision C): value order precedes the
+    exact-before-one-up tie-break, so the better-value one-up row lists
+    first — amended AC6."""
     table = {grade: [] for grade in GRADES}
     table["A+"].append(
         Profile(
@@ -246,8 +255,8 @@ def test_one_up_never_outranks_exact_at_equal_quota_and_boost():
     )
     table["A"].append(Profile("devin-exact", "Exact", 80.0, aa_model_id="m-exact"))
     providers = [ProviderResult(id="devin", pool_class="preserve", buckets=[_bucket()])]
-    # The one-up row's pool slot wins the value reorder (18.0 > 8.0): without
-    # the one-up sort key it would outrank the exact row at equal quota/boost.
+    # The one-up row's pool slot wins the value reorder (18.0 > 8.0) and
+    # value_order sorts before the one_up tie-break under decision C.
     prices = {
         "m-up": bench.ModelPrice(
             model_id="m-up",
@@ -265,7 +274,7 @@ def test_one_up_never_outranks_exact_at_equal_quota_and_boost():
         ),
     }
     ranked = _ranked(recommend(providers, "A", today=TODAY, now=NOW, grade_table=table, model_prices=prices))
-    assert ranked == ["devin-exact", "devin-oneup"], ranked
+    assert ranked == ["devin-oneup", "devin-exact"], ranked
 
 
 def test_sol_profiles_never_appear_outside_splus():
@@ -469,12 +478,13 @@ def test_seeded_server_catalog_keeps_the_bundled_rep_set():
     assert selected == {(grade, label) for grade, labels in EXPECTED_REP_MEASURED.items() for label in labels}
 
 
-# ── round 2: exact-first regardless of benchmark presence (B2) ───────────────
+# ── round 3: one total-order key (director-1 decision C, amended AC6) ─────────
 
 
-def test_exact_unmeasured_ahead_at_equal_quota_and_boost(monkeypatch):
-    """Exact rows stay ahead of one-up rows at equal quota and boost even when
-    the exact row has no numeric benchmark and the one-up row does."""
+def test_measured_one_up_may_outrank_unmeasured_exact_at_equal_quota_and_boost(monkeypatch):
+    """Amended AC6 (decision C): the rank key applies unmeasured-last first, so
+    a measured one-up row may outrank an unmeasured exact row at equal quota
+    and boost. This supersedes the round-2 pin in the other direction."""
     table = {grade: [] for grade in GRADES}
     table["A+"].append(Profile("devin-oneup", "Measured", 80.0, benchmark_annotation="급 실측(A+; reps 3/3)"))
     table["A"].append(Profile("sonnet", "Exact", None))
@@ -484,9 +494,54 @@ def test_exact_unmeasured_ahead_at_equal_quota_and_boost(monkeypatch):
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
     rows = [row for row in payload["rows"] if row["kind"] == "candidate"]
     assert rows[0]["score"] == rows[1]["score"] and rows[0]["boost"] == rows[1]["boost"]
-    assert rows[0]["profile"] == "sonnet", [
+    assert [row["profile"] for row in rows] == ["devin-oneup", "sonnet"], [
         (row["profile"], row["one_up"], row["score"], row["boost"]) for row in rows
     ]
+
+
+def test_exact_ahead_of_one_up_on_a_full_quota_tie(monkeypatch):
+    """Exact-before-one-up at equal quota/boost/score and benchmark presence:
+    a measured one-up row never jumps a measured exact row it only ties on
+    quota — the slot dims and the ``one_up`` tail keep the exact row first."""
+    table = {grade: [] for grade in GRADES}
+    measured = Profile("devin-swe2", "Measured one-up", 80.0, benchmark_annotation="급 실측(A+; reps 3/3)")
+    exact = Profile("devin-swe2", "Exact same-name", 80.0)
+    table["A+"].append(measured)
+    table["A"].append(exact)
+    providers = _pool_providers()
+    monkeypatch.setattr(recommend_mod, "get_policy", lambda *a, **k: ("preserve", None))
+    monkeypatch.setattr(recommend_mod, "get_boost", lambda *a, **k: (None, None))
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
+    rows = [row for row in payload["rows"] if row["kind"] == "candidate"]
+    assert [(row["profile"], row["one_up"]) for row in rows] == [
+        ("devin-swe2", False),
+        ("devin-swe2", True),
+    ], rows
+
+
+def test_e1_e2_u_three_row_case_has_one_fixed_order(monkeypatch):
+    """The tester's r2 permutation case (E1 exact unscored boosted, E2 exact
+    scored unboosted, U one-up scored mid-boost) must give one fixed order —
+    [U, E2, E1] — regardless of the exact rows' input order."""
+    providers = _pool_providers()
+    monkeypatch.setattr(recommend_mod, "get_policy", lambda *a, **k: ("preserve", None))
+    monkeypatch.setattr(
+        recommend_mod,
+        "get_boost",
+        lambda pool, *a, **k: ({"claude": 1, "devin": 2}.get(pool), None),
+    )
+    e1 = Profile("sonnet", "E1 unscored boosted", None)
+    e2 = Profile("codex-sol", "E2 scored unboosted", 50.0)
+    u = Profile(
+        "devin-oneup", "U scored intermediate boost", 50.0, benchmark_annotation="급 실측(A+; reps 3/3)"
+    )
+    for exact_rows in ([e1, e2], [e2, e1]):
+        table = {grade: [] for grade in GRADES}
+        table["A+"].append(u)
+        table["A"].extend(exact_rows)
+        payload = recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
+        rows = [row for row in payload["rows"] if row["kind"] == "candidate"]
+        assert [row["profile"] for row in rows] == ["devin-oneup", "codex-sol", "sonnet"], rows
 
 
 def test_unscored_one_up_never_outranks_scored_exact_even_boosted(monkeypatch):
@@ -503,3 +558,186 @@ def test_unscored_one_up_never_outranks_scored_exact_even_boosted(monkeypatch):
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
     rows = [row for row in payload["rows"] if row["kind"] == "candidate"]
     assert rows[0]["profile"] == "sonnet", [row["profile"] for row in rows]
+
+
+# ── round 3: stamp shape anchoring (B1 residual) ─────────────────────────────
+
+
+def _catalog_decided(ref: str) -> Profile:
+    return Profile(
+        "catalog-only",
+        "No score",
+        None,
+        catalog_backed=True,
+        catalog_annotation="추정(외삽)",
+        catalog_decided_by="operator-desk",
+        catalog_deviation_ref=ref,
+    )
+
+
+@pytest.mark.parametrize("action", ["promote", "demote"])
+@pytest.mark.parametrize(
+    "refs",
+    [
+        "srv:1",
+        "local:1",
+        "srv:9001,srv:9002,srv:9003",
+        "local:1,local:2,local:3",
+        "local:1,srv:2,srv:3",
+        "local@home-desktop:80,local@home-desktop:81",
+    ],
+)
+def test_real_stamp_shapes(action: str, refs: str):
+    """Every deviation_ref shape grades apply emits — "<artifact>; <action>
+    evidence <srv|local[:@host]>:<id>,…" — marks the row rep-decided."""
+    assert is_rep_measured(_catalog_decided(f"hk:task/999; {action} evidence {refs}"))
+    assert not is_rep_measured(
+        replace(_catalog_decided(f"hk:task/999; {action} evidence {refs}"), catalog_decided_by=None)
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hk:task/999",
+        "estimate placement; no counted reps",
+        "promotion evidence srv:1",
+        "promote evidence arbitrary",
+        "hold evidence srv:1",
+        "demote evidence local:not-a-number",
+    ],
+)
+def test_unrelated_refs_rejected(text: str):
+    assert not is_rep_measured(_catalog_decided(text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hk:task/999; note: do not promote evidence srv:9001 (example only)",
+        "hk:task/999; unrelated demote evidence local:9001invalid",
+        "hk:task/999; not-promote evidence srv:9001",
+    ],
+)
+def test_arbitrary_ref_not_a_stamp(text: str):
+    """Text that merely *contains* a stamp substring is not a stamp — the
+    action must open a field and the ref list must run to its end."""
+    assert not is_rep_measured(_catalog_decided(text))
+
+
+# ── round 3: rank-key total-order property (B2-R2 / CodeRabbit Major) ─────────
+
+
+def _candidate_template(monkeypatch) -> recommend_mod._Candidate:
+    """A real _Candidate built by _evaluate, used as the replace() base so the
+    property test exercises genuine production candidate fields."""
+    monkeypatch.setattr(recommend_mod, "get_policy", lambda *a, **k: ("preserve", None))
+    monkeypatch.setattr(recommend_mod, "get_boost", lambda *a, **k: (None, None))
+    table = {grade: [] for grade in GRADES}
+    table["A"].append(Profile("sonnet", "Exact", 50.0))
+    evaluation = recommend_mod._evaluate(
+        _pool_providers(),
+        "A",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=[],
+        normalized_prices={},
+        table=table,
+    )
+    return evaluation.included[0]
+
+
+def test_rank_key_is_a_total_order_under_permutation(monkeypatch):
+    """Generated candidate sets: the production tuple key sorts identically
+    across input permutations and admits no intransitive triple."""
+    base = _candidate_template(monkeypatch)
+    rng = random.Random(1318138)
+    intransitive = 0
+    order_dependent = 0
+    for seed in range(1500):
+        candidates = []
+        value_order: dict[int, int] = {}
+        intra_pool_rank: dict[int, int] = {}
+        for index in range(rng.randint(3, 10)):
+            profile = replace(
+                base.profile, name=f"set{seed}-row{index}", benchmark=rng.choice([None, 20.0, 80.0])
+            )
+            candidates.append(
+                replace(
+                    base,
+                    profile=profile,
+                    one_up=bool(rng.getrandbits(1)),
+                    imminent_exhaustion=rng.choice([False, False, True]),
+                    boost=rng.choice([None, None, 1, 2, 5]),
+                    score=rng.choice([0.0, 50.0, 112.5, 250.0]),
+                )
+            )
+            value_order[id(profile)] = index
+            intra_pool_rank[id(profile)] = index
+        # The slot is identity-stable (production slots come from the
+        # deterministic pre-sort list), so every permutation must agree.
+        slot = {id(candidate): index for index, candidate in enumerate(candidates)}
+
+        def key_of(c, vo=value_order, rank=intra_pool_rank, slots=slot):
+            return _recommend_rank_key(c, [], vo, rank, slots[id(c)])
+
+        orders = set()
+        for perm_index in range(6):
+            perm = list(candidates)
+            if perm_index == 1:
+                perm.reverse()
+            elif perm_index > 1:
+                rng.shuffle(perm)
+            orders.add(tuple(c.profile.name for c in sorted(perm, key=key_of)))
+        if len(orders) != 1:
+            order_dependent += 1
+        for a, b, c in itertools.permutations(candidates, 3):
+            if key_of(a) < key_of(b) < key_of(c) and not key_of(a) < key_of(c):
+                intransitive += 1
+    assert intransitive == 0 and order_dependent == 0
+
+
+def test_rank_key_matches_main_key_for_exact_only_sets(monkeypatch):
+    """For exact-only sets the order equals main's original sort key byte for
+    byte — the one_up tail and stable slot are unreachable constants."""
+    base = _candidate_template(monkeypatch)
+    rng = random.Random(1318)
+    for seed in range(500):
+        candidates = []
+        value_order: dict[int, int] = {}
+        intra_pool_rank: dict[int, int] = {}
+        for index in range(rng.randint(2, 10)):
+            profile = replace(
+                base.profile, name=f"exact{seed}-{index}", benchmark=rng.choice([None, 20.0, 80.0])
+            )
+            candidates.append(
+                replace(
+                    base,
+                    profile=profile,
+                    one_up=False,
+                    imminent_exhaustion=rng.choice([False, False, True]),
+                    boost=rng.choice([None, None, 1, 2, 5]),
+                    score=rng.choice([0.0, 50.0, 112.5, 250.0]),
+                )
+            )
+            value_order[id(profile)] = index
+            intra_pool_rank[id(profile)] = index
+        slot = {id(candidate): index for index, candidate in enumerate(candidates)}
+        actual = sorted(
+            candidates,
+            key=lambda c: _recommend_rank_key(c, [], value_order, intra_pool_rank, slot[id(c)]),
+        )
+        expected = sorted(
+            candidates,
+            key=lambda c: (
+                0 if _profile_has_benchmark_score(c.profile, []) else 1,
+                0 if c.imminent_exhaustion else 1,
+                0 if c.boost is not None else 1,
+                c.boost if c.boost is not None else 0,
+                -c.score,
+                value_order[id(c.profile)],
+                intra_pool_rank[id(c.profile)],
+            ),
+        )
+        assert [c.profile.name for c in actual] == [c.profile.name for c in expected]

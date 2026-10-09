@@ -15,7 +15,6 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 from __future__ import annotations
 
 import datetime as dt
-import functools
 import json
 import math
 import os
@@ -1528,9 +1527,19 @@ ONE_UP_TAG_PREFIX = "[one-up "
 # ``<ref>; <action> evidence <rep-ref>,<rep-ref>…`` in ``deviation_ref``
 # (grades.py:2567) without touching ``benchmark_annotation`` — this is the
 # canonical promote/demote shape, e.g. "hk:task/999; promote evidence
-# srv:9001,srv:9002". Rep refs are ``srv:<id>`` / ``local:<id>`` /
-# ``local@<host>:<id>`` (grades.py §ref rules).
-_REP_DECISION_REF = re.compile(r"(?:promote|demote) evidence\s+(?:srv|local)(?:@[\w.-]+)?:\d+")
+# srv:9001,srv:9002". The match is anchored to the whole ``;``-separated
+# field: the action word must open the field and the comma-joined ref list
+# must run to the end of it, so commentary like "note: do not promote
+# evidence srv:9001" or "not-promote evidence …" is never a stamp. Rep refs
+# are ``srv:<id>`` / ``local:<id>`` (grades.py:793-810); the
+# ``local@<host>:<id>`` form is accepted too (a host-scoped exclusion ref,
+# grades.py:894).
+_REP_DECISION_REF = re.compile(
+    r"(?:^|;\s*)(?:promote|demote) evidence\s+"
+    r"(?:srv:\d+|local(?:@[\w.-]+)?:\d+)"
+    r"(?:,(?:srv:\d+|local(?:@[\w.-]+)?:\d+))*"
+    r"(?=\s*(?:;|$))"
+)
 
 
 def is_rep_measured(profile: Profile) -> bool:
@@ -3412,6 +3421,39 @@ class _Evaluation:
     escalation: list[_EscalationEntry]
 
 
+def _recommend_rank_key(
+    candidate: _Candidate,
+    bench_scores: list[ModelScore] | None,
+    value_order: dict[int, int],
+    intra_pool_rank: dict[int, int],
+    slot: int,
+) -> tuple[int, int, int, int, float, int, int, int, int]:
+    """The one total order every included ``--recommend`` candidate sorts by.
+
+    #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
+    comparator — the round-2 comparator could express cyclic preferences
+    (boost>one-up, one-up>missing, missing>boost) which are unreachable in a
+    total order. Field precedence is fixed: unmeasured-last first, then the
+    usual quota and boost dimensions in main's order — imminent exhaustion,
+    boost presence and value, continuous score, the value-order slot,
+    intra-pool rank — then exact before one-up as the last tie-break, then
+    the caller's stable slot. Because ``one_up`` sits after the quota dims,
+    a *measured* one-up row may outrank an *unmeasured* exact row (amended
+    AC6); exact rows win only a full quota/boost/score/slot tie.
+    """
+    return (
+        0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
+        0 if candidate.imminent_exhaustion else 1,
+        0 if candidate.boost is not None else 1,
+        candidate.boost if candidate.boost is not None else 0,
+        -candidate.score,
+        value_order[id(candidate.profile)],
+        intra_pool_rank[id(candidate.profile)],
+        1 if candidate.one_up else 0,
+        slot,
+    )
+
+
 def _evaluate(
     providers: list[ProviderResult],
     grade: Grade,
@@ -3666,47 +3708,19 @@ def _evaluate(
             value_order[id(candidate.profile)] = slot
             intra_pool_rank[id(candidate.profile)] = rank
 
-    # 0) 소멸 임박 역전 → 1) numeric boost(하드 오버라이드) → 2) continuous score(큰 순)
-    # → 3) one-up은 quota/boost 동률에서만 정급 행 뒤 → 4) 풀 내 가성비로 재배정된
-    # base 슬롯 → 5) 풀 내 순위(결정성).
     # Base 슬롯은 기존 이름 기준 first-match 의미를 보존한다. 한 슬롯을 공유하는 프로필은
     # 항상 동명이고 따라서 같은 풀이다. intra_pool_rank는 그 충돌만 풀어 AC3의 가성비
     # 순서를 보존하며 풀 간 순서에는 영향을 주지 않는다. Binary 🔥 urgency 정렬 키는
-    # 연속 점수로 대체했다(표시는 유지).
-    # Benchmark가 없는 항목은 quota boost/urgency와 무관하게 급 내 마지막으로 보낸다.
-    # #1318-2: one-up flag 는 quota·boost·score 가 모두 같을 때만 묶는다 — quota 가
-    # 실제로 더 나은 상위급 행을 급 내 하위 행 아래로 숨기지 않는다(operator A).
-    # 같은 급 내(정급끼리 · one-up끼리) 비교는 기존 키 그대로다 — 미측정-뒤 규칙이
-    # quota 차원보다 먼저 결정한다. 정급↔one-up 비교는 quota/boost/score 차원만 본다:
-    # benchmark 보유 여부는 quota 가 아니므로 정급 우선을 완화하지 않고(B2 — benchmark
-    # 없는 정급 행이 score 있는 one-up 에 밀리는 것을 막는다), 점수 없는 one-up 행은
-    # 어떤 정급 행도 앞지르지 않는다(미측정-뒤 규칙이 one-up 계열에도 적용).
-    # flat 키로는 이 우선관계를 표현할 수 없다 — boost>one-up·one-up>missing·
-    # missing>boost 가 동시에 성립해야 해 순환이다 — 그래서 비교자로 둔다.
-    def _quota_dims(c: _Candidate) -> tuple[int, int, int, float]:
-        return (
-            0 if c.imminent_exhaustion else 1,
-            0 if c.boost is not None else 1,
-            c.boost if c.boost is not None else 0,
-            -c.score,
+    # 연속 점수로 대체했다(표시는 유지). Benchmark가 없는 항목은 quota boost/urgency와
+    # 무관하게 급 내 마지막으로 보낸다.
+    # #1318-2 round 3 (director-1 decision C): _recommend_rank_key 하나의 튜플이
+    # 전체 순서다 — pairwise 비교자는 없다.
+    slot_of = {id(candidate): index for index, candidate in enumerate(included)}
+    included.sort(
+        key=lambda candidate: _recommend_rank_key(
+            candidate, bench_scores, value_order, intra_pool_rank, slot_of[id(candidate)]
         )
-
-    def _candidate_cmp(a: _Candidate, b: _Candidate) -> int:
-        missing_a = 0 if _profile_has_benchmark_score(a.profile, bench_scores) else 1
-        missing_b = 0 if _profile_has_benchmark_score(b.profile, bench_scores) else 1
-        if a.one_up == b.one_up:
-            ka = (missing_a, *_quota_dims(a), value_order[id(a.profile)], intra_pool_rank[id(a.profile)])
-            kb = (missing_b, *_quota_dims(b), value_order[id(b.profile)], intra_pool_rank[id(b.profile)])
-            return -1 if ka < kb else (1 if ka > kb else 0)
-        one_up, exact = (a, b) if a.one_up else (b, a)
-        missing_one_up = missing_a if a.one_up else missing_b
-        # 점수 없는 one-up 은 정급을 절대 앞지르지 않고, quota 차원이 정급과 같거나
-        # 나쁘면 정급이 앞선다 — one-up 이 앞서려면 quota 우선이 엄밀하게 더 좋아야 한다.
-        if missing_one_up or _quota_dims(exact) <= _quota_dims(one_up):
-            return -1 if a is exact else 1
-        return 1 if a is exact else -1
-
-    included.sort(key=functools.cmp_to_key(_candidate_cmp))
+    )
     return _Evaluation(
         grade=grade,
         included=included,
