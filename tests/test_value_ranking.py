@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from scopefuel import bench, cli
+from scopefuel import bench, cli, launch
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     ASTRA_ROLE_PROFILES,
@@ -16,7 +16,6 @@ from scopefuel.recommend import (
     MODEL_ONLY_ANNOTATION,
     Profile,
     _one_up_profiles,
-    _text_label,
     gate_check,
     profile_pool,
     recommend,
@@ -323,7 +322,18 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         providers.append(ProviderResult(id=provider_id, pool_class="preserve", buckets=buckets))
 
     def label(profile: Profile) -> str:
-        return _text_label(profile)
+        """Literal expected ranked-line label (hk 1331 SHOULD, #1339) —
+        pins the label contract instead of delegating to
+        ``recommend._text_label``, so a label-format change turns this
+        oracle red: bare name, ``<name> --effort <rung>`` on launchers
+        that take the flag, ``<name> (effort <rung>)`` where the rung is
+        baked into the profile name."""
+        effort = profile.launcher_effort
+        if not effort:
+            return profile.name
+        if launch.launcher_accepts_effort_flag(profile.name):
+            return f"{profile.name} --effort {effort}"
+        return f"{profile.name} (effort {effort})"
 
     expected: dict[str, list[str]] = {}
     actual: dict[str, list[str]] = {}

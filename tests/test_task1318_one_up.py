@@ -15,7 +15,7 @@ from dataclasses import replace
 
 import pytest
 
-from scopefuel import bench, cli
+from scopefuel import bench, cli, launch
 from scopefuel import recommend as recommend_mod
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
@@ -82,7 +82,20 @@ def _pool_providers() -> list[ProviderResult]:
 
 
 def _label(profile: Profile) -> str:
-    return recommend_mod._text_label(profile)
+    """Literal expected ranked-line label (hk 1331 SHOULD, #1339).
+
+    The oracle pins the label contract itself rather than delegating to
+    ``recommend._text_label``: the bare profile name, ``<name> --effort
+    <rung>`` on a launcher that takes the flag, or ``<name> (effort <rung>)``
+    where the rung is baked into the profile name. A ``_text_label`` format
+    change must turn these tests red, not move the expectation.
+    """
+    effort = profile.launcher_effort
+    if not effort:
+        return profile.name
+    if launch.launcher_accepts_effort_flag(profile.name):
+        return f"{profile.name} --effort {effort}"
+    return f"{profile.name} (effort {effort})"
 
 
 def _line_label(line: str) -> str:
@@ -240,11 +253,11 @@ def test_e6_arm_rungs_are_never_one_up_or_ranked():
 # ── ordering (AC6 / AC7c) ────────────────────────────────────────────────────
 
 
-def test_one_up_with_better_value_slot_outranks_exact_at_equal_quota_and_boost():
+def test_better_value_one_up_outranks_exact_exact_first_only_on_full_tie():
     """Same pool, same quota, no boost — and the one-up row has the better
-    가성비 slot. Round 3 (director-1 decision C): value order precedes the
-    exact-before-one-up tie-break, so the better-value one-up row lists
-    first — amended AC6."""
+    가성비 slot. Exact-before-one-up is only the last tie-break on a full
+    tie (round 3, director-1 decision C): the value-order slot precedes it,
+    so the better-value one-up row lists first — amended AC6."""
     table = {grade: [] for grade in GRADES}
     table["A+"].append(
         Profile(
