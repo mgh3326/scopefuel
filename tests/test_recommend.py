@@ -23,6 +23,8 @@ from scopefuel.recommend import (
     PRESERVE_EXCLUDE_PCT,
     PROFILE_ALIASES,
     RETIRED_PROFILES,
+    SONNET_5_5_ESTIMATE_REASON,
+    SONNET_5_5_HIGH_GRADE_ANNOTATION,
     SPEND_EXCLUDE_PCT,
     Profile,
     _brake_factor,
@@ -528,6 +530,24 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     kimi = next(p for p in GRADE_TABLE["S"] if p.name == "kimi-k3")
     assert kimi.aa_model_id == "kimi-k3"
     assert kimi.aa_agent_model_id == "kimi-k3"
+
+
+def test_task1305_sonnet_high_reason_is_its_measured_evidence():
+    """#1305: sonnet@high is an operator-measured B row.
+
+    Its displayed reason is the decision evidence, not the shared
+    SONNET_5_5_ESTIMATE_REASON — that constant's conservative-placement
+    sentence still covers only the estimated max/xhigh/medium rungs.
+    """
+
+    rows = {(p.name, p.launcher_effort): p for profiles in GRADE_TABLE.values() for p in profiles}
+    high = rows[("sonnet", "high")]
+    assert high.estimate_reason == SONNET_5_5_HIGH_GRADE_ANNOTATION
+    assert high.estimate_reason != SONNET_5_5_ESTIMATE_REASON
+    assert "한 단계 아래에 배치" not in high.estimate_reason
+    for effort in ("max", "xhigh", "medium"):
+        assert rows[("sonnet", effort)].estimate_reason == SONNET_5_5_ESTIMATE_REASON
+    assert "한 단계 아래에 배치" in SONNET_5_5_ESTIMATE_REASON
 
 
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
