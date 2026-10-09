@@ -547,7 +547,11 @@ def test_task1305_sonnet_high_reason_is_its_measured_evidence():
     assert "한 단계 아래에 배치" not in high.estimate_reason
     for effort in ("max", "xhigh", "medium"):
         assert rows[("sonnet", effort)].estimate_reason == SONNET_5_5_ESTIMATE_REASON
-    assert "한 단계 아래에 배치" in SONNET_5_5_ESTIMATE_REASON
+    # The narrowed wording itself is the pinned requirement: the
+    # one-grade-below sentence must name the estimated rungs, and the old
+    # every-rung wording must be gone (reverting either is RED).
+    assert "추정 런그는 점수가 가리키는 급의 한 단계 아래에 배치" in SONNET_5_5_ESTIMATE_REASON
+    assert "각 런그는 점수가 가리키는 급의 한 단계 아래에 배치" not in SONNET_5_5_ESTIMATE_REASON
 
 
 def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
