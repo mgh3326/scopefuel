@@ -216,20 +216,24 @@ def test_a_high_recorded_builder_devin_pass_counts_on_the_high_rung(isolated_cac
 
 
 @pytest.mark.parametrize(
-    ("profile", "model_id", "default_row"),
+    ("profile", "model_id", "default_row", "no_rung"),
     [
         # #1296: the promoted max rung is devin-swe2-max's best-graded ordinary
         # row, so the catalog default IS the max rung now.
-        ("builder-devin-max", "swe-2-max", MAX_RUNG),
-        ("builder-devin", "swe-2", ("devin-swe2", "")),
+        ("builder-devin-max", "swe-2-max", MAX_RUNG, None),
+        ("builder-devin", "swe-2", ("devin-swe2", ""), HIGH_RUNG),
     ],
 )
-def test_an_effortless_rep_counts_on_the_catalog_default_rung(isolated_cache, profile, model_id, default_row):
+def test_an_effortless_rep_counts_on_the_catalog_default_rung(
+    isolated_cache, profile, model_id, default_row, no_rung
+):
     """v1.2: an inferred effort lands on the profile's catalog default rung.
 
     The rungs are ordinary placements now, so ``_catalog_default_effort``
     follows the canon: devin-swe2-max's default is the A+ max rung;
     devin-swe2 keeps its effort-"" row (tied at A+, the default rung wins).
+    An inferred effort is never re-read as the higher rung's evidence (the
+    pre-#1296 generic no-new-rung pin, kept for devin-swe2@high).
     """
 
     _add("b1", profile, model_id, "", "impl", "A+")
@@ -238,6 +242,8 @@ def test_an_effortless_rep_counts_on_the_catalog_default_rung(isolated_cache, pr
     assert row.row_key == default_row, row.resolution_detail
     assert row.effort_inferred is True
     assert row.excluded == ""
+    if no_rung is not None:
+        assert all(r.key != no_rung for r in proposal.results)
 
 
 # --- AC5 (c): a non-matching model id stays excluded (no widening) ------------

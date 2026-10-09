@@ -253,7 +253,7 @@ SONNET_5_5_ESTIMATE_REASON = (
     "(medium 29.0 · high 43.0 · xhigh 61.0 · max 70.6)을 추정 점수로 표기; "
     "FrontierCode xhigh 52.1 · max 46.2는 TB4 하회라 교차 확인용 "
     "(hk:doc report/2026-09-29/sonnet55-catalog-and-reps-status). "
-    "실측 reps 전까지 각 런그는 점수가 가리키는 급의 한 단계 아래에 배치"
+    "실측 reps 전까지 추정 런그는 점수가 가리키는 급의 한 단계 아래에 배치"
 )
 SONNET_5_5_MEDIUM_PLACEMENT_NOTE = "raw 29.0 은 이미 최하위 급(C) — 낮출 급이 없어 C 유지"
 # #1297 — operator 2026-10-08 via operator-desk (hk:task/1297): sonnet@high
@@ -264,7 +264,9 @@ SONNET_5_5_MEDIUM_PLACEMENT_NOTE = "raw 29.0 은 이미 최하위 급(C) — 낮
 # pattern — so a future bench push-catalog --emit-seed cannot silently
 # revert the operator decision. A reps-decided grade like
 # DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION; the displayed 43.0 stays the vendor
-# TB4 estimate (SONNET_5_5_ESTIMATE_REASON).
+# TB4 estimate, so its reason is that measured-evidence annotation (#1305) —
+# not SONNET_5_5_ESTIMATE_REASON, whose conservative-placement sentence only
+# applies to the still-estimated rungs.
 SONNET_5_5_HIGH_GRADE_ANNOTATION = (
     "급 실측(B; evidence reps srv:1224, srv:1228, srv:1230, srv:1238, srv:1248, "
     "srv:1288, srv:1291, srv:1298, srv:1343, srv:1357 · operator 2026-10-08 "
@@ -1135,7 +1137,10 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             launcher_effort="high",
             benchmark_effort="high",
             benchmark_annotation=SONNET_5_5_HIGH_GRADE_ANNOTATION,
-            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
+            # #1305: measured B row — the displayed reason is the decision
+            # evidence, not the estimated-rung sentence (that sentence still
+            # covers the max/xhigh/medium rungs above/below).
+            estimate_reason=SONNET_5_5_HIGH_GRADE_ANNOTATION,
             aa_model_id="claude-sonnet-5-5",
         ),
     ],
