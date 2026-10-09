@@ -154,6 +154,21 @@ def test_each_new_rung_keeps_the_profile_pool_and_aa_mapping(key):
         assert row.aa_model_id or row.aa_agent_model_id
 
 
+@pytest.mark.parametrize("key", [("devin-swe2", "high"), ("devin-swe2-max", "max")])
+def test_a_graduated_devin_rung_still_carries_no_aa_mapping(key):
+    """#1284/#1296: SWE-2 has no AA measurement at all.
+
+    These two rungs left NEW_RUNGS for ordinary A+ placements, so the
+    NO_AA_RUNGS branch above no longer visits them. Pin the absence
+    explicitly: the graduated placement rows must not invent an AA mapping.
+    """
+
+    profile = next(
+        p for profiles in GRADE_TABLE.values() for p in profiles if (p.name, p.launcher_effort) == key
+    )
+    assert not (profile.aa_model_id or profile.aa_agent_model_id)
+
+
 def test_new_rungs_stay_out_of_the_placement_snapshot():
     """The snapshot mirrors the placement canon (Sol S+-only) — rows, not placements."""
 
