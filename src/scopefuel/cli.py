@@ -849,23 +849,38 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
     catalog = bench.read_catalog()
-    print(
-        recommend.recommend(
+    if getattr(args, "json", False):
+        payload = recommend.recommend_dict(
             results,
             args.recommend,
             today=now.date(),
             now=now,
             bench_scores=bench_scores,
             model_prices=model_prices,
-            explain=bool(getattr(args, "explain", False)),
-            hide_excluded=bool(getattr(args, "hide_excluded", False)),
             grade_table=grade_table,
         )
-    )
-    # Provenance line, always printed: a table that silently came from the
-    # bundled snapshot instead of the canon is the failure this whole change
-    # exists to make impossible to miss (hk:doc 2558).
-    print(catalog.label)
+        payload["catalog"] = catalog.label
+        print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
+        # Provenance stays visible off-band so stdout remains clean JSON.
+        print(catalog.label, file=sys.stderr)
+    else:
+        print(
+            recommend.recommend(
+                results,
+                args.recommend,
+                today=now.date(),
+                now=now,
+                bench_scores=bench_scores,
+                model_prices=model_prices,
+                explain=bool(getattr(args, "explain", False)),
+                hide_excluded=bool(getattr(args, "hide_excluded", False)),
+                grade_table=grade_table,
+            )
+        )
+        # Provenance line, always printed: a table that silently came from the
+        # bundled snapshot instead of the canon is the failure this whole change
+        # exists to make impossible to miss (hk:doc 2558).
+        print(catalog.label)
     _emit_stale_build_warning()
     return 0
 

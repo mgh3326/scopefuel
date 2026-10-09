@@ -191,6 +191,19 @@ class Profile:
     # table and then rendered "측정 불가", so the server could add a profile that
     # could never actually be recommended.
     catalog_pool: str | None = None
+    # #1318-2: the catalog row's own grade evidence, set only when this runtime
+    # profile was built from a canonical catalog row (bench._profile_from_catalog).
+    # ``benchmark_annotation`` above stays the *display* text — for a row that
+    # also exists in the bundled snapshot it keeps the template's wording, which
+    # may lag the canon — so is_rep_measured reads these fields instead whenever
+    # ``catalog_backed`` is set, never the stale template.  A catalog row that
+    # carries no evidence at all (every field empty) is therefore correctly not
+    # rep-measured, which is why the flag is explicit rather than inferred from
+    # the three fields being set.
+    catalog_backed: bool = False
+    catalog_annotation: str | None = None
+    catalog_deviation_ref: str | None = None
+    catalog_decided_by: str | None = None
 
 
 _HARNESS_LABELS = {
@@ -1503,6 +1516,106 @@ _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
 )
 _SOL_PROFILES = frozenset({"codex-sol", "kiro-sol"})
 
+# ── #1318 part 2 (operator decision A, hk 1321): one-up listing ──────────────
+# ``--recommend G`` also lists the rep-measured rows placed exactly one grade
+# above G, each tagged ``[one-up <grade>]`` naming its placed grade. Only a row
+# whose *grade* is rep evidence moves down — estimate-only, AA-agent-score and
+# unmeasured rows (including E6 arm rows) never do.
+REP_MEASURED_ANNOTATION_PREFIX = "급 실측("
+ONE_UP_TAG_PREFIX = "[one-up "
+# ``grades apply`` stamps an operator-approved measured move as
+# ``<ref>; <action> evidence <rep-ref>,<rep-ref>…`` in ``deviation_ref``
+# (grades.py:2567) without touching ``benchmark_annotation`` — this is the
+# canonical promote/demote shape, e.g. "hk:task/999; promote evidence
+# srv:9001,srv:9002". The match is anchored to the whole ``;``-separated
+# field: the action word must open the field and the comma-joined ref list
+# must run to the end of it, so commentary like "note: do not promote
+# evidence srv:9001" or "not-promote evidence …" is never a stamp. Rep refs
+# are ``srv:<id>`` / ``local:<id>`` (grades.py:793-810); the
+# ``local@<host>:<id>`` form is accepted too (a host-scoped exclusion ref,
+# grades.py:894).
+_REP_DECISION_REF = re.compile(
+    r"(?:^|;\s*)(?:promote|demote) evidence\s+"
+    r"(?:srv:\d+|local(?:@[\w.-]+)?:\d+)"
+    r"(?:,(?:srv:\d+|local(?:@[\w.-]+)?:\d+))*"
+    r"(?=\s*(?:;|$))"
+)
+
+
+def is_rep_measured(profile: Profile) -> bool:
+    """Whether this row's *grade* is rep-measured evidence.
+
+    Reads the row's authoritative grade evidence:
+
+    * a catalog-backed runtime row (``catalog_backed`` — built by
+      ``bench._profile_from_catalog``) is judged on the catalog row's own
+      fields only: ``catalog_annotation`` (the server's annotation when
+      present) and the ``grades apply`` decision stamp — ``catalog_decided_by``
+      plus a ``catalog_deviation_ref`` carrying
+      ``promote evidence srv:…`` / ``demote evidence srv:…`` rep refs.  The
+      bundled template ``benchmark_annotation`` is *never* consulted here, so
+      a server promote lands (rep evidence in the ref) and a server revoke to
+      estimate-only drops out;
+    * a bundled code-table row is judged on its own ``benchmark_annotation``:
+      it must open with ``급 실측(<grade>;`` and name its rep evidence
+      (``reps 3/3``, ``evidence reps srv:…``, ``reps PASS srv:…``) —
+      DEVIN_DS41_GRADE_ANNOTATION, DEVIN_SWE2_HIGH_GRADE_ANNOTATION,
+      DEVIN_SWE2_MAX_GRADE_ANNOTATION, DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
+      GROK_HI_XHIGH_GRADE_ANNOTATION, OC_SOLAR4_GRADE_ANNOTATION,
+      SONNET_5_5_HIGH_GRADE_ANNOTATION.
+
+    ``benchmark_source`` and ``estimate_reason`` are deliberately not read: the
+    first only marks AA-table scores (an AA-agent row never claims a rep-decided
+    grade), the second explains a displayed *score*, not the grade — a
+    rep-measured row may still show an estimate score (sonnet@high, oc-solar4).
+    """
+    if profile.catalog_backed:
+        ref = profile.catalog_deviation_ref or ""
+        if profile.catalog_decided_by and _REP_DECISION_REF.search(ref):
+            return True
+        annotation = profile.catalog_annotation
+    else:
+        annotation = profile.benchmark_annotation
+    return (
+        annotation is not None
+        and annotation.startswith(REP_MEASURED_ANNOTATION_PREFIX)
+        and "reps" in annotation
+    )
+
+
+def _one_up_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tuple[Profile, Grade]]:
+    """Rep-measured rows placed exactly one grade above ``grade``.
+
+    Only ordinary placements qualify: an escalation-gated row stays behind its
+    gate (it is a conditional candidate, not a ranked one), and Sol profiles
+    never appear outside S+ (the ``_SOL_PROFILES`` rule stands).
+    """
+
+    grade_index = _GRADE_ORDER.index(grade)
+    if grade_index == 0:
+        return []
+    upper = _GRADE_ORDER[grade_index - 1]
+    return [
+        (profile, upper)
+        for profile in table.get(upper, [])
+        if profile.gate == "default" and profile.name not in _SOL_PROFILES and is_rep_measured(profile)
+    ]
+
+
+def _one_up_suffix(item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
+    """The ``[one-up <placed grade>]`` tag, or ``""`` for an exact-grade row."""
+    if item.one_up and item.placed_grade is not None:
+        return f"  {ONE_UP_TAG_PREFIX}{item.placed_grade}]"
+    return ""
+
+
+def _fold_name(item: _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
+    """Profile name inside a folded exclusion line, tagged when one-up."""
+    if item.one_up and item.placed_grade is not None:
+        return f"{item.profile.name}{ONE_UP_TAG_PREFIX}{item.placed_grade}]"
+    return item.profile.name
+
+
 # These launcher spellings exist for director-controlled workflows, but they
 # are never recommendation candidates and must fail the ordinary quota gate.
 # task #527: this set IS the astra model identification — membership decides
@@ -1786,6 +1899,10 @@ class _Candidate:
     blended_price: float | None = None
     value_ratio: float | None = None
     value_sort_skipped: bool = False
+    # #1318-2 (operator A, hk 1321): the grade the row is placed at. ``one_up``
+    # marks a rep-measured row listed one grade below that placement.
+    placed_grade: Grade | None = None
+    one_up: bool = False
 
 
 @dataclass
@@ -1794,6 +1911,8 @@ class _Excluded:
     reason: str
     provider_id: str = ""
     kind: str = "other"  # "exhausted" | "unmeasurable" | "other"
+    placed_grade: Grade | None = None
+    one_up: bool = False
 
 
 @dataclass
@@ -1803,6 +1922,8 @@ class _PolicyExcluded:
     provider_label: str
     until: dt.date | None
     note: str | None
+    placed_grade: Grade | None = None
+    one_up: bool = False
 
 
 @dataclass
@@ -1817,6 +1938,8 @@ class _Unsubscribed:
     profile: Profile
     provider_id: str
     source: str  # "pool" | "profile" — which level's flag decided
+    placed_grade: Grade | None = None
+    one_up: bool = False
 
 
 @dataclass
@@ -1826,6 +1949,8 @@ class _EscalationEntry:
     provider_id: str
     gate_reason: str
     status_note: str | None
+    placed_grade: Grade | None = None
+    one_up: bool = False
 
 
 def _matching_buckets(result: ProviderResult, group_name: str | None) -> list[tuple[float, str, str | None]]:
@@ -2570,7 +2695,11 @@ def _alt_candidates(
     model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
 ) -> tuple[str, ...]:
-    """같은 grade 안에서 exclude_profile 을 뺀 사용 가능한 정상(비-escalation) 후보 이름."""
+    """같은 grade 안에서 exclude_profile 을 뺀 사용 가능한 정상(비-escalation) 후보 이름.
+
+    #1318-2: ``[one-up G]`` 태그가 붙은 행은 한 급 위 배치 행이라 같은 급의
+    대체 후보가 아니다 — gate 의 대안 나열 의미를 좁히지 않기 위해 건너뛴다.
+    """
     out = recommend(
         providers,
         grade,
@@ -2584,6 +2713,8 @@ def _alt_candidates(
     names: list[str] = []
     for line in out.splitlines():
         if not line[:1].isdigit():
+            continue
+        if ONE_UP_TAG_PREFIX in line:
             continue
         # "N. [🔥] name  label ..." 또는 "N. name  label ..."
         rest = line.split(".", 1)[1].strip()
@@ -3273,26 +3404,67 @@ def _format_benchmark_score(score: ModelScore) -> str:
     return f"{rendered} · {measurements}" if measurements else rendered
 
 
-def recommend(
+@dataclass
+class _Evaluation:
+    """The folded candidate lists of one ``--recommend`` grade.
+
+    Shared by the text render (``recommend``) and the structured row API
+    (``recommend_dict``) so the two can never disagree about which rows exist
+    or how they are marked.
+    """
+
+    grade: Grade
+    included: list[_Candidate]
+    excluded: list[_Excluded]
+    policy_excluded: list[_PolicyExcluded]
+    unsubscribed: list[_Unsubscribed]
+    escalation: list[_EscalationEntry]
+
+
+def _recommend_rank_key(
+    candidate: _Candidate,
+    bench_scores: list[ModelScore] | None,
+    value_order: dict[int, int],
+    intra_pool_rank: dict[int, int],
+    slot: int,
+) -> tuple[int, int, int, int, float, int, int, int, int]:
+    """The one total order every included ``--recommend`` candidate sorts by.
+
+    #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
+    comparator — the round-2 comparator could express cyclic preferences
+    (boost>one-up, one-up>missing, missing>boost) which are unreachable in a
+    total order. Field precedence is fixed: unmeasured-last first, then the
+    usual quota and boost dimensions in main's order — imminent exhaustion,
+    boost presence and value, continuous score, the value-order slot,
+    intra-pool rank — then exact before one-up as the last tie-break, then
+    the caller's stable slot. Because ``one_up`` sits after the quota dims,
+    a *measured* one-up row may outrank an *unmeasured* exact row (amended
+    AC6); exact rows win only a full quota/boost/score/slot tie.
+    """
+    return (
+        0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
+        0 if candidate.imminent_exhaustion else 1,
+        0 if candidate.boost is not None else 1,
+        candidate.boost if candidate.boost is not None else 0,
+        -candidate.score,
+        value_order[id(candidate.profile)],
+        intra_pool_rank[id(candidate.profile)],
+        1 if candidate.one_up else 0,
+        slot,
+    )
+
+
+def _evaluate(
     providers: list[ProviderResult],
     grade: Grade,
-    today: dt.date | None = None,
-    now: dt.datetime | None = None,
+    today: dt.date,
+    now: dt.datetime,
     *,
-    urgency_hours: float | None = None,
-    bench_scores: list[ModelScore] | None = None,
-    model_prices: Mapping[str, ModelPrice] | None = None,
-    explain: bool = False,
-    hide_excluded: bool = False,
-    grade_table: dict[Grade, list[Profile]] | None = None,
-) -> str:
-    today = today or dt.datetime.now(dt.UTC).date()
-    now = now or dt.datetime.now(dt.UTC)
-    urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
-    table = GRADE_TABLE if grade_table is None else grade_table
-    normalized_prices = {
-        normalize_aa_model_id(model_id): price for model_id, price in (model_prices or {}).items()
-    }
+    urgency_hours: float,
+    bench_scores: list[ModelScore] | None,
+    normalized_prices: Mapping[str, ModelPrice],
+    table: dict[Grade, list[Profile]],
+) -> _Evaluation:
     by_id = {r.id: r for r in providers}
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []
@@ -3300,7 +3472,15 @@ def recommend(
     unsubscribed: list[_Unsubscribed] = []
     escalation: list[_EscalationEntry] = []
 
-    for profile in table[grade]:
+    # #1318-2 (operator A, hk 1321): exact-grade rows first, then the
+    # rep-measured rows placed one grade up. A one-up row flows through the
+    # identical candidacy checks — the unsubscribed/policy/exhausted folds keep
+    # it in the same exclusion lines as an exact-grade row.
+    entries: list[tuple[Profile, Grade]] = [(profile, grade) for profile in table[grade]]
+    entries += _one_up_profiles(grade, table)
+
+    for profile, placed_grade in entries:
+        one_up = placed_grade != grade
         provider_id, group_name = resolved_pool(profile)
         # task #742 — 구독 해지(풀 또는 프로필 플래그)는 후보·승급·비상 후보 어떤
         # 경로로도 추천되지 않는다. 행은 지우지 않고 후보 평가만 건너뛴다 —
@@ -3308,13 +3488,21 @@ def recommend(
         subscription = profile_subscription(profile.name, provider_id)
         if not subscription.subscribed:
             unsubscribed.append(
-                _Unsubscribed(profile=profile, provider_id=provider_id, source=subscription.source)
+                _Unsubscribed(
+                    profile=profile,
+                    provider_id=provider_id,
+                    source=subscription.source,
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                )
             )
             continue
 
         # Escalation profiles → separate section, not in normal ranked candidates.
         if profile.gate == "escalation":
-            escalation.append(_build_escalation_entry(profile, by_id, today, now=now))
+            entry = _build_escalation_entry(profile, by_id, today, now=now)
+            entry.placed_grade = placed_grade
+            escalation.append(entry)
             continue
 
         provider_label = _provider_label(provider_id, group_name)
@@ -3328,13 +3516,24 @@ def recommend(
                     _unmeasurable_reason(provider_id, result),
                     provider_id=provider_id,
                     kind="unmeasurable",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
                 )
             )
             continue
 
         matches = _matching_buckets(result, group_name)
         if not matches:
-            excluded.append(_Excluded(profile, "측정 불가", provider_id=provider_id, kind="unmeasurable"))
+            excluded.append(
+                _Excluded(
+                    profile,
+                    "측정 불가",
+                    provider_id=provider_id,
+                    kind="unmeasurable",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                )
+            )
             continue
 
         states = _window_states(matches, now)
@@ -3356,6 +3555,8 @@ def recommend(
                     provider_label=provider_label,
                     until=override.until if override is not None else None,
                     note=override.note if override is not None else None,
+                    placed_grade=placed_grade,
+                    one_up=one_up,
                 )
             )
             continue
@@ -3371,6 +3572,8 @@ def recommend(
                     f"{_exhaust_suffix(cutoff_status, notify_status)}",
                     provider_id=provider_id,
                     kind="exhausted",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
                 )
             )
             continue
@@ -3439,29 +3642,36 @@ def recommend(
                 throughput_term=throughput_term,
                 score=score,
                 imminent_exhaustion=imminent_exhaustion,
+                placed_grade=placed_grade,
+                one_up=one_up,
             )
         )
 
+    upper_grade: Grade | None = (
+        _GRADE_ORDER[_GRADE_ORDER.index(grade) - 1] if _GRADE_ORDER.index(grade) > 0 else None
+    )
     for profile, reason in _cross_grade_measured_alternatives(grade, grade_table=table):
-        escalation.append(
-            _build_escalation_entry(
-                profile,
-                by_id,
-                today,
-                now=now,
-                reason_override=reason,
-            )
+        entry = _build_escalation_entry(
+            profile,
+            by_id,
+            today,
+            now=now,
+            reason_override=reason,
         )
+        entry.placed_grade = upper_grade
+        escalation.append(entry)
 
     # Reassign only the existing table slots owned by one (grade, pool) group.
     # This changes order inside that pool without changing the sequence of pool
     # slots relative to any other pool, even when their quota sort keys tie.
-    physical_order = {id(profile): index for index, profile in enumerate(table[grade])}
+    # One-up rows take appended slots after the exact-grade rows they follow.
+    ordered_profiles = [profile for profile, _placed in entries]
+    physical_order = {id(profile): index for index, profile in enumerate(ordered_profiles)}
     base_slot = {
         id(profile): next(
-            index for index, candidate in enumerate(table[grade]) if candidate.name == profile.name
+            index for index, candidate in enumerate(ordered_profiles) if candidate.name == profile.name
         )
-        for profile in table[grade]
+        for profile in ordered_profiles
     }
     value_order = {id(candidate.profile): base_slot[id(candidate.profile)] for candidate in included}
     intra_pool_rank = {id(candidate.profile): physical_order[id(candidate.profile)] for candidate in included}
@@ -3498,29 +3708,64 @@ def recommend(
             value_order[id(candidate.profile)] = slot
             intra_pool_rank[id(candidate.profile)] = rank
 
-    # 0) 소멸 임박 역전 → 1) numeric boost(하드 오버라이드) → 2) continuous score(큰 순)
-    # → 3) 풀 내 가성비로 재배정된 base 슬롯 → 4) 풀 내 순위(결정성).
     # Base 슬롯은 기존 이름 기준 first-match 의미를 보존한다. 한 슬롯을 공유하는 프로필은
     # 항상 동명이고 따라서 같은 풀이다. intra_pool_rank는 그 충돌만 풀어 AC3의 가성비
     # 순서를 보존하며 풀 간 순서에는 영향을 주지 않는다. Binary 🔥 urgency 정렬 키는
-    # 연속 점수로 대체했다(표시는 유지).
-    # Benchmark가 없는 항목은 quota boost/urgency와 무관하게 급 내 마지막으로 보낸다.
-    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int, int]:
-        benchmark_missing = 0 if _profile_has_benchmark_score(c.profile, bench_scores) else 1
-        imminent_first = 0 if c.imminent_exhaustion else 1
-        boost_present = 0 if c.boost is not None else 1
-        boost_value = c.boost if c.boost is not None else 0
-        return (
-            benchmark_missing,
-            imminent_first,
-            boost_present,
-            boost_value,
-            -c.score,
-            value_order[id(c.profile)],
-            intra_pool_rank[id(c.profile)],
+    # 연속 점수로 대체했다(표시는 유지). Benchmark가 없는 항목은 quota boost/urgency와
+    # 무관하게 급 내 마지막으로 보낸다.
+    # #1318-2 round 3 (director-1 decision C): _recommend_rank_key 하나의 튜플이
+    # 전체 순서다 — pairwise 비교자는 없다.
+    slot_of = {id(candidate): index for index, candidate in enumerate(included)}
+    included.sort(
+        key=lambda candidate: _recommend_rank_key(
+            candidate, bench_scores, value_order, intra_pool_rank, slot_of[id(candidate)]
         )
+    )
+    return _Evaluation(
+        grade=grade,
+        included=included,
+        excluded=excluded,
+        policy_excluded=policy_excluded,
+        unsubscribed=unsubscribed,
+        escalation=escalation,
+    )
 
-    included.sort(key=sort_key)
+
+def recommend(
+    providers: list[ProviderResult],
+    grade: Grade,
+    today: dt.date | None = None,
+    now: dt.datetime | None = None,
+    *,
+    urgency_hours: float | None = None,
+    bench_scores: list[ModelScore] | None = None,
+    model_prices: Mapping[str, ModelPrice] | None = None,
+    explain: bool = False,
+    hide_excluded: bool = False,
+    grade_table: dict[Grade, list[Profile]] | None = None,
+) -> str:
+    today = today or dt.datetime.now(dt.UTC).date()
+    now = now or dt.datetime.now(dt.UTC)
+    urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
+    table = GRADE_TABLE if grade_table is None else grade_table
+    normalized_prices = {
+        normalize_aa_model_id(model_id): price for model_id, price in (model_prices or {}).items()
+    }
+    evaluation = _evaluate(
+        providers,
+        grade,
+        today,
+        now,
+        urgency_hours=urgency_hours,
+        bench_scores=bench_scores,
+        normalized_prices=normalized_prices,
+        table=table,
+    )
+    included = evaluation.included
+    excluded = evaluation.excluded
+    policy_excluded = evaluation.policy_excluded
+    unsubscribed = evaluation.unsubscribed
+    escalation = evaluation.escalation
 
     def _compact_bench(
         profile: Profile,
@@ -3739,7 +3984,7 @@ def recommend(
             by_pool.setdefault(item.provider_id, []).append(item)
         lines_out: list[str] = []
         for provider_id, group in by_pool.items():
-            names = "·".join(i.profile.name for i in group)
+            names = "·".join(_fold_name(i) for i in group)
             sample = group[0]
             until_s = f"until {sample.until.isoformat()}" if sample.until is not None else ""
             note_s = sample.note or ""
@@ -3774,7 +4019,7 @@ def recommend(
             )
             by_key.setdefault(key, []).append(item)
         return [
-            f"✗ {key} — 이 급에서 {len(group)}개({'·'.join(i.profile.name for i in group)})"
+            f"✗ {key} — 이 급에서 {len(group)}개({'·'.join(_fold_name(i) for i in group)})"
             for key, group in by_key.items()
         ]
 
@@ -3788,9 +4033,9 @@ def recommend(
         lines_out: list[str] = []
         for (kind, provider_id, reason), group in groups.items():
             if len(group) == 1 and not group[0].provider_id:
-                lines_out.append(f"✗ {group[0].profile.name:<12} {reason}")
+                lines_out.append(f"✗ {group[0].profile.name:<12} {reason}{_one_up_suffix(group[0])}")
                 continue
-            names = "·".join(i.profile.name for i in group)
+            names = "·".join(_fold_name(i) for i in group)
             if kind == "exhausted":
                 label = f"{provider_id} 풀 소진"
             elif kind == "unmeasurable":
@@ -3818,12 +4063,13 @@ def recommend(
             note_s = f"  {item.note}" if item.note else ""
             lines.append(
                 f"  {item.profile.name:<12} {item.provider_label}  pool={item.provider_id}"
-                f"  until={until_s}{note_s}"
+                f"  until={until_s}{note_s}{_one_up_suffix(item)}"
             )
     else:
         for rank, cand in enumerate(included, start=1):
             benchmark, live_measured = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
+            one_up_tag = _one_up_suffix(cand)
             profile_label = _profile_label(cand.profile)
             usage = cand.windows_display
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
@@ -3831,17 +4077,19 @@ def recommend(
                     f"{rank}. 🔥🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"  소멸 임박 우선 (boost 역전){bench}"
+                    f"  소멸 임박 우선 (boost 역전){bench}{one_up_tag}"
                 )
             elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
-                    f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}{bench}"
+                    f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
+                    f"{bench}{one_up_tag}"
                 )
             else:
                 lines.append(
-                    f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}{bench}"
+                    f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}"
+                    f"{bench}{one_up_tag}"
                 )
             if explain:
                 brake_explain = ""
@@ -3894,3 +4142,96 @@ def recommend(
                 lines.append(f"    추정근거: {entry.profile.estimate_reason}")
 
     return "\n".join(lines)
+
+
+def recommend_dict(
+    providers: list[ProviderResult],
+    grade: Grade,
+    today: dt.date | None = None,
+    now: dt.datetime | None = None,
+    *,
+    urgency_hours: float | None = None,
+    bench_scores: list[ModelScore] | None = None,
+    model_prices: Mapping[str, ModelPrice] | None = None,
+    grade_table: dict[Grade, list[Profile]] | None = None,
+) -> dict[str, object]:
+    """Structured ``--recommend`` rows — the same fold ``recommend()`` renders.
+
+    Each row carries ``placed_grade`` (the grade the catalog places the profile
+    at) and ``one_up`` (True when the row is a rep-measured placement listed one
+    grade below it, the text surface's ``[one-up <grade>]`` tag). Exact-grade
+    rows have ``one_up`` false and ``placed_grade == grade``; escalation entries
+    report their own placement.
+    """
+
+    today = today or dt.datetime.now(dt.UTC).date()
+    now = now or dt.datetime.now(dt.UTC)
+    urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
+    table = GRADE_TABLE if grade_table is None else grade_table
+    normalized_prices = {
+        normalize_aa_model_id(model_id): price for model_id, price in (model_prices or {}).items()
+    }
+    evaluation = _evaluate(
+        providers,
+        grade,
+        today,
+        now,
+        urgency_hours=urgency_hours,
+        bench_scores=bench_scores,
+        normalized_prices=normalized_prices,
+        table=table,
+    )
+
+    def _row(
+        item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed | _EscalationEntry,
+    ) -> dict[str, object]:
+        return {
+            "profile": item.profile.name,
+            "display": _profile_label(item.profile),
+            "provider": item.provider_id,
+            "placed_grade": item.placed_grade,
+            "one_up": item.one_up,
+        }
+
+    rows: list[dict[str, object]] = []
+    for cand in evaluation.included:
+        rows.append(
+            {
+                **_row(cand),
+                "kind": "candidate",
+                "provider_label": cand.provider_label,
+                "windows": cand.windows_display,
+                "remaining_pct": cand.remaining_pct,
+                "pool_class": cand.pool_class,
+                "boost": cand.boost,
+                "weight": cand.weight,
+                "effective_remaining": cand.effective_remaining,
+                "score": cand.score,
+                "urgent": cand.urgent,
+                "imminent_exhaustion": cand.imminent_exhaustion,
+            }
+        )
+    for item in evaluation.excluded:
+        rows.append({**_row(item), "kind": item.kind, "reason": item.reason})
+    for item in evaluation.policy_excluded:
+        rows.append(
+            {
+                **_row(item),
+                "kind": "policy_excluded",
+                "provider_label": item.provider_label,
+                "until": item.until.isoformat() if item.until is not None else None,
+                "note": item.note,
+            }
+        )
+    for item in evaluation.unsubscribed:
+        rows.append({**_row(item), "kind": "unsubscribed", "source": item.source})
+    for entry in evaluation.escalation:
+        rows.append(
+            {
+                **_row(entry),
+                "kind": "escalation",
+                "provider_label": entry.provider_label,
+                "gate_reason": entry.gate_reason,
+            }
+        )
+    return {"grade": grade, "rows": rows}

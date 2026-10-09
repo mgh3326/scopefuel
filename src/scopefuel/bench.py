@@ -3355,6 +3355,13 @@ def _profile_from_catalog(entry: CatalogEntry, template: object | None):
     only placement, model id and gate from the canon — losing the metadata would
     turn every ``--recommend`` line into a bare model id the moment a host went
     server-canonical.
+
+    The catalog row's own grade evidence is also carried into the (never
+    rendered) ``catalog_*`` fields so is_rep_measured can judge the canon's
+    annotation and grades-apply stamp rather than the template's possibly stale
+    annotation — a server promote/demote is stamped only in ``deviation_ref`` /
+    ``decided_by`` and a server-side annotation rewrite or revoke must take
+    effect for the one-up listing (#1318-2).
     """
 
     from .recommend import Profile
@@ -3368,6 +3375,10 @@ def _profile_from_catalog(entry: CatalogEntry, template: object | None):
             benchmark=entry.score if entry.score is not None else template.benchmark,
             aa_agent_model_id=entry.model_id or template.aa_agent_model_id,
             launcher_effort=effort or template.launcher_effort,
+            catalog_backed=True,
+            catalog_annotation=entry.benchmark_annotation,
+            catalog_deviation_ref=entry.deviation_ref or None,
+            catalog_decided_by=entry.decided_by,
         )
     label = entry.model_id or entry.profile
     return Profile(
@@ -3386,6 +3397,10 @@ def _profile_from_catalog(entry: CatalogEntry, template: object | None):
         # only to render "측정 불가" — a server addition that can never be
         # recommended is not an addition.
         catalog_pool=entry.pool or None,
+        catalog_backed=True,
+        catalog_annotation=entry.benchmark_annotation,
+        catalog_deviation_ref=entry.deviation_ref or None,
+        catalog_decided_by=entry.decided_by,
     )
 
 

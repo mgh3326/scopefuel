@@ -15,6 +15,7 @@ from scopefuel.recommend import (
     GRADE_TABLE,
     MODEL_ONLY_ANNOTATION,
     Profile,
+    _one_up_profiles,
     gate_check,
     profile_pool,
     recommend,
@@ -325,17 +326,24 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
     expected: dict[str, list[str]] = {}
     actual: dict[str, list[str]] = {}
     for grade in GRADES:
+        # #1318-2 round 3 (director-1 decision C): the ranked list is the
+        # exact-grade fold followed by the rep-measured one-up rows; with
+        # quota/boost/score all equal the surviving key dims are
+        # (unmeasured-last, then the value-order slot) — one-up rows take
+        # appended slots after the exact rows, so position encodes exact-first,
+        # and an unmeasured exact row sinks below a measured one-up (amended
+        # AC6).
         profiles = [profile for profile in GRADE_TABLE[grade] if profile.gate != "escalation"]
+        ordered = [(profile, False) for profile in profiles]
+        ordered += [(profile, True) for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)]
         expected[grade] = [
             label(profile)
-            for profile in sorted(
-                profiles,
-                key=lambda profile: (
-                    profile.benchmark is None,
+            for profile, _one_up in sorted(
+                ordered,
+                key=lambda item: (
+                    item[0].benchmark is None,
                     next(
-                        index
-                        for index, candidate in enumerate(GRADE_TABLE[grade])
-                        if candidate.name == profile.name
+                        index for index, candidate in enumerate(ordered) if candidate[0].name == item[0].name
                     ),
                 ),
             )

@@ -69,7 +69,8 @@ Not fail-open and not fail-closed — the axis is *what the action does*, not
     because the canon may have raised it since the last successful read;
   * a profile absent from the snapshot is refused (`rc 3`), never defaulted.
 * **Disclosure is the precondition.** Every non-canonical path is labelled —
-  `scopefuel --recommend` prints a `catalog=…` line, `policy launch --json`
+  `scopefuel --recommend` prints a `catalog=…` line (stderr under `--json`,
+  which also carries `catalog` as a payload field), `policy launch --json`
   carries `catalog.source`/`catalog.stale`, and `wrk` stamps `catalog=stale` on
   the spawn brief header. Fail-open without a label is just fail-open.
 

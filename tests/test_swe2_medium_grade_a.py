@@ -33,7 +33,25 @@ PRE_787_ROWS = FIXTURES / "grade_table_pre_787.json"
 
 
 def _rows(table) -> list[dict]:
-    return [{"grade": grade, **dataclasses.asdict(p)} for grade, profiles in table.items() for p in profiles]
+    return [
+        {
+            "grade": grade,
+            **{k: v for k, v in dataclasses.asdict(p).items() if k not in _RUNTIME_ONLY_FIELDS},
+        }
+        for grade, profiles in table.items()
+        for p in profiles
+    ]
+
+
+# #1318-2 round 2: catalog-evidence fields exist only on profiles built from a
+# server/cache catalog — every bundled row keeps the defaults, so they carry no
+# placement information the pre-#787 fixture could compare against.
+_RUNTIME_ONLY_FIELDS = {
+    "catalog_backed",
+    "catalog_annotation",
+    "catalog_deviation_ref",
+    "catalog_decided_by",
+}
 
 
 def test_devin_swe2_medium_is_a_single_a_row_with_provenance():

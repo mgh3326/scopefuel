@@ -187,11 +187,18 @@ def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, 
 def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_text):
     providers = [devin.parse(_models_list(fixture_text))]
     # Measured placements are A (medium), A+ (swe2-max's promoted max rung) and
-    # C (the effort-less max rungs) — nowhere else.
-    for grade in ("S+", "S", "B"):
+    # C (the effort-less max rungs) — nowhere else. #1318-2: the A rep-measured
+    # row (medium) also lists at B, tagged one-up; the unmeasured C rungs do not
+    # move (their variant annotation is not rep evidence).
+    for grade in ("S+", "S"):
         out = recommend(providers, grade, explain=True)
         for name in VARIANTS:
             assert name not in out, (grade, name, out)
+    b_out = recommend(providers, "B", explain=True)
+    medium_b = [line for line in b_out.splitlines() if "devin-swe2-medium" in line]
+    assert medium_b and all("[one-up A]" in line for line in medium_b)
+    for name in ("devin-swe2-max", "devin-ds41-max"):
+        assert name not in b_out, (name, b_out)
     aplus = recommend(providers, "A+", explain=True)
     assert "devin-swe2-medium" not in aplus
     assert "devin-ds41-max" not in aplus
@@ -210,11 +217,19 @@ def test_recommend_c_lists_only_the_still_unmeasured_variants(fixture_text):
 
 
 def test_recommend_a_lists_only_the_measured_variant(fixture_text):
-    """#787: devin-swe2-medium is the A candidate; the C variants stay out."""
+    """#787: devin-swe2-medium is the A candidate; the C variants stay out.
+
+    #1318-2: the A+ rep-measured rungs (devin-swe2@high, devin-swe2-max@max,
+    devin-ds41) now list at A as one-up rows — tagged, never untagged.
+    """
     providers = [devin.parse(_models_list(fixture_text))]
     out = recommend(providers, "A")
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     rows = [line for line in ranked if line.split()[1] == "devin-swe2-medium"]
     assert len(rows) == 1, out
-    for name in ("devin-swe2-max", "devin-ds41-max"):
-        assert name not in out, (name, out)
+    assert "[one-up" not in rows[0]
+    # The promoted A+ max rung lists here only as a tagged one-up row; the
+    # unmeasured C max rungs stay at C.
+    swe2_max_a = [line for line in ranked if "devin-swe2-max" in line]
+    assert swe2_max_a and all("[one-up A+]" in line for line in swe2_max_a), out
+    assert "devin-ds41-max" not in out, out
