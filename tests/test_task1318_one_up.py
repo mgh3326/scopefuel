@@ -392,3 +392,114 @@ def test_one_up_listing_does_not_widen_gate_admission():
     # gate reads recommend only for alternatives — one-up names stay out of it.
     assert "devin-ds41" not in result.alternatives
     assert "devin-swe2-max" not in result.alternatives
+
+
+# ── round 2: authoritative catalog grade evidence (B1) ───────────────────────
+
+
+def _server_view(rows=None):
+    """A server-source CatalogView built from catalog-row dicts."""
+    rows = rows or [entry.as_dict() for entry in bench.catalog_snapshot()]
+    entries = bench._catalog_from_payload({"catalog": rows})
+    return bench.CatalogView(tuple(entries), source="server", backend="handoffkeep")
+
+
+def test_server_rep_promotion_evidence_is_honored():
+    """A grades-apply promote stamp (deviation_ref + decided_by) makes the row
+    rep-measured even though its annotation stays an estimate."""
+    rows = [entry.as_dict() for entry in bench.catalog_snapshot()]
+    for row in rows:
+        if row["profile"] == "sonnet" and row["effort"] == "medium":
+            row.update(
+                grade="B",
+                deviation_ref="hk:task/999; promote evidence srv:9001,srv:9002,srv:9003",
+                decided_by="operator-desk",
+                decided_at="2026-10-09T00:00:00Z",
+            )
+    table = bench._catalog_grade_table(_server_view(rows))
+    assert table is not None
+    profile = next(p for p in table["B"] if p.name == "sonnet" and p.launcher_effort == "medium")
+    assert is_rep_measured(profile), ("server rep promotion lost", profile)
+
+
+def test_server_annotation_updates_are_honored():
+    """The server's own benchmark_annotation wins over the bundled template's."""
+    rows = [entry.as_dict() for entry in bench.catalog_snapshot()]
+    for row in rows:
+        if row["profile"] == "sonnet" and row["effort"] == "medium":
+            row.update(
+                grade="B",
+                benchmark_annotation="급 실측(B; evidence reps srv:9001, srv:9002, srv:9003)",
+            )
+    table = bench._catalog_grade_table(_server_view(rows))
+    assert table is not None
+    profile = next(p for p in table["B"] if p.name == "sonnet" and p.launcher_effort == "medium")
+    assert is_rep_measured(profile), ("server annotation discarded", profile.benchmark_annotation)
+
+
+def test_server_unmeasured_revocation_is_honored():
+    """A server-demoted-to-estimate row must not keep the template's rep
+    annotation — the stale bundled text never decides."""
+    rows = [entry.as_dict() for entry in bench.catalog_snapshot()]
+    for row in rows:
+        if row["profile"] == "sonnet" and row["effort"] == "high":
+            row.update(
+                benchmark_annotation="추정(외삽)",
+                deviation_ref="hk:task/999; estimate placement; no counted reps",
+            )
+    table = bench._catalog_grade_table(_server_view(rows))
+    assert table is not None
+    profile = next(p for p in table["B"] if p.name == "sonnet" and p.launcher_effort == "high")
+    assert not is_rep_measured(profile), (
+        "server estimate-only row falsely lowered",
+        profile.benchmark_annotation,
+    )
+
+
+def test_seeded_server_catalog_keeps_the_bundled_rep_set():
+    """The bundled snapshot's own canon seed selects exactly the same rows."""
+    table = bench._catalog_grade_table(_server_view())
+    assert table is not None
+    selected = {
+        (grade, _label(profile))
+        for grade, profiles in table.items()
+        for profile in profiles
+        if is_rep_measured(profile)
+    }
+    assert selected == {(grade, label) for grade, labels in EXPECTED_REP_MEASURED.items() for label in labels}
+
+
+# ── round 2: exact-first regardless of benchmark presence (B2) ───────────────
+
+
+def test_exact_unmeasured_ahead_at_equal_quota_and_boost(monkeypatch):
+    """Exact rows stay ahead of one-up rows at equal quota and boost even when
+    the exact row has no numeric benchmark and the one-up row does."""
+    table = {grade: [] for grade in GRADES}
+    table["A+"].append(Profile("devin-oneup", "Measured", 80.0, benchmark_annotation="급 실측(A+; reps 3/3)"))
+    table["A"].append(Profile("sonnet", "Exact", None))
+    providers = _pool_providers()
+    monkeypatch.setattr(recommend_mod, "get_policy", lambda *a, **k: ("preserve", None))
+    monkeypatch.setattr(recommend_mod, "get_boost", lambda *a, **k: (None, None))
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
+    rows = [row for row in payload["rows"] if row["kind"] == "candidate"]
+    assert rows[0]["score"] == rows[1]["score"] and rows[0]["boost"] == rows[1]["boost"]
+    assert rows[0]["profile"] == "sonnet", [
+        (row["profile"], row["one_up"], row["score"], row["boost"]) for row in rows
+    ]
+
+
+def test_unscored_one_up_never_outranks_scored_exact_even_boosted(monkeypatch):
+    """The unmeasured-last rule reaches one-up rows too: an unscored one-up row
+    stays behind a scored exact row even when its pool is boosted."""
+    table = {grade: [] for grade in GRADES}
+    table["A+"].append(Profile("devin-oneup", "Measured", None, benchmark_annotation="급 실측(A+; reps 3/3)"))
+    table["A"].append(Profile("sonnet", "Exact", 50.0))
+    providers = _pool_providers()
+    monkeypatch.setattr(recommend_mod, "get_policy", lambda *a, **k: ("preserve", None))
+    monkeypatch.setattr(
+        recommend_mod, "get_boost", lambda pool, *a, **k: (1, None) if pool == "devin" else (None, None)
+    )
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
+    rows = [row for row in payload["rows"] if row["kind"] == "candidate"]
+    assert rows[0]["profile"] == "sonnet", [row["profile"] for row in rows]

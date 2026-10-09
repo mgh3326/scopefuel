@@ -15,6 +15,7 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
 import math
 import os
@@ -191,6 +192,19 @@ class Profile:
     # table and then rendered "측정 불가", so the server could add a profile that
     # could never actually be recommended.
     catalog_pool: str | None = None
+    # #1318-2: the catalog row's own grade evidence, set only when this runtime
+    # profile was built from a canonical catalog row (bench._profile_from_catalog).
+    # ``benchmark_annotation`` above stays the *display* text — for a row that
+    # also exists in the bundled snapshot it keeps the template's wording, which
+    # may lag the canon — so is_rep_measured reads these fields instead whenever
+    # ``catalog_backed`` is set, never the stale template.  A catalog row that
+    # carries no evidence at all (every field empty) is therefore correctly not
+    # rep-measured, which is why the flag is explicit rather than inferred from
+    # the three fields being set.
+    catalog_backed: bool = False
+    catalog_annotation: str | None = None
+    catalog_deviation_ref: str | None = None
+    catalog_decided_by: str | None = None
 
 
 _HARNESS_LABELS = {
@@ -1505,26 +1519,49 @@ _SOL_PROFILES = frozenset({"codex-sol", "kiro-sol"})
 # unmeasured rows (including E6 arm rows) never do.
 REP_MEASURED_ANNOTATION_PREFIX = "급 실측("
 ONE_UP_TAG_PREFIX = "[one-up "
+# ``grades apply`` stamps an operator-approved measured move as
+# ``<ref>; <action> evidence <rep-ref>,<rep-ref>…`` in ``deviation_ref``
+# (grades.py:2567) without touching ``benchmark_annotation`` — this is the
+# canonical promote/demote shape, e.g. "hk:task/999; promote evidence
+# srv:9001,srv:9002". Rep refs are ``srv:<id>`` / ``local:<id>`` /
+# ``local@<host>:<id>`` (grades.py §ref rules).
+_REP_DECISION_REF = re.compile(r"(?:promote|demote) evidence\s+(?:srv|local)(?:@[\w.-]+)?:\d+")
 
 
 def is_rep_measured(profile: Profile) -> bool:
     """Whether this row's *grade* is rep-measured evidence.
 
-    Reads ``profile.benchmark_annotation`` — the grade-evidence text. A row
-    whose grade was decided by measured reps, or by an operator grade decision
-    on rep evidence, carries an annotation that opens with ``급 실측(<grade>;``
-    and names its rep evidence (``reps 3/3``, ``evidence reps srv:…``,
-    ``reps PASS srv:…``): DEVIN_DS41_GRADE_ANNOTATION,
-    DEVIN_SWE2_HIGH_GRADE_ANNOTATION, DEVIN_SWE2_MAX_GRADE_ANNOTATION,
-    DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION, GROK_HI_XHIGH_GRADE_ANNOTATION,
-    OC_SOLAR4_GRADE_ANNOTATION, SONNET_5_5_HIGH_GRADE_ANNOTATION.
+    Reads the row's authoritative grade evidence:
+
+    * a catalog-backed runtime row (``catalog_backed`` — built by
+      ``bench._profile_from_catalog``) is judged on the catalog row's own
+      fields only: ``catalog_annotation`` (the server's annotation when
+      present) and the ``grades apply`` decision stamp — ``catalog_decided_by``
+      plus a ``catalog_deviation_ref`` carrying
+      ``promote evidence srv:…`` / ``demote evidence srv:…`` rep refs.  The
+      bundled template ``benchmark_annotation`` is *never* consulted here, so
+      a server promote lands (rep evidence in the ref) and a server revoke to
+      estimate-only drops out;
+    * a bundled code-table row is judged on its own ``benchmark_annotation``:
+      it must open with ``급 실측(<grade>;`` and name its rep evidence
+      (``reps 3/3``, ``evidence reps srv:…``, ``reps PASS srv:…``) —
+      DEVIN_DS41_GRADE_ANNOTATION, DEVIN_SWE2_HIGH_GRADE_ANNOTATION,
+      DEVIN_SWE2_MAX_GRADE_ANNOTATION, DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
+      GROK_HI_XHIGH_GRADE_ANNOTATION, OC_SOLAR4_GRADE_ANNOTATION,
+      SONNET_5_5_HIGH_GRADE_ANNOTATION.
 
     ``benchmark_source`` and ``estimate_reason`` are deliberately not read: the
     first only marks AA-table scores (an AA-agent row never claims a rep-decided
     grade), the second explains a displayed *score*, not the grade — a
     rep-measured row may still show an estimate score (sonnet@high, oc-solar4).
     """
-    annotation = profile.benchmark_annotation
+    if profile.catalog_backed:
+        ref = profile.catalog_deviation_ref or ""
+        if profile.catalog_decided_by and _REP_DECISION_REF.search(ref):
+            return True
+        annotation = profile.catalog_annotation
+    else:
+        annotation = profile.benchmark_annotation
     return (
         annotation is not None
         and annotation.startswith(REP_MEASURED_ANNOTATION_PREFIX)
@@ -3634,24 +3671,37 @@ def _evaluate(
     # Benchmark가 없는 항목은 quota boost/urgency와 무관하게 급 내 마지막으로 보낸다.
     # #1318-2: one-up flag 는 quota·boost·score 가 모두 같을 때만 묶는다 — quota 가
     # 실제로 더 나은 상위급 행을 급 내 하위 행 아래로 숨기지 않는다(operator A).
-    def sort_key(c: _Candidate) -> tuple[int, int, int, int, float, int, int, int]:
-        benchmark_missing = 0 if _profile_has_benchmark_score(c.profile, bench_scores) else 1
-        imminent_first = 0 if c.imminent_exhaustion else 1
-        boost_present = 0 if c.boost is not None else 1
-        boost_value = c.boost if c.boost is not None else 0
-        one_up_last = 1 if c.one_up else 0
+    # 같은 급 내(정급끼리 · one-up끼리) 비교는 기존 키 그대로다 — 미측정-뒤 규칙이
+    # quota 차원보다 먼저 결정한다. 정급↔one-up 비교는 quota/boost/score 차원만 본다:
+    # benchmark 보유 여부는 quota 가 아니므로 정급 우선을 완화하지 않고(B2 — benchmark
+    # 없는 정급 행이 score 있는 one-up 에 밀리는 것을 막는다), 점수 없는 one-up 행은
+    # 어떤 정급 행도 앞지르지 않는다(미측정-뒤 규칙이 one-up 계열에도 적용).
+    # flat 키로는 이 우선관계를 표현할 수 없다 — boost>one-up·one-up>missing·
+    # missing>boost 가 동시에 성립해야 해 순환이다 — 그래서 비교자로 둔다.
+    def _quota_dims(c: _Candidate) -> tuple[int, int, int, float]:
         return (
-            benchmark_missing,
-            imminent_first,
-            boost_present,
-            boost_value,
+            0 if c.imminent_exhaustion else 1,
+            0 if c.boost is not None else 1,
+            c.boost if c.boost is not None else 0,
             -c.score,
-            one_up_last,
-            value_order[id(c.profile)],
-            intra_pool_rank[id(c.profile)],
         )
 
-    included.sort(key=sort_key)
+    def _candidate_cmp(a: _Candidate, b: _Candidate) -> int:
+        missing_a = 0 if _profile_has_benchmark_score(a.profile, bench_scores) else 1
+        missing_b = 0 if _profile_has_benchmark_score(b.profile, bench_scores) else 1
+        if a.one_up == b.one_up:
+            ka = (missing_a, *_quota_dims(a), value_order[id(a.profile)], intra_pool_rank[id(a.profile)])
+            kb = (missing_b, *_quota_dims(b), value_order[id(b.profile)], intra_pool_rank[id(b.profile)])
+            return -1 if ka < kb else (1 if ka > kb else 0)
+        one_up, exact = (a, b) if a.one_up else (b, a)
+        missing_one_up = missing_a if a.one_up else missing_b
+        # 점수 없는 one-up 은 정급을 절대 앞지르지 않고, quota 차원이 정급과 같거나
+        # 나쁘면 정급이 앞선다 — one-up 이 앞서려면 quota 우선이 엄밀하게 더 좋아야 한다.
+        if missing_one_up or _quota_dims(exact) <= _quota_dims(one_up):
+            return -1 if a is exact else 1
+        return 1 if a is exact else -1
+
+    included.sort(key=functools.cmp_to_key(_candidate_cmp))
     return _Evaluation(
         grade=grade,
         included=included,

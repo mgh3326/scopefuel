@@ -328,7 +328,9 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
     for grade in GRADES:
         # #1318-2: the ranked list is the exact-grade fold followed by the
         # rep-measured one-up rows; with quota/boost all equal the order oracle
-        # is (unmeasured-last, one-up-last, table position).
+        # is (one-up-last, unmeasured-last, table position) — B2: an exact row
+        # stays ahead of a one-up row at equal quota/boost regardless of
+        # benchmark presence.
         profiles = [profile for profile in GRADE_TABLE[grade] if profile.gate != "escalation"]
         ordered = [(profile, False) for profile in profiles]
         ordered += [(profile, True) for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)]
@@ -337,8 +339,8 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             for profile, _one_up in sorted(
                 ordered,
                 key=lambda item: (
-                    item[0].benchmark is None,
                     item[1],
+                    item[0].benchmark is None,
                     next(
                         index for index, candidate in enumerate(ordered) if candidate[0].name == item[0].name
                     ),
