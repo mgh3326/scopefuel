@@ -16,7 +16,6 @@ from scopefuel.recommend import (
     MODEL_ONLY_ANNOTATION,
     Profile,
     _one_up_profiles,
-    _text_label,
     gate_check,
     profile_pool,
     recommend,
@@ -26,6 +25,71 @@ from scopefuel.recommend import (
 NOW = dt.datetime(2026, 9, 9, 6, 0, tzinfo=dt.UTC)
 TODAY = NOW.date()
 GRADES = ("S+", "S", "A+", "A", "B", "C")
+
+# #1339 round 2 (hk 1331 SHOULD): literal expected ranked-line labels — one
+# pinned string per bundled (name, launcher_effort) row. The oracle neither
+# re-derives ``recommend._text_label``'s format nor consults launch's flag
+# predicate, so a label-format or predicate change turns these tests red
+# instead of moving the expectation; a bundled row missing here fails loudly
+# on the lookup.
+_EXPECTED_LABELS = {
+    ("agy-flash", None): "agy-flash",
+    ("cc-glm", None): "cc-glm",
+    ("cc-qwen38", None): "cc-qwen38",
+    ("codex-luna", "high"): "codex-luna --effort high",
+    ("codex-luna", "low"): "codex-luna --effort low",
+    ("codex-luna", "medium"): "codex-luna --effort medium",
+    ("codex-luna", "xhigh"): "codex-luna --effort xhigh",
+    ("codex-luna-max", None): "codex-luna-max",
+    ("codex-sol", "max"): "codex-sol --effort max",
+    ("codex-sol", "xhigh"): "codex-sol --effort xhigh",
+    ("codex-terra", "high"): "codex-terra --effort high",
+    ("codex-terra", "medium"): "codex-terra --effort medium",
+    ("codex-terra", "xhigh"): "codex-terra --effort xhigh",
+    ("codex-terra-max", None): "codex-terra-max",
+    ("devin-ds41", None): "devin-ds41",
+    ("devin-ds41-max", None): "devin-ds41-max",
+    ("devin-glm52", None): "devin-glm52",
+    ("devin-swe17", None): "devin-swe17",
+    ("devin-swe2", None): "devin-swe2",
+    ("devin-swe2", "high"): "devin-swe2 (effort high)",
+    ("devin-swe2-max", None): "devin-swe2-max",
+    ("devin-swe2-max", "max"): "devin-swe2-max (effort max)",
+    ("devin-swe2-medium", None): "devin-swe2-medium",
+    ("grok", "low"): "grok --effort low",
+    ("grok", "medium"): "grok --effort medium",
+    ("grok-hi", None): "grok-hi",
+    ("grok-hi", "xhigh"): "grok-hi --effort xhigh",
+    ("haiku", "high"): "haiku --effort high",
+    ("haiku", "low"): "haiku --effort low",
+    ("haiku", "max"): "haiku --effort max",
+    ("haiku", "medium"): "haiku --effort medium",
+    ("haiku", "xhigh"): "haiku --effort xhigh",
+    ("kimi-k27-code", None): "kimi-k27-code",
+    ("kimi-k3", None): "kimi-k3",
+    ("kimi-k3-low", None): "kimi-k3-low",
+    ("kiro-cheap", None): "kiro-cheap",
+    ("kiro-haiku", None): "kiro-haiku",
+    ("kiro-opus", None): "kiro-opus",
+    ("kiro-sol", None): "kiro-sol",
+    ("kiro-sonnet", None): "kiro-sonnet",
+    ("oc-dsflash", None): "oc-dsflash",
+    ("oc-glm", None): "oc-glm",
+    ("oc-minimax-m3", None): "oc-minimax-m3",
+    ("oc-omni", None): "oc-omni",
+    ("oc-qwen37-max", None): "oc-qwen37-max",
+    ("oc-solar4", None): "oc-solar4",
+    ("oc-sonnet46", None): "oc-sonnet46",
+    ("opus", "high"): "opus --effort high",
+    ("opus", "low"): "opus --effort low",
+    ("opus", "max"): "opus --effort max",
+    ("opus", "medium"): "opus --effort medium",
+    ("opus", "xhigh"): "opus --effort xhigh",
+    ("sonnet", "high"): "sonnet --effort high",
+    ("sonnet", "max"): "sonnet --effort max",
+    ("sonnet", "medium"): "sonnet --effort medium",
+    ("sonnet", "xhigh"): "sonnet --effort xhigh",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -323,7 +387,9 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         providers.append(ProviderResult(id=provider_id, pool_class="preserve", buckets=buckets))
 
     def label(profile: Profile) -> str:
-        return _text_label(profile)
+        """Literal expected label — the pinned string for this row, never a
+        ``_text_label`` derivation (hk 1331 SHOULD, #1339 round 2)."""
+        return _EXPECTED_LABELS[(profile.name, profile.launcher_effort)]
 
     expected: dict[str, list[str]] = {}
     actual: dict[str, list[str]] = {}

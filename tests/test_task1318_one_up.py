@@ -81,8 +81,76 @@ def _pool_providers() -> list[ProviderResult]:
     return providers
 
 
+# #1339 round 2 (hk 1331 SHOULD): literal expected ranked-line labels — one
+# pinned string per bundled (name, launcher_effort) row. The oracle neither
+# re-derives ``recommend._text_label``'s format nor consults launch's flag
+# predicate, so a label-format or predicate change turns these tests red
+# instead of moving the expectation; a bundled row missing here fails loudly
+# on the lookup, the same drift contract as EXPECTED_REP_MEASURED.
+_EXPECTED_LABELS = {
+    ("agy-flash", None): "agy-flash",
+    ("cc-glm", None): "cc-glm",
+    ("cc-qwen38", None): "cc-qwen38",
+    ("codex-luna", "high"): "codex-luna --effort high",
+    ("codex-luna", "low"): "codex-luna --effort low",
+    ("codex-luna", "medium"): "codex-luna --effort medium",
+    ("codex-luna", "xhigh"): "codex-luna --effort xhigh",
+    ("codex-luna-max", None): "codex-luna-max",
+    ("codex-sol", "max"): "codex-sol --effort max",
+    ("codex-sol", "xhigh"): "codex-sol --effort xhigh",
+    ("codex-terra", "high"): "codex-terra --effort high",
+    ("codex-terra", "medium"): "codex-terra --effort medium",
+    ("codex-terra", "xhigh"): "codex-terra --effort xhigh",
+    ("codex-terra-max", None): "codex-terra-max",
+    ("devin-ds41", None): "devin-ds41",
+    ("devin-ds41-max", None): "devin-ds41-max",
+    ("devin-glm52", None): "devin-glm52",
+    ("devin-swe17", None): "devin-swe17",
+    ("devin-swe2", None): "devin-swe2",
+    ("devin-swe2", "high"): "devin-swe2 (effort high)",
+    ("devin-swe2-max", None): "devin-swe2-max",
+    ("devin-swe2-max", "max"): "devin-swe2-max (effort max)",
+    ("devin-swe2-medium", None): "devin-swe2-medium",
+    ("grok", "low"): "grok --effort low",
+    ("grok", "medium"): "grok --effort medium",
+    ("grok-hi", None): "grok-hi",
+    ("grok-hi", "xhigh"): "grok-hi --effort xhigh",
+    ("haiku", "high"): "haiku --effort high",
+    ("haiku", "low"): "haiku --effort low",
+    ("haiku", "max"): "haiku --effort max",
+    ("haiku", "medium"): "haiku --effort medium",
+    ("haiku", "xhigh"): "haiku --effort xhigh",
+    ("kimi-k27-code", None): "kimi-k27-code",
+    ("kimi-k3", None): "kimi-k3",
+    ("kimi-k3-low", None): "kimi-k3-low",
+    ("kiro-cheap", None): "kiro-cheap",
+    ("kiro-haiku", None): "kiro-haiku",
+    ("kiro-opus", None): "kiro-opus",
+    ("kiro-sol", None): "kiro-sol",
+    ("kiro-sonnet", None): "kiro-sonnet",
+    ("oc-dsflash", None): "oc-dsflash",
+    ("oc-glm", None): "oc-glm",
+    ("oc-minimax-m3", None): "oc-minimax-m3",
+    ("oc-omni", None): "oc-omni",
+    ("oc-qwen37-max", None): "oc-qwen37-max",
+    ("oc-solar4", None): "oc-solar4",
+    ("oc-sonnet46", None): "oc-sonnet46",
+    ("opus", "high"): "opus --effort high",
+    ("opus", "low"): "opus --effort low",
+    ("opus", "max"): "opus --effort max",
+    ("opus", "medium"): "opus --effort medium",
+    ("opus", "xhigh"): "opus --effort xhigh",
+    ("sonnet", "high"): "sonnet --effort high",
+    ("sonnet", "max"): "sonnet --effort max",
+    ("sonnet", "medium"): "sonnet --effort medium",
+    ("sonnet", "xhigh"): "sonnet --effort xhigh",
+}
+
+
 def _label(profile: Profile) -> str:
-    return recommend_mod._text_label(profile)
+    """Literal expected label — the pinned string for this row, never a
+    ``_text_label`` derivation."""
+    return _EXPECTED_LABELS[(profile.name, profile.launcher_effort)]
 
 
 def _line_label(line: str) -> str:
@@ -240,43 +308,52 @@ def test_e6_arm_rungs_are_never_one_up_or_ranked():
 # ── ordering (AC6 / AC7c) ────────────────────────────────────────────────────
 
 
-def test_one_up_with_better_value_slot_outranks_exact_at_equal_quota_and_boost():
-    """Same pool, same quota, no boost — and the one-up row has the better
-    가성비 slot. Round 3 (director-1 decision C): value order precedes the
-    exact-before-one-up tie-break, so the better-value one-up row lists
-    first — amended AC6."""
+def test_better_value_one_up_outranks_exact_exact_first_only_on_full_tie():
+    """Same pool, same quota, same score, no boost — and the one-up row has
+    the better 가성비 slot. Exact-before-one-up is only the last tie-break
+    on a full tie (round 3, director-1 decision C): the value-order slot
+    precedes it, so the better-value one-up row lists first — and once the
+    value standing ties too, the exact row leads again (amended AC6)."""
     table = {grade: [] for grade in GRADES}
     table["A+"].append(
         Profile(
             "devin-oneup",
             "Up",
-            90.0,
+            80.0,
             benchmark_annotation="급 실측(A+; reps 3/3)",
             aa_model_id="m-up",
         )
     )
     table["A"].append(Profile("devin-exact", "Exact", 80.0, aa_model_id="m-exact"))
     providers = [ProviderResult(id="devin", pool_class="preserve", buckets=[_bucket()])]
-    # The one-up row's pool slot wins the value reorder (18.0 > 8.0) and
+
+    # The one-up row's pool slot wins the value reorder (16.0 > 8.0) and
     # value_order sorts before the one_up tie-break under decision C.
-    prices = {
-        "m-up": bench.ModelPrice(
-            model_id="m-up",
-            price_1m_blended_3_to_1=5.0,
+    def price(model_id: str, blended: float) -> bench.ModelPrice:
+        return bench.ModelPrice(
+            model_id=model_id,
+            price_1m_blended_3_to_1=blended,
             price_1m_input_tokens=1.0,
             price_1m_output_tokens=4.0,
             captured_at="2026-10-09T00:00:00+00:00",
-        ),
-        "m-exact": bench.ModelPrice(
-            model_id="m-exact",
-            price_1m_blended_3_to_1=10.0,
-            price_1m_input_tokens=1.0,
-            price_1m_output_tokens=4.0,
-            captured_at="2026-10-09T00:00:00+00:00",
-        ),
-    }
+        )
+
+    prices = {"m-up": price("m-up", 5.0), "m-exact": price("m-exact", 10.0)}
     ranked = _ranked(recommend(providers, "A", today=TODAY, now=NOW, grade_table=table, model_prices=prices))
     assert ranked == ["devin-oneup", "devin-exact"], ranked
+    # The name's second half: equal blended prices tie the value standing,
+    # leaving exact-first as the surviving rule on the full tie.
+    tied = _ranked(
+        recommend(
+            providers,
+            "A",
+            today=TODAY,
+            now=NOW,
+            grade_table=table,
+            model_prices={"m-up": price("m-up", 10.0), "m-exact": price("m-exact", 10.0)},
+        )
+    )
+    assert tied == ["devin-exact", "devin-oneup"], tied
 
 
 def test_sol_profiles_never_appear_outside_splus():
@@ -519,6 +596,30 @@ def test_exact_ahead_of_one_up_on_a_full_quota_tie(monkeypatch):
         ("devin-swe2", False),
         ("devin-swe2", True),
     ], rows
+
+
+def test_one_up_flag_alone_puts_exact_first_on_a_full_tie(monkeypatch):
+    """The ``one_up`` element is the only key term that can separate a full
+    tie — unreachable through ``recommend`` itself, since ``_evaluate``
+    always hands one-up rows appended (later) caller slots. Drive the key
+    directly and give the one-up candidate the *earlier* slot: drop or
+    invert the flag element and the slot would wrongly list it first."""
+    base = _candidate_template(monkeypatch)
+    exact = replace(base, profile=replace(base.profile, name="exact-row"), one_up=False)
+    one_up = replace(base, profile=replace(base.profile, name="oneup-row"), one_up=True)
+    value_order = {id(exact.profile): 0, id(one_up.profile): 0}
+    intra_pool_rank = {id(exact.profile): 0, id(one_up.profile): 0}
+    ranked = sorted(
+        (one_up, exact),
+        key=lambda candidate: _recommend_rank_key(
+            candidate,
+            [],
+            value_order,
+            intra_pool_rank,
+            0 if candidate.one_up else 1,  # the one-up row holds the earlier input slot
+        ),
+    )
+    assert [candidate.profile.name for candidate in ranked] == ["exact-row", "oneup-row"]
 
 
 def test_e1_e2_u_three_row_case_has_one_fixed_order(monkeypatch):
