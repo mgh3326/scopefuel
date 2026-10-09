@@ -202,7 +202,9 @@ def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_
     aplus = recommend(providers, "A+", explain=True)
     assert "devin-swe2-medium" not in aplus
     assert "devin-ds41-max" not in aplus
-    assert any(line[:1].isdigit() and "devin-swe2-max --effort max" in line for line in aplus.splitlines())
+    # #1331: the rung prints as a non-command annotation — devin takes no
+    # --effort flag, so the accepted spelling is the bare profile name.
+    assert any(line[:1].isdigit() and "devin-swe2-max (effort max)" in line for line in aplus.splitlines())
 
 
 def test_recommend_c_lists_only_the_still_unmeasured_variants(fixture_text):

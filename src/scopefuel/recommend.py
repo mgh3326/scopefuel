@@ -1740,6 +1740,32 @@ def _profile_label(profile: Profile) -> str:
     return profile.name
 
 
+def _launch_spelling(profile: Profile) -> str:
+    """The exact ``wrk spawn -m`` fragment for this row.
+
+    launch.py owns which launchers take an effort flag; the import is deferred
+    because launch already imports this module (the same cycle break
+    ``bench.catalog_snapshot`` uses).
+    """
+    from .launch import launch_spelling
+
+    return launch_spelling(profile.name, profile.launcher_effort)
+
+
+def _text_label(profile: Profile) -> str:
+    """The ranked-line label: a copyable launch spelling plus rung context.
+
+    ``--effort <rung>`` is the flag a flag-taking launcher's wrk spelling is
+    built from; on a no-flag launcher the rung is baked into the profile name,
+    so printing the flag would produce a spelling wrk rejects. The rung stays
+    visible as a parenthetical annotation instead of a command fragment.
+    """
+    spelling = _launch_spelling(profile)
+    if profile.launcher_effort and spelling == profile.name:
+        return f"{spelling} (effort {profile.launcher_effort})"
+    return spelling
+
+
 def _benchmark_annotation(profile: Profile) -> str | None:
     if profile.model_only:
         annotation = profile.benchmark_annotation or MODEL_ONLY_ANNOTATION
@@ -2575,8 +2601,8 @@ def _cross_grade_measured_alternatives(
                 continue
             seen.add(key)
             reason = (
-                f"{CROSS_GRADE_MEASURED_REASON} — {grade}의 {_profile_label(source_profile)}은 "
-                f"{source_profile.benchmark_annotation}, {upper_grade}의 {_profile_label(profile)}은 "
+                f"{CROSS_GRADE_MEASURED_REASON} — {grade}의 {_text_label(source_profile)}은 "
+                f"{source_profile.benchmark_annotation}, {upper_grade}의 {_text_label(profile)}은 "
                 f"AA-agent 실측 {profile.benchmark:.1f}"
             )
             alternatives.append((profile, reason))
@@ -4070,7 +4096,7 @@ def recommend(
             benchmark, live_measured = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
             one_up_tag = _one_up_suffix(cand)
-            profile_label = _profile_label(cand.profile)
+            profile_label = _text_label(cand.profile)
             usage = cand.windows_display
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
                 lines.append(
@@ -4133,7 +4159,7 @@ def recommend(
         lines.append("⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)")
         for entry in escalation:
             lines.append(
-                f"  {_profile_label(entry.profile):<24} {entry.provider_label}  pool={entry.provider_id}"
+                f"  {_text_label(entry.profile):<24} {entry.provider_label}  pool={entry.provider_id}"
             )
             lines.append(f"    근거: {entry.gate_reason}")
             if entry.status_note:
@@ -4188,6 +4214,7 @@ def recommend_dict(
         return {
             "profile": item.profile.name,
             "display": _profile_label(item.profile),
+            "launch": _launch_spelling(item.profile),
             "provider": item.provider_id,
             "placed_grade": item.placed_grade,
             "one_up": item.one_up,

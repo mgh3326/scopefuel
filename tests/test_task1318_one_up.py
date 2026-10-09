@@ -38,10 +38,11 @@ TODAY = NOW.date()
 GRADES = _GRADE_ORDER
 
 # The bundled catalog's rep-measured rows, per grade — generated from the table,
-# pinned here so a silent catalog drift fails loudly. Keyed by display label
-# (name + effort rung): bare devin-swe2 sits at three grades as a non-rep row.
+# pinned here so a silent catalog drift fails loudly. Keyed by the ranked-line
+# label (the #1331 launch spelling plus a non-command rung annotation): bare
+# devin-swe2 sits at three grades as a non-rep row.
 EXPECTED_REP_MEASURED = {
-    "A+": {"devin-ds41", "devin-swe2 --effort high", "devin-swe2-max --effort max"},
+    "A+": {"devin-ds41", "devin-swe2 (effort high)", "devin-swe2-max (effort max)"},
     "A": {"devin-swe2-medium", "grok-hi --effort xhigh", "oc-solar4"},
     "B": {"sonnet --effort high"},
 }
@@ -81,8 +82,7 @@ def _pool_providers() -> list[ProviderResult]:
 
 
 def _label(profile: Profile) -> str:
-    effort = f" --effort {profile.launcher_effort}" if profile.launcher_effort else ""
-    return f"{profile.name}{effort}"
+    return recommend_mod._text_label(profile)
 
 
 def _line_label(line: str) -> str:
@@ -92,6 +92,8 @@ def _line_label(line: str) -> str:
     label = tokens[0]
     if len(tokens) >= 3 and tokens[1] == "--effort":
         label += f" --effort {tokens[2]}"
+    elif len(tokens) >= 3 and tokens[1] == "(effort":
+        label += f" (effort {tokens[2]}"
     return label
 
 
@@ -143,7 +145,7 @@ def test_predicate_ignores_estimates_aa_agent_and_unmeasured_rows():
 def test_recommend_a_lists_the_aplus_rep_rows_tagged_one_up():
     out = recommend(_pool_providers(), "A", today=TODAY, now=NOW)
     ranked = _ranked(out)
-    for label in ("devin-ds41", "devin-swe2 --effort high", "devin-swe2-max --effort max"):
+    for label in ("devin-ds41", "devin-swe2 (effort high)", "devin-swe2-max (effort max)"):
         lines = [line for line in out.splitlines() if line[:1].isdigit() and label in line]
         # exactly one listing, always tagged — never an untagged copy at A
         assert len(lines) == 1 and "[one-up A+]" in lines[0], (label, out)

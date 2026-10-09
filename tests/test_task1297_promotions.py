@@ -128,7 +128,9 @@ def test_recommend_lists_each_rung_at_its_decided_grade_and_one_up():
 
     one_below = {"A+": "A", "A": "B", "B": "C"}
     expected_lines = {
-        "A+": ["devin-swe2 --effort high", "devin-swe2-max --effort max"],
+        # #1331: devin launchers take no --effort flag — the rung is a
+        # parenthetical annotation, the launch spelling is the bare profile.
+        "A+": ["devin-swe2 (effort high)", "devin-swe2-max (effort max)"],
         "A": ["grok-hi --effort xhigh", "oc-solar4"],
         "B": ["sonnet --effort high"],
     }

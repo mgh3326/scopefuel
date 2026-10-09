@@ -165,8 +165,11 @@ def test_recommend_lists_the_new_rungs_only_at_their_placement():
             if line[:1].isdigit() and line.split()[1].startswith("devin-swe2"):
                 assert "--effort" not in line, (grade, line)
     out = recommend(providers, "A+", today=TODAY, now=NOW)
-    assert any(line[:1].isdigit() and "devin-swe2 --effort high" in line for line in out.splitlines())
-    assert any(line[:1].isdigit() and "devin-swe2-max --effort max" in line for line in out.splitlines())
+    # #1331: devin launchers take no effort flag — the rung is baked into the
+    # profile name, so the printed spelling is the bare profile and the rung
+    # shows as a non-command annotation.
+    assert any(line[:1].isdigit() and "devin-swe2 (effort high)" in line for line in out.splitlines())
+    assert any(line[:1].isdigit() and "devin-swe2-max (effort max)" in line for line in out.splitlines())
 
 
 # --- AC1: every recorded rep shape, counted or excluded with its reason -------

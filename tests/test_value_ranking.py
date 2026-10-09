@@ -16,6 +16,7 @@ from scopefuel.recommend import (
     MODEL_ONLY_ANNOTATION,
     Profile,
     _one_up_profiles,
+    _text_label,
     gate_check,
     profile_pool,
     recommend,
@@ -86,6 +87,8 @@ def _ranked_labels(output: str) -> list[str]:
         label = tokens[0]
         if len(tokens) >= 3 and tokens[1] == "--effort":
             label += f" --effort {tokens[2]}"
+        elif len(tokens) >= 3 and tokens[1] == "(effort":
+            label += f" (effort {tokens[2]}"
         labels.append(label)
     return labels
 
@@ -320,8 +323,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         providers.append(ProviderResult(id=provider_id, pool_class="preserve", buckets=buckets))
 
     def label(profile: Profile) -> str:
-        effort = f" --effort {profile.launcher_effort}" if profile.launcher_effort else ""
-        return f"{profile.name}{effort}"
+        return _text_label(profile)
 
     expected: dict[str, list[str]] = {}
     actual: dict[str, list[str]] = {}
