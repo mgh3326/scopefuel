@@ -2667,6 +2667,24 @@ _RFC3339_ZONED_RE = re.compile(
 )
 
 
+def _rfc3339_zoned(text: str) -> bool:
+    """True when ``text`` is exactly an RFC3339 timestamp carrying a zone.
+
+    This is the zoned branch of :func:`catalog_wire_timestamp` — the
+    ``_RFC3339_ZONED_RE`` shape plus a real ``datetime.fromisoformat`` parse.
+    It is factored out so the destination preflight reader can reuse the same
+    rule: unlike that writer it does not accept a bare ISO date, because the
+    Go server's ``time.Time`` emits only the zoned form.
+    """
+    if _RFC3339_ZONED_RE.fullmatch(text) is None:
+        return False
+    try:
+        dt.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
 def catalog_wire_timestamp(value: object, field: str) -> str | None:
     """Normalize one catalog timestamp field to the server's RFC3339 contract.
 
@@ -2684,13 +2702,8 @@ def catalog_wire_timestamp(value: object, field: str) -> str | None:
         except ValueError:
             raise BenchError(f"catalog {field} is not a real date: {text!r}") from None
         return f"{text}T00:00:00Z"
-    if _RFC3339_ZONED_RE.fullmatch(text):
-        try:
-            dt.datetime.fromisoformat(text)
-        except ValueError:
-            pass
-        else:
-            return text
+    if _rfc3339_zoned(text):
+        return text
     raise BenchError(f"catalog {field} must be RFC3339 with a zone (e.g. 2026-09-27T00:00:00Z), got {text!r}")
 
 
@@ -2755,14 +2768,23 @@ def _catalog_entry_exact(value: object) -> CatalogEntry:
         raise BenchError("invalid handoffkeep catalog row")
     if not isinstance(grade, str):
         raise BenchError("invalid handoffkeep catalog row")
+    # retired_at is either null (live) or the RFC3339-with-zone timestamp the
+    # Go server's time.Time emits. Anything else — a non-string, an empty
+    # string, or a string that is not that timestamp — is a row this reader
+    # cannot vouch for, so the preflight fails closed rather than silently
+    # calling it live. The accepted form is exactly catalog_wire_timestamp's
+    # zoned rule (the same _RFC3339_ZONED_RE shape and fromisoformat parse);
+    # the value is kept verbatim, never rewritten.
     retired_at = value.get("retired_at")
+    if retired_at is not None and (not isinstance(retired_at, str) or not _rfc3339_zoned(retired_at)):
+        raise BenchError("invalid handoffkeep catalog row")
     return CatalogEntry(
         profile=profile,
         effort=effort or "",
         model_id="",
         pool="",
         grade=grade,
-        retired_at=retired_at if isinstance(retired_at, str) and retired_at else None,
+        retired_at=retired_at,
     )
 
 
