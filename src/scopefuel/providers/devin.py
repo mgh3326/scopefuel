@@ -9,11 +9,15 @@
 ``Daily 0% / Weekly 18%`` 불일치를 봤다 — ``월`` 은 SWE-2 Free 버킷의 30d
 창이 만든 가짜 쿼타 축이었다(쿼타가 아니라 모델 Free 태그 → model scope).
 
-- 배너는 두 번 그려진다 — 첫 페인트는 버전만, 몇 초 뒤 커서이동+화면클리어 후
-  같은 줄이 쿼타까지 포함해 다시 그려진다. 입력은 상태줄(쿼타 배너)이나
-  composer placeholder(``Ask Devin to build …``)가 확인된 뒤에만 보낸다 —
-  어느 쪽도 안 보이면 로그인이나 업데이트 프롬프트일 수 있으므로 아무것도
-  치지 않고 끝낸다(fail-closed).
+- 배너는 두 번 그려진다 — 첫 페인트는 버전과 composer placeholder, 몇 초 뒤
+  커서이동+화면클리어 후 쿼타 상태줄이 그려지고 입력창도 다시 그려진다.
+  입력은 ①쿼타 상태줄이 확인되고 ②그 상태줄 이후에 composer placeholder
+  (``Ask Devin to build …``)가 다시 확인되며 ③상태줄 뒤 화면에 chevron 옵션
+  목록(``❯ Yes, update`` 류)이나 ``?`` 질문 프롬프트가 없을 때만 보낸다 —
+  첫 페인트의 입력창만 보고 치면 아직 쿼타 조회 전(placeholder 만으로는
+  부족), 상태줄만 보고 치면 그 위의 업데이트·로그인 모달에 Enter 가
+  들어간다(상태줄만으로도 부족). 어느 조건이든 빠지면 deadline 까지
+  아무것도 치지 않고 끝낸다(fail-closed).
   ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
   둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
 - ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
@@ -110,6 +114,10 @@ _USAGE_USED = re.compile(r"(?<![\d,.\-])(?P<used>\d+(?:\.\d+)?)[ \t]*%[ \t]*used
 # ``❯`` 만으로 시작하는 줄은 로그인·업데이트 프롬프트의 옵션 목록일 수 있으므로
 # 입력을 여는 근거로 쓰지 않는다(fail-closed).
 _INPUT_READY = re.compile(r"(?m)^[ \t]*[❭❯][ \t]*Ask Devin to build")
+# 상태줄 이후 화면의 chevron 옵션 목록(``❯ Yes, update`` 류)이나 ``?`` 로
+# 시작하는 질문 프롬프트 — 그 화면은 composer 가 아니라 모달이므로 Enter 가
+# 선택지를 누른다. composer placeholder 줄 자체는 옵션이 아니라서 제외한다.
+_MODAL_OR_OPTION = re.compile(r"(?m)^[ \t]*(?:\?|[❭❯›][ \t]*(?!Ask Devin to build)\S)")
 _USAGE_RESET = re.compile(
     r"resets?\s+in\s+(?P<reset>\d+(?:\.\d+)?[ \t]*[dhms](?:[ \t]+\d+(?:\.\d+)?[ \t]*[dhms])*)",
     re.IGNORECASE,
@@ -135,6 +143,9 @@ _MONTHS = {
     "nov": 11,
     "dec": 12,
 }
+# 연도 없는 절대 리셋의 미래쪽 지평 — 축 창 길이보다 먼 리셋은 그 창의 시각이
+# 아니므로(weekly >8d, daily >25h) 후보에서 버린다.
+_ABS_RESET_HORIZON = {"daily": dt.timedelta(hours=25), "weekly": dt.timedelta(days=8)}
 
 
 def fetch() -> ProviderResult:
@@ -381,15 +392,19 @@ def _probe_session() -> str:
             clean = _clean(raw)
             if banner_seen_at is None and _banner_quota_match(clean) is not None:
                 banner_seen_at = now
-            if ready_at is None and (banner_seen_at is not None or _INPUT_READY.search(clean)):
-                ready_at = now
+            if _input_gate_open(clean):
+                if ready_at is None:
+                    ready_at = now
+            else:
+                ready_at = None
             if not focus_sent and FOCUS_REPORT_SEQ in raw:
                 with contextlib.suppress(OSError):
                     os.write(master_fd, FOCUS_IN.encode())
                 focus_sent = True
-            # 입력은 상태줄(쿼타 배너)이나 composer placeholder 마커가 보인 뒤에만 보낸다 —
-            # 어느 쪽도 없으면 그 TUI 는 로그인·업데이트 프롬프트일 수 있으므로
-            # 아무것도 치지 않고 deadline 까지 기다린 뒤 fail-closed 로 끝낸다.
+            # 입력은 쿼타 상태줄 + 그 이후에 다시 확인된 composer placeholder +
+            # 상태줄 뒤 화면에 모달(chevron 옵션·질문 프롬프트) 부재 — 세 조건이
+            # 모두 갖춰진 뒤에만 보낸다. 조건이 무너지면 ready_at 을 되돌려,
+            # 상태줄 위에 그려진 업데이트 모달 같은 화면에는 절대 치지 않는다.
             # 조건은 출력 도착과 무관하게 매 반복 평가한다 — TUI 가 침묵하는
             # 사이에는 readable 이 비어 입력 시점을 영원히 못 잡는다.
             if usage_typed_at is None and ready_at is not None and now - ready_at >= BANNER_SETTLE_S:
@@ -587,11 +602,11 @@ def _usage_axes(clean: str, now: dt.datetime | None = None) -> dict[str, dict[st
                 break
         if used is None:
             continue
-        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(line, now=now)}
+        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(line, now=now, axis=name)}
     return axes
 
 
-def _segment_reset_iso(segment: str, now: dt.datetime | None = None) -> str | None:
+def _segment_reset_iso(segment: str, now: dt.datetime | None = None, axis: str | None = None) -> str | None:
     """축 행 안의 리셋 — 상대 기간(resets in …) 또는 절대 시각(resets Oct 11, …)."""
     moment = now or dt.datetime.now(dt.UTC)
     if moment.tzinfo is None:
@@ -615,15 +630,19 @@ def _segment_reset_iso(segment: str, now: dt.datetime | None = None) -> str | No
         offset = dt.timedelta(hours=sign * (int(hours) + int(minutes or 0) / 60))
         tzinfo = dt.timezone(offset)
         # 연도가 없는 절대 시각 — 라벨의 tz 기준으로 올해·작년·내년 후보를 만들어
-        # 하루 이상 지나지 않은 후보 중 지금에 가장 가까운 것을 고른다
-        # (연말에 ``resets Jan 1, …`` 가 작년으로 해석되는 것을 막는다).
+        # 그 축 창의 지평(지난쪽 하루 ~ 창 길이) 안의 후보 중 지금에 가장 가까운
+        # 것을 고른다(연말에 ``resets Jan 1, …`` 가 작년으로 해석되는 것을 막는다).
+        # 지평 밖 후보만 남으면 지어낸 시각이 되므로 None 으로 둔다 — 하루 이상
+        # 지난 리셋이 다음 해 같은 날짜로 점프하는 것을 막는다.
         local_now = moment.astimezone(tzinfo)
         day = int(absolute["day"])
+        earliest = local_now - dt.timedelta(days=1)
+        latest = local_now + _ABS_RESET_HORIZON.get(axis or "", dt.timedelta(days=8))
         candidates = []
         for year in (local_now.year - 1, local_now.year, local_now.year + 1):
             with contextlib.suppress(ValueError):
                 candidate = dt.datetime(year, month, day, hour, minute, tzinfo=tzinfo)
-                if candidate >= local_now - dt.timedelta(days=1):
+                if earliest <= candidate <= latest:
                     candidates.append(candidate)
         if not candidates:
             return None
@@ -647,6 +666,25 @@ def _banner_quota_match(clean: str) -> re.Match[str] | None:
             if 0 <= remaining <= 100:
                 return match
     return None
+
+
+def _input_gate_open(clean: str) -> bool:
+    """/usage 를 쳐도 되는 화면인가 — 세 조건이 모두 갖춰져야 연다(fail-closed).
+
+    ① 쿼타 상태줄이 보이고(계정·쿼타 조회가 끝난 화면),
+    ② 그 상태줄 이후에 composer placeholder 가 다시 그려졌으며(placeholder 는
+      첫 페인트에서 상태줄보다 먼저 나오므로, 상태줄 뒤에도 보여야 지금
+      composer 가 살아 있는 입력창이다),
+    ③ 상태줄 뒤 화면에 chevron 옵션 목록이나 ``?`` 질문 프롬프트가 없다
+      (상태줄 위에 열린 업데이트·로그인 모달에 Enter 가 들어가는 것을 막는다).
+    """
+    banner = _banner_quota_match(clean)
+    if banner is None:
+        return False
+    tail = clean[banner.end() :]
+    if _INPUT_READY.search(tail) is None:
+        return False
+    return _MODAL_OR_OPTION.search(tail) is None
 
 
 def _unknown_quota_buckets() -> list[Bucket]:

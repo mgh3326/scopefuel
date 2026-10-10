@@ -363,18 +363,24 @@ def test_parse_session_usage_fixture_reads_both_axes(fixture_text):
 def test_parse_session_resolves_yearless_reset_against_given_now(fixture_text):
     """연도 없는 절대 리셋은 주어진 ``now`` 로 해석한다 — 실제 시계 의존 금지.
 
-    now 를 캡처 이후(2026-10-13)로 둬도 같은 픽스처의 ``resets Oct 11`` 은
-    Oct 11 로 읽힌다 — 하루 이상 지난 2026 후보는 버려지고 다음 Oct 11
-    (2027)이 고른다.
+    now 를 캡처 이후(2026-10-13)로 두면 픽스처의 ``resets Oct 11`` 은 어떤
+    연도 후보도 weekly 지평(now-1d ~ now+8d) 안에 들지 못한다 — 하루 이상
+    지난 리셋을 다음 해 같은 날짜로 지어내지 않고 resets_at 을 None 으로 둔다.
+    버킷의 resets_at 은 같은 창을 증명한 배너의 상대 리셋으로 채워진다.
     """
     later = dt.datetime(2026, 10, 13, 12, 0, tzinfo=dt.UTC)
 
-    result = devin.parse_session(fixture_text("devin_usage"), now=later)
+    text = fixture_text("devin_usage")
+    axes = devin._usage_axes(devin._clean(text), now=later)
+    assert axes["weekly"]["resets_at"] is None
+
+    result = devin.parse_session(text, now=later)
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
     assert labels["weekly"].used_pct == 18.0
-    assert labels["weekly"].resets_at == "2027-10-11T17:00:00+09:00"
+    # /usage 절대 리셋은 지평 밖이라 None — 배너 ``resets in 1d 2h`` 의 폴백이다.
+    assert labels["weekly"].resets_at == "2026-10-14T14:00:00+00:00"
     assert labels["daily"].resets_at == "2026-10-13T14:07:00+00:00"
 
 
@@ -516,6 +522,28 @@ def test_usage_stray_label_word_does_not_block_the_real_row():
     assert labels["weekly"].used_pct == 18.0
 
 
+def test_usage_non_row_line_with_label_word_and_used_pct_is_not_a_row():
+    """opus S3 / sonnet G5: 행 중간의 레이블 단어 + N% used 는 축 행이 아니다.
+
+    슬래시 팔레트 설명 줄 같은 '행이 아닌 줄'이 레이블 단어와 ``N% used`` 를
+    싣고 진짜 행보다 먼저 나와도, 레이블은 줄 시작에서만 인정한다 — 첫 읽힌
+    행이 이기는 규칙과 합쳐져, 앵커를 빼는 뮤턴트는 weekly 를 3 으로 읽어
+    RED 가 된다.
+    """
+    text = (
+        "○ /usage   Show weekly 3% used summary\r\n"
+        " Daily 0% used  · resets in 2h 7m\r\n"
+        " Weekly 18% used  · resets Oct 11, 5:00 PM (UTC+9)\r\n"
+    )
+
+    result = devin.parse_session(text, now=_NOW)
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["weekly"].used_pct == 18.0
+
+
 def test_usage_daily_row_without_used_stays_none_even_with_banner():
     """Daily 행에 % used 가 없으면 daily 는 None — 배너 퍼센트로 채우지 않는다."""
     text = (
@@ -530,6 +558,24 @@ def test_usage_daily_row_without_used_stays_none_even_with_banner():
     labels = {b.label: b for b in result.buckets}
     assert labels["daily"].used_pct is None
     assert labels["weekly"].used_pct == 18.0
+
+
+def test_parse_session_weekly_unreadable_stays_none_at_bucket_level():
+    """sonnet S2: /usage 는 읽혔는데 weekly 행과 배너가 둘 다 없으면 weekly 버킷은 None.
+
+    ``used_pct`` 를 0.0 이나 100.0 으로 채우는 뮤턴트는 여기서 RED 가 된다
+    (daily 쪽 대응은 banner 픽스처 테스트가 잡고 있었다 — weekly 쪽을 핀다).
+    """
+    text = " Daily 0% used  · resets in 2h 7m\r\n"
+
+    result = devin.parse_session(text, now=_NOW)
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["weekly"].used_pct is None
+    assert labels["weekly"].resets_at is None
+    assert "weekly 미측정" in (result.note or "")
 
 
 # -- S4: 연도 없는 절대 리셋은 라벨 tz 에서 year±1 후보를 비교한다 --------------
@@ -574,10 +620,18 @@ def _pty_tui_script(
             "  exit 0",
             "fi",
         ]
+    # 실제 TUI 처럼 echo 를 끈다 — 프로브가 보낸 ESC[I / /usage 가 canonical
+    # echo(^[[I, /usage)로 출력에 섞여 placeholder·행 파싱을 깨지 않게 한다.
+    # 어떤 출력보다 먼저 실행돼야 한다(프로브는 ?1004h 를 보는 즉시 쓴다).
+    lines.append("stty -echo")
     if banner_text is not None:
         lines.append(f"printf '%s\\r\\n' '{banner_text}'")
     elif banner_fixture is not None:
         lines.append("cat <<'EOF'\n" + banner_fixture + "EOF\n")
+    if banner_text is not None or banner_fixture is not None:
+        # 실측 두 번째 페인트처럼 상태줄 뒤에 composer placeholder 를 다시 그린다 —
+        # 입력 게이트는 상태줄 이후의 placeholder 재확인을 요구한다.
+        lines.append("printf '%s\\r\\n' '❭ Ask Devin to build features, fix bugs, or work on your code'")
     logged = f" >> {input_log}" if input_log else ""
     lines += [
         "IFS= read -r command",
@@ -734,6 +788,28 @@ def test_probe_session_sends_usage_and_exit_and_reads_both(tmp_path, monkeypatch
     assert proctrack.pids_with_cwd(workdir, nested=True) == []
 
 
+def test_probe_session_registers_child_pgid_with_instance_dir(tmp_path, monkeypatch, fixture_text):
+    """sonnet S2 / M6d: 세션 프로브는 자식 pgid 와 인스턴스 디렉터리를 proctrack 에 등록한다.
+
+    refresh 타임아웃 핸들러의 kill_registered 가 이 등록에 의존한다 — 등록 호출을
+    빼는 뮤턴트는 여기서 RED 가 된다.
+    """
+    workdir = tmp_path / "probe-workdir"
+    log = _stub_tui_binary(tmp_path, monkeypatch, models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    registered: list[tuple[int, Path]] = []
+    monkeypatch.setattr(devin.proctrack, "register", lambda pgid, cwd: registered.append((pgid, Path(cwd))))
+
+    result = devin.fetch()
+
+    assert result.error is None
+    pid_line = next(line for line in log.read_text().splitlines() if line.startswith("pid "))
+    child_pgid = int(pid_line.split()[-1])  # start_new_session → pgid == pid
+    matches = [(pgid, cwd) for pgid, cwd in registered if pgid == child_pgid]
+    assert len(matches) == 1
+    assert matches[0][1].parent == workdir
+
+
 def test_probe_usage_unanswered_keeps_banner_axis_and_daily_none(tmp_path, monkeypatch, fixture_text):
     """AC3 fail-closed: /usage 미응답 → 배너가 증명한 weekly 만 쓰고 daily 는 None."""
     log = _stub_tui_binary(
@@ -771,14 +847,15 @@ def test_probe_sends_no_input_when_no_status_line_or_input_marker(tmp_path, monk
     assert _stub_reads(log) == []
 
 
-def test_probe_sends_no_input_to_login_like_arrow_options(tmp_path, monkeypatch, fixture_text):
+@pytest.mark.parametrize("mode", ["login_prompt", "login_arrow_list"])
+def test_probe_sends_no_input_to_login_like_arrow_options(tmp_path, monkeypatch, fixture_text, mode):
     """CodeRabbit minor: chevron 으로 시작하는 옵션 목록은 composer 가 아니다.
 
     로그인형 프롬프트가 ``❯ …`` 옵션을 그려도 composer placeholder
     (``Ask Devin to build …``)가 없으면 입력을 열지 않는다 — bare ❯ 를
     받아들이는 뮤턴트는 여기에 /usage 를 쳐 넣어 RED 가 된다.
     """
-    log = _stub_tui_binary(tmp_path, monkeypatch, mode="login_prompt", models_payload=_fixture(fixture_text))
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode=mode, models_payload=_fixture(fixture_text))
     monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
 
     result = devin.fetch()
@@ -791,18 +868,89 @@ def test_probe_sends_no_input_to_login_like_arrow_options(tmp_path, monkeypatch,
     assert _stub_reads(log) == []
 
 
-def test_probe_sends_usage_after_input_box_marker_without_banner(tmp_path, monkeypatch, fixture_text):
-    """S2: 상태줄은 안 보여도 composer placeholder 마커가 확인되면 /usage 를 보낸다."""
+def test_probe_sends_no_input_on_placeholder_without_status_line(tmp_path, monkeypatch, fixture_text):
+    """placeholder 만으로는 입력을 열지 않는다 — 쿼타 상태줄이 아직 없다.
+
+    실측 캡처에서 composer placeholder 는 첫 페인트에 상태줄보다 먼저 그려지므로
+    placeholder 단독은 '쿼타 조회가 끝난 화면'을 증명하지 못한다. 상태줄 요구를
+    빼는 뮤턴트는 여기에 /usage 를 쳐 넣어 RED 가 된다.
+    """
     log = _stub_tui_binary(tmp_path, monkeypatch, mode="prompt_only", models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert result.warning is not None  # 쿼타 프로브 fail-closed → models 만
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct is None
+    assert labels["weekly"].used_pct is None
+    assert _stub_reads(log) == []
+
+
+def test_probe_waits_for_status_line_when_placeholder_paints_first(tmp_path, monkeypatch, fixture_text):
+    """실측 캡처 순서: placeholder(첫 페인트) → 상태줄(두 번째 페인트) → 입력.
+
+    상태줄이 그려질 때까지 기다렸다가 치므로 plan·양 축을 모두 읽는다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="real_order", models_payload=_fixture(fixture_text))
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert result.plan == "Pro"
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["weekly"].used_pct == 18.0
+    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
+    # 상태줄이 그려진 뒤에만 입력이 갔다 — 첫 read 시각이 paint-status 이후다.
+    events = []
+    for line in log.read_text().splitlines():
+        head, _, rest = line.strip().partition(" ")
+        try:
+            events.append((float(head), rest))
+        except ValueError:
+            continue
+    painted_at = next(t for t, event in events if event.startswith("paint-status"))
+    first_read_at = next(t for t, event in events if event.startswith("read"))
+    assert first_read_at >= painted_at
+
+
+def test_probe_sends_no_input_when_status_line_has_no_composer(tmp_path, monkeypatch, fixture_text):
+    """상태줄만으로도 입력을 열지 않는다 — placeholder 재확인이 필요하다.
+
+    placeholder 요구를 빼는 뮤턴트는 여기에 /usage 를 쳐 넣어 RED 가 된다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="status_only", models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
 
     result = devin.fetch()
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
-    assert labels["daily"].used_pct == 0.0
-    assert labels["weekly"].used_pct == 18.0
-    assert "배너" in (result.note or "")
-    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
+    assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축은 쓴다
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == []
+
+
+def test_probe_sends_no_input_to_update_modal_over_status_line(tmp_path, monkeypatch, fixture_text):
+    """상태줄 + placeholder 위에 업데이트 모달이 열리면 아무것도 치지 않는다.
+
+    모달의 ``❯ Yes, update`` 에 Enter 가 들어가면 선택지를 누른다 — 모달 검사를
+    빼는 뮤턴트는 여기에 /usage·Enter 를 쳐 넣어 RED 가 된다.
+    """
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="update_over_banner", models_payload=_fixture(fixture_text)
+    )
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축은 쓴다
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == []
 
 
 def test_probe_answers_focus_reporting_before_typing(tmp_path, monkeypatch, fixture_text):
@@ -885,8 +1033,10 @@ def test_probe_session_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypa
     binary = tmp_path / "fake-devin-winsize"
     binary.write_text(
         "#!/bin/sh\n"
+        "stty -echo\n"
         'printf \'LINES=%s COLUMNS=%s TERM=%s\\r\\n\' "$LINES" "$COLUMNS" "$TERM"\n'
         f"printf '%s\\r\\n' '{_BANNER_82}'\n"
+        "printf '%s\\r\\n' '❭ Ask Devin to build features, fix bugs, or work on your code'\n"
         "IFS= read -r command\n"
         'case "$command" in /usage*) ;; *) exit 9;; esac\n'
         "printf '%s\\r\\n' 'Daily 0% used (resets in 3h 12m)'\n"
