@@ -35,7 +35,8 @@ POOL_PROFILE = {
     "kiro": "kiro-opus",
 }
 POOL_WINDOWS = {
-    "devin": ("1d",),
+    # #1381: devin 필수 창은 weekly(7d) 하나 (manual.REQUIRED_WINDOWS 와 동기).
+    "devin": ("7d",),
     "kimi": ("5h", "7d"),
     "grok": ("7d",),
     "kiro": ("30d",),
@@ -208,12 +209,12 @@ def test_gate_blocked_with_lock_held_and_elapsed_reset():
         id="devin",
         buckets=[
             Bucket(
-                label="daily",
-                window="1d",
+                label="weekly",
+                window="7d",
                 used_pct=11.0,
                 resets_at=(NOW - dt.timedelta(hours=1)).isoformat(),
                 scope=Scope("account"),
-                horizon="now",
+                horizon="week",
             )
         ],
         pool_class="spend",
@@ -275,14 +276,15 @@ def test_gate_cli_passes_while_probe_in_progress(monkeypatch, capsys):
     fresh = ProviderResult(
         id="devin",
         buckets=[
+            # #1381: devin 필수 창은 weekly 하나 — 배너가 증명하는 축이다.
             Bucket(
-                label="daily",
-                window="1d",
+                label="weekly",
+                window="7d",
                 used_pct=11.0,
-                resets_at=(now + dt.timedelta(hours=20)).isoformat(),
+                resets_at=(now + dt.timedelta(hours=160)).isoformat(),
                 scope=Scope("account"),
-                horizon="now",
-            )
+                horizon="week",
+            ),
         ],
         source="test",
         pool_class="spend",

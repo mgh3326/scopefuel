@@ -1,17 +1,32 @@
-"""Devin CLI — 기동 배너의 daily quota와 `devin models list`의 SWE-2 Free 태그를 읽는다.
+"""Devin CLI — PTY 세션 하나로 기동 배너(weekly 잔여)와 ``/usage``(daily·weekly)를 읽는다.
 
-두 소스는 서로 다른 신호다:
+실측(2026-10-10, v3000.11.3)으로 다시 확인한 창 매핑: 기동 배너의
+``Pro · N% remaining (resets in ...)`` 퍼센트는 ``/usage`` 의 **Weekly** 축이다.
+배너의 리셋이 24h 를 넘어 그려지는 것(실측 ``resets in 1d 2h``)으로도 daily 창
+(≤24h 안에 리셋)일 수 없음이 확인되고, 같은 회차 ``/usage`` Weekly 사용률과
+``100 - N`` 이 일치했다. 옛 구현은 이 줄을 daily 로 잘못 붙이고 weekly 를
+"CLI 에서 못 읽는다"고 둬, desk 가 ``일 18% / 월 0%`` 와 ``/usage`` 의
+``Daily 0% / Weekly 18%`` 불일치를 봤다 — ``월`` 은 SWE-2 Free 버킷의 30d
+창이 만든 가짜 쿼타 축이었다(쿼타가 아니라 모델 Free 태그 → model scope).
 
-- 기동 배너(PTY 프로브, 입력 없음)는 일간(daily) 쿼타를 직접 렌더한다
-  (``v3000.10.21 · Pro · 100% remaining (resets in 1h 41m)``). 배너는 두 번
-  그려진다 — 첫 페인트는 버전만, 몇 초 뒤 커서이동+화면클리어 후 같은 줄이
-  쿼타까지 포함해 다시 그려진다. 그 두 번째 페인트를 기다린다.
-- ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때만 별도
-  account 버킷을 낸다(과금 모델은 이 provider 범위 밖).
+- 배너는 두 번 그려진다 — 첫 페인트는 버전과 composer placeholder, 몇 초 뒤
+  커서이동+화면클리어 후 쿼타 상태줄이 그려지고 입력창도 다시 그려진다.
+  입력은 ①쿼타 상태줄이 확인되고 ②그 상태줄 이후에 composer placeholder
+  (``Ask Devin to build …``)가 다시 확인되며 ③상태줄 뒤 화면에 chevron 옵션
+  목록(``❯ Yes, update`` 류)이나 ``?`` 질문 프롬프트가 없을 때만 보낸다 —
+  첫 페인트의 입력창만 보고 치면 아직 쿼타 조회 전(placeholder 만으로는
+  부족), 상태줄만 보고 치면 그 위의 업데이트·로그인 모달에 Enter 가
+  들어간다(상태줄만으로도 부족). 어느 조건이든 빠지면 deadline 까지
+  아무것도 치지 않고 끝낸다(fail-closed).
+  ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
+  둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
+- ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
+  버킷을 낸다(계정 쿼타 창이 아니므로 창 표시·게이트 축에서 제외).
 
-주간(weekly) 쿼타는 배너에도 models list 에도 없다 — Devin 웹 콘솔 전용이다.
 못 읽는 축은 0%/100% 로 추정하지 않고 ``used_pct=None`` 으로 명시한다
-(fail-closed). Devin credential/config 파일은 열지 않고, 로그인·복구도 시도하지 않는다.
+(fail-closed): ``/usage`` 를 못 읽으면 배너가 증명한 축만 쓰고 나머지는 None.
+배너와 ``/usage`` 가 같은 창에서 어긋나면 ``/usage`` 가 이기고 note 에 적는다.
+Devin credential/config 파일은 열지 않고, 로그인·복구도 시도하지 않는다.
 """
 
 from __future__ import annotations
@@ -38,10 +53,24 @@ from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 BINARY = os.environ.get("SCOPEFUEL_DEVIN_BIN") or "devin"
 TIMEOUT_S = 30.0
 BANNER_SETTLE_S = 0.5
+USAGE_WAIT_S = 15.0
+USAGE_SETTLE_S = 1.0
+EXIT_WAIT_S = 3.0
+# 명령 텍스트와 제출(Enter)을 나눠 보낸다 — 한 write 에 붙여 보내면 TUI 의
+# 슬래시 팔레트가 뜨기 전에 Enter 가 처리돼 명령이 실행되지 않는다(실측:
+# ``/usage`` 가 입력창에 찍히고만 끝남). TUI 가 focus reporting(?1004h)을
+# 켜면 진짜 터미널처럼 FocusGained 를 한 번 보낸다 — 포커스 없는 입력을
+# 무시하는 TUI 대비.
+USAGE_INPUT = "/usage"
+EXIT_INPUT = "/exit"
+SUBMIT_INPUT = "\r"
+FOCUS_IN = "\x1b[I"
+FOCUS_REPORT_SEQ = "\x1b[?1004h"
+USAGE_TYPE_SETTLE_S = 0.6
+EXIT_TYPE_SETTLE_S = 0.4
 SOURCE = "cli:models list"
-SOURCE_BANNER = "cli:banner"
+SOURCE_QUOTA = "cli:banner+/usage"
 FREE_NOTE = "free until ~2026-10-10"
-WEEKLY_UNKNOWN_NOTE = "배너에 없음 — Devin 웹 콘솔에서만 확인"
 PROVIDER_ID = "devin"
 PROBE_WORKDIR = Path.home() / ".local" / "share" / "scopefuel" / "devin-probe-workdir"
 # A/B 실측(grok/kimi): 크기 미설정 PTY에서는 TUI가 배너/패널을 렌더하지 않아 timeout한다.
@@ -71,13 +100,59 @@ _BANNER_QUOTA_NEW = re.compile(
     rf"\(resets in {_BANNER_RESET}\)[ \t]*$"
 )
 _DURATION_PART = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[dhms])", re.IGNORECASE)
+# /usage 축 행은 물리 줄 단위다 — ``Daily``·``Weekly`` 레이블이 선행하는 그 줄
+# 안에서만 퍼센트·리셋을 읽는다. 다른 줄(상태줄 리페인트·안내 문구 등)의 값은
+# 어느 축에도 새어 들어오지 않는다.
+_USAGE_ROW = re.compile(r"^[ \t]*(?P<axis>daily|weekly)\b", re.IGNORECASE)
+# ``N% used`` 의 N 은 구분자 없는 숫자만 인정한다 — ``1,000% used``(천단위
+# 구분), ``-5% used``(부호), ``N% remaining``(키워드 없음) 같은 형태는 사용률로
+# 읽지 않는다. 숫자 앞에 [\d,.-] 가 붙어 있으면 거절.
+_USAGE_USED = re.compile(r"(?<![\d,.\-])(?P<used>\d+(?:\.\d+)?)[ \t]*%[ \t]*used\b", re.IGNORECASE)
+# 입력창이 그려졌다는 마커는 프롬프트 chevron 이 아니라 composer placeholder
+# 다 — 실측 캡처(v3000.11.3)의 입력창 줄:
+#   ``❭ Ask Devin to build features, fix bugs, or work on your code``
+# ``❯`` 만으로 시작하는 줄은 로그인·업데이트 프롬프트의 옵션 목록일 수 있으므로
+# 입력을 여는 근거로 쓰지 않는다(fail-closed).
+_INPUT_READY = re.compile(r"(?m)^[ \t]*[❭❯][ \t]*Ask Devin to build")
+# 상태줄 이후 화면의 chevron 옵션 목록(``❯ Yes, update`` 류)이나 ``?`` 로
+# 시작하는 질문 프롬프트 — 그 화면은 composer 가 아니라 모달이므로 Enter 가
+# 선택지를 누른다. composer placeholder 줄 자체는 옵션이 아니라서 제외한다.
+_MODAL_OR_OPTION = re.compile(r"(?m)^[ \t]*(?:\?|[❭❯›][ \t]*(?!Ask Devin to build)\S)")
+_USAGE_RESET = re.compile(
+    r"resets?\s+in\s+(?P<reset>\d+(?:\.\d+)?[ \t]*[dhms](?:[ \t]+\d+(?:\.\d+)?[ \t]*[dhms])*)",
+    re.IGNORECASE,
+)
+# /usage Weekly 는 상대 기간이 아니라 절대 시각으로 그린다:
+# ``resets Oct 11, 5:00 PM (UTC+9)`` (실측 v3000.11.3). 연도는 안 적으므로 현재 연도.
+_USAGE_RESET_ABS = re.compile(
+    r"resets?\s+(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2}),[ \t]*"
+    r"(?P<hm>\d{1,2}:\d{2})[ \t]*(?P<ampm>[AP]M)[ \t]*\(UTC(?P<tz>[+-]\d+(?::\d+)?)\)",
+    re.IGNORECASE,
+)
+_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+# 연도 없는 절대 리셋의 미래쪽 지평 — 축 창 길이보다 먼 리셋은 그 창의 시각이
+# 아니므로(weekly >8d, daily >25h) 후보에서 버린다.
+_ABS_RESET_HORIZON = {"daily": dt.timedelta(hours=25), "weekly": dt.timedelta(days=8)}
 
 
 def fetch() -> ProviderResult:
-    """기동 배너(daily) + models list(SWE-2 Free)를 합성한다.
+    """PTY 세션(daily·weekly 쿼타) + models list(SWE-2 Free 태그)를 합성한다.
 
-    배너가 실패해도 models list 가 성공하면 fail-closed 로 weekly-None 버킷을
-    붙여 반환한다(추정 금지). 둘 다 실패하면 error.
+    쿼타 프로브가 실패해도 models list 가 성공하면 fail-closed 로 daily·weekly
+    used_pct=None 버킷을 붙여 반환한다(추정 금지). 둘 다 실패하면 error.
     """
     if shutil.which(BINARY) is None:
         return _failed(
@@ -95,24 +170,24 @@ def fetch() -> ProviderResult:
                     f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
                     error_kind=PROBE_IN_PROGRESS,
                 )
-            banner = _banner_result()
+            quota = _quota_result()
             models = _fetch_models_list()
     except OSError as exc:
         return _failed(f"{BINARY} 실행 실패: {exc}")
 
-    if banner.error is None:
-        buckets = list(banner.buckets)
-        source = SOURCE_BANNER
+    if quota.error is None:
+        buckets = list(quota.buckets)
+        source = SOURCE_QUOTA
         if models.error is None:
             buckets = buckets + models.buckets
-            source = f"{SOURCE_BANNER}+{SOURCE}"
+            source = f"{SOURCE_QUOTA}+{SOURCE}"
         return ProviderResult(
             id=PROVIDER_ID,
-            plan=banner.plan,
+            plan=quota.plan,
             buckets=buckets,
-            note=banner.note,
+            note=quota.note,
             source=source,
-            raw={"banner": banner.raw, "models_list": models.raw},
+            raw={"pty": quota.raw, "models_list": models.raw},
             pool_class="spend",
         )
 
@@ -120,9 +195,9 @@ def fetch() -> ProviderResult:
         return ProviderResult(
             id=PROVIDER_ID,
             plan=models.plan,
-            buckets=[*models.buckets, _weekly_unknown_bucket()],
+            buckets=[*models.buckets, *_unknown_quota_buckets()],
             note=models.note,
-            warning=banner.error,
+            warning=quota.error,
             source=models.source,
             raw=models.raw,
             pool_class="spend",
@@ -218,29 +293,29 @@ def _fetch_models_list() -> ProviderResult:
         shutil.rmtree(instance_dir, ignore_errors=True)
 
 
-def _banner_result() -> ProviderResult:
+def _quota_result() -> ProviderResult:
     try:
-        raw = _probe_banner()
+        raw = _probe_session()
     except subprocess.TimeoutExpired:
         return ProviderResult(
             id=PROVIDER_ID,
-            error=f"{BINARY} 기동 배너가 {TIMEOUT_S:.0f}초 안에 쿼타 줄을 그리지 않음",
-            hint="devin 을 직접 실행해 기동 배너에 쿼타 줄이 그려지는지 확인하세요",
-            source=SOURCE_BANNER,
+            error=f"{BINARY} PTY 세션이 {TIMEOUT_S:.0f}초 안에 쿼타 줄을 그리지 않음",
+            hint="devin 을 직접 실행해 기동 배너와 /usage 가 그려지는지 확인하세요",
+            source=SOURCE_QUOTA,
             pool_class="spend",
         )
     except OSError as exc:
         return ProviderResult(
             id=PROVIDER_ID,
-            error=f"{BINARY} 배너 프로브 실행 실패: {exc}",
-            source=SOURCE_BANNER,
+            error=f"{BINARY} PTY 프로브 실행 실패: {exc}",
+            source=SOURCE_QUOTA,
             pool_class="spend",
         )
-    return parse_banner(raw)
+    return parse_session(raw)
 
 
-def _probe_banner() -> str:
-    """Run devin's startup banner in a PTY. 입력은 보내지 않는다 — 배너가 자기가 갱신한다.
+def _probe_session() -> str:
+    """Run devin in a PTY: 기동 배너 → ``/usage`` → ``/exit``. 다른 입력은 없다.
 
     자식은 전용 세션(start_new_session)에 두므로 부모의 finally killpg 외의
     경로로 나가면 고아가 된다. 그 경로들을 막는 장치:
@@ -293,6 +368,13 @@ def _probe_banner() -> str:
         output = bytearray()
         deadline = time.monotonic() + TIMEOUT_S
         banner_seen_at: float | None = None
+        ready_at: float | None = None
+        focus_sent = False
+        usage_typed_at: float | None = None
+        usage_sent_at: float | None = None
+        usage_seen_at: float | None = None
+        exit_typed_at: float | None = None
+        exit_sent_at: float | None = None
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
             if readable:
@@ -305,19 +387,62 @@ def _probe_banner() -> str:
                 if not chunk:
                     break
                 output.extend(chunk)
-                clean = _clean(output.decode("utf-8", errors="replace"))
-                if banner_seen_at is None and _banner_quota_match(clean) is not None:
-                    banner_seen_at = time.monotonic()
-                if banner_seen_at is not None and time.monotonic() - banner_seen_at >= BANNER_SETTLE_S:
-                    break
-                continue
-
-            if process.poll() is not None:
+            now = time.monotonic()
+            raw = output.decode("utf-8", errors="replace")
+            clean = _clean(raw)
+            if banner_seen_at is None and _banner_quota_match(clean) is not None:
+                banner_seen_at = now
+            if _input_gate_open(clean):
+                if ready_at is None:
+                    ready_at = now
+            else:
+                ready_at = None
+            if not focus_sent and FOCUS_REPORT_SEQ in raw:
+                with contextlib.suppress(OSError):
+                    os.write(master_fd, FOCUS_IN.encode())
+                focus_sent = True
+            # 입력은 쿼타 상태줄 + 그 이후에 다시 확인된 composer placeholder +
+            # 상태줄 뒤 화면에 모달(chevron 옵션·질문 프롬프트) 부재 — 세 조건이
+            # 모두 갖춰진 뒤에만 보낸다. 조건이 무너지면 ready_at 을 되돌려,
+            # 상태줄 위에 그려진 업데이트 모달 같은 화면에는 절대 치지 않는다.
+            # 조건은 출력 도착과 무관하게 매 반복 평가한다 — TUI 가 침묵하는
+            # 사이에는 readable 이 비어 입력 시점을 영원히 못 잡는다.
+            if usage_typed_at is None and ready_at is not None and now - ready_at >= BANNER_SETTLE_S:
+                with contextlib.suppress(OSError):
+                    os.write(master_fd, USAGE_INPUT.encode())
+                usage_typed_at = now
+            if (
+                usage_typed_at is not None
+                and usage_sent_at is None
+                and now - usage_typed_at >= USAGE_TYPE_SETTLE_S
+            ):
+                with contextlib.suppress(OSError):
+                    os.write(master_fd, SUBMIT_INPUT.encode())
+                usage_sent_at = now
+            if usage_sent_at is not None and usage_seen_at is None and _usage_pct_seen(clean):
+                usage_seen_at = now
+            usage_done = usage_sent_at is not None and (
+                (usage_seen_at is not None and now - usage_seen_at >= USAGE_SETTLE_S)
+                or now - usage_sent_at >= USAGE_WAIT_S
+            )
+            if usage_done and exit_typed_at is None:
+                with contextlib.suppress(OSError):
+                    os.write(master_fd, EXIT_INPUT.encode())
+                exit_typed_at = now
+            if (
+                exit_typed_at is not None
+                and exit_sent_at is None
+                and now - exit_typed_at >= EXIT_TYPE_SETTLE_S
+            ):
+                with contextlib.suppress(OSError):
+                    os.write(master_fd, SUBMIT_INPUT.encode())
+                exit_sent_at = now
+            if exit_sent_at is not None and (process.poll() is not None or now - exit_sent_at >= EXIT_WAIT_S):
                 break
-            if banner_seen_at is not None and time.monotonic() - banner_seen_at >= BANNER_SETTLE_S:
+            if not readable and process.poll() is not None:
                 break
 
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline and banner_seen_at is None and usage_seen_at is None:
             raise subprocess.TimeoutExpired([BINARY], TIMEOUT_S)
         return output.decode("utf-8", errors="replace")
     finally:
@@ -363,54 +488,171 @@ def _probe_banner() -> str:
             os.close(master_fd)
 
 
-def parse_banner(text: str) -> ProviderResult:
-    """기동 배너의 daily quota 세그먼트를 파싱한다. 못 읽으면 fail-closed(error)."""
+def parse_session(text: str, now: dt.datetime | None = None) -> ProviderResult:
+    """PTY 세션 출력을 daily·weekly 버킷으로 파싱한다. 읽힌 축만 쓴다(fail-closed).
+
+    ``now`` 를 주면 상대·절대 리셋을 그 시각 기준으로 해석한다 — 기본은 실제
+    시계다(테스트는 반드시 고정해야 연도 없는 절대 리셋이 미끄러지지 않는다).
+
+    - 기동 배너 ``Pro · N% remaining`` 은 실측상 **weekly** 잔여다(리셋이 24h
+      를 넘어 그려진다 — daily 창은 24h 안에 리셋된다).
+    - ``/usage`` 의 ``Daily``·``Weekly`` 행이 각 축의 사용률·리셋을 준다.
+    - 같은 창에서 배너와 ``/usage`` 가 어긋나면 ``/usage`` 가 이기고 note 에 적는다.
+    - 어느 소스도 증명하지 못한 축은 ``used_pct=None`` — 0·100 추정 금지.
+    """
     clean = _clean(text)
-    match = _banner_quota_match(clean)
-    if match is None:
+    banner = _banner_quota_match(clean)
+    axes = _usage_axes(clean, now=now)
+    usage_daily = axes.get("daily", {})
+    usage_weekly = axes.get("weekly", {})
+
+    banner_weekly_used: float | None = None
+    banner_weekly_reset: str | None = None
+    plan: str | None = None
+    if banner is not None:
+        plan = banner["plan"].strip()
+        banner_weekly_used = round(100.0 - float(banner["remaining"]), 1)
+        banner_weekly_reset = banner["reset"].strip()
+
+    daily_used = usage_daily.get("used_pct")
+    daily_reset_at = usage_daily.get("resets_at")
+    weekly_used = usage_weekly.get("used_pct")
+    weekly_reset_at = usage_weekly.get("resets_at") or _reset_iso(banner_weekly_reset, now=now)
+
+    notes: list[str] = []
+    if banner is not None:
+        notes.append(f"배너 weekly remaining {100.0 - banner_weekly_used:g}%")
+    else:
+        notes.append("기동 배너 쿼타 줄 미출현")
+    if weekly_used is not None:
+        if banner_weekly_used is not None and abs(banner_weekly_used - weekly_used) > 0.05:
+            notes.append(
+                f"배너 weekly {banner_weekly_used:g}% 와 /usage {weekly_used:g}% 불일치 — /usage 우선"
+            )
+    else:
+        weekly_used = banner_weekly_used
+    if daily_used is None and weekly_used is None:
         return ProviderResult(
             id=PROVIDER_ID,
-            error="기동 배너에서 쿼타 세그먼트를 찾지 못함(형식 불일치 또는 미출현)",
-            hint="devin 을 직접 실행해 배너가 두 번째 페인트까지 그려지는지 확인하세요",
-            source=SOURCE_BANNER,
+            error="PTY 세션에서 daily/weekly 쿼타를 읽지 못함(배너·/usage 모두 형식 불일치 또는 미출현)",
+            hint="devin 을 직접 실행해 기동 배너와 /usage 출력이 그려지는지 확인하세요",
+            source=SOURCE_QUOTA,
             raw={"stdout": clean},
             pool_class="spend",
         )
+    if daily_used is None:
+        notes.append("daily 미측정 — /usage Daily 축을 못 읽음")
+    if weekly_used is None:
+        notes.append("weekly 미측정 — 배너·/usage 어느 쪽도 증명 못함")
 
-    try:
-        remaining = float(match["remaining"])
-    except (TypeError, ValueError):
-        remaining = None
-    if remaining is None or not 0 <= remaining <= 100:
-        return ProviderResult(
-            id=PROVIDER_ID,
-            error="기동 배너의 remaining 값이 유효 범위를 벗어남",
-            source=SOURCE_BANNER,
-            raw={"stdout": clean},
-            pool_class="spend",
-        )
-
-    plan = match["plan"].strip()
-    reset_duration = match["reset"].strip()
-    used = round(100.0 - remaining, 1)
     daily = Bucket(
         label="daily",
         window="1d",
-        used_pct=used,
-        resets_at=_reset_iso(reset_duration),
+        used_pct=daily_used,
+        resets_at=daily_reset_at,
         scope=Scope("account"),
         horizon="now",
-        note=f"remaining {remaining:g}%; resets in {reset_duration}",
+        note="/usage Daily" if daily_used is not None else "미측정",
+    )
+    weekly = Bucket(
+        label="weekly",
+        window="7d",
+        used_pct=weekly_used,
+        resets_at=weekly_reset_at,
+        scope=Scope("account"),
+        horizon="week",
+        note=("/usage Weekly" if usage_weekly.get("used_pct") is not None else "기동 배너 weekly")
+        if weekly_used is not None
+        else "미측정",
     )
     return ProviderResult(
         id=PROVIDER_ID,
         plan=plan,
-        buckets=[daily, _weekly_unknown_bucket()],
-        note=f"기동 배너 daily quota (plan={plan})",
-        source=SOURCE_BANNER,
+        buckets=[daily, weekly],
+        note=" · ".join(notes),
+        source=SOURCE_QUOTA,
         raw={"stdout": clean},
         pool_class="spend",
     )
+
+
+def _usage_axes(clean: str, now: dt.datetime | None = None) -> dict[str, dict[str, object]]:
+    """/usage 출력의 daily·weekly 축을 물리 줄 단위로 파싱한다.
+
+    ``Daily``·``Weekly`` 레이블로 시작하는 각 줄을 한 축 행으로 보고 그 줄
+    안에서만 ``N% used`` 와 리셋을 찾는다 — 레이블에서 다음 레이블까지의 임의
+    구간을 한 축으로 보지 않으므로, 뒤에 다시 그려진 상태줄(``Pro · …``)이나
+    다른 줄의 퍼센트가 이 축에 새어 들어오지 않는다. 같은 축에서는 첫 읽힌
+    행이 이기고, ``% used`` 가 안 읽힌 행은 축을 만들지 않는다 — 절대
+    0/100 으로 채우지 않는다.
+    """
+    axes: dict[str, dict[str, object]] = {}
+    for line in clean.splitlines():
+        label = _USAGE_ROW.match(line)
+        if label is None:
+            continue
+        name = label["axis"].lower()
+        if name in axes:
+            continue
+        used: float | None = None
+        for candidate in _USAGE_USED.finditer(line):
+            value = float(candidate["used"])
+            if 0 <= value <= 100:
+                used = value
+                break
+        if used is None:
+            continue
+        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(line, now=now, axis=name)}
+    return axes
+
+
+def _segment_reset_iso(segment: str, now: dt.datetime | None = None, axis: str | None = None) -> str | None:
+    """축 행 안의 리셋 — 상대 기간(resets in …) 또는 절대 시각(resets Oct 11, …)."""
+    moment = now or dt.datetime.now(dt.UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
+    duration = _USAGE_RESET.search(segment)
+    if duration is not None:
+        return _reset_iso(duration["reset"].strip(), now=moment)
+    absolute = _USAGE_RESET_ABS.search(segment)
+    if absolute is None:
+        return None
+    try:
+        month = _MONTHS[absolute["mon"].lower()[:3]]
+        hour, minute = (int(part) for part in absolute["hm"].split(":"))
+        if absolute["ampm"].upper() == "PM" and hour != 12:
+            hour += 12
+        if absolute["ampm"].upper() == "AM" and hour == 12:
+            hour = 0
+        tz_text = absolute["tz"]
+        sign = 1 if tz_text.startswith("+") else -1
+        hours, _, minutes = tz_text[1:].partition(":")
+        offset = dt.timedelta(hours=sign * (int(hours) + int(minutes or 0) / 60))
+        tzinfo = dt.timezone(offset)
+        # 연도가 없는 절대 시각 — 라벨의 tz 기준으로 올해·작년·내년 후보를 만들어
+        # 그 축 창의 지평(지난쪽 하루 ~ 창 길이) 안의 후보 중 지금에 가장 가까운
+        # 것을 고른다(연말에 ``resets Jan 1, …`` 가 작년으로 해석되는 것을 막는다).
+        # 지평 밖 후보만 남으면 지어낸 시각이 되므로 None 으로 둔다 — 하루 이상
+        # 지난 리셋이 다음 해 같은 날짜로 점프하는 것을 막는다.
+        local_now = moment.astimezone(tzinfo)
+        day = int(absolute["day"])
+        earliest = local_now - dt.timedelta(days=1)
+        latest = local_now + _ABS_RESET_HORIZON.get(axis or "", dt.timedelta(days=8))
+        candidates = []
+        for year in (local_now.year - 1, local_now.year, local_now.year + 1):
+            with contextlib.suppress(ValueError):
+                candidate = dt.datetime(year, month, day, hour, minute, tzinfo=tzinfo)
+                if earliest <= candidate <= latest:
+                    candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda c: abs(c - local_now)).isoformat()
+    except (KeyError, ValueError):
+        return None
+
+
+def _usage_pct_seen(clean: str) -> bool:
+    return any(axis["used_pct"] is not None for axis in _usage_axes(clean).values())
 
 
 def _banner_quota_match(clean: str) -> re.Match[str] | None:
@@ -426,16 +668,47 @@ def _banner_quota_match(clean: str) -> re.Match[str] | None:
     return None
 
 
-def _weekly_unknown_bucket() -> Bucket:
-    return Bucket(
-        label="weekly",
-        window="7d",
-        used_pct=None,
-        resets_at=None,
-        scope=Scope("account"),
-        horizon="week",
-        note=WEEKLY_UNKNOWN_NOTE,
-    )
+def _input_gate_open(clean: str) -> bool:
+    """/usage 를 쳐도 되는 화면인가 — 세 조건이 모두 갖춰져야 연다(fail-closed).
+
+    ① 쿼타 상태줄이 보이고(계정·쿼타 조회가 끝난 화면),
+    ② 그 상태줄 이후에 composer placeholder 가 다시 그려졌으며(placeholder 는
+      첫 페인트에서 상태줄보다 먼저 나오므로, 상태줄 뒤에도 보여야 지금
+      composer 가 살아 있는 입력창이다),
+    ③ 상태줄 뒤 화면에 chevron 옵션 목록이나 ``?`` 질문 프롬프트가 없다
+      (상태줄 위에 열린 업데이트·로그인 모달에 Enter 가 들어가는 것을 막는다).
+    """
+    banner = _banner_quota_match(clean)
+    if banner is None:
+        return False
+    tail = clean[banner.end() :]
+    if _INPUT_READY.search(tail) is None:
+        return False
+    return _MODAL_OR_OPTION.search(tail) is None
+
+
+def _unknown_quota_buckets() -> list[Bucket]:
+    """쿼타 프로브가 통째로 실패했을 때의 fail-closed 축 — 값을 지어내지 않는다."""
+    return [
+        Bucket(
+            label="daily",
+            window="1d",
+            used_pct=None,
+            resets_at=None,
+            scope=Scope("account"),
+            horizon="now",
+            note="미측정 — PTY 프로브 실패",
+        ),
+        Bucket(
+            label="weekly",
+            window="7d",
+            used_pct=None,
+            resets_at=None,
+            scope=Scope("account"),
+            horizon="week",
+            note="미측정 — PTY 프로브 실패",
+        ),
+    ]
 
 
 def parse(text: str) -> ProviderResult:
@@ -462,11 +735,14 @@ def parse(text: str) -> ProviderResult:
         buckets=[
             Bucket(
                 label="swe-2",
-                window="30d",
+                # Free 태그는 쿼타 창이 아니다 — '30d'·'month' 로 그리면 '월' 축
+                # 오독이 다시 생긴다(1381: desk 의 '월 0%'). 창을 비우고 non-month
+                # 지평만 둔다; model scope 이므로 어느 축에도 합산되지 않는다.
+                window="",
                 used_pct=0.0,
                 resets_at=None,
-                scope=Scope("account"),
-                horizon="week",
+                scope=Scope("model", "swe-2"),
+                horizon="now",
                 note=FREE_NOTE,
             )
         ],
@@ -518,7 +794,7 @@ def _clean(text: str) -> str:
     return _ANSI.sub("", text).replace("\r", "\n")
 
 
-def _reset_iso(duration: str | None) -> str | None:
+def _reset_iso(duration: str | None, now: dt.datetime | None = None) -> str | None:
     if not duration:
         return None
     total_seconds = 0.0
@@ -527,7 +803,10 @@ def _reset_iso(duration: str | None) -> str | None:
         total_seconds += value * {"d": 86400, "h": 3600, "m": 60, "s": 1}[match["unit"].lower()]
     if total_seconds <= 0:
         return None
-    return (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=total_seconds)).isoformat()
+    moment = now or dt.datetime.now(dt.UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
+    return (moment + dt.timedelta(seconds=total_seconds)).isoformat()
 
 
 def _child_env() -> dict[str, str]:
