@@ -4377,12 +4377,18 @@ def _rep_diff_fields(ours: RepRecord, remote: RepRecord) -> list[str]:
 def _annotate_rep_conflict(
     exc: BenchRepConflictError, written: list[_RemoteRep], backend: BenchBackend
 ) -> BenchRepConflictError:
-    """Name the fields that differ, when the conflicting server row is readable."""
+    """Name the fields that differ, when the conflicting server row is readable.
+
+    Always returns a new exception, even when the read fails: the callers
+    raise the result ``from exc`` while handling ``exc``, and re-raising
+    ``exc`` itself there would make the exception its own ``__cause__`` —
+    a cycle for anything walking the chain (hk 1403).
+    """
 
     try:
         fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
     except BenchError:
-        return exc
+        fetched = []
     by_server = {item.server_id: item for item in fetched if item.server_id is not None}
     conflicts = []
     for conflict in exc.conflicts:

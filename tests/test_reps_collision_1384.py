@@ -17,8 +17,10 @@ content-different row, or showing cached content under a contradicted
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
+import socket
 import sqlite3
 import urllib.parse
 from collections import Counter
@@ -63,6 +65,9 @@ class FakeRepStore:
         self.mode = mode
         self.reps: list[dict] = []
         self.hits: Counter[str] = Counter()
+        # Every PUT body as received, including ones the fake then refuses —
+        # lets a test prove a retry resends the identical payload.
+        self.put_payloads: list[list[dict]] = []
         self.offline = False
         # Raised on the next PUT after the write is applied ("landed") or
         # before it ("lost") — the two ways a response can go missing.
@@ -154,6 +159,7 @@ class FakeRepStore:
         assert method == "PUT" and body is not None
         rows = body["reps"]
         assert 1 <= len(rows) <= 1000
+        self.put_payloads.append(rows)
         failure = self.fail_next_put
         self.fail_next_put = None
         if failure is not None and not self.fail_next_put_after_write:
@@ -590,3 +596,143 @@ def test_migrate_still_uses_its_own_band(tmp_path, monkeypatch):
 
     origin = bench._migrate_origin_id("host", "profile", 7)
     assert (1 << 40) <= origin < (1 << 40) + (1 << 48)
+
+
+def _assert_acyclic_chain(exc: BaseException) -> None:
+    """Every __cause__/__context__ edge reachable from ``exc``, walked with a
+    visited set — hk 1403: a self-caused BenchRepConflictError made a set-less
+    walk spin until the box OOM-killed it. No exception may be its own cause
+    or context, and the walk must terminate."""
+
+    nodes: list[BaseException] = []
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        node = queue.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        nodes.append(node)
+        assert node.__cause__ is not node, f"{node!r} is its own __cause__"
+        assert node.__context__ is not node, f"{node!r} is its own __context__"
+        queue.extend(link for link in (node.__cause__, node.__context__) if link is not None)
+    assert len(nodes) <= 8, "the exception chain did not terminate"
+
+
+def _local_rep(task_ref: str) -> dict:
+    return {
+        "profile": "builder-devin-max",
+        "model_id": "swe-2-max",
+        "task_ref": task_ref,
+        "tier": "T1",
+        "role": "impl",
+        "rounds": 1,
+        "blockers_found": 0,
+        "completed": 1,
+        "recorded_at": "2026-09-20T10:00:00Z",
+    }
+
+
+def _unreadable_conflict_row(monkeypatch, fake: FakeRepStore, real_fetch_reps) -> None:
+    """The post-409 annotate read fails while pre-PUT reads still work — the
+    "server row not readable" branch of ``_annotate_rep_conflict``, where the
+    self-cause bug lived."""
+
+    def flaky(backend, *, query=None):
+        if fake.hits["PUT"]:
+            raise bench.BenchBackendError("reps read failed")
+        return real_fetch_reps(backend, query=query)
+
+    monkeypatch.setattr(bench, "_fetch_reps", flaky)
+
+
+def test_409_error_chain_has_no_self_reference(tmp_path, monkeypatch):
+    """Mutant guard: ``raise _annotate_rep_conflict(...) from exc`` with the
+    annotate result being ``exc`` itself made BenchRepConflictError its own
+    __cause__ (the hk 1403 OOM). For each call site — add_rep, migrate and
+    push_local — with the conflicting server row unreadable, the raised chain
+    must be acyclic and the walked error must still name both ids."""
+
+    real_fetch_reps = bench._fetch_reps
+
+    # add_rep -> _write_reps_handoffkeep -> PUT 409 -> annotate.
+    fake = _remote(monkeypatch, tmp_path / "add")
+    origin = BAND_BASE + 777
+    fake.reps.append(_remote_row(id=1, origin_id=origin, task_ref="victim", notes="held by A"))
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: origin)
+    _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
+    with pytest.raises(bench.BenchRepConflictError) as excinfo:
+        bench.add_rep(
+            profile="builder-devin-max",
+            model_id="swe-2-max",
+            task_ref="attacker",
+            tier="T1",
+            role="impl",
+            rounds=1,
+            blockers_found=0,
+            completed=1,
+            notes="B's rep",
+        )
+    _assert_acyclic_chain(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, bench.BenchRepConflictError)
+    assert f"origin:{origin}" in str(excinfo.value) and "srv:1" in str(excinfo.value)
+
+    # migrate_reps -> PUT 409 -> annotate (pre-PUT reads must still succeed).
+    mig = tmp_path / "migrate"
+    _client_env(mig, monkeypatch, backend="local")
+    bench.add_rep(**_local_rep("local-1"))
+    fake = _remote(monkeypatch, mig)
+    origin = bench._migrate_origin_id("mig-host", "builder-devin-max", 1)
+    fake.reps.append(_remote_row(id=5, origin_id=origin, task_ref="occupied", notes="[src:mig-host] x"))
+    _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
+    with pytest.raises(bench.BenchRepConflictError) as excinfo:
+        bench.migrate_reps(host="mig-host", apply=True, force=True)
+    _assert_acyclic_chain(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, bench.BenchRepConflictError)
+    assert f"origin:{origin}" in str(excinfo.value) and "srv:5" in str(excinfo.value)
+
+    # push_local -> PUT 409 -> annotate.
+    pl = tmp_path / "pushlocal"
+    _client_env(pl, monkeypatch, backend="local")
+    bench.add_rep(**_local_rep("push-1"))
+    fake = _remote(monkeypatch, pl)
+    record = bench._read_local_reps_for_push()[0]
+    origin = bench._push_local_origin_id(socket.gethostname() or "local", record)
+    fake.reps.append(_remote_row(id=7, origin_id=origin, task_ref="occupied", notes="different rep"))
+    _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
+    with pytest.raises(bench.BenchRepConflictError) as excinfo:
+        bench.push_local()
+    _assert_acyclic_chain(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, bench.BenchRepConflictError)
+    assert f"origin:{origin}" in str(excinfo.value) and "srv:7" in str(excinfo.value)
+
+
+def test_retryable_503_resends_the_same_pending_payload(tmp_path, monkeypatch, capsys):
+    """503 bench_reps_retryable (the merged server contract, on deadlock or
+    serialization failure) is a transient refusal: the rep stays pending and
+    the retry resends the SAME payload — same origin_id, same recorded_at,
+    every wire field identical (mutant: re-stamp recorded_at on resend, so
+    the clock is advanced between the two adds to make that visible)."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    clock = itertools.count()
+    monkeypatch.setattr(bench, "_utc_now", lambda: f"2026-10-10T12:00:{next(clock):02d}+00:00")
+    fake.fail_next_put = bench.HttpError(503, json.dumps({"error": "bench_reps_retryable"}))
+
+    assert cli.main(_add_args()) == 2
+    assert "stays queued locally as origin:" in capsys.readouterr().err
+    assert fake.reps == []  # refused before it landed
+    assert len(_pending_rows(tmp_path / "hosta")) == 1
+
+    assert cli.main(_add_args()) == 0
+    assert "recorded rep id=srv:1" in capsys.readouterr().out
+    assert len(fake.reps) == 1  # the identical resend landed once
+    assert _pending_rows(tmp_path / "hosta") == []
+
+    # Byte-for-byte identical wire payloads: the resend kept the pending
+    # row's origin_id and its ORIGINAL recorded_at even though the clock moved.
+    assert len(fake.put_payloads) == 2
+    first, second = fake.put_payloads
+    assert first == second
+    assert second[0]["recorded_at"] == "2026-10-10T12:00:00+00:00"
+    assert second[0]["origin_id"] == fake.reps[0]["origin_id"]
