@@ -80,7 +80,8 @@ def test_no_other_grade_table_row_changed():
     plus the #1269 Haiku 5.5 refresh (the two Haiku 4.5 rows replaced by five
     estimated C-rung rows) plus #1297's five-row apply (sonnet@high -> B;
     devin-swe2@high and devin-swe2-max@max E6-graduated to A+; grok-hi@xhigh
-    E6-graduated to A; oc-solar4 B -> A)."""
+    E6-graduated to A; oc-solar4 B -> A) plus #1380's four paid fusion rows
+    (devin-fusion-opus55/sonnet55 listed unmeasured at A and B)."""
     pre = json.loads(PRE_787_ROWS.read_text())
     pre_counts = Counter(json.dumps(row, sort_keys=True) for row in pre)
     post_counts = Counter(json.dumps(row, sort_keys=True) for row in _rows(GRADE_TABLE))
@@ -113,6 +114,13 @@ def test_no_other_grade_table_row_changed():
         ("A+", "devin-swe2-max", "max"),
         ("A", "grok-hi", "xhigh"),
         ("A", "oc-solar4", None),
+        # #1380 (director-1 10-10, operator 15:0x): the paid Devin fusion lane —
+        # Claude family under the hood, devin quota pool, unmeasured pending
+        # hk 1382's first reps.
+        ("A", "devin-fusion-opus55", None),
+        ("A", "devin-fusion-sonnet55", None),
+        ("B", "devin-fusion-opus55", None),
+        ("B", "devin-fusion-sonnet55", None),
     }
     assert {key(row) for row in removed} == {
         ("C", "devin-swe2-medium", None),

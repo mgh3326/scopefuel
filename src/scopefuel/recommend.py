@@ -422,6 +422,17 @@ DEVIN_SWE2_MAX_GRADE_ANNOTATION = (
     "srv:1383 · operator 2026-10-08 via operator-desk · hk:task/1296) · "
     "AA-agent 점수 미측정"
 )
+# #1380 (director-1 10-10, operator decision 15:0x via desk): the Devin PAID
+# fusion lane — supersedes the 09-14 no-paid-Devin line. The fusion rows serve
+# Claude models under the hood (provider family claude, NOT cognition — same
+# family the claude rows use) while the spend bills the devin pool (Devin
+# credits), so billing is paid and the free-before-paid rule (#1340) sinks
+# them below the Free-tag SWE-2 rows. No rep evidence exists yet — hk 1382
+# runs the first reps — so the rows stay unmeasured: no 급 실측 prefix, no
+# ArmGradeOverride, no promote-evidence stamp.
+DEVIN_FUSION_ANNOTATION = (
+    "미측정(유료 Devin fusion 레인 · Claude 패밀리 · pool devin · hk 1382 첫 reps 대기 · #1380)"
+)
 
 # task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
 # opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
@@ -460,6 +471,44 @@ def _devin_swe2_profile() -> Profile:
         # #1340 (dr-1340-1): swe-2 carries the Free tag in devin models list —
         # launches on it draw no paid budget.
         billing="free",
+    )
+
+
+def _devin_fusion_opus55_profile() -> Profile:
+    """Canonical devin-fusion-opus55 row. Same object shape is copied into A/B.
+
+    #1380 paid fusion lane: the launch id is
+    ``fusion-claude-opus-5-5-high-sidekick-swe-2-medium`` (devin models list —
+    Fusion (Claude Opus 5.5 High + SWE-2 Medium), $4 / 1M input). Listed at A
+    and B like devin-swe2 so --recommend at those grades can propose it;
+    unmeasured, so it sorts last inside each grade.
+    """
+
+    return Profile(
+        "devin-fusion-opus55",
+        "Claude Opus 5.5 Fusion (high)",
+        None,
+        benchmark_annotation=DEVIN_FUSION_ANNOTATION,
+        # #1380: paid — the fusion rung draws Devin credits, not the Free tag
+        # the swe-2 family carries ($4 / 1M input on the models list).
+        billing="paid",
+    )
+
+
+def _devin_fusion_sonnet55_profile() -> Profile:
+    """Canonical devin-fusion-sonnet55 row. Same object shape is copied into A/B.
+
+    #1380 paid fusion lane: the launch id is
+    ``fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium`` (devin models list —
+    Fusion (Claude Sonnet 5.5 High + SWE-2 Medium), $2 / 1M input).
+    """
+
+    return Profile(
+        "devin-fusion-sonnet55",
+        "Claude Sonnet 5.5 Fusion (high)",
+        None,
+        benchmark_annotation=DEVIN_FUSION_ANNOTATION,
+        billing="paid",
     )
 
 
@@ -1047,6 +1096,13 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
             billing="free",
         ),
+        # #1380 (director-1 10-10, operator decision 15:0x via desk): the paid
+        # Devin fusion lane, listed at A and B like devin-swe2 — unmeasured
+        # (hk 1382 runs the first reps), so the unmeasured-last rank sinks
+        # them inside each grade, and the paid flag (#1340) keeps them below
+        # the Free-tag SWE-2 rows in the devin pool.
+        _devin_fusion_opus55_profile(),
+        _devin_fusion_sonnet55_profile(),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1296:
         # grok-hi@xhigh promoted to A on the served canon (evidence srv:1396·
         # 1397) — the #737 E6 arm rung graduates to an ordinary placement like
@@ -1142,6 +1198,10 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # refresh below measures every launchable rung at C on the vendor TB4
         # curve.
         _devin_swe2_profile(),
+        # #1380: the paid fusion lane's second placement — same unmeasured rows
+        # as the A listing above (see the comment there).
+        _devin_fusion_opus55_profile(),
+        _devin_fusion_sonnet55_profile(),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1297:
         # sonnet@high promoted C -> B on the served canon (evidence reps
         # srv:1224·1228·1230·1238·1248·1288·1291·1298·1343·1357); this row
@@ -1859,6 +1919,34 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     if profile == "devin-swe2" or profile.startswith("devin-"):
         return "devin", None
     return "", None
+
+
+# ── #1380: provider family for tester separation ─────────────────────────────
+# The family names the *underlying model vendor* a tester is rated on — a
+# different axis from the quota pool (who bills). The devin fusion rows serve
+# Claude models under the hood, so they share the claude family value the
+# claude rows get from profile_pool — the spend stays Devin credits while the
+# model being measured is Claude. cognition is deliberately NOT a family: it
+# is Cognition's brand, not a tester-ratable model vendor.
+PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
+    "devin-fusion-opus55": "claude",
+    "devin-fusion-sonnet55": "claude",
+}
+
+
+def provider_family(profile: str) -> str:
+    """The tester-separation family of a profile's underlying model.
+
+    Defaults to the quota pool's provider id — most profiles' model vendor IS
+    their pool. ``PROVIDER_FAMILY_OVERRIDES`` names the exceptions where the
+    two axes diverge (today only the paid devin fusion rungs: pool devin,
+    family claude).
+    """
+
+    canonical = PROFILE_ALIASES.get(profile, profile)
+    if canonical in PROVIDER_FAMILY_OVERRIDES:
+        return PROVIDER_FAMILY_OVERRIDES[canonical]
+    return profile_pool(canonical)[0]
 
 
 # ── task #742: 구독 해지(unsubscribed) 플래그 ────────────────────────────────

@@ -350,6 +350,25 @@ AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     # used (hk:doc brief/2026-10-08/haiku55-scopefuel-catalog). The AA-synced
     # price table does not carry the new id yet; a synced row wins when it lands.
     ModelPrice("claude-haiku-5-5", 0.20, 0.10, 0.50, "2026-10-08T00:00:00+00:00"),
+    # #1380: the paid devin fusion lane — vendor list prices from the 10-10
+    # devin models list: opus55 rung input $4 / output $20 per 1M, sonnet55
+    # rung input $2 / output $10 per 1M; blended by the #920 3:1 formula
+    # ((3·in+out)/4 = 8.0 / 4.0). Not AA rows — the seeds carry the price the
+    # catalog rows' billing=paid flag reports.
+    ModelPrice(
+        "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+        8.0,
+        4.0,
+        20.0,
+        "2026-10-10T00:00:00+00:00",
+    ),
+    ModelPrice(
+        "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+        4.0,
+        2.0,
+        10.0,
+        "2026-10-10T00:00:00+00:00",
+    ),
 )
 
 

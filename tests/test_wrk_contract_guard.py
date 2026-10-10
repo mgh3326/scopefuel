@@ -144,6 +144,10 @@ WRK_CATALOG_EXEMPT: dict[str, str] = {
     "devin-ds41-max": "fixed argv; paid ds41 max rung",
     "builder-ds41": "#666 builder spelling of devin-ds41 (operator ds41-builder policy)",
     "builder-ds41-max": "#666 builder spelling of devin-ds41-max",
+    # #1380 part B (agent-skills) keeps these fixed-argv too — same names on
+    # both sides so the two repos' drift guard stays a byte comparison.
+    "devin-fusion-opus55": "fixed argv; #1380 paid fusion rung (family claude, pool devin)",
+    "devin-fusion-sonnet55": "fixed argv; #1380 paid fusion rung (family claude, pool devin)",
     "cc-dsflash": "experimental alias; the CLI is given the alias, not a model id",
     "cc-dspro": "ditto",
     "cc-glm53": "ditto",
