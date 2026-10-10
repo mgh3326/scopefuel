@@ -11,6 +11,7 @@ unmeasured C; devin-ds41-max stays unmeasured C.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 
@@ -37,6 +38,8 @@ VARIANTS: dict[str, str] = {
 }
 EXISTING_DEVIN = ("devin-swe2", "devin-ds41")
 GATE_GOLDEN = FIXTURES / "devin_gate_golden_635.json"
+# devin_usage 픽스처의 캡처 시각 — 연도 없는 절대 리셋 해석을 고정한다.
+_FIXTURE_NOW = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)
 
 
 def _models_list(fixture_text) -> str:
@@ -189,7 +192,7 @@ def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, 
 
 def _measured_devin(fixture_text):
     """#1381: models list 는 쿼타를 안 주므로 측정된 devin 풀은 PTY 세션 파서로 만든다."""
-    return devin.parse_session(fixture_text("devin_usage"))
+    return devin.parse_session(fixture_text("devin_usage"), now=_FIXTURE_NOW)
 
 
 def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_text):

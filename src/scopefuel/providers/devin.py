@@ -11,8 +11,9 @@
 
 - 배너는 두 번 그려진다 — 첫 페인트는 버전만, 몇 초 뒤 커서이동+화면클리어 후
   같은 줄이 쿼타까지 포함해 다시 그려진다. 입력은 상태줄(쿼타 배너)이나
-  입력창 ``❯`` 마커가 확인된 뒤에만 보낸다 — 어느 쪽도 안 보이면 로그인이나
-  업데이트 프롬프트일 수 있으므로 아무것도 치지 않고 끝낸다(fail-closed).
+  composer placeholder(``Ask Devin to build …``)가 확인된 뒤에만 보낸다 —
+  어느 쪽도 안 보이면 로그인이나 업데이트 프롬프트일 수 있으므로 아무것도
+  치지 않고 끝낸다(fail-closed).
   ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
   둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
 - ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
@@ -103,9 +104,12 @@ _USAGE_ROW = re.compile(r"^[ \t]*(?P<axis>daily|weekly)\b", re.IGNORECASE)
 # 구분), ``-5% used``(부호), ``N% remaining``(키워드 없음) 같은 형태는 사용률로
 # 읽지 않는다. 숫자 앞에 [\d,.-] 가 붙어 있으면 거절.
 _USAGE_USED = re.compile(r"(?<![\d,.\-])(?P<used>\d+(?:\.\d+)?)[ \t]*%[ \t]*used\b", re.IGNORECASE)
-# 입력창이 그려졌다는 최소 마커 — devin TUI 의 프롬프트 chevron. 상태줄이
-# 안 그려진 TUI 에도 입력창이 있으면 /usage 를 보낼 수 있다.
-_INPUT_READY = re.compile(r"(?m)^[ \t]*❯")
+# 입력창이 그려졌다는 마커는 프롬프트 chevron 이 아니라 composer placeholder
+# 다 — 실측 캡처(v3000.11.3)의 입력창 줄:
+#   ``❭ Ask Devin to build features, fix bugs, or work on your code``
+# ``❯`` 만으로 시작하는 줄은 로그인·업데이트 프롬프트의 옵션 목록일 수 있으므로
+# 입력을 여는 근거로 쓰지 않는다(fail-closed).
+_INPUT_READY = re.compile(r"(?m)^[ \t]*[❭❯][ \t]*Ask Devin to build")
 _USAGE_RESET = re.compile(
     r"resets?\s+in\s+(?P<reset>\d+(?:\.\d+)?[ \t]*[dhms](?:[ \t]+\d+(?:\.\d+)?[ \t]*[dhms])*)",
     re.IGNORECASE,
@@ -383,7 +387,7 @@ def _probe_session() -> str:
                 with contextlib.suppress(OSError):
                     os.write(master_fd, FOCUS_IN.encode())
                 focus_sent = True
-            # 입력은 상태줄(쿼타 배너)이나 입력창 ❯ 마커가 보인 뒤에만 보낸다 —
+            # 입력은 상태줄(쿼타 배너)이나 composer placeholder 마커가 보인 뒤에만 보낸다 —
             # 어느 쪽도 없으면 그 TUI 는 로그인·업데이트 프롬프트일 수 있으므로
             # 아무것도 치지 않고 deadline 까지 기다린 뒤 fail-closed 로 끝낸다.
             # 조건은 출력 도착과 무관하게 매 반복 평가한다 — TUI 가 침묵하는
@@ -469,8 +473,11 @@ def _probe_session() -> str:
             os.close(master_fd)
 
 
-def parse_session(text: str) -> ProviderResult:
+def parse_session(text: str, now: dt.datetime | None = None) -> ProviderResult:
     """PTY 세션 출력을 daily·weekly 버킷으로 파싱한다. 읽힌 축만 쓴다(fail-closed).
+
+    ``now`` 를 주면 상대·절대 리셋을 그 시각 기준으로 해석한다 — 기본은 실제
+    시계다(테스트는 반드시 고정해야 연도 없는 절대 리셋이 미끄러지지 않는다).
 
     - 기동 배너 ``Pro · N% remaining`` 은 실측상 **weekly** 잔여다(리셋이 24h
       를 넘어 그려진다 — daily 창은 24h 안에 리셋된다).
@@ -480,7 +487,7 @@ def parse_session(text: str) -> ProviderResult:
     """
     clean = _clean(text)
     banner = _banner_quota_match(clean)
-    axes = _usage_axes(clean)
+    axes = _usage_axes(clean, now=now)
     usage_daily = axes.get("daily", {})
     usage_weekly = axes.get("weekly", {})
 
@@ -495,7 +502,7 @@ def parse_session(text: str) -> ProviderResult:
     daily_used = usage_daily.get("used_pct")
     daily_reset_at = usage_daily.get("resets_at")
     weekly_used = usage_weekly.get("used_pct")
-    weekly_reset_at = usage_weekly.get("resets_at") or _reset_iso(banner_weekly_reset)
+    weekly_reset_at = usage_weekly.get("resets_at") or _reset_iso(banner_weekly_reset, now=now)
 
     notes: list[str] = []
     if banner is not None:
@@ -554,7 +561,7 @@ def parse_session(text: str) -> ProviderResult:
     )
 
 
-def _usage_axes(clean: str) -> dict[str, dict[str, object]]:
+def _usage_axes(clean: str, now: dt.datetime | None = None) -> dict[str, dict[str, object]]:
     """/usage 출력의 daily·weekly 축을 물리 줄 단위로 파싱한다.
 
     ``Daily``·``Weekly`` 레이블로 시작하는 각 줄을 한 축 행으로 보고 그 줄
@@ -580,7 +587,7 @@ def _usage_axes(clean: str) -> dict[str, dict[str, object]]:
                 break
         if used is None:
             continue
-        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(line)}
+        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(line, now=now)}
     return axes
 
 

@@ -57,10 +57,16 @@ if mode == "hang":
     time.sleep(120)
     sys.exit(0)
 if mode == "prompt_only":
-    # 입력창 chevron 만 그리고 상태줄(쿼타 배너)은 안 그리는 TUI —
-    # ❯ 마커만 봐도 /usage 를 보낼 수 있는지 확인하는 모드.
-    emit("❯ Ask Devin to build anything...\r\n")
-if mode not in ("no_banner", "prompt_only"):
+    # 입력창 composer placeholder 만 그리고 상태줄(쿼타 배너)은 안 그리는 TUI —
+    # 실측 캡처(v3000.11.3)의 입력창 줄 그대로다.
+    emit("❭ Ask Devin to build features, fix bugs, or work on your code\r\n")
+if mode == "login_prompt":
+    # 로그인 프롬프트 흉내 — chevron 으로 시작하는 옵션 목록은 composer 가
+    # 아니다: bare ❯ 행만 보고 입력을 여는 구현은 여기에 /usage 를 쳐 넣는다.
+    emit("Welcome back — sign in to continue\r\n")
+    emit("❯ Sign in with your org account\r\n")
+    emit("❯ Use an API key\r\n")
+if mode not in ("no_banner", "prompt_only", "login_prompt"):
     emit(BANNER)
 if mode == "crash_after_banner":
     time.sleep(0.8)

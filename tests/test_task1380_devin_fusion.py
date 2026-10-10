@@ -76,7 +76,7 @@ def _devin_ranked_names(output: str) -> list[str]:
 
 def _measured_devin(fixture_text) -> ProviderResult:
     """#1381: models list 는 쿼타를 안 주므로 측정된 devin 풀은 PTY 세션 파서로 만든다."""
-    return devin.parse_session(fixture_text("devin_usage"))
+    return devin.parse_session(fixture_text("devin_usage"), now=NOW)
 
 
 def _placements(name: str) -> list[str]:

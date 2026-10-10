@@ -34,6 +34,10 @@ from scopefuel.recommend import (
 FREE_NOTE = "free until ~2026-10-10"
 NEW_DEVIN_PROFILES = ("devin-glm52", "devin-swe17", "devin-ds41")
 UNMEASURED_DEVIN_PROFILES = ("devin-glm52", "devin-swe17")
+# 픽스처가 캡처된 시각 — parse_session 이 리셋을 해석할 때 쓰는 고정 시계.
+# devin_usage 의 ``resets Oct 11, 5:00 PM (UTC+9)`` 는 연도가 없으므로
+# 실제 시계에 맡기면 캡처일을 지나서 다른 연도로 해석돼 깨진다.
+_NOW = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)
 
 
 def _fixture(fixture_text) -> str:
@@ -231,7 +235,7 @@ def test_devin_swe2_grade_exposure_and_non_aa_provenance():
 
 def _measured_devin(fixture_text):
     """#1381: models list 는 쿼타를 안 주므로 측정된 devin 풀은 PTY 세션 파서로 만든다."""
-    return devin.parse_session(fixture_text("devin_usage"))
+    return devin.parse_session(fixture_text("devin_usage"), now=_NOW)
 
 
 def test_gate_cli_ok_on_measured_quota_fixture(monkeypatch, capsys, fixture_text):
@@ -315,7 +319,7 @@ def test_oserror_from_probe_is_unknown(tmp_path, monkeypatch):
 
 def test_parse_session_banner_fixture_reads_weekly_and_marks_daily_unknown(fixture_text):
     """배너만 읽힌 세션: 배너 퍼센트는 weekly 잔여이고 daily 는 미측정(None)."""
-    result = devin.parse_session(_banner_fixture(fixture_text))
+    result = devin.parse_session(_banner_fixture(fixture_text), now=_NOW)
 
     assert result.error is None
     assert result.plan == "Pro"
@@ -331,7 +335,7 @@ def test_parse_session_banner_fixture_reads_weekly_and_marks_daily_unknown(fixtu
 
 
 def test_parse_session_observed_3000_11_1_fixture_reads_weekly(fixture_text):
-    result = devin.parse_session(_new_banner_fixture(fixture_text))
+    result = devin.parse_session(_new_banner_fixture(fixture_text), now=_NOW)
 
     assert result.error is None
     assert result.plan == "Pro"
@@ -343,23 +347,35 @@ def test_parse_session_observed_3000_11_1_fixture_reads_weekly(fixture_text):
 
 def test_parse_session_usage_fixture_reads_both_axes(fixture_text):
     """AC2: 정제된 /usage 캡처 픽스처에서 daily·weekly 사용률과 리셋을 읽는다."""
-    before = dt.datetime.now(dt.UTC)
-    result = devin.parse_session(fixture_text("devin_usage"))
+    result = devin.parse_session(fixture_text("devin_usage"), now=_NOW)
 
     assert result.error is None
     assert result.plan == "Pro"
     labels = {b.label: b for b in result.buckets}
     assert labels["daily"].used_pct == 0.0
-    # Daily: ``resets in 2h 7m`` — 상대 기간이라 파싱 시각 기준으로 검사한다.
-    daily_reset = dt.datetime.fromisoformat(labels["daily"].resets_at)
-    assert (
-        before + dt.timedelta(hours=2, minutes=6)
-        <= daily_reset
-        <= dt.datetime.now(dt.UTC) + dt.timedelta(hours=2, minutes=8)
-    )
+    # Daily: ``resets in 2h 7m`` — 고정 시계(_NOW) 기준 상대 기간.
+    assert labels["daily"].resets_at == "2026-10-10T14:07:00+00:00"
     assert labels["weekly"].used_pct == 18.0
     # Weekly: ``resets Oct 11, 5:00 PM (UTC+9)`` — 절대 시각 그대로.
     assert labels["weekly"].resets_at == "2026-10-11T17:00:00+09:00"
+
+
+def test_parse_session_resolves_yearless_reset_against_given_now(fixture_text):
+    """연도 없는 절대 리셋은 주어진 ``now`` 로 해석한다 — 실제 시계 의존 금지.
+
+    now 를 캡처 이후(2026-10-13)로 둬도 같은 픽스처의 ``resets Oct 11`` 은
+    Oct 11 로 읽힌다 — 하루 이상 지난 2026 후보는 버려지고 다음 Oct 11
+    (2027)이 고른다.
+    """
+    later = dt.datetime(2026, 10, 13, 12, 0, tzinfo=dt.UTC)
+
+    result = devin.parse_session(fixture_text("devin_usage"), now=later)
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0
+    assert labels["weekly"].resets_at == "2027-10-11T17:00:00+09:00"
+    assert labels["daily"].resets_at == "2026-10-13T14:07:00+00:00"
 
 
 def _rendered_windows(result: devin.ProviderResult, now: dt.datetime | None = None) -> str:
@@ -376,10 +392,10 @@ def test_parse_session_desk_case_renders_il_and_ju_not_wol(fixture_text):
 
     옛 매핑(배너=daily, swe-2 Free=account 30d)이면 '일 18% · 월 0%' 가 나온다.
     """
-    result = devin.parse_session(fixture_text("devin_usage"))
+    result = devin.parse_session(fixture_text("devin_usage"), now=_NOW)
     assert result.error is None
 
-    rendered = _rendered_windows(result)
+    rendered = _rendered_windows(result, now=_NOW)
     assert rendered == "일 0% · 주 18% · 제약=일"
     assert "월" not in rendered
 
@@ -396,7 +412,7 @@ def test_parse_session_rejects_unrelated_partial_unknown_and_out_of_range_text(f
     ]
 
     for text in cases:
-        result = devin.parse_session(text)
+        result = devin.parse_session(text, now=_NOW)
         assert result.error is not None, text
         assert result.buckets == [], text
 
@@ -405,7 +421,7 @@ def test_parse_session_format_mismatch_does_not_guess_used_pct():
     """배너는 있으나 쿼타 세그먼트가 다른 형식이면 fail-closed."""
     mutated = "v3000.10.31 · Pro · quota 100 percent (resets in 1h 41m)"
 
-    result = devin.parse_session(mutated)
+    result = devin.parse_session(mutated, now=_NOW)
 
     assert result.error is not None
     assert result.buckets == []
@@ -418,7 +434,7 @@ def test_parse_session_first_paint_only_is_fail_closed(fixture_text):
     first_paint_only = full[: full.index(redraw_marker)]
     assert "remaining" not in first_paint_only
 
-    result = devin.parse_session(first_paint_only)
+    result = devin.parse_session(first_paint_only, now=_NOW)
 
     assert result.error is not None
     assert result.buckets == []
@@ -433,7 +449,7 @@ def test_parse_session_usage_wins_over_banner_on_same_window():
         "Weekly 40% used (resets in 1d 2h)\r\n"
     )
 
-    result = devin.parse_session(text)
+    result = devin.parse_session(text, now=_NOW)
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
@@ -457,7 +473,7 @@ def test_parse_session_usage_wins_over_banner_on_same_window():
 )
 def test_usage_row_malformed_percent_never_becomes_used(line, axis):
     """S1 섹션 D: 깨진 퍼센트·remaining 문구는 그 축을 만들지 않는다(None, 추정 금지)."""
-    axes = devin._usage_axes(devin._clean(line))
+    axes = devin._usage_axes(devin._clean(line), now=_NOW)
 
     assert axis not in axes
 
@@ -472,7 +488,7 @@ def test_usage_repaint_or_other_line_never_feeds_a_row():
         "Pro · 82% remaining (resets in 1d 2h)\r\n"  # 상태줄 리페인트
     )
 
-    result = devin.parse_session(text)
+    result = devin.parse_session(text, now=_NOW)
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
@@ -492,7 +508,7 @@ def test_usage_stray_label_word_does_not_block_the_real_row():
         " Weekly 18% used  · resets Oct 11, 5:00 PM (UTC+9)\r\n"
     )
 
-    result = devin.parse_session(text)
+    result = devin.parse_session(text, now=_NOW)
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
@@ -508,7 +524,7 @@ def test_usage_daily_row_without_used_stays_none_even_with_banner():
         " Weekly 18% used  · resets Oct 11, 5:00 PM (UTC+9)\r\n"
     )
 
-    result = devin.parse_session(text)
+    result = devin.parse_session(text, now=_NOW)
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
@@ -737,7 +753,7 @@ def test_probe_usage_unanswered_keeps_banner_axis_and_daily_none(tmp_path, monke
 
 
 def test_probe_sends_no_input_when_no_status_line_or_input_marker(tmp_path, monkeypatch, fixture_text):
-    """S2: 상태줄도 입력창 ❯ 마커도 없으면 어떤 입력도 치지 않는다(blind input 금지).
+    """S2: 상태줄도 composer 마커도 없으면 어떤 입력도 치지 않는다(blind input 금지).
 
     로그인·업데이트 프롬프트에 Enter 가 들어가는 것을 막는다 — 기다리다가
     deadline 에 fail-closed 로 끝난다.
@@ -755,8 +771,28 @@ def test_probe_sends_no_input_when_no_status_line_or_input_marker(tmp_path, monk
     assert _stub_reads(log) == []
 
 
+def test_probe_sends_no_input_to_login_like_arrow_options(tmp_path, monkeypatch, fixture_text):
+    """CodeRabbit minor: chevron 으로 시작하는 옵션 목록은 composer 가 아니다.
+
+    로그인형 프롬프트가 ``❯ …`` 옵션을 그려도 composer placeholder
+    (``Ask Devin to build …``)가 없으면 입력을 열지 않는다 — bare ❯ 를
+    받아들이는 뮤턴트는 여기에 /usage 를 쳐 넣어 RED 가 된다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="login_prompt", models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert result.warning is not None  # 쿼타 프로브 fail-closed → models 만
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct is None
+    assert labels["weekly"].used_pct is None
+    assert _stub_reads(log) == []
+
+
 def test_probe_sends_usage_after_input_box_marker_without_banner(tmp_path, monkeypatch, fixture_text):
-    """S2: 상태줄은 안 보여도 입력창 ❯ 마커가 확인되면 /usage 를 보낸다."""
+    """S2: 상태줄은 안 보여도 composer placeholder 마커가 확인되면 /usage 를 보낸다."""
     log = _stub_tui_binary(tmp_path, monkeypatch, mode="prompt_only", models_payload=_fixture(fixture_text))
 
     result = devin.fetch()
@@ -871,7 +907,7 @@ def test_probe_session_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypa
     monkeypatch.setattr(devin.fcntl, "ioctl", recording_ioctl)
 
     output = devin._probe_session()
-    result = devin.parse_session(output)
+    result = devin.parse_session(output, now=_NOW)
 
     assert result.error is None
     labels = {b.label: b for b in result.buckets}
