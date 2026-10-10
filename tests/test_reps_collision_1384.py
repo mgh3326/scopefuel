@@ -1,0 +1,592 @@
+"""task #1384 — collision-free rep origin ids, write-ahead, server-contract binds.
+
+The old client derived ``origin_id`` from local SQLite maxima, so two hosts
+sharing one bearer token (one ``created_by``) picked the same key and the
+server's ``ON CONFLICT DO UPDATE`` silently overwrote the earlier rep. This
+suite runs an in-process fake of ``PUT/GET /v1/bench/reps`` in both server
+dialects — "new" (post-#1384: ``ids`` in the PUT response, 409
+``bench_rep_conflict`` on a differing slot, identical resend returns the
+stored id) and "old" (bare ``upserted`` count, silent overwrite) — plus two
+client identities with separate local DBs under one token.
+
+Each test doubles as a mutant guard named in its docstring: restoring
+``_next_origin_id``, generating a fresh retry id, binding a non-unique or
+content-different row, or showing cached content under a contradicted
+``srv:`` id must all go RED.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import urllib.parse
+from collections import Counter
+
+import pytest
+
+from scopefuel import bench, cli
+
+HK_URL = "https://hk.invalid"
+HK_TOKEN = "hk-test-token"
+CLIENT = "ops"  # the token's client identity, stamped server-side on PUT
+BAND_BASE = 1 << 62
+BAND_TOP = 1 << 63
+
+# Wire fields the server's identical-resend rule compares — everything the
+# client PUTs except the (created_by, origin_id) key itself.
+_CONTENT_FIELDS = (
+    "profile",
+    "model_id",
+    "task_ref",
+    "tier",
+    "role",
+    "rounds",
+    "blockers_found",
+    "completed",
+    "input_tokens",
+    "output_tokens",
+    "notes",
+    "recorded_at",
+    "effort",
+    "grade",
+    "table_grade",
+)
+
+
+class FakeRepStore:
+    """In-process GET/PUT /v1/bench/reps keyed on (created_by, origin_id)."""
+
+    def __init__(self, url: str, *, mode: str) -> None:
+        assert mode in {"new", "old"}
+        self.url = url
+        self.mode = mode
+        self.reps: list[dict] = []
+        self.hits: Counter[str] = Counter()
+        self.offline = False
+        # Raised on the next PUT after the write is applied ("landed") or
+        # before it ("lost") — the two ways a response can go missing.
+        self.fail_next_put: BaseException | None = None
+        self.fail_next_put_after_write = False
+        # Rewrites the store after a PUT applies — models a second host's
+        # resend landing between our PUT and our post-write GET.
+        self.after_put = None
+
+    @staticmethod
+    def _same_content(a: dict, b: dict) -> bool:
+        return all(a.get(field) == b.get(field) for field in _CONTENT_FIELDS)
+
+    def _put_new(self, rows: list[dict]) -> dict:
+        ids: list[int] = []
+        conflicts: list[dict] = []
+        staged: list[dict] = []
+        for index, row in enumerate(rows):
+            stored = dict(row)
+            stored["created_by"] = CLIENT
+            stored.setdefault("created_at", "2026-10-10T00:00:00Z")
+            match = next(
+                (
+                    old
+                    for old in self.reps + staged
+                    if old["origin_id"] == stored["origin_id"] and old["created_by"] == CLIENT
+                ),
+                None,
+            )
+            if match is None:
+                stored["id"] = max((old["id"] for old in self.reps + staged), default=0) + 1
+                staged.append(stored)
+                ids.append(stored["id"])
+            elif self._same_content(match, stored):
+                ids.append(match["id"])  # identical resend: the stored id
+            else:
+                conflicts.append(
+                    {
+                        "index": index,
+                        "origin_id": stored["origin_id"],
+                        "conflict_server_id": match["id"],
+                    }
+                )
+        if conflicts:
+            raise bench.HttpError(409, json.dumps({"error": "bench_rep_conflict", "conflicts": conflicts}))
+        self.reps.extend(staged)
+        return {"upserted": len(rows), "ids": ids}
+
+    def _put_old(self, rows: list[dict]) -> dict:
+        for row in rows:
+            stored = dict(row)
+            stored["created_by"] = CLIENT
+            stored.setdefault("created_at", "2026-10-10T00:00:00Z")
+            match = next(
+                (
+                    old
+                    for old in self.reps
+                    if old["origin_id"] == stored["origin_id"] and old["created_by"] == CLIENT
+                ),
+                None,
+            )
+            if match is None:
+                stored["id"] = max((old["id"] for old in self.reps), default=0) + 1
+                self.reps.append(stored)
+            else:
+                stored["id"] = match["id"]
+                self.reps[self.reps.index(match)] = stored
+        return {"upserted": len(rows)}
+
+    def __call__(self, url, *, method="GET", headers=None, body=None, timeout=None, **_kw):
+        assert (headers or {}).get("Authorization") == f"Bearer {HK_TOKEN}"
+        url = str(url)
+        assert url.startswith(self.url), f"request left the configured endpoint: {url}"
+        split = urllib.parse.urlsplit(url)
+        assert split.path == "/v1/bench/reps", f"unexpected path: {url}"
+        params = urllib.parse.parse_qs(split.query)
+        assert set(params) <= {"limit", "profile"}, f"unexpected query: {sorted(params)}"
+        self.hits[method] += 1
+        if self.offline:
+            raise OSError("offline")
+        if method == "GET":
+            limit = min(int(params.get("limit", ["1000"])[0]), 5000)
+            profile = params.get("profile", [""])[0]
+            rows = self.reps
+            if profile:
+                rows = [row for row in rows if row["profile"] == profile]
+            rows = sorted(rows, key=lambda row: row["id"], reverse=True)[:limit]
+            return {"reps": [dict(row) for row in rows]}
+        assert method == "PUT" and body is not None
+        rows = body["reps"]
+        assert 1 <= len(rows) <= 1000
+        failure = self.fail_next_put
+        self.fail_next_put = None
+        if failure is not None and not self.fail_next_put_after_write:
+            raise failure
+        result = self._put_new(rows) if self.mode == "new" else self._put_old(rows)
+        if self.after_put is not None:
+            hook, self.after_put = self.after_put, None
+            hook()
+        if failure is not None:
+            raise failure
+        return result
+
+
+def _client_env(home, monkeypatch, *, backend: str = "handoffkeep") -> None:
+    config = home / "config" / "scopefuel" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(f'[bench]\nbackend = "{backend}"\n', encoding="utf-8")
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+
+
+def _remote(monkeypatch, home, mode: str = "new") -> FakeRepStore:
+    _client_env(home, monkeypatch)
+    monkeypatch.setenv("HANDOFFKEEP_URL", HK_URL)
+    monkeypatch.setenv("HANDOFFKEEP_TOKEN", HK_TOKEN)
+    fake = FakeRepStore(HK_URL, mode=mode)
+    monkeypatch.setattr(bench, "request_json", fake)
+    return fake
+
+
+def _add_args(task="1384", notes="rep", **overrides) -> list[str]:
+    args = [
+        "reps",
+        "add",
+        "--profile",
+        "builder-devin-max",
+        "--model",
+        "swe-2-max",
+        "--task",
+        task,
+        "--tier",
+        "T1",
+        "--role",
+        "impl",
+        "--grade",
+        "A",
+        "--rounds",
+        "1",
+        "--blockers-found",
+        "0",
+        "--completed",
+        "1",
+        "--notes",
+        notes,
+    ]
+    if overrides.get("effort"):
+        args += ["--effort", overrides["effort"]]
+    return args
+
+
+def _remote_row(*, id: int, origin_id: int, created_by: str = CLIENT, **fields) -> dict:
+    row = {
+        "id": id,
+        "origin_id": origin_id,
+        "created_by": created_by,
+        "created_at": "2026-10-10T00:00:00Z",
+        "profile": "builder-devin-max",
+        "model_id": "swe-2-max",
+        "task_ref": "1384",
+        "tier": "T1",
+        "role": "impl",
+        "rounds": 1,
+        "blockers_found": 0,
+        "completed": 1,
+        "input_tokens": None,
+        "output_tokens": None,
+        "notes": "rep",
+        "recorded_at": "2026-10-10T00:00:00Z",
+        "effort": None,
+        "grade": "A",
+        "table_grade": "A",
+    }
+    row.update(fields)
+    return row
+
+
+def _seed_cache_row(
+    home,
+    *,
+    cache_key: str,
+    origin_id: int,
+    server_id: int | None = None,
+    created_by: str | None = None,
+    **fields,
+) -> None:
+    row = {
+        "profile": "builder-devin-max",
+        "model_id": "swe-2-max",
+        "task_ref": "1384",
+        "tier": "T1",
+        "role": "impl",
+        "rounds": 1,
+        "blockers_found": 0,
+        "completed": 1,
+        "input_tokens": None,
+        "output_tokens": None,
+        "notes": "rep",
+        "recorded_at": "2026-10-10T00:00:00Z",
+        "effort": None,
+        "grade": "A",
+        "table_grade": "A",
+    }
+    row.update(fields)
+    conn = bench._cache_connect()
+    try:
+        conn.execute(
+            "INSERT INTO bench_cache_reps "
+            "(cache_key, server_id, origin_id, created_by, profile, model_id, task_ref, tier, role, "
+            "rounds, blockers_found, completed, input_tokens, output_tokens, notes, recorded_at, "
+            "effort, grade, table_grade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cache_key,
+                server_id,
+                origin_id,
+                created_by,
+                row["profile"],
+                row["model_id"],
+                row["task_ref"],
+                row["tier"],
+                row["role"],
+                row["rounds"],
+                row["blockers_found"],
+                row["completed"],
+                row["input_tokens"],
+                row["output_tokens"],
+                row["notes"],
+                row["recorded_at"],
+                row["effort"],
+                row["grade"],
+                row["table_grade"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _pending_rows(home) -> list[sqlite3.Row]:
+    conn = bench._cache_connect()
+    try:
+        return conn.execute(
+            "SELECT origin_id, task_ref, notes FROM bench_pending_reps ORDER BY origin_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_origin_ids_stay_inside_the_band_over_10k_draws():
+    """Band guard (mutant: _next_origin_id restored). Every draw must sit in
+    [2^62, 2^63) — disjoint from legacy counters and the migrate band — and
+    10k draws must not collide."""
+
+    assert not hasattr(bench, "_next_origin_id")
+    draws = [bench._new_rep_origin_id() for _ in range(10_000)]
+    assert all(BAND_BASE <= value < BAND_TOP for value in draws)
+    assert len(set(draws)) == len(draws)
+
+
+def test_two_clients_same_token_distinct_origins_and_bound_ids(tmp_path, monkeypatch, capsys):
+    """Two hosts, one token, separate local DBs: every add gets its own key
+    and the printed srv id is the row that actually holds the rep."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    printed: dict[int, str] = {}
+    origins: set[int] = set()
+    for client, task, notes in (
+        ("hosta", "a1", "rep from host A"),
+        ("hostb", "b1", "rep from host B"),
+        ("hosta", "a2", "second rep from host A"),
+        ("hostb", "b2", "second rep from host B"),
+    ):
+        _client_env(tmp_path / client, monkeypatch)
+        assert cli.main(_add_args(task=task, notes=notes)) == 0
+        match = re.search(r"recorded rep id=srv:(\d+)", capsys.readouterr().out)
+        assert match, "the add did not print a server id"
+        printed[int(match.group(1))] = task
+
+    assert len(printed) == 4
+    assert len(fake.reps) == 4
+    for row in fake.reps:
+        assert BAND_BASE <= row["origin_id"] < BAND_TOP
+        origins.add(row["origin_id"])
+        # The printed id names exactly the row holding that rep's content.
+        assert printed[row["id"]] == row["task_ref"]
+    assert len(origins) == 4
+
+    # Each client's cache holds at least its own reps, server-bound. (The
+    # cache mirrors the fetched page — hosta's predates hostb's later adds.)
+    for client, tasks in (("hosta", {"a1", "a2"}), ("hostb", {"b1", "b2"})):
+        _client_env(tmp_path / client, monkeypatch)
+        conn = bench._cache_connect()
+        try:
+            cached = conn.execute("SELECT server_id, task_ref FROM bench_cache_reps").fetchall()
+        finally:
+            conn.close()
+        mine = [row for row in cached if row["task_ref"] in tasks]
+        assert {row["task_ref"] for row in mine} == tasks
+        assert all(row["server_id"] is not None for row in mine)
+
+
+def test_new_server_409_prints_both_ids_and_differing_fields(tmp_path, monkeypatch, capsys):
+    """Forced same-origin/different-content collision on the new server:
+    409, both ids named, differing fields named, exit 2, nothing written."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    _client_env(tmp_path / "hosta", monkeypatch)
+    assert cli.main(_add_args(task="victim", notes="host A's rep")) == 0
+    out = capsys.readouterr().out
+    assert "recorded rep id=srv:1" in out
+    origin = fake.reps[0]["origin_id"]
+
+    _client_env(tmp_path / "hostb", monkeypatch)
+    # A buggy/mutant client reusing a taken key: force the collision the band
+    # makes unreachable in practice.
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: origin)
+    assert cli.main(_add_args(task="attacker", notes="host B's rep")) == 2
+    captured = capsys.readouterr()
+    assert f"origin:{origin}" in captured.err
+    assert "srv:1" in captured.err
+    assert "task_ref" in captured.err or "notes" in captured.err  # differing fields
+    # The refused batch wrote nothing — the victim's row is intact and the
+    # client did not retry under a fresh id.
+    assert len(fake.reps) == 1
+    assert fake.reps[0]["task_ref"] == "victim"
+    assert fake.hits["PUT"] == 2
+
+    # The refused rep stays queued locally as origin:<O> — never srv:1.
+    pending = _pending_rows(tmp_path / "hostb")
+    assert [row["origin_id"] for row in pending] == [origin]
+    assert cli.main(["reps", "list"]) == 0
+    out = capsys.readouterr().out
+    attacker_line = next(line for line in out.splitlines() if "task=attacker" in line)
+    assert f"id=origin:{origin}" in attacker_line
+    assert "srv:" not in attacker_line
+
+
+def test_old_server_contradicted_slot_binds_fail_closed(tmp_path, monkeypatch, capsys):
+    """Old server (no ids, silent overwrite): host B's PUT lands, but the
+    victim's resend reclaims the slot before B's post-write GET — the real
+    ping-pong from the root-cause transcript. The bind then sees a different
+    rep under the key and must stay origin:<O> (mutant: bind accepts a
+    content-different row)."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta", mode="old")
+    _client_env(tmp_path / "hosta", monkeypatch)
+    assert cli.main(_add_args(task="victim", notes="host A's rep")) == 0
+    capsys.readouterr()
+    origin = fake.reps[0]["origin_id"]
+    victim = dict(fake.reps[0])
+
+    _client_env(tmp_path / "hostb", monkeypatch)
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: origin)
+    fake.after_put = lambda: fake.reps.__setitem__(
+        next(i for i, row in enumerate(fake.reps) if row["origin_id"] == origin), victim
+    )
+    assert cli.main(_add_args(task="attacker", notes="host B's rep")) == 0
+    captured = capsys.readouterr()
+    assert f"recorded rep id=origin:{origin}" in captured.out
+    assert "srv:" not in captured.out
+    assert "warning" in captured.err
+    assert f"origin:{origin}" in captured.err
+
+    # B's own rep must not claim srv:1 — the cache row under srv:1 is the
+    # server's row (A's content), and B's rep stays an unbound origin marker.
+    conn = bench._cache_connect()
+    try:
+        rows = conn.execute(
+            "SELECT cache_key, server_id, task_ref FROM bench_cache_reps WHERE origin_id = ?",
+            (origin,),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_task = {row["task_ref"]: row["server_id"] for row in rows}
+    assert by_task["victim"] == 1  # the server's row, cached faithfully
+    assert by_task["attacker"] is None  # never bound to the foreign pk
+
+
+def test_old_server_clean_bind_still_learns_srv_id(tmp_path, monkeypatch, capsys):
+    """On an old server with no collision the GET bind still proves and
+    prints the real server pk."""
+
+    _remote(monkeypatch, tmp_path / "hosta", mode="old")
+    assert cli.main(_add_args()) == 0
+    assert "recorded rep id=srv:1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("request timed out"), bench.HttpError(503, "")],
+    ids=["timeout", "5xx"],
+)
+def test_write_ahead_retry_resends_same_origin(tmp_path, monkeypatch, capsys, failure):
+    """Write-ahead (mutant: fresh id on retry). A PUT whose response never
+    arrives leaves a pending row; the retry resends the same origin_id and
+    payload, and the server's identical-resend rule answers the same id."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    fake.fail_next_put = failure
+    monkeypatch.setattr(bench, "_utc_now", lambda: "2026-10-10T12:00:00+00:00")
+
+    assert cli.main(_add_args()) == 2
+    captured = capsys.readouterr()
+    assert "stays queued locally as origin:" in captured.err
+    pending = _pending_rows(tmp_path / "hosta")
+    assert len(pending) == 1
+    origin = pending[0]["origin_id"]
+    assert BAND_BASE <= origin < BAND_TOP
+    assert fake.reps == []  # the PUT was refused before it landed
+
+    # While the server is unreachable the rep lists as its origin key only.
+    fake.offline = True
+    assert cli.main(["reps", "list"]) == 0
+    out = capsys.readouterr().out
+    assert f"id=origin:{origin}" in out
+    assert "id=srv:" not in out
+    fake.offline = False
+
+    assert cli.main(_add_args()) == 0
+    out = capsys.readouterr().out
+    assert "recorded rep id=srv:1" in out
+    assert len(fake.reps) == 1
+    assert fake.reps[0]["origin_id"] == origin  # resent under the same key
+    assert _pending_rows(tmp_path / "hosta") == []  # confirmed: cleared
+
+
+def test_write_ahead_retry_after_lost_response_keeps_one_row(tmp_path, monkeypatch, capsys):
+    """The dangerous case: the PUT landed but the answer was lost. The retry
+    must resend the same key — the server returns the same id, no dup."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    fake.fail_next_put = OSError("connection dropped after write")
+    fake.fail_next_put_after_write = True
+    monkeypatch.setattr(bench, "_utc_now", lambda: "2026-10-10T12:00:00+00:00")
+
+    assert cli.main(_add_args()) == 2
+    capsys.readouterr()
+    assert len(fake.reps) == 1  # the write landed anyway
+    origin = fake.reps[0]["origin_id"]
+
+    assert cli.main(_add_args()) == 0
+    out = capsys.readouterr().out
+    assert "recorded rep id=srv:1" in out
+    assert len(fake.reps) == 1
+    assert fake.reps[0]["origin_id"] == origin
+    assert _pending_rows(tmp_path / "hosta") == []
+
+
+def test_cache_shadow_moves_contradicted_row_to_lost(tmp_path, monkeypatch, capsys):
+    """Shadow rule (mutant: cached content shown under a contradicted srv id).
+
+    The cache remembers our rep at srv:7; the server now holds a different
+    rep there (an overwrite happened while the cache was stale). Refetch must
+    show the server row as srv:7 and our copy as lost:<origin> — warned once,
+    never written back."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    origin = BAND_BASE + 4242
+    fake.reps.append(_remote_row(id=7, origin_id=origin, task_ref="other-rep", notes="whoever wrote last"))
+    _seed_cache_row(
+        tmp_path / "hosta",
+        cache_key=f"shared:{origin}",
+        origin_id=origin,
+        server_id=7,
+        created_by=CLIENT,
+        task_ref="my-rep",
+        notes="the rep this host recorded",
+    )
+
+    assert cli.main(["reps", "list"]) == 0
+    captured = capsys.readouterr()
+    assert "shadowed" in captured.err
+    server_line = next(line for line in captured.out.splitlines() if "id=srv:7" in line)
+    assert "task=other-rep" in server_line  # server content is authoritative
+    lost_line = next(line for line in captured.out.splitlines() if f"id=lost:{origin}" in line)
+    assert "task=my-rep" in lost_line  # the local copy keeps its own content
+    assert "shadowed-by=srv:7" in lost_line
+    assert "reps add" in captured.out  # the re-add hint
+    assert fake.hits["PUT"] == 0  # nothing is ever written back
+
+    conn = bench._cache_connect()
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM bench_cache_reps WHERE task_ref = 'my-rep'").fetchone()[0] == 0
+        )
+        lost = conn.execute("SELECT shadowed_by FROM bench_lost_reps").fetchall()
+    finally:
+        conn.close()
+    assert [row["shadowed_by"] for row in lost] == [7]
+
+    # The warning fires once — the copy lives in the lost table afterwards.
+    assert cli.main(["reps", "list"]) == 0
+    captured = capsys.readouterr()
+    assert "shadowed" not in captured.err
+    assert f"id=lost:{origin}" in captured.out
+
+
+def test_push_local_uses_stable_banded_ids_and_is_idempotent(tmp_path, monkeypatch, capsys):
+    """push_local derives a stable band key per local row, so a re-run
+    resends the same origin_id and the server stays at one row."""
+
+    home = tmp_path / "hosta"
+    _client_env(home, monkeypatch, backend="local")
+    monkeypatch.setattr(bench, "request_json", lambda *a, **k: pytest.fail("network called"))
+    assert cli.main(_add_args(task="local-rep", notes="kept locally")) == 0
+    capsys.readouterr()
+
+    fake = _remote(monkeypatch, home)
+    scores, reps = bench.push_local()
+    assert (scores, reps) == (0, 1)
+    assert len(fake.reps) == 1
+    first = dict(fake.reps[0])
+    assert BAND_BASE <= first["origin_id"] < BAND_TOP
+    assert first["task_ref"] == "local-rep"
+
+    scores, reps = bench.push_local()
+    assert (scores, reps) == (0, 1)
+    assert len(fake.reps) == 1  # resend, not a duplicate
+    assert fake.reps[0] == first  # same server id, same content, same key
+
+
+def test_migrate_still_uses_its_own_band(tmp_path, monkeypatch):
+    """reps migrate keeps the [2^40, 2^40+2^48) band — untouched by #1384."""
+
+    origin = bench._migrate_origin_id("host", "profile", 7)
+    assert (1 << 40) <= origin < (1 << 40) + (1 << 48)

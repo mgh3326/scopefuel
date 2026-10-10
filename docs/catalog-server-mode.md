@@ -254,6 +254,55 @@ $ scopefuel policy launch opus --json
 
 Steps 1 and 2 write to handoffkeep. Nothing in the #593 PRs performs a server write.
 
+## Rep identity on the server (#1384)
+
+Reps share the handoffkeep backend but keep their own write contract, which
+differs from the catalog's: the server upsert key is `(created_by,
+origin_id)` and `created_by` is derived from the bearer token, so hosts that
+share a token share one key space. Since #1384 the client picks `origin_id`
+as a random draw in the reserved band `[2^62, 2^63)` (`2^62 +
+secrets.randbits(62)`) — disjoint from legacy counter ids and from the
+`reps migrate` band `[2^40, 2^40+2^48)` — so two hosts can no longer collide
+on the same key.
+
+`reps list` names every id with its store: `srv:<id>` for a confirmed server
+row, `origin:<id>` for a rep whose server pk is not yet proven locally,
+`lost:<id>` for a local copy the server contradicts (with
+`shadowed-by=srv:N`), `local:<id>` for local-backend rows.
+
+Client write path, in order:
+
+1. **Write-ahead.** Before the PUT, the rep (origin_id + full payload, no
+   server id) is persisted in the local `bench_pending_reps` table. A retry
+   after a failure or timeout resends the *same* key and payload — the
+   server's identical-resend rule answers the same server id, never a
+   duplicate.
+2. **Ids from the PUT response** when the server supplies them (post-#1384
+   contract: `{"upserted": n, "ids": [...]}` in input order). Those ids are
+   authoritative.
+3. **Fail-closed GET bind on old servers** that answer a bare count: a rep
+   takes `srv:` only from the unique holder of its `origin_id` + identical
+   content inside a provably complete read window; otherwise it stays
+   `origin:` and a warning is printed. A foreign server id is never
+   reported.
+4. **409 `bench_rep_conflict`.** A differing rep already holding the slot
+   rejects the whole batch; the client prints `origin:<id>` and
+   `srv:<conflict_server_id>` (plus the differing field names when the
+   server row is readable), exits 2, and never retries under a fresh id.
+
+`bench push-local` uses the same band: each local row's `origin_id` is a
+stable SHA-256 hash of `(hostname, profile, local rowid)`, so a re-run is an
+idempotent resend and identical local rowids on different hosts cannot
+collide. `reps migrate` keeps its own hashed band unchanged.
+
+**Shadow rule.** The server row is authoritative for a server id: on
+refetch, a cache row whose `server_id` S holds different content on the
+server is overwrite evidence — it moves to `bench_lost_reps` (warned once),
+`reps list` shows the server row as `srv:S` and the local copy as
+`lost:<origin>` with a re-add hint, and nothing is ever written back
+automatically. Recovery of lost reps is a one-time, operator-reviewed
+manifest re-add — not an automatic path.
+
 ## Quota measurement note
 
 Three machines each poll the same Claude usage API, which started returning
