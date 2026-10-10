@@ -23,11 +23,13 @@ import pathlib
 import pytest
 
 from scopefuel import bench, cli, launch
+from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.providers import devin
 from scopefuel.recommend import (
     DEVIN_FUSION_ANNOTATION,
     GRADE_TABLE,
     PROFILE_ALIASES,
+    _evaluate,
     _profile_has_benchmark_score,
     is_rep_measured,
     profile_pool,
@@ -51,7 +53,10 @@ FUSION_INPUT_PRICE = {
     "devin-fusion-opus55": 4.0,
     "devin-fusion-sonnet55": 2.0,
 }
-FUSION_PLACEMENTS = {"devin-fusion-opus55": ["A", "B"], "devin-fusion-sonnet55": ["A", "B"]}
+# B only — verdict 1380a-verify-20261010-1449 BLOCKER B1/S1, director option
+# (b): a whole-model-unmeasured row claims no A placement, and the B-only
+# listing keeps every rep-measured row ahead of it under equal quota.
+FUSION_PLACEMENTS = {"devin-fusion-opus55": ["B"], "devin-fusion-sonnet55": ["B"]}
 
 
 def _ranked(output: str) -> list[str]:
@@ -65,6 +70,54 @@ def _devin_ranked_names(output: str) -> list[str]:
 
 def _placements(name: str) -> list[str]:
     return [grade for grade, profiles in GRADE_TABLE.items() if any(p.name == name for p in profiles)]
+
+
+def _equal_quota_providers() -> list[ProviderResult]:
+    """Every pool the grade tables route to, at identical 10% weekly standing
+    — the verifier's equal-quota probe shape."""
+    scopes: dict[str, set[str | None]] = {}
+    for profiles in GRADE_TABLE.values():
+        for p in profiles:
+            provider_id, group = profile_pool(p.name)
+            if provider_id:
+                scopes.setdefault(provider_id, set()).add(group)
+    return [
+        ProviderResult(
+            id=provider_id,
+            pool_class="spend",
+            buckets=[
+                Bucket(
+                    label="7d",
+                    window="7d",
+                    used_pct=10.0,
+                    resets_at=(NOW + dt.timedelta(days=6)).isoformat(),
+                    scope=Scope("account") if group is None else Scope("group", group),
+                    horizon="week",  # type: ignore[arg-type]
+                )
+                for group in group_names
+            ],
+        )
+        for provider_id, group_names in scopes.items()
+    ]
+
+
+def _is_measured(candidate) -> bool:
+    """Score-measured (benchmark or AA-agent score) or rep-measured — the two
+    senses of "measured" the AC2 ordering requirement uses."""
+    return _profile_has_benchmark_score(candidate.profile, []) or is_rep_measured(candidate.profile)
+
+
+def _b_evaluation(providers):
+    return _evaluate(
+        providers,
+        "B",
+        TODAY,
+        NOW,
+        urgency_hours=672.0,
+        bench_scores=[],
+        normalized_prices={},
+        table=GRADE_TABLE,
+    )
 
 
 # ── AC1: policy launch --json ────────────────────────────────────────────────
@@ -83,6 +136,7 @@ def test_policy_launch_json_reports_fusion_id_paid_family_devin_pool(capsys, nam
     assert decision["billing"] == "paid"
     assert decision["family"] == "claude"
     assert decision["pool"] == "devin"
+    assert decision["grade"] == "B"  # B-only listing — no A claim
     assert decision["gate"] == "default"
     assert decision["effort"] == ""
 
@@ -100,7 +154,7 @@ def test_policy_launch_text_surface_carries_the_same_fields(capsys):
 # ── rows: placements, spelling, billing, unmeasured ──────────────────────────
 
 
-def test_fusion_rows_are_placed_at_a_and_b_nowhere_else():
+def test_fusion_rows_are_placed_at_b_nowhere_else():
     for name in FUSION_PROFILES:
         assert _placements(name) == FUSION_PLACEMENTS[name]
 
@@ -189,15 +243,16 @@ def test_grades_model_equivalence_maps_fusion_ids_to_profiles():
         assert MODEL_EQUIVALENCE[uid] == frozenset({name})
 
 
-def test_fusion_snapshot_rows_collapse_to_the_best_placement():
-    """Both A/B listings emit one (profile, "") catalog row at the best grade A
-    with the fusion model id and the devin pool — same shape as devin-swe2."""
+def test_fusion_snapshot_rows_collapse_to_the_b_placement():
+    """The single B listing emits one (profile, "") catalog row at grade B
+    with the fusion model id and the devin pool — the bundled snapshot
+    carries grade B, no A claim."""
     for name, uid in FUSION_IDS.items():
         rows = [entry for entry in launch.snapshot_entries() if entry.profile == name]
         assert len(rows) == 1
         (row,) = rows
         assert row.effort == ""
-        assert row.grade == "A"
+        assert row.grade == "B"
         assert row.model_id == uid
         assert row.pool == "devin"
         assert row.score is None
@@ -217,38 +272,67 @@ def test_fusion_model_ids_are_real_devin_model_uids(fixture_text):
         assert f"${int(FUSION_INPUT_PRICE[name])} / 1M Input" in listed[uid]
 
 
-def test_price_seeds_carry_the_fusion_input_prices(tmp_path):
+FUSION_BLENDED_PRICE = {
+    "devin-fusion-opus55": 8.0,  # (3*4 + 20) / 4 — the #920 3:1 formula
+    "devin-fusion-sonnet55": 4.0,  # (3*2 + 10) / 4
+}
+
+
+def test_price_seeds_carry_the_fusion_prices(tmp_path):
+    """Input, output AND blended — the blended cell is the one value ranking
+    reads, so it is pinned separately (mutant 8.0->80.0 must go red)."""
     prices = bench.read_prices(path=tmp_path / "missing.db")
     for name, uid in FUSION_IDS.items():
         price = prices[uid]
         assert price.price_1m_input_tokens == FUSION_INPUT_PRICE[name]
         assert price.price_1m_output_tokens == FUSION_INPUT_PRICE[name] * 5
+        assert price.price_1m_blended_3_to_1 == FUSION_BLENDED_PRICE[name]
 
 
-# ── AC2: --recommend B and A — unmeasured-last, paid after free ─────────────
+# ── AC2: --recommend B only — unmeasured-last, paid after free ───────────────
 
 
-def test_recommend_lists_fusion_rows_only_at_a_and_b(fixture_text):
+def test_recommend_lists_fusion_rows_only_at_b(fixture_text):
+    """B-only listing: the rows are absent at every other grade, A included —
+    verdict option (b) removed the A claim entirely."""
     providers = [devin.parse(fixture_text("devin_models_list"))]
-    for grade in ("S+", "S", "A+", "C"):
+    for grade in ("S+", "S", "A+", "A", "C"):
         out = recommend(providers, grade, explain=True)
         for name in FUSION_PROFILES:
             assert name not in out, (grade, name, out)
 
 
-@pytest.mark.parametrize("grade", ["A", "B"])
-def test_recommend_fusion_rows_follow_every_measured_and_free_swe2_row(fixture_text, grade):
-    """At A and B the fusion rows rank after every measured row (unmeasured-
-    last) and after the free SWE-2 rows (paid sinks below free at equal quota
-    standing) — as exact rows, never [one-up] tagged."""
+def test_at_b_every_measured_row_precedes_the_first_fusion_row():
+    """The verifier's equal-quota probe as a pin (BLOCKER B1): at B, every
+    rep-measured or score-measured candidate — exact row or one-up — ranks
+    ahead of the first fusion row. Everything at or below the fusion rows is
+    unmeasured by both senses."""
+    evaluation = _b_evaluation(_equal_quota_providers())
+    included = evaluation.included
+    first_fusion = next(i for i, c in enumerate(included) if c.profile.name in FUSION_PROFILES)
+    # Sanity: both fusion rows are present and adjacent at the tail of B.
+    assert [c.profile.name for c in included[first_fusion:]] == [
+        "devin-fusion-opus55",
+        "devin-fusion-sonnet55",
+    ]
+    for candidate in included[first_fusion:]:
+        assert not _is_measured(candidate), candidate.profile.name
+    # And concretely: the rep-measured one-ups at B sit ahead of the lane.
+    rep_measured_names = {c.profile.name for c in included[:first_fusion] if is_rep_measured(c.profile)}
+    assert {"devin-swe2-medium", "grok-hi", "oc-solar4"} <= rep_measured_names
+
+
+def test_recommend_b_fusion_rows_are_exact_unmeasured_and_after_free_swe2(fixture_text):
+    """At B the fusion rows rank as exact rows (never [one-up] tagged) after
+    every free devin row (paid sinks below free at equal quota standing)."""
     providers = [devin.parse(fixture_text("devin_models_list"))]
-    out = recommend(providers, grade)
+    out = recommend(providers, "B")
     ranked = _ranked(out)
     for name in FUSION_PROFILES:
         lines = [line for line in ranked if line.split()[1] == name]
-        assert len(lines) == 1, (grade, name, out)
-        assert "[one-up" not in lines[0], (grade, name, lines[0])
-        assert "미측정" in lines[0], (grade, name, lines[0])
+        assert len(lines) == 1, (name, out)
+        assert "[one-up" not in lines[0], (name, lines[0])
+        assert "미측정" in lines[0], (name, lines[0])
     # Every free devin row precedes every paid fusion row in the pool order.
     devin_names = _devin_ranked_names(out)
     free_devin = [
@@ -258,12 +342,13 @@ def test_recommend_fusion_rows_follow_every_measured_and_free_swe2_row(fixture_t
     ]
     for free_name in free_devin:
         for name in FUSION_PROFILES:
-            assert devin_names.index(free_name) < devin_names.index(name), (grade, free_name, name, out)
+            assert devin_names.index(free_name) < devin_names.index(name), (free_name, name, out)
 
 
 def test_recommend_b_devin_pool_order_is_free_then_paid(fixture_text):
     """The pinned devin-pool order at B: the free SWE-2 rows (including the
-    tagged one-up swe2-medium) lead the two paid fusion rungs."""
+    tagged one-up swe2-medium) lead the two paid fusion rungs — nothing in
+    the pool ranks after them."""
     providers = [devin.parse(fixture_text("devin_models_list"))]
     out = recommend(providers, "B")
     devin_names = _devin_ranked_names(out)
@@ -271,25 +356,27 @@ def test_recommend_b_devin_pool_order_is_free_then_paid(fixture_text):
     assert devin_names[0] == "devin-swe2", out
 
 
-def test_recommend_a_devin_pool_order_is_free_then_paid_fusion(fixture_text):
-    """The pinned devin-pool order at A: free rows first, the two paid fusion
-    rungs before the paid ds41 one-up (one-up rows take appended slots)."""
+def test_recommend_a_has_no_fusion_rows_and_the_ds41_one_up_is_unchanged(fixture_text):
+    """At A the fusion rows are absent and the devin pool keeps its
+    pre-#1380 order — the rep-measured ds41 one-up is no longer outranked by
+    unmeasured rows (the B1 evidence case)."""
     providers = [devin.parse(fixture_text("devin_models_list"))]
     out = recommend(providers, "A")
+    for name in FUSION_PROFILES:
+        assert name not in out
     devin_names = _devin_ranked_names(out)
-    assert devin_names[-3:] == ["devin-fusion-opus55", "devin-fusion-sonnet55", "devin-ds41"], out
+    assert devin_names[-1] == "devin-ds41", out
 
 
-@pytest.mark.parametrize("grade", ["A", "B"])
-def test_fusion_rows_are_not_rep_measured_and_not_one_up_anywhere(fixture_text, grade):
-    payload = recommend_dict_rows(fixture_text, grade)
+def test_fusion_rows_are_not_rep_measured_and_not_one_up_at_b(fixture_text):
+    payload = recommend_dict_rows(fixture_text, "B")
     for name in FUSION_PROFILES:
         rows = [row for row in payload["rows"] if row["profile"] == name]
         assert len(rows) == 1
         row = rows[0]
         assert row["billing"] == "paid"
         assert row["one_up"] is False
-        assert row["placed_grade"] == grade
+        assert row["placed_grade"] == "B"
 
 
 def recommend_dict_rows(fixture_text, grade):
@@ -313,10 +400,18 @@ def test_wrk_contract_exempt_carries_the_fusion_spellings():
 
 
 def test_no_builder_alias_exists_for_the_fusion_rows():
-    """#1380: no builder-* aliases — builder use is decided after hk 1382."""
+    """#1380: no builder-* aliases — builder use is decided after hk 1382.
+
+    Both directions are pinned: no _BUILDER_RUNGS target or key reaches the
+    fusion names, and no PROFILE_ALIASES *value* maps an alias onto a fusion
+    name (a "builder-fusion -> devin-fusion-opus55" entry is the direction
+    the earlier version of this test could not see)."""
     from scopefuel.grades import _BUILDER_RUNGS
 
     for name in FUSION_PROFILES:
         assert not any(target[0] == name for target in _BUILDER_RUNGS.values())
+        assert name not in PROFILE_ALIASES.values()  # no alias maps onto a fusion name
     assert not any(name.startswith("builder-fusion") for name in _BUILDER_RUNGS)
-    assert not any(PROFILE_ALIASES.get(name, "").startswith("builder") for name in FUSION_PROFILES)
+    assert not any(
+        alias.startswith("builder") for alias in PROFILE_ALIASES if PROFILE_ALIASES[alias] in FUSION_PROFILES
+    )

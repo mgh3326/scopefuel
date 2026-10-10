@@ -337,7 +337,11 @@ class ModelPrice:
 
 
 # operator decision 2026-09-09 doc1144. These are the only approved static
-# AA-model price seeds; a synchronized DB row takes precedence at read time.
+# price seeds: AA-model rows plus, since #1380, the two fusion-claude-* seeds —
+# those are Devin price-list seeds (devin models list, 10-10), not AA rows, so
+# the 09-09 "AA seeds" approval does not cover them by itself; their approval
+# is the #1380 paid-lane decision. A synchronized DB row takes precedence at
+# read time.
 AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     ModelPrice("kimi-k2-7-code", 1.7125, 0.95, 4.0, "2026-09-09T00:00:00+00:00"),
     ModelPrice("grok-4-6", 3.0, 2.0, 6.0, "2026-09-09T00:00:00+00:00"),

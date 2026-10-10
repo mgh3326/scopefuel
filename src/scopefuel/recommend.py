@@ -475,13 +475,12 @@ def _devin_swe2_profile() -> Profile:
 
 
 def _devin_fusion_opus55_profile() -> Profile:
-    """Canonical devin-fusion-opus55 row. Same object shape is copied into A/B.
+    """Canonical devin-fusion-opus55 row — listed at B only (verdict option b).
 
     #1380 paid fusion lane: the launch id is
     ``fusion-claude-opus-5-5-high-sidekick-swe-2-medium`` (devin models list —
-    Fusion (Claude Opus 5.5 High + SWE-2 Medium), $4 / 1M input). Listed at A
-    and B like devin-swe2 so --recommend at those grades can propose it;
-    unmeasured, so it sorts last inside each grade.
+    Fusion (Claude Opus 5.5 High + SWE-2 Medium), $4 / 1M input). Unmeasured,
+    so it sorts last inside B after every rep- and score-measured row.
     """
 
     return Profile(
@@ -496,7 +495,7 @@ def _devin_fusion_opus55_profile() -> Profile:
 
 
 def _devin_fusion_sonnet55_profile() -> Profile:
-    """Canonical devin-fusion-sonnet55 row. Same object shape is copied into A/B.
+    """Canonical devin-fusion-sonnet55 row — listed at B only (verdict option b).
 
     #1380 paid fusion lane: the launch id is
     ``fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium`` (devin models list —
@@ -1096,13 +1095,6 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             benchmark_annotation=DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
             billing="free",
         ),
-        # #1380 (director-1 10-10, operator decision 15:0x via desk): the paid
-        # Devin fusion lane, listed at A and B like devin-swe2 — unmeasured
-        # (hk 1382 runs the first reps), so the unmeasured-last rank sinks
-        # them inside each grade, and the paid flag (#1340) keeps them below
-        # the Free-tag SWE-2 rows in the devin pool.
-        _devin_fusion_opus55_profile(),
-        _devin_fusion_sonnet55_profile(),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1296:
         # grok-hi@xhigh promoted to A on the served canon (evidence srv:1396·
         # 1397) — the #737 E6 arm rung graduates to an ordinary placement like
@@ -1198,8 +1190,14 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # refresh below measures every launchable rung at C on the vendor TB4
         # curve.
         _devin_swe2_profile(),
-        # #1380: the paid fusion lane's second placement — same unmeasured rows
-        # as the A listing above (see the comment there).
+        # #1380 (director-1 10-10, operator decision 15:0x via desk): the paid
+        # Devin fusion lane — listed at B only (verdict doc
+        # 1380a-verify-20261010-1449, option b): a whole-model-unmeasured row
+        # claims no higher grade, and the B-only listing keeps every
+        # rep-measured row ahead of it under equal quota (the ds41 one-up at A
+        # was the case that failed). hk 1382 runs the first reps; until then
+        # the unmeasured-last rank sinks the rows inside B and the paid flag
+        # (#1340) keeps them below the Free-tag SWE-2 rows.
         _devin_fusion_opus55_profile(),
         _devin_fusion_sonnet55_profile(),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1297:
@@ -1935,12 +1933,15 @@ PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
 
 
 def provider_family(profile: str) -> str:
-    """The tester-separation family of a profile's underlying model.
+    """The tester-separation family — the quota pool id, unless overridden.
 
-    Defaults to the quota pool's provider id — most profiles' model vendor IS
-    their pool. ``PROVIDER_FAMILY_OVERRIDES`` names the exceptions where the
-    two axes diverge (today only the paid devin fusion rungs: pool devin,
-    family claude).
+    For every profile without an override this returns the quota pool's
+    provider id verbatim (devin-ds41 -> "devin" though the model is DeepSeek,
+    kiro-opus -> "kiro", oc-sonnet46 -> "agy") — it is NOT a per-model vendor
+    lookup. ``PROVIDER_FAMILY_OVERRIDES`` names the only exceptions where the
+    underlying model vendor is known to diverge from the pool: today only the
+    paid devin fusion rungs, which serve Claude models (family "claude") while
+    the spend stays Devin credits.
     """
 
     canonical = PROFILE_ALIASES.get(profile, profile)
