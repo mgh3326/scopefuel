@@ -40,6 +40,9 @@ FIXTURE = Path(__file__).parent / "fixtures" / "devin_models_list.txt"
 
 # dr-1340-1 pinned enumeration: free = swe-2 / swe-2-medium / swe-2-max /
 # glm-5-2 / swe-1-7 launch rows; paid = devin-ds41; everything else unknown.
+# #1380 adds the paid fusion lane — the two Claude-under-the-hood fusion rungs
+# draw Devin credits, so they join ds41 in the paid class (claude family, devin
+# pool: the sidekick's "Free" tag is the swe-2-medium helper's, not the rung's).
 PINNED_BILLING = {
     "devin-swe2": "free",
     "devin-swe2-medium": "free",
@@ -47,6 +50,8 @@ PINNED_BILLING = {
     "devin-glm52": "free",
     "devin-swe17": "free",
     "devin-ds41": "paid",
+    "devin-fusion-opus55": "paid",
+    "devin-fusion-sonnet55": "paid",
 }
 
 
@@ -151,12 +156,17 @@ def test_free_marks_are_backed_by_a_free_tag_in_the_recorded_models_list():
             )
 
 
-def test_paid_pin_is_ds41_and_its_launch_id_has_no_free_tag():
-    """devin-ds41 is the only paid row; its launch id is absent from the
-    recorded Free tags (it draws the Devin Pro budget)."""
+def test_paid_pin_is_ds41_and_the_fusion_rows_whose_launch_ids_are_priced():
+    """The paid set is ds41 plus the two #1380 fusion rungs — ds41's launch id
+    is absent from the recorded Free tags, and each fusion id resolves to a
+    priced (dollar-input) model row: the "Sidekick: Free" tag on the row is
+    the swe-2-medium helper's, not the rung's."""
     paid = {p.name for profiles in GRADE_TABLE.values() for p in profiles if p.billing == "paid"}
-    assert paid == {"devin-ds41"}
+    assert paid == {"devin-ds41", "devin-fusion-opus55", "devin-fusion-sonnet55"}
     assert not _launch_free_in_fixture(launch.LAUNCH_MODEL_IDS["devin-ds41"])
+    uid_tags, _ = _fixture_model_tags(FIXTURE.read_text())
+    assert "$4 / 1M Input" in uid_tags[launch.LAUNCH_MODEL_IDS["devin-fusion-opus55"]]
+    assert "$2 / 1M Input" in uid_tags[launch.LAUNCH_MODEL_IDS["devin-fusion-sonnet55"]]
 
 
 def _server_view(rows=None):

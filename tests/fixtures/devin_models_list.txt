@@ -26,6 +26,8 @@ SWE-1.7 (swe-1.7)
 Fusion (fusion)
   fusion-claude-fable-5-1-medium-sidekick-swe-2-medium                     Fusion (Claude Fable 5.1 Medium + SWE-2 Medium)  [1M context, $10 / 1M Input · $0.25 / 1M Cached input · $50 / 1M Output]
   fusion-gpt-5-6-sol-high-sidekick-swe-2-high                              Fusion (GPT-5.6 Sol High Thinking + SWE-2 High)  [1M context, $1.2 / 1M Input · $0.12 / 1M Cached input · $6 / 1M Output]
+  fusion-claude-opus-5-5-high-sidekick-swe-2-medium                        Fusion (Claude Opus 5.5 High + SWE-2 Medium)  [1M context, $4 / 1M Input · $0.2 / 1M Cached input · $20 / 1M Output · Sidekick: Free]
+  fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium                      Fusion (Claude Sonnet 5.5 High + SWE-2 Medium)  [1M context, $2 / 1M Input · $0.1 / 1M Cached input · $10 / 1M Output · Sidekick: Free]
 
 Pass a family slug, alias, or model UID to `--model` (e.g. `--model opus`)
 or switch models in a session with `/model <name>`.
