@@ -337,7 +337,11 @@ class ModelPrice:
 
 
 # operator decision 2026-09-09 doc1144. These are the only approved static
-# AA-model price seeds; a synchronized DB row takes precedence at read time.
+# price seeds: AA-model rows plus, since #1380, the two fusion-claude-* seeds —
+# those are Devin price-list seeds (devin models list, 10-10), not AA rows, so
+# the 09-09 "AA seeds" approval does not cover them by itself; their approval
+# is the #1380 paid-lane decision. A synchronized DB row takes precedence at
+# read time.
 AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     ModelPrice("kimi-k2-7-code", 1.7125, 0.95, 4.0, "2026-09-09T00:00:00+00:00"),
     ModelPrice("grok-4-6", 3.0, 2.0, 6.0, "2026-09-09T00:00:00+00:00"),
@@ -350,6 +354,25 @@ AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     # used (hk:doc brief/2026-10-08/haiku55-scopefuel-catalog). The AA-synced
     # price table does not carry the new id yet; a synced row wins when it lands.
     ModelPrice("claude-haiku-5-5", 0.20, 0.10, 0.50, "2026-10-08T00:00:00+00:00"),
+    # #1380: the paid devin fusion lane — vendor list prices from the 10-10
+    # devin models list: opus55 rung input $4 / output $20 per 1M, sonnet55
+    # rung input $2 / output $10 per 1M; blended by the #920 3:1 formula
+    # ((3·in+out)/4 = 8.0 / 4.0). Not AA rows — the seeds carry the price the
+    # catalog rows' billing=paid flag reports.
+    ModelPrice(
+        "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+        8.0,
+        4.0,
+        20.0,
+        "2026-10-10T00:00:00+00:00",
+    ),
+    ModelPrice(
+        "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+        4.0,
+        2.0,
+        10.0,
+        "2026-10-10T00:00:00+00:00",
+    ),
 )
 
 

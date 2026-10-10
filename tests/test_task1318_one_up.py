@@ -104,6 +104,8 @@ _EXPECTED_LABELS = {
     ("codex-terra-max", None): "codex-terra-max",
     ("devin-ds41", None): "devin-ds41",
     ("devin-ds41-max", None): "devin-ds41-max",
+    ("devin-fusion-opus55", None): "devin-fusion-opus55",
+    ("devin-fusion-sonnet55", None): "devin-fusion-sonnet55",
     ("devin-glm52", None): "devin-glm52",
     ("devin-swe17", None): "devin-swe17",
     ("devin-swe2", None): "devin-swe2",

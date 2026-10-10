@@ -47,6 +47,7 @@ from .recommend import (
     parse_e6_arm_marker,
     profile_pool,
     profile_subscription,
+    provider_family,
 )
 
 GATE_DEFAULT = "default"
@@ -89,6 +90,10 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     "devin-swe2-medium": "swe-2-medium",
     "devin-swe2-max": "swe-2-max",
     "devin-ds41-max": "deepseek-v4-1-flash-max",
+    # #1380: the paid fusion lane — Claude fusion rungs served on the devin
+    # pool; the rung is baked into the model id like every devin spelling.
+    "devin-fusion-opus55": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+    "devin-fusion-sonnet55": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
     # Same model as kimi-k3; the differentiator is KIMI_CODE_HOME, not the model.
     "kimi-k3-low": "kimi-k3",
     "oc-qwen37-max": "qwen3.7-max",
@@ -390,6 +395,17 @@ class LaunchDecision:
     # #692: the E6 measurement rung this launch was resolved as ("<profile>@<effort>"),
     # or None for every ordinary launch. Only an E6 arm marker opens one.
     e6_arm: str | None = None
+    # #1340+#1380: the launch billing class the bundled table holds for this
+    # profile ("free" | "paid" | "unknown") — the recommend rank's paid-within
+    # pool flag, disclosed on the launch verdict so the launcher sees the same
+    # cost class without reading GRADE_TABLE itself. Not a wire column: a
+    # profile with no bundled row reports "unknown", the neutral class.
+    billing: str = "unknown"
+    # #1380: the tester-separation provider family of the underlying model —
+    # recommend.provider_family(), NOT the quota pool. The paid devin fusion
+    # rows report "claude" (they serve Claude under the hood) while pool stays
+    # "devin" (the spend is Devin credits).
+    family: str = ""
 
     def as_dict(self) -> dict[str, object]:
         value = dataclasses.asdict(self)
@@ -408,6 +424,8 @@ class LaunchDecision:
             f"model_id {self.model_id or '-'}",
             f"effort {self.effort or '-'}",
             f"pool {self.pool or '-'}",
+            f"family {self.family or '-'}",
+            f"billing {self.billing}",
             f"gate {self.gate}",
             f"grade {self.grade}",
         ]
@@ -517,6 +535,23 @@ def _retired_rung(view: CatalogView, profile: str, effort: str) -> bool:
     return any(
         entry.profile == profile and entry.effort == effort and entry.retired_at for entry in view.entries
     )
+
+
+def _bundled_billing(profile_name: str) -> str:
+    """The launch billing class the bundled table holds for this profile.
+
+    ``recommend.Profile.billing`` is bundled-table data — the wire carries no
+    billing column (its #1340 docstring is explicit), so the launch verdict
+    reports the same flag the recommend rank reads. A profile with no bundled
+    row at all (a server-introduced name) reports "unknown", the neutral
+    class that never moves a row.
+    """
+
+    for profiles in GRADE_TABLE.values():
+        for profile in profiles:
+            if profile.name == profile_name:
+                return profile.billing
+    return "unknown"
 
 
 def resolve_launch(
@@ -690,4 +725,6 @@ def resolve_launch(
         catalog_age_s=view.age_s,
         operator_request=operator_request,
         e6_arm=opened_arm,
+        billing=_bundled_billing(canonical),
+        family=provider_family(canonical),
     )

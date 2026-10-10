@@ -173,6 +173,10 @@ MODEL_EQUIVALENCE: dict[str, frozenset[str]] = {
     "glm-5-2": frozenset({"devin-glm52"}),
     "deepseek-v4-1-flash-high": frozenset({"devin-ds41"}),
     "deepseek-v4-1-flash-max": frozenset({"devin-ds41-max"}),
+    # #1380: the paid fusion lane — the devin-* launchers embed exactly this
+    # model id in the profile argv, same equivalence shape as ds41 above.
+    "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": frozenset({"devin-fusion-opus55"}),
+    "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": frozenset({"devin-fusion-sonnet55"}),
     # provider-namespaced / launcher spellings of the same model id.
     "solar-pro4": frozenset({"upstage/solar-pro4"}),
     "kimi-k3": frozenset({"kimi-code/k3"}),
