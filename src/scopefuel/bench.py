@@ -4098,24 +4098,43 @@ def _retire_shadowed_reps(conn: sqlite3.Connection, fetched: list[_RemoteRep], n
 
     The server row is authoritative for a server id (consult hk#1384 Q4): a
     bound cache row whose fetched counterpart carries different content is
-    overwrite evidence, and the same holds for an unbound row whose origin_id
-    the page holds under a different rep. Each copy moves to the lost table —
-    once, so the warning cannot repeat — and is never written back. A slot
-    absent from the fetched page proves nothing (the read window may be
-    truncated), so only rows the server visibly contradicts are moved.
+    overwrite evidence, and the same holds for a creator-known row whose
+    ``(created_by, origin_id)`` pair the page holds under a different rep —
+    the pair is the server's upsert key, so its unique fetched holder is our
+    slot. An anonymous echo (no server id, ``created_by`` NULL) has no known
+    server key at all: an ``origin_id`` twin may be another creator's rep,
+    so it is never retired on the key alone. Each copy moves to the lost
+    table — once, so the warning cannot repeat — and is never written back.
+    A slot absent from the fetched page proves nothing (the read window may
+    be truncated) and neither does an ambiguous holder, so only rows the
+    server visibly contradicts are moved.
     """
 
-    by_server = {item.server_id: item for item in fetched if item.server_id is not None}
-    by_origin = {item.origin_id: item for item in fetched}
+    by_server: dict[int, list[_RemoteRep]] = {}
+    by_origin: dict[int, list[_RemoteRep]] = {}
+    for item in fetched:
+        if item.server_id is not None:
+            by_server.setdefault(item.server_id, []).append(item)
+        by_origin.setdefault(item.origin_id, []).append(item)
+
+    def _unique(holders: list[_RemoteRep]) -> _RemoteRep | None:
+        """The single fetched holder of a key, or None when absent or ambiguous."""
+
+        return holders[0] if len(holders) == 1 else None
+
     rows = conn.execute(
         "SELECT cache_key, server_id, created_by, " + _REP_MARK_FIELDS + " FROM bench_cache_reps"
     ).fetchall()
     retired = 0
     for row in rows:
         if row["server_id"] is not None:
-            remote = by_server.get(row["server_id"])
+            remote = _unique(by_server.get(row["server_id"], []))
+        elif row["created_by"] is None:
+            continue  # anonymous echo: no server key, so nothing can contradict it
         else:
-            remote = by_origin.get(row["origin_id"])
+            remote = _unique(
+                [item for item in by_origin.get(row["origin_id"], []) if item.created_by == row["created_by"]]
+            )
         if remote is None or _same_rep_row(_rep_record_from_row(row), remote.record):
             continue
         conn.execute(
@@ -4159,16 +4178,27 @@ def _retire_shadowed_reps(conn: sqlite3.Connection, fetched: list[_RemoteRep], n
     return retired
 
 
-def _reconcile_pending_reps(conn: sqlite3.Connection, fetched: list[_RemoteRep]) -> None:
-    """Drop write-ahead rows whose rep the fetched page proves is stored.
+def _reconcile_pending_reps(
+    conn: sqlite3.Connection, fetched: list[_RemoteRep], written: Iterable[_RemoteRep] = ()
+) -> None:
+    """Drop write-ahead rows only on a write-specific confirmation.
 
-    A pending row whose ``(origin_id, content)`` appears in the fetched page
-    already displays as its ``srv:`` row; keeping it would double-list the
-    rep. Rows whose slot is held by different content stay pending — the
-    write is still unconfirmed and the next ``reps add`` retries the same key.
+    A generic refresh proves nothing about a pending row: the server keys
+    reps on ``(created_by, origin_id)`` and bench_pending_reps stores no
+    creator, so an equal-content fetched row may be another creator's rep —
+    clearing on it would delete a write the server never confirmed. The
+    confirming identity is the one this commit's own writes carry
+    (``written`` items bound by the PUT answer or the post-write GET — empty
+    on a pure refresh, which therefore clears nothing); the PUT-answer
+    itself clears via ``pending_done`` in ``_commit_rep_cache``. Everything
+    else stays queued: it is display-deduped behind any ``srv:`` twin and
+    the next identical ``reps add`` resends the same key.
     """
 
-    by_origin = {item.origin_id: item for item in fetched}
+    own = {item.created_by for item in written if item.created_by is not None}
+    if not own:
+        return
+    by_origin = {item.origin_id: item for item in fetched if item.created_by in own}
     for row in conn.execute("SELECT " + _REP_MARK_FIELDS + " FROM bench_pending_reps").fetchall():
         remote = by_origin.get(row["origin_id"])
         if remote is not None and _same_rep_row(_rep_record_from_row(row), remote.record):
@@ -4219,10 +4249,15 @@ def _local_rep_marks(
 
 
 def _replace_cached_reps(
-    conn: sqlite3.Connection, reps: list[_RemoteRep], backend: BenchBackend, now: dt.datetime
+    conn: sqlite3.Connection,
+    reps: list[_RemoteRep],
+    backend: BenchBackend,
+    now: dt.datetime,
+    *,
+    written: Iterable[_RemoteRep] = (),
 ) -> None:
     _retire_shadowed_reps(conn, reps, now)
-    _reconcile_pending_reps(conn, reps)
+    _reconcile_pending_reps(conn, reps, written)
     conn.execute("DELETE FROM bench_cache_reps")
     for item in reps:
         _put_cached_rep(conn, item)
@@ -4241,7 +4276,7 @@ def _commit_rep_cache(
     try:
         now = _cache_now()
         conn.execute("BEGIN")
-        _replace_cached_reps(conn, fetched, backend, now)
+        _replace_cached_reps(conn, fetched, backend, now, written=written)
         for item in written:
             _put_cached_rep(conn, item)
         _stamp_cache(conn, "reps", backend, now)
@@ -4981,7 +5016,7 @@ def _commit_push_cache(
                 _put_cached_score(conn, score)
             _stamp_cache(conn, "scores", score_backend, now)
         if written_reps:
-            _replace_cached_reps(conn, fetched_reps, rep_backend, now)
+            _replace_cached_reps(conn, fetched_reps, rep_backend, now, written=written_reps)
             for item in written_reps:
                 _put_cached_rep(conn, item)
             _stamp_cache(conn, "reps", rep_backend, now)

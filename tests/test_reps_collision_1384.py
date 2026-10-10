@@ -736,3 +736,169 @@ def test_retryable_503_resends_the_same_pending_payload(tmp_path, monkeypatch, c
     assert first == second
     assert second[0]["recorded_at"] == "2026-10-10T12:00:00+00:00"
     assert second[0]["origin_id"] == fake.reps[0]["origin_id"]
+
+
+def test_anonymous_cache_row_is_never_retired_by_origin_alone(tmp_path, monkeypatch, capsys):
+    """Shadow rule, anonymous echo (mutant: retire by origin_id alone). An
+    unbound cache row carries no server id and no created_by — its server key
+    was never learned — so a fetched row at the same origin with different
+    content may be another creator's rep and must NOT park it in lost."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    origin = BAND_BASE + 31337
+    fake.reps.append(
+        _remote_row(id=3, origin_id=origin, created_by="other-client", task_ref="other", notes="not ours")
+    )
+    _seed_cache_row(
+        tmp_path / "hosta",
+        cache_key=f"origin:{origin}",
+        origin_id=origin,
+        server_id=None,
+        created_by=None,
+        task_ref="our-echo",
+        notes="our unbound write",
+    )
+
+    assert cli.main(["reps", "list"]) == 0
+    captured = capsys.readouterr()
+    assert "shadowed" not in captured.err
+    assert "id=lost:" not in captured.out
+    assert "id=srv:3" in captured.out  # the foreign row displays under its own pk
+    conn = bench._cache_connect()
+    try:
+        lost = conn.execute("SELECT task_ref FROM bench_lost_reps").fetchall()
+    finally:
+        conn.close()
+    assert lost == []
+
+
+def test_shadow_retire_compares_only_the_proven_holder(tmp_path, monkeypatch, capsys):
+    """The retire match must be key-precise (mutant: any origin_id holder
+    retires). A creator-known row moves to lost only when the UNIQUE fetched
+    holder of its own (created_by, origin_id) pair contradicts it; a holder
+    under another creator, or several holders of the pair, proves nothing."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    contradicted = BAND_BASE + 100
+    foreign_only = BAND_BASE + 200
+    ambiguous = BAND_BASE + 300
+    # Our own pair slot holds a different rep -> real overwrite evidence.
+    fake.reps.append(
+        _remote_row(id=5, origin_id=contradicted, created_by=CLIENT, task_ref="overwriter", notes="diff")
+    )
+    # Only a FOREIGN creator holds this origin -> our pair slot is unproven.
+    fake.reps.append(
+        _remote_row(id=6, origin_id=foreign_only, created_by="other-client", task_ref="other", notes="diff")
+    )
+    # Two fetched rows claim our pair (a server invariant violation) -> keep.
+    fake.reps.append(
+        _remote_row(id=7, origin_id=ambiguous, created_by=CLIENT, task_ref="twin-a", notes="one")
+    )
+    fake.reps.append(
+        _remote_row(id=8, origin_id=ambiguous, created_by=CLIENT, task_ref="twin-b", notes="two")
+    )
+    home = tmp_path / "hosta"
+    _seed_cache_row(
+        home,
+        cache_key=f"{CLIENT}:{contradicted}",
+        origin_id=contradicted,
+        created_by=CLIENT,
+        task_ref="ours",
+    )
+    _seed_cache_row(
+        home,
+        cache_key=f"{CLIENT}:{foreign_only}",
+        origin_id=foreign_only,
+        created_by=CLIENT,
+        task_ref="ours-2",
+    )
+    _seed_cache_row(
+        home,
+        cache_key=f"{CLIENT}:{ambiguous}",
+        origin_id=ambiguous,
+        created_by=CLIENT,
+        task_ref="ours-3",
+    )
+
+    assert cli.main(["reps", "list"]) == 0
+    captured = capsys.readouterr()
+    assert "shadowed" in captured.err  # exactly one row retires
+    out = captured.out
+    assert f"id=lost:{contradicted}" in out  # own pair contradicted -> lost
+    assert "shadowed-by=srv:5" in out
+    assert "task=ours-2" not in out and "task=ours-3" not in out
+    assert f"id=lost:{foreign_only}" not in out
+    assert f"id=lost:{ambiguous}" not in out
+    conn = bench._cache_connect()
+    try:
+        lost_keys = [
+            row["cache_key"] for row in conn.execute("SELECT cache_key FROM bench_lost_reps").fetchall()
+        ]
+    finally:
+        conn.close()
+    assert lost_keys == [f"{CLIENT}:{contradicted}"]
+
+
+def test_pending_row_survives_identical_content_under_another_creator(tmp_path, monkeypatch, capsys):
+    """Pending reconciliation (mutant: equal content under ANY creator
+    clears). The server keys reps on (created_by, origin_id); a fetched row
+    at our pending origin with identical content but another creator is not
+    our write — the pending row must survive a generic refresh."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    monkeypatch.setattr(bench, "_utc_now", lambda: "2026-10-10T12:00:00+00:00")
+    fake.fail_next_put = OSError("request dropped")
+
+    assert cli.main(_add_args()) == 2
+    capsys.readouterr()
+    pending = _pending_rows(tmp_path / "hosta")
+    assert len(pending) == 1
+    origin = pending[0]["origin_id"]
+
+    # Another creator's identical rep occupies that origin on the server.
+    fake.reps.append(
+        _remote_row(
+            id=9,
+            origin_id=origin,
+            created_by="other-client",
+            recorded_at="2026-10-10T12:00:00+00:00",
+            table_grade=None,
+        )
+    )
+    assert cli.main(["reps", "list"]) == 0
+    captured = capsys.readouterr()
+    assert "id=srv:9" in captured.out
+    # The pending write is still queued — never confirmed under our key.
+    assert [row["origin_id"] for row in _pending_rows(tmp_path / "hosta")] == [origin]
+
+
+def test_pending_row_clears_on_own_confirmed_row(tmp_path, monkeypatch, capsys):
+    """The positive half (mutant: pending rows never reconcile). A pending
+    row whose own-creator server row is visible inside a write commit is
+    confirmed and clears — here the first add's PUT landed but its answer
+    was lost; the second add's commit proves the row under our created_by."""
+
+    fake = _remote(monkeypatch, tmp_path / "hosta")
+    fake.fail_next_put = OSError("connection dropped after write")
+    fake.fail_next_put_after_write = True
+
+    assert cli.main(_add_args(task="landed", notes="first rep")) == 2
+    capsys.readouterr()
+    assert len(fake.reps) == 1  # the write landed anyway
+    origin = fake.reps[0]["origin_id"]
+    assert len(_pending_rows(tmp_path / "hosta")) == 1
+
+    # An unrelated successful add: its commit's bound write carries our
+    # created_by, and the fetched page holds the pending rep's own row.
+    assert cli.main(_add_args(task="second", notes="second rep")) == 0
+    capsys.readouterr()
+    assert len(fake.reps) == 2
+    assert _pending_rows(tmp_path / "hosta") == []  # reconciled, not just hidden
+    conn = bench._cache_connect()
+    try:
+        row = conn.execute(
+            "SELECT server_id, created_by FROM bench_cache_reps WHERE origin_id = ?", (origin,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["server_id"] == 1 and row["created_by"] == CLIENT
