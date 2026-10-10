@@ -580,6 +580,7 @@ def test_known_timeout_and_transport_failures_are_manual_eligible(error):
 
 
 def test_devin_banner_timeout_can_use_a_complete_daily_manual_observation(capsys, monkeypatch):
+    """#1381: devin 은 daily+weekly 두 창이 필수 — 수동 관측도 둘 다 있어야 게이트가 열린다."""
     monkeypatch.setattr(
         cli,
         "registry",
@@ -592,6 +593,7 @@ def test_devin_banner_timeout_can_use_a_complete_daily_manual_observation(capsys
         },
     )
     _set_manual(capsys, pool="devin", window="daily", used="10")
+    _set_manual(capsys, pool="devin", window="7d", used="10")
 
     rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
 

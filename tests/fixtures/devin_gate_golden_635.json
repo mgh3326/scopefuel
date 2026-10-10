@@ -1,11 +1,11 @@
 {
   "devin-ds41/free": {
-    "rc": 0,
+    "rc": 4,
     "record": {
       "alternatives": [],
       "escalation_override": false,
       "exhaust_notice": null,
-      "exit_code": 0,
+      "exit_code": 4,
       "expires_at": null,
       "grade": "A+",
       "last_auto_error": null,
@@ -13,16 +13,17 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d"
+        "1d",
+        "7d"
       ],
       "observed_age_s": null,
-      "ok": true,
+      "ok": false,
       "operator_request_ref": null,
-      "pool_class": "spend",
+      "pool_class": null,
       "profile": "devin-ds41",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin-ds41 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]",
+      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -32,11 +33,11 @@
       "source_label": null,
       "source_verification": null,
       "stale_accepted": false,
-      "unmeasurable": false,
-      "used_pct": 0.0
+      "unmeasurable": true,
+      "used_pct": null
     },
-    "stderr": "",
-    "stdout": "profile=devin-ds41 pool=devin used_pct=0.0 class=spend\ndevin-ds41 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]\n"
+    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stdout": ""
   },
   "devin-ds41/swe2_not_free": {
     "rc": 4,
@@ -52,7 +53,8 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d"
+        "1d",
+        "7d"
       ],
       "observed_age_s": null,
       "ok": false,
@@ -61,7 +63,7 @@
       "profile": "devin-ds41",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -74,16 +76,16 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   },
   "devin-swe2/free": {
-    "rc": 0,
+    "rc": 4,
     "record": {
       "alternatives": [],
       "escalation_override": false,
       "exhaust_notice": null,
-      "exit_code": 0,
+      "exit_code": 4,
       "expires_at": null,
       "grade": "A+",
       "last_auto_error": null,
@@ -91,16 +93,17 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d"
+        "1d",
+        "7d"
       ],
       "observed_age_s": null,
-      "ok": true,
+      "ok": false,
       "operator_request_ref": null,
-      "pool_class": "spend",
+      "pool_class": null,
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin-swe2 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]",
+      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -110,11 +113,11 @@
       "source_label": null,
       "source_verification": null,
       "stale_accepted": false,
-      "unmeasurable": false,
-      "used_pct": 0.0
+      "unmeasurable": true,
+      "used_pct": null
     },
-    "stderr": "",
-    "stdout": "profile=devin-swe2 pool=devin used_pct=0.0 class=spend\ndevin-swe2 pool=devin 사용 0% class=spend [필수 창 미측정: 1d — 측정된 창으로 판정]\n"
+    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stdout": ""
   },
   "devin-swe2/swe2_not_free": {
     "rc": 4,
@@ -130,7 +133,8 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d"
+        "1d",
+        "7d"
       ],
       "observed_age_s": null,
       "ok": false,
@@ -139,7 +143,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -152,7 +156,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   }
 }

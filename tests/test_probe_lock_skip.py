@@ -35,7 +35,8 @@ POOL_PROFILE = {
     "kiro": "kiro-opus",
 }
 POOL_WINDOWS = {
-    "devin": ("1d",),
+    # #1381: devin 필수 창은 daily+weekly 둘 (manual.REQUIRED_WINDOWS 와 동기).
+    "devin": ("1d", "7d"),
     "kimi": ("5h", "7d"),
     "grok": ("7d",),
     "kiro": ("30d",),
@@ -282,7 +283,15 @@ def test_gate_cli_passes_while_probe_in_progress(monkeypatch, capsys):
                 resets_at=(now + dt.timedelta(hours=20)).isoformat(),
                 scope=Scope("account"),
                 horizon="now",
-            )
+            ),
+            Bucket(
+                label="weekly",
+                window="7d",
+                used_pct=11.0,
+                resets_at=(now + dt.timedelta(hours=160)).isoformat(),
+                scope=Scope("account"),
+                horizon="week",
+            ),
         ],
         source="test",
         pool_class="spend",
