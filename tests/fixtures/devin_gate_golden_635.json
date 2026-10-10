@@ -13,7 +13,6 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d",
         "7d"
       ],
       "observed_age_s": null,
@@ -23,7 +22,7 @@
       "profile": "devin-ds41",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -36,7 +35,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   },
   "devin-ds41/swe2_not_free": {
@@ -53,7 +52,6 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d",
         "7d"
       ],
       "observed_age_s": null,
@@ -63,7 +61,7 @@
       "profile": "devin-ds41",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -76,7 +74,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   },
   "devin-swe2/free": {
@@ -93,7 +91,6 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d",
         "7d"
       ],
       "observed_age_s": null,
@@ -103,7 +100,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -116,7 +113,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   },
   "devin-swe2/swe2_not_free": {
@@ -133,7 +130,6 @@
       "manual_observations": [],
       "measured_at": null,
       "missing_windows": [
-        "1d",
         "7d"
       ],
       "observed_age_s": null,
@@ -143,7 +139,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -156,7 +152,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 1d, 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   }
 }

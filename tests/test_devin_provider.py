@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import datetime as dt
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from scopefuel import cli, launch, proctrack
+from scopefuel import cli, launch, proctrack, render
 from scopefuel import recommend as recommend_mod
 from scopefuel.providers import BUILTIN, devin
 from scopefuel.recommend import (
@@ -102,6 +104,18 @@ def test_parse_swe2_free_fixture_is_model_scoped_zero(fixture_text):
     assert bucket.scope.label == "swe-2"
     assert bucket.note == FREE_NOTE
     assert bucket.label == "swe-2"
+    # N1: 쿼타 창이 아니므로 '30d'/'month' 를 싣지 않는다 — 표에 'month swe-2'
+    # 행이 나오면 desk 의 '월 0%' 오독이 재현된다.
+    assert bucket.window != "30d"
+    assert bucket.horizon != "month"
+
+
+def test_swe2_model_tag_does_not_render_a_month_axis(fixture_text):
+    """N1: model-scope swe-2 Free 태그 행은 표에서 'month' 축으로 그려지지 않는다."""
+    result = devin.parse(_fixture(fixture_text))
+    out = render.table([result], color=False)
+    assert "month" not in out
+    assert "swe-2" in out
 
 
 def test_parse_strips_ansi_before_swe2_free_check():
@@ -213,6 +227,22 @@ def test_devin_swe2_grade_exposure_and_non_aa_provenance():
     assert "Terminal-Bench 4 27.3" in DEVIN_SWE2_ESTIMATE_REASON
     assert "비-AA" in DEVIN_SWE2_ESTIMATE_REASON
     assert "AA-agent" in DEVIN_SWE2_ESTIMATE_REASON
+
+
+def _measured_devin(fixture_text):
+    """#1381: models list 는 쿼타를 안 주므로 측정된 devin 풀은 PTY 세션 파서로 만든다."""
+    return devin.parse_session(fixture_text("devin_usage"))
+
+
+def test_gate_cli_ok_on_measured_quota_fixture(monkeypatch, capsys, fixture_text):
+    """S6: PTY /usage 측정이 있으면 Free 태그와 함께 gate 가 열린다(복원)."""
+    result = _measured_devin(fixture_text)
+    monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
+    rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "pool=devin" in out.out
+    assert "class=spend" in out.out
 
 
 def test_gate_cli_fail_closed_on_free_fixture_without_quota(monkeypatch, capsys, fixture_text):
@@ -411,6 +441,105 @@ def test_parse_session_usage_wins_over_banner_on_same_window():
     assert "/usage 우선" in (result.note or "")
 
 
+# -- S1: /usage 행 파서는 줄 단위다 — 아래 case 는 전부 None 또는 참값만 준다 --
+
+
+@pytest.mark.parametrize(
+    ("line", "axis"),
+    [
+        (" Daily 1,000% used", "daily"),  # 천단위 구분 — '000' 을 0.0 으로 읽으면 안 된다
+        (" Daily -5% used", "daily"),  # 부호가 떨어져 5.0 이 되면 안 된다
+        (" Daily 0% remaining", "daily"),  # 'used' 키워드 없이 remaining 은 사용률이 아니다
+        (" Weekly 18% remaining", "weekly"),
+        (" Weekly 230% used", "weekly"),  # 범위 밖
+        (" Weekly (n/a)", "weekly"),  # 퍼센트 없음
+    ],
+)
+def test_usage_row_malformed_percent_never_becomes_used(line, axis):
+    """S1 섹션 D: 깨진 퍼센트·remaining 문구는 그 축을 만들지 않는다(None, 추정 금지)."""
+    axes = devin._usage_axes(devin._clean(line))
+
+    assert axis not in axes
+
+
+def test_usage_repaint_or_other_line_never_feeds_a_row():
+    """S1 섹션 D: 상태줄 리페인트·다른 줄의 퍼센트는 행의 축에 새어 들어오지 않는다."""
+    text = (
+        "Pro · 82% remaining (resets in 1d 2h)\r\n"
+        " Daily 0% used  · resets in 2h 7m\r\n"
+        " Weekly (n/a)\r\n"
+        "Context 7% full\r\n"
+        "Pro · 82% remaining (resets in 1d 2h)\r\n"  # 상태줄 리페인트
+    )
+
+    result = devin.parse_session(text)
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    # /usage Weekly 는 못 읽었으므로 배너가 증명한 참값(18%)로 둔다 —
+    # 리페인트의 82% remaining 을 'used' 로 읽거나 '/usage 와 불일치' 노트를
+    # 남겨서는 안 된다.
+    assert labels["weekly"].used_pct == 18.0
+    assert "불일치" not in (result.note or "")
+
+
+def test_usage_stray_label_word_does_not_block_the_real_row():
+    """S1 섹션 D: 'weekly' 가 들어간 안내 줄은 행이 아니다 — 진짜 행이 이긴다."""
+    text = (
+        "weekly counters refresh on Mondays\r\n"
+        " Daily 0% used  · resets in 2h 7m\r\n"
+        " Weekly 18% used  · resets Oct 11, 5:00 PM (UTC+9)\r\n"
+    )
+
+    result = devin.parse_session(text)
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["weekly"].used_pct == 18.0
+
+
+def test_usage_daily_row_without_used_stays_none_even_with_banner():
+    """Daily 행에 % used 가 없으면 daily 는 None — 배너 퍼센트로 채우지 않는다."""
+    text = (
+        "Pro · 82% remaining (resets in 1d 2h)\r\n"
+        " Daily (n/a)\r\n"
+        " Weekly 18% used  · resets Oct 11, 5:00 PM (UTC+9)\r\n"
+    )
+
+    result = devin.parse_session(text)
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct is None
+    assert labels["weekly"].used_pct == 18.0
+
+
+# -- S4: 연도 없는 절대 리셋은 라벨 tz 에서 year±1 후보를 비교한다 --------------
+
+
+def test_usage_absolute_reset_dec31_to_jan1_is_next_year():
+    """Dec 31 에 `resets Jan 1` 은 작년(364일 전)이 아니라 내년이다."""
+    row = " Weekly 18% used  · resets Jan 1, 5:00 PM (UTC+9)"
+    now = dt.datetime(2026, 12, 31, 12, 0, tzinfo=dt.UTC)
+    assert devin._segment_reset_iso(row, now=now) == "2027-01-01T17:00:00+09:00"
+
+
+def test_usage_absolute_reset_dec28_to_jan3_is_next_year():
+    """Dec 28 에 `resets Jan 3` 도 마찬가지로 내년 후보가 이긴다."""
+    row = " Weekly 18% used  · resets Jan 3, 5:00 PM (UTC+9)"
+    now = dt.datetime(2026, 12, 28, 12, 0, tzinfo=dt.UTC)
+    assert devin._segment_reset_iso(row, now=now) == "2027-01-03T17:00:00+09:00"
+
+
+def test_usage_absolute_reset_same_year_when_reset_is_upcoming():
+    """연중 평범한 경우는 올해 후보가 이긴다 (Oct 10 → Oct 11)."""
+    row = " Weekly 18% used  · resets Oct 11, 5:00 PM (UTC+9)"
+    now = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)
+    assert devin._segment_reset_iso(row, now=now) == "2026-10-11T17:00:00+09:00"
+
+
 def _pty_tui_script(
     *,
     models_payload: str | None = None,
@@ -460,19 +589,48 @@ _USAGE_DESK = [
     " Weekly  ■■■■■■■■■■■■■■■■■■■■  18% used  · resets Oct 11, 5:00 PM (UTC+9)",
 ]
 
+_STUB_TUI = Path(__file__).with_name("devin_stub_tui.py")
+
+
+def _stub_tui_binary(
+    tmp_path: Path, monkeypatch, *, mode: str = "normal", models_payload: str | None = None
+) -> Path:
+    """TUI-faithful stub (devin_stub_tui.py): raw stdin reads.
+
+    슬래시 팔레트는 텍스트+Enter 가 한 write 로 붙어 오면 삼키고, require_focus
+    모드는 ESC[I(FocusGained) 전 입력을 무시한다 — 텍스트/Enter 분리 전송과
+    포커스 응답이 없으면 프로브가 멈추는 실제 TUI 동작을 그대로 흉내낸다.
+    모든 read 는 타임스탬프와 함께 STUB_LOG 에 남는다.
+    """
+    target = tmp_path / "fake-devin-tui"
+    shutil.copy(_STUB_TUI, target)
+    target.chmod(0o755)
+    log = tmp_path / "stub-input.log"
+    monkeypatch.setenv("STUB_MODE", mode)
+    monkeypatch.setenv("STUB_LOG", str(log))
+    if models_payload is not None:
+        models = tmp_path / "models.txt"
+        models.write_text(models_payload)
+        monkeypatch.setenv("STUB_MODELS", str(models))
+    monkeypatch.setattr(devin, "BINARY", str(target))
+    return log
+
+
+def _stub_reads(log: Path) -> list[bytes]:
+    """스텁이 stdin 에서 읽은 바이트 청크들(시간순)."""
+    chunks: list[bytes] = []
+    for line in log.read_text().splitlines():
+        if " read " in line:
+            chunks.append(ast.literal_eval(line.split(" read ", 1)[1]))
+    return chunks
+
+
+def _stub_lines(log: Path, tag: str) -> list[str]:
+    return [line for line in log.read_text().splitlines() if f" {tag}" in line]
+
 
 def test_fetch_probes_session_and_appends_swe2_bucket(tmp_path, monkeypatch, fixture_text):
-    payload = _fixture(fixture_text)
-    binary = tmp_path / "fake-devin-session-and-models"
-    binary.write_text(
-        _pty_tui_script(
-            models_payload=payload,
-            banner_text=f"v3000.10.31\r\n{_BANNER_82}",
-            usage_lines=_USAGE_DESK,
-        )
-    )
-    binary.chmod(binary.stat().st_mode | 0o111)
-    monkeypatch.setattr(devin, "BINARY", str(binary))
+    _stub_tui_binary(tmp_path, monkeypatch, models_payload=_fixture(fixture_text))
 
     result = devin.fetch()
 
@@ -483,7 +641,7 @@ def test_fetch_probes_session_and_appends_swe2_bucket(tmp_path, monkeypatch, fix
     labels = [(b.label, b.used_pct, b.horizon) for b in result.buckets]
     assert ("daily", 0.0, "now") in labels
     assert ("weekly", 18.0, "week") in labels
-    assert ("swe-2", 0.0, "month") in labels
+    assert ("swe-2", 0.0, "now") in labels
 
 
 def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(tmp_path, monkeypatch, fixture_text):
@@ -509,7 +667,7 @@ def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(tmp_pat
     labels = {(b.label, b.used_pct, b.horizon) for b in result.buckets}
     assert ("daily", 0.0, "now") in labels
     assert ("weekly", 18.0, "week") in labels
-    assert ("swe-2", 0.0, "month") in labels
+    assert ("swe-2", 0.0, "now") in labels
 
 
 def test_fetch_session_failure_falls_back_to_models_list_with_warning(tmp_path, monkeypatch, fixture_text):
@@ -526,27 +684,15 @@ def test_fetch_session_failure_falls_back_to_models_list_with_warning(tmp_path, 
     assert result.warning is not None
     assert result.source == "cli:models list"
     labels = [(b.label, b.used_pct, b.horizon) for b in result.buckets]
-    assert ("swe-2", 0.0, "month") in labels
+    assert ("swe-2", 0.0, "now") in labels
     assert ("daily", None, "now") in labels
     assert ("weekly", None, "week") in labels
 
 
 def test_probe_session_sends_usage_and_exit_and_reads_both(tmp_path, monkeypatch, fixture_text):
     """AC3: 한 PTY 세션이 정확히 /usage·/exit 만 보내고, winsize 를 걸고, 자식을 정리한다."""
-    payload = _fixture(fixture_text)
-    input_log = tmp_path / "devin-input.log"
     workdir = tmp_path / "probe-workdir"
-    binary = tmp_path / "fake-devin-tui"
-    binary.write_text(
-        _pty_tui_script(
-            models_payload=payload,
-            banner_text=f"v3000.11.3\r\n{_BANNER_82}",
-            usage_lines=_USAGE_DESK,
-            input_log=input_log,
-        )
-    )
-    binary.chmod(binary.stat().st_mode | 0o111)
-    monkeypatch.setattr(devin, "BINARY", str(binary))
+    log = _stub_tui_binary(tmp_path, monkeypatch, models_payload=_fixture(fixture_text))
     monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
     ioctl_calls = []
     original_ioctl = devin.fcntl.ioctl
@@ -563,8 +709,9 @@ def test_probe_session_sends_usage_and_exit_and_reads_both(tmp_path, monkeypatch
     labels = {b.label: b for b in result.buckets}
     assert labels["daily"].used_pct == 0.0
     assert labels["weekly"].used_pct == 18.0
-    sent = input_log.read_text().replace("\r", "").splitlines()
-    assert sent == ["/usage", "/exit"]
+    # 텍스트와 Enter 는 별도 write 다 — 한 write 로 붙여 보내는 뮤턴트는
+    # 스텁 팔레트가 삼켜 /usage 가 실행되지 않는다(RED).
+    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
     assert ioctl_calls
     assert ioctl_calls[0][1] == devin.termios.TIOCSWINSZ
     assert devin.struct.unpack("HHHH", ioctl_calls[0][2]) == (50, 200, 0, 0)
@@ -573,20 +720,9 @@ def test_probe_session_sends_usage_and_exit_and_reads_both(tmp_path, monkeypatch
 
 def test_probe_usage_unanswered_keeps_banner_axis_and_daily_none(tmp_path, monkeypatch, fixture_text):
     """AC3 fail-closed: /usage 미응답 → 배너가 증명한 weekly 만 쓰고 daily 는 None."""
-    payload = _fixture(fixture_text)
-    input_log = tmp_path / "devin-input.log"
-    binary = tmp_path / "fake-devin-no-usage-answer"
-    binary.write_text(
-        _pty_tui_script(
-            models_payload=payload,
-            banner_text=f"v3000.11.3\r\n{_BANNER_82}",
-            usage_lines=None,
-            input_log=input_log,
-            answer_usage=False,
-        )
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="no_usage_answer", models_payload=_fixture(fixture_text)
     )
-    binary.chmod(binary.stat().st_mode | 0o111)
-    monkeypatch.setattr(devin, "BINARY", str(binary))
     monkeypatch.setattr(devin, "USAGE_WAIT_S", 0.5)
     monkeypatch.setattr(devin, "EXIT_WAIT_S", 0.5)
 
@@ -597,26 +733,31 @@ def test_probe_usage_unanswered_keeps_banner_axis_and_daily_none(tmp_path, monke
     assert labels["weekly"].used_pct == 18.0  # 배너 82% remaining → used 18
     assert labels["daily"].used_pct is None
     assert "daily 미측정" in (result.note or "")
-    sent = input_log.read_text().replace("\r", "").splitlines()
-    assert sent == ["/usage", "/exit"]
+    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
 
 
-def test_probe_status_line_missing_still_reads_usage(tmp_path, monkeypatch, fixture_text):
-    """AC3: 상태줄 미출현 — /usage 두 축으로 버킷을 채우고 배너 부재를 note 에 남긴다."""
-    payload = _fixture(fixture_text)
-    input_log = tmp_path / "devin-input.log"
-    binary = tmp_path / "fake-devin-no-banner-line"
-    binary.write_text(
-        _pty_tui_script(
-            models_payload=payload,
-            banner_text=None,
-            usage_lines=_USAGE_DESK,
-            input_log=input_log,
-        )
-    )
-    binary.chmod(binary.stat().st_mode | 0o111)
-    monkeypatch.setattr(devin, "BINARY", str(binary))
-    monkeypatch.setattr(devin, "BANNER_WAIT_S", 0.2)
+def test_probe_sends_no_input_when_no_status_line_or_input_marker(tmp_path, monkeypatch, fixture_text):
+    """S2: 상태줄도 입력창 ❯ 마커도 없으면 어떤 입력도 치지 않는다(blind input 금지).
+
+    로그인·업데이트 프롬프트에 Enter 가 들어가는 것을 막는다 — 기다리다가
+    deadline 에 fail-closed 로 끝난다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="no_banner", models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    assert result.warning is not None  # 쿼타 프로브 fail-closed → models 만
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct is None
+    assert labels["weekly"].used_pct is None
+    assert _stub_reads(log) == []
+
+
+def test_probe_sends_usage_after_input_box_marker_without_banner(tmp_path, monkeypatch, fixture_text):
+    """S2: 상태줄은 안 보여도 입력창 ❯ 마커가 확인되면 /usage 를 보낸다."""
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="prompt_only", models_payload=_fixture(fixture_text))
 
     result = devin.fetch()
 
@@ -625,23 +766,43 @@ def test_probe_status_line_missing_still_reads_usage(tmp_path, monkeypatch, fixt
     assert labels["daily"].used_pct == 0.0
     assert labels["weekly"].used_pct == 18.0
     assert "배너" in (result.note or "")
-    sent = input_log.read_text().replace("\r", "").splitlines()
-    assert sent == ["/usage", "/exit"]
+    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
+
+
+def test_probe_answers_focus_reporting_before_typing(tmp_path, monkeypatch, fixture_text):
+    """?1004h 가 켜진 TUI 에는 FocusGained(ESC[I)를 먼저 한 번 보낸다."""
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="focus_adv", models_payload=_fixture(fixture_text))
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    reads = _stub_reads(log)
+    assert reads[0] == b"\x1b[I"
+    assert reads[1:] == [b"/usage", b"\r", b"/exit", b"\r"]
+
+
+def test_probe_types_after_focus_gained_when_tui_gates_input(tmp_path, monkeypatch, fixture_text):
+    """require_focus 모드 — FocusGained 없이 온 입력은 TUI 가 무시한다.
+
+    프로브가 ESC[I 를 안 보내는 뮤턴트는 여기서 RED 가 된다(입력 무시 →
+    /usage 미응답 → daily None).
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="require_focus", models_payload=_fixture(fixture_text))
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["weekly"].used_pct == 18.0
+    assert _stub_lines(log, "ignored-no-focus") == []
 
 
 def test_probe_out_of_range_percentages_are_unreadable_not_guessed(tmp_path, monkeypatch, fixture_text):
     """AC3: 범위 밖 퍼센트는 읽히지 않은 것으로 둔다 — 0/100 추정 금지."""
-    payload = _fixture(fixture_text)
-    binary = tmp_path / "fake-devin-out-of-range"
-    binary.write_text(
-        _pty_tui_script(
-            models_payload=payload,
-            banner_text=f"v3000.11.3\r\n{_BANNER_82}",
-            usage_lines=["Daily 230% used", "Weekly 999% used"],
-        )
-    )
-    binary.chmod(binary.stat().st_mode | 0o111)
-    monkeypatch.setattr(devin, "BINARY", str(binary))
+    _stub_tui_binary(tmp_path, monkeypatch, mode="malformed", models_payload=_fixture(fixture_text))
     monkeypatch.setattr(devin, "USAGE_WAIT_S", 0.5)
     monkeypatch.setattr(devin, "EXIT_WAIT_S", 0.5)
 
@@ -652,6 +813,36 @@ def test_probe_out_of_range_percentages_are_unreadable_not_guessed(tmp_path, mon
     assert labels["daily"].used_pct is None
     # 범위 밖 /usage Weekly 는 무시하고 배너가 증명한 값을 쓴다.
     assert labels["weekly"].used_pct == 18.0
+
+
+def test_probe_session_raises_timeout_expired_on_silent_tui(tmp_path, monkeypatch):
+    """S3: 침묵 TUI 는 입력을 한 번도 치지 않고 TimeoutExpired 분기로 끝난다."""
+    _stub_tui_binary(tmp_path, monkeypatch, mode="hang")
+    monkeypatch.setattr(devin, "TIMEOUT_S", 0.5)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        devin._probe_session()
+
+
+def test_probe_exit_ignored_still_cleans_up_grandchild(tmp_path, monkeypatch, fixture_text):
+    """/exit 을 무시하고 손자를 남긴 TUI 도 프로브가 자기 인스턴스를 쓴다."""
+    workdir = tmp_path / "probe-workdir"
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="ignore_exit", models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "PROBE_WORKDIR", workdir)
+    monkeypatch.setattr(devin, "EXIT_WAIT_S", 0.3)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    grandchild = [line for line in log.read_text().splitlines() if line.startswith("grandchild ")]
+    assert grandchild
+    pid = int(grandchild[0].split()[-1])
+    try:
+        assert _wait_gone([pid], timeout=10) == []
+        assert proctrack.pids_with_cwd(workdir, nested=True) == []
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def test_probe_session_sets_pty_winsize_and_columns_lines_env(tmp_path, monkeypatch):
@@ -1130,7 +1321,10 @@ def test_task295_recommend_c_lists_remaining_devin_profiles_as_unmeasured(fixtur
 
 
 def _ranked_names(out: str) -> list[str]:
-    return [line.split()[1] for line in out.splitlines() if line[:1].isdigit()]
+    # 행이 🔥 마커로 시작할 수 있어 위치가 아닌 토큰 멤버십으로 잡는다 (#1381,
+    # test_devin_effort_variants 와 같은 패턴).
+    tokens = {token for line in out.splitlines() if line[:1].isdigit() for token in line.split()}
+    return [token for token in tokens if token.startswith("devin-")]
 
 
 def test_task631_ds41_measured_grade_is_in_both_snapshot_consumers(capsys, fixture_text):
@@ -1160,14 +1354,12 @@ def test_task631_ds41_measured_grade_is_in_both_snapshot_consumers(capsys, fixtu
     assert launched["model_id"] == "deepseek-v4-1-flash-high"
     assert launched["catalog"]["source"] == "snapshot"
 
-    providers = [devin.parse(_fixture(fixture_text))]
+    providers = [_measured_devin(fixture_text)]
     aplus = recommend(providers, "A+")
     c_grade = recommend(providers, "C")
-    # 쿼타 미측정 devin 풀은 순위 대신 측정 불가 제외 행으로 나온다 (fail-closed).
-    excluded = next((line for line in aplus.splitlines() if line.startswith("✗ devin 측정 불가")), None)
-    assert excluded is not None and "devin-ds41" in excluded, aplus
+    assert "hk:doc 2227" in aplus
     # Match the row token, not a substring: #635's devin-ds41-max stays in C.
-    assert "devin-ds41" not in _ranked_names(aplus)
+    assert "devin-ds41" in _ranked_names(aplus)
     assert "devin-ds41" not in _ranked_names(c_grade)
 
 
@@ -1196,6 +1388,23 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
 def test_task295_profile_pool_shares_devin_pool():
     for name in NEW_DEVIN_PROFILES:
         assert profile_pool(name) == ("devin", None)
+
+
+def test_task295_gate_cli_ok_on_new_devin_profiles(monkeypatch, capsys, fixture_text):
+    """S6: PTY /usage 측정이 있으면 새 devin 프로필 게이트도 열린다(복원)."""
+    result = _measured_devin(fixture_text)
+    monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
+
+    parser = cli.build_parser(["devin"])
+    gate = parser._subparsers._group_actions[0].choices["gate"]
+    profile_action = next(action for action in gate._actions if action.dest == "profile")
+    for name in NEW_DEVIN_PROFILES:
+        assert name in profile_action.choices
+
+        rc = cli.main(["gate", "-m", name, "--no-cache"])
+        out = capsys.readouterr()
+        assert rc == 0, (name, out)
+        assert "pool=devin" in out.out, (name, out)
 
 
 def test_task295_gate_cli_fail_closed_on_new_devin_profiles_without_quota(monkeypatch, capsys, fixture_text):

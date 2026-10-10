@@ -10,9 +10,11 @@
 창이 만든 가짜 쿼타 축이었다(쿼타가 아니라 모델 Free 태그 → model scope).
 
 - 배너는 두 번 그려진다 — 첫 페인트는 버전만, 몇 초 뒤 커서이동+화면클리어 후
-  같은 줄이 쿼타까지 포함해 다시 그려진다. 두 번째 페인트를 본 뒤 ``/usage``
-  를 보내고, 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이 둘뿐이다 —
-  쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
+  같은 줄이 쿼타까지 포함해 다시 그려진다. 입력은 상태줄(쿼타 배너)이나
+  입력창 ``❯`` 마커가 확인된 뒤에만 보낸다 — 어느 쪽도 안 보이면 로그인이나
+  업데이트 프롬프트일 수 있으므로 아무것도 치지 않고 끝낸다(fail-closed).
+  ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
+  둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
 - ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
   버킷을 낸다(계정 쿼타 창이 아니므로 창 표시·게이트 축에서 제외).
 
@@ -46,9 +48,6 @@ from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 BINARY = os.environ.get("SCOPEFUEL_DEVIN_BIN") or "devin"
 TIMEOUT_S = 30.0
 BANNER_SETTLE_S = 0.5
-# 배너가 아예 안 그려질 때 /usage 전송까지 기다리는 상한 — 상태줄이 없어도
-# /usage 축은 읽을 수 있으므로 포기하지 않고 보낸다.
-BANNER_WAIT_S = 10.0
 USAGE_WAIT_S = 15.0
 USAGE_SETTLE_S = 1.0
 EXIT_WAIT_S = 3.0
@@ -96,10 +95,17 @@ _BANNER_QUOTA_NEW = re.compile(
     rf"\(resets in {_BANNER_RESET}\)[ \t]*$"
 )
 _DURATION_PART = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[dhms])", re.IGNORECASE)
-# /usage 출력의 축 레이블. TUI 패널은 커서 이동으로 각 셀을 따로 페인트하므로
-# ANSI 를 걷어낸 뒤 "레이블 → 다음 다른 레이블" 구간 안에서 퍼센트·리셋을 찾는다.
-_USAGE_LABEL = re.compile(r"\b(?P<axis>daily|weekly)\b", re.IGNORECASE)
-_USAGE_PCT = re.compile(r"(?P<used>\d+(?:\.\d+)?)\s*%")
+# /usage 축 행은 물리 줄 단위다 — ``Daily``·``Weekly`` 레이블이 선행하는 그 줄
+# 안에서만 퍼센트·리셋을 읽는다. 다른 줄(상태줄 리페인트·안내 문구 등)의 값은
+# 어느 축에도 새어 들어오지 않는다.
+_USAGE_ROW = re.compile(r"^[ \t]*(?P<axis>daily|weekly)\b", re.IGNORECASE)
+# ``N% used`` 의 N 은 구분자 없는 숫자만 인정한다 — ``1,000% used``(천단위
+# 구분), ``-5% used``(부호), ``N% remaining``(키워드 없음) 같은 형태는 사용률로
+# 읽지 않는다. 숫자 앞에 [\d,.-] 가 붙어 있으면 거절.
+_USAGE_USED = re.compile(r"(?<![\d,.\-])(?P<used>\d+(?:\.\d+)?)[ \t]*%[ \t]*used\b", re.IGNORECASE)
+# 입력창이 그려졌다는 최소 마커 — devin TUI 의 프롬프트 chevron. 상태줄이
+# 안 그려진 TUI 에도 입력창이 있으면 /usage 를 보낼 수 있다.
+_INPUT_READY = re.compile(r"(?m)^[ \t]*❯")
 _USAGE_RESET = re.compile(
     r"resets?\s+in\s+(?P<reset>\d+(?:\.\d+)?[ \t]*[dhms](?:[ \t]+\d+(?:\.\d+)?[ \t]*[dhms])*)",
     re.IGNORECASE,
@@ -346,8 +352,8 @@ def _probe_session() -> str:
 
         output = bytearray()
         deadline = time.monotonic() + TIMEOUT_S
-        started_at = time.monotonic()
         banner_seen_at: float | None = None
+        ready_at: float | None = None
         focus_sent = False
         usage_typed_at: float | None = None
         usage_sent_at: float | None = None
@@ -371,16 +377,18 @@ def _probe_session() -> str:
             clean = _clean(raw)
             if banner_seen_at is None and _banner_quota_match(clean) is not None:
                 banner_seen_at = now
+            if ready_at is None and (banner_seen_at is not None or _INPUT_READY.search(clean)):
+                ready_at = now
             if not focus_sent and FOCUS_REPORT_SEQ in raw:
                 with contextlib.suppress(OSError):
                     os.write(master_fd, FOCUS_IN.encode())
                 focus_sent = True
-            # /usage 전송 조건은 출력 도착과 무관하게 매 반복 평가한다 — TUI 가
-            # 침묵하는 사이에는 readable 이 비어 입력 시점을 영원히 못 잡는다.
-            if usage_typed_at is None and (
-                (banner_seen_at is not None and now - banner_seen_at >= BANNER_SETTLE_S)
-                or now - started_at >= BANNER_WAIT_S
-            ):
+            # 입력은 상태줄(쿼타 배너)이나 입력창 ❯ 마커가 보인 뒤에만 보낸다 —
+            # 어느 쪽도 없으면 그 TUI 는 로그인·업데이트 프롬프트일 수 있으므로
+            # 아무것도 치지 않고 deadline 까지 기다린 뒤 fail-closed 로 끝낸다.
+            # 조건은 출력 도착과 무관하게 매 반복 평가한다 — TUI 가 침묵하는
+            # 사이에는 readable 이 비어 입력 시점을 영원히 못 잡는다.
+            if usage_typed_at is None and ready_at is not None and now - ready_at >= BANNER_SETTLE_S:
                 with contextlib.suppress(OSError):
                     os.write(master_fd, USAGE_INPUT.encode())
                 usage_typed_at = now
@@ -547,39 +555,43 @@ def parse_session(text: str) -> ProviderResult:
 
 
 def _usage_axes(clean: str) -> dict[str, dict[str, object]]:
-    """/usage 출력의 daily·weekly 축을 레이블 구간 단위로 파싱한다.
+    """/usage 출력의 daily·weekly 축을 물리 줄 단위로 파싱한다.
 
-    축 레이블에서 다음 다른 축 레이블까지를 그 축의 구간으로 보고, 구간 안 첫
-    in-range 퍼센트와 ``resets in`` 기간을 읽는다. 범위 밖 퍼센트는 그 축을
-    "못 읽음"(None)으로 남긴다 — 절대 0/100 으로 채우지 않는다.
+    ``Daily``·``Weekly`` 레이블로 시작하는 각 줄을 한 축 행으로 보고 그 줄
+    안에서만 ``N% used`` 와 리셋을 찾는다 — 레이블에서 다음 레이블까지의 임의
+    구간을 한 축으로 보지 않으므로, 뒤에 다시 그려진 상태줄(``Pro · …``)이나
+    다른 줄의 퍼센트가 이 축에 새어 들어오지 않는다. 같은 축에서는 첫 읽힌
+    행이 이기고, ``% used`` 가 안 읽힌 행은 축을 만들지 않는다 — 절대
+    0/100 으로 채우지 않는다.
     """
-    marks = list(_USAGE_LABEL.finditer(clean))
     axes: dict[str, dict[str, object]] = {}
-    for index, mark in enumerate(marks):
-        name = mark["axis"].lower()
+    for line in clean.splitlines():
+        label = _USAGE_ROW.match(line)
+        if label is None:
+            continue
+        name = label["axis"].lower()
         if name in axes:
             continue
-        end = len(clean)
-        for later in marks[index + 1 :]:
-            if later["axis"].lower() != name:
-                end = later.start()
-                break
-        segment = clean[mark.end() : end]
         used: float | None = None
-        for candidate in _USAGE_PCT.finditer(segment):
+        for candidate in _USAGE_USED.finditer(line):
             value = float(candidate["used"])
             if 0 <= value <= 100:
                 used = value
                 break
-        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(segment)}
+        if used is None:
+            continue
+        axes[name] = {"used_pct": used, "resets_at": _segment_reset_iso(line)}
     return axes
 
 
-def _segment_reset_iso(segment: str) -> str | None:
-    """축 구간 안의 리셋 — 상대 기간(resets in …) 또는 절대 시각(resets Oct 11, …)."""
+def _segment_reset_iso(segment: str, now: dt.datetime | None = None) -> str | None:
+    """축 행 안의 리셋 — 상대 기간(resets in …) 또는 절대 시각(resets Oct 11, …)."""
+    moment = now or dt.datetime.now(dt.UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
     duration = _USAGE_RESET.search(segment)
     if duration is not None:
-        return _reset_iso(duration["reset"].strip())
+        return _reset_iso(duration["reset"].strip(), now=moment)
     absolute = _USAGE_RESET_ABS.search(segment)
     if absolute is None:
         return None
@@ -594,10 +606,21 @@ def _segment_reset_iso(segment: str) -> str | None:
         sign = 1 if tz_text.startswith("+") else -1
         hours, _, minutes = tz_text[1:].partition(":")
         offset = dt.timedelta(hours=sign * (int(hours) + int(minutes or 0) / 60))
-        year = dt.datetime.now(dt.UTC).year
-        return dt.datetime(
-            year, month, int(absolute["day"]), hour, minute, tzinfo=dt.timezone(offset)
-        ).isoformat()
+        tzinfo = dt.timezone(offset)
+        # 연도가 없는 절대 시각 — 라벨의 tz 기준으로 올해·작년·내년 후보를 만들어
+        # 하루 이상 지나지 않은 후보 중 지금에 가장 가까운 것을 고른다
+        # (연말에 ``resets Jan 1, …`` 가 작년으로 해석되는 것을 막는다).
+        local_now = moment.astimezone(tzinfo)
+        day = int(absolute["day"])
+        candidates = []
+        for year in (local_now.year - 1, local_now.year, local_now.year + 1):
+            with contextlib.suppress(ValueError):
+                candidate = dt.datetime(year, month, day, hour, minute, tzinfo=tzinfo)
+                if candidate >= local_now - dt.timedelta(days=1):
+                    candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda c: abs(c - local_now)).isoformat()
     except (KeyError, ValueError):
         return None
 
@@ -667,14 +690,14 @@ def parse(text: str) -> ProviderResult:
         buckets=[
             Bucket(
                 label="swe-2",
-                window="30d",
+                # Free 태그는 쿼타 창이 아니다 — '30d'·'month' 로 그리면 '월' 축
+                # 오독이 다시 생긴다(1381: desk 의 '월 0%'). 창을 비우고 non-month
+                # 지평만 둔다; model scope 이므로 어느 축에도 합산되지 않는다.
+                window="",
                 used_pct=0.0,
                 resets_at=None,
-                # Free 태그는 SWE-2 패밀리 한정이지 계정 쿼타 창이 아니다 —
-                # account 로 두면 '30d' 가 '월' 쿼타 축으로 렌더돼 /usage 에
-                # 없는 창이 생긴다(1381: desk 의 '월 0%' 오독).
                 scope=Scope("model", "swe-2"),
-                horizon="month",
+                horizon="now",
                 note=FREE_NOTE,
             )
         ],
@@ -726,7 +749,7 @@ def _clean(text: str) -> str:
     return _ANSI.sub("", text).replace("\r", "\n")
 
 
-def _reset_iso(duration: str | None) -> str | None:
+def _reset_iso(duration: str | None, now: dt.datetime | None = None) -> str | None:
     if not duration:
         return None
     total_seconds = 0.0
@@ -735,7 +758,10 @@ def _reset_iso(duration: str | None) -> str | None:
         total_seconds += value * {"d": 86400, "h": 3600, "m": 60, "s": 1}[match["unit"].lower()]
     if total_seconds <= 0:
         return None
-    return (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=total_seconds)).isoformat()
+    moment = now or dt.datetime.now(dt.UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
+    return (moment + dt.timedelta(seconds=total_seconds)).isoformat()
 
 
 def _child_env() -> dict[str, str]:

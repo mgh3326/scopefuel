@@ -65,7 +65,18 @@ def _ranked(output: str) -> list[str]:
 
 def _devin_ranked_names(output: str) -> list[str]:
     """The devin-pool ranked rows in output order (ranked-line name token)."""
-    return [line.split()[1] for line in _ranked(output) if profile_pool(line.split()[1])[0] == "devin"]
+    names: list[str] = []
+    for line in _ranked(output):
+        # 행이 🔥 마커로 시작할 수 있어 고정 위치가 아닌 토큰 멤버십으로 잡는다.
+        name = next((t for t in line.split() if profile_pool(t)[0] == "devin"), None)
+        if name is not None:
+            names.append(name)
+    return names
+
+
+def _measured_devin(fixture_text) -> ProviderResult:
+    """#1381: models list 는 쿼타를 안 주므로 측정된 devin 풀은 PTY 세션 파서로 만든다."""
+    return devin.parse_session(fixture_text("devin_usage"))
 
 
 def _placements(name: str) -> list[str]:
@@ -220,7 +231,7 @@ def test_fusion_launch_spelling_is_the_bare_profile(name):
 
 
 def test_no_fusion_line_anywhere_carries_the_effort_flag(fixture_text):
-    providers = [devin.parse(fixture_text("devin_models_list"))]
+    providers = [_measured_devin(fixture_text)]
     for grade in ("S+", "S", "A+", "A", "B", "C"):
         out = recommend(providers, grade, today=TODAY, now=NOW)
         for line in out.splitlines():
@@ -295,7 +306,7 @@ def test_price_seeds_carry_the_fusion_prices(tmp_path):
 def test_recommend_lists_fusion_rows_only_at_b(fixture_text):
     """B-only listing: the rows are absent at every other grade, A included —
     verdict option (b) removed the A claim entirely."""
-    providers = [devin.parse(fixture_text("devin_models_list"))]
+    providers = [_measured_devin(fixture_text)]
     for grade in ("S+", "S", "A+", "A", "C"):
         out = recommend(providers, grade, explain=True)
         for name in FUSION_PROFILES:
@@ -325,11 +336,11 @@ def test_at_b_every_measured_row_precedes_the_first_fusion_row():
 def test_recommend_b_fusion_rows_are_exact_unmeasured_and_after_free_swe2(fixture_text):
     """At B the fusion rows rank as exact rows (never [one-up] tagged) after
     every free devin row (paid sinks below free at equal quota standing)."""
-    providers = [devin.parse(fixture_text("devin_models_list"))]
+    providers = [_measured_devin(fixture_text)]
     out = recommend(providers, "B")
     ranked = _ranked(out)
     for name in FUSION_PROFILES:
-        lines = [line for line in ranked if line.split()[1] == name]
+        lines = [line for line in ranked if name in line.split()]
         assert len(lines) == 1, (name, out)
         assert "[one-up" not in lines[0], (name, lines[0])
         assert "미측정" in lines[0], (name, lines[0])
@@ -349,7 +360,7 @@ def test_recommend_b_devin_pool_order_is_free_then_paid(fixture_text):
     """The pinned devin-pool order at B: the free SWE-2 rows (including the
     tagged one-up swe2-medium) lead the two paid fusion rungs — nothing in
     the pool ranks after them."""
-    providers = [devin.parse(fixture_text("devin_models_list"))]
+    providers = [_measured_devin(fixture_text)]
     out = recommend(providers, "B")
     devin_names = _devin_ranked_names(out)
     assert devin_names[-2:] == ["devin-fusion-opus55", "devin-fusion-sonnet55"], out
@@ -360,7 +371,7 @@ def test_recommend_a_has_no_fusion_rows_and_the_ds41_one_up_is_unchanged(fixture
     """At A the fusion rows are absent and the devin pool keeps its
     pre-#1380 order — the rep-measured ds41 one-up is no longer outranked by
     unmeasured rows (the B1 evidence case)."""
-    providers = [devin.parse(fixture_text("devin_models_list"))]
+    providers = [_measured_devin(fixture_text)]
     out = recommend(providers, "A")
     for name in FUSION_PROFILES:
         assert name not in out
@@ -382,7 +393,7 @@ def test_fusion_rows_are_not_rep_measured_and_not_one_up_at_b(fixture_text):
 def recommend_dict_rows(fixture_text, grade):
     from scopefuel.recommend import recommend_dict
 
-    providers = [devin.parse(fixture_text("devin_models_list"))]
+    providers = [_measured_devin(fixture_text)]
     return recommend_dict(providers, grade, today=TODAY, now=NOW)
 
 

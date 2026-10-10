@@ -174,9 +174,9 @@ def gate_outputs(monkeypatch, capsys, tmp_path, fixture_text) -> dict:
 
 def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, tmp_path, fixture_text):
     # Golden originally captured at af2233f (main, before #635) with this same
-    # helper; re-captured under #1381's quota semantics — devin now requires
-    # 1d+7d windows and swe-2 is model-scoped, so models-list-only input gates
-    # fail-closed with both windows missing.
+    # helper; re-captured under #1381's quota semantics — devin requires the
+    # weekly (7d) window only and swe-2 is model-scoped, so models-list-only
+    # input gates fail-closed with the 7d window missing.
     expected = json.loads(GATE_GOLDEN.read_text())
     actual = gate_outputs(monkeypatch, capsys, tmp_path, fixture_text)
     assert json.dumps(actual, ensure_ascii=False, sort_keys=True) == json.dumps(

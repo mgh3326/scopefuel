@@ -48,12 +48,13 @@ DEFAULT_WINDOWS = {
     "upstage": "30d",
 }
 # These are admission-coverage floors, not synthetic zero-valued buckets.
-# Devin requires both axes /usage exposes: the CLI's startup banner only proves
-# the weekly remainder, so a snapshot missing either window is incomplete.
+# Devin requires only the weekly window: the startup banner always proves the
+# weekly remainder, while Daily exists only when /usage is readable — requiring
+# it would refuse stale/manual snapshots that a fresh probe would admit.
 REQUIRED_WINDOWS = {
     "claude": frozenset({"5h", "7d"}),
     "codex": frozenset({"5h", "7d"}),
-    "devin": frozenset({"1d", "7d"}),
+    "devin": frozenset({"7d"}),
     "grok": frozenset({"7d"}),
     "kimi": frozenset({"5h", "7d"}),
     "kiro": frozenset({"30d"}),
