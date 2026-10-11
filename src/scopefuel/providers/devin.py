@@ -120,6 +120,8 @@ _INPUT_READY = re.compile(r"(?m)^[ \t]*[❭❯][ \t]*Ask Devin to build")
 # 시작하는 질문 프롬프트 — 그 화면은 composer 가 아니라 모달이므로 Enter 가
 # 선택지를 누른다. composer placeholder 줄 자체는 옵션이 아니라서 제외한다.
 _MODAL_OR_OPTION = re.compile(r"(?m)^[ \t]*(?:\?|[❭❯›][ \t]*(?!Ask Devin to build)\S)")
+# 입력을 친 뒤 새로 그려진 모달 — composer 의 /usage·/exit 에코 줄은 옵션이 아니다.
+_POST_INPUT_MODAL = re.compile(r"(?m)^[ \t]*(?:\?|[❭❯›][ \t]*(?!Ask Devin to build|/usage\b|/exit\b)\S)")
 _USAGE_RESET = re.compile(
     r"resets?\s+in\s+(?P<reset>\d+(?:\.\d+)?[ \t]*[dhms](?:[ \t]+\d+(?:\.\d+)?[ \t]*[dhms])*)",
     re.IGNORECASE,
@@ -373,6 +375,7 @@ def _probe_session() -> str:
         ready_at: float | None = None
         focus_sent = False
         usage_typed_at: float | None = None
+        typed_from: int | None = None
         usage_sent_at: float | None = None
         usage_seen_at: float | None = None
         exit_typed_at: float | None = None
@@ -413,6 +416,11 @@ def _probe_session() -> str:
                 with contextlib.suppress(OSError):
                     os.write(master_fd, USAGE_INPUT.encode())
                 usage_typed_at = now
+                typed_from = len(output)
+            if typed_from is not None and _POST_INPUT_MODAL.search(
+                _clean(bytes(output[typed_from:]).decode("utf-8", errors="replace"))
+            ):
+                break  # 입력 뒤 모달 — 더 치지 않고 끝낸다(fail-closed)
             if (
                 usage_typed_at is not None
                 and usage_sent_at is None

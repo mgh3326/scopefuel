@@ -991,6 +991,144 @@ def test_probe_sends_no_input_when_modal_opens_after_gate(tmp_path, monkeypatch,
     assert _stub_reads(log) == []
 
 
+@pytest.mark.parametrize("mode", ["question_over_banner", "chevron_over_banner"])
+def test_probe_sends_no_input_to_single_modal_line_over_status_line(
+    tmp_path, monkeypatch, fixture_text, mode
+):
+    """tester S1: ``?`` 질문줄 하나만, chevron 옵션 목록 하나만 있어도 게이트는 닫힌다.
+
+    상태줄+composer 뒤의 화면에 ``?`` 질문줄만(question_over_banner) 또는
+    chevron 옵션 목록만(chevron_over_banner) 있을 때 아무것도 치지 않는다 —
+    ``_MODAL_OR_OPTION`` 의 ``?`` 브랜치나 chevron 브랜치를 빼는 뮤턴트는
+    여기에 /usage 를 쳐 넣어 RED 가 된다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode=mode, models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축은 쓴다
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == []
+
+
+@pytest.mark.parametrize("capture", _CAPTURE_REPLAYS)
+def test_probe_sends_no_enter_when_modal_paints_after_usage_typed(
+    tmp_path, monkeypatch, fixture_text, capture
+):
+    """B1-r4: /usage 텍스트를 친 '뒤'·Enter '전'에 모달이 뜨면 Enter 를 보내지 않는다.
+
+    입력이 시작된 뒤의 화면을 다시 검사하지 않는 구현은 Enter 가 모달의
+    ``Yes, update and restart`` 를 확정한다(KEYS-INTO-MODAL + MODAL-CONFIRMED
+    로 RED). daily 는 못 읽고 None, weekly 는 배너가 증명한 18.0 이다.
+    """
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="cr_modal_usage", models_payload=_fixture(fixture_text)
+    )
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path(capture)))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage"]
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
+
+
+def test_probe_sends_no_enter_when_question_paints_after_usage_typed(tmp_path, monkeypatch, fixture_text):
+    """B1-r4: /usage 뒤 (Y/n) 질문 프롬프트가 뜨면 Enter 가 기본 Y 를 확정하지 못한다."""
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="cr_q_usage", models_payload=_fixture(fixture_text))
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path("devin_capture3")))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage"]
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
+
+
+def test_probe_sends_no_enter_when_modal_paints_after_exit_typed(tmp_path, monkeypatch, fixture_text):
+    """B1-r4: /exit 텍스트를 친 뒤 Enter 전에 모달이 뜨면 확정하지 않고 끝낸다.
+
+    /usage 축은 모달 전에 실제 /usage 화면에서 읽혔으므로 daily 0.0 을 유지한다
+    (모달을 만나도 이미 읽은 축은 지우지 않는다).
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="cr_modal_exit", models_payload=_fixture(fixture_text))
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path("devin_capture3")))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setenv("STUB_USAGE", "file")
+    monkeypatch.setenv("STUB_USAGE_FILE", str(_capture_path("devin_usage")))
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["daily"].note == "/usage Daily"
+    assert labels["weekly"].used_pct == 18.0
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage", b"\r", b"/exit"]
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
+
+
+def test_probe_sends_no_exit_when_modal_paints_after_usage_answer(tmp_path, monkeypatch, fixture_text):
+    """B1-r4: /usage 화면이 그려진 뒤 /exit 전에 모달이 뜨면 /exit 를 치지 않는다."""
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="modal_usage_wait", models_payload=_fixture(fixture_text)
+    )
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path("devin_capture3")))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setenv("STUB_MODAL_AFTER", "0.3")
+    monkeypatch.setenv("STUB_USAGE", "file")
+    monkeypatch.setenv("STUB_USAGE_FILE", str(_capture_path("devin_usage")))
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0  # 모달 전에 실제로 읽은 축
+    assert labels["weekly"].used_pct == 18.0
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage", b"\r"]
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
+
+
+def test_probe_sends_no_exit_when_modal_paints_while_usage_unanswered(tmp_path, monkeypatch, fixture_text):
+    """B1-r4: /usage 미응답 대기 중 모달이 뜨면 /exit·Enter 를 치지 않는다."""
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="modal_usage_silent", models_payload=_fixture(fixture_text)
+    )
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path("devin_capture3")))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setenv("STUB_MODAL_AFTER", "0.3")
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축
+    assert labels["daily"].used_pct is None  # /usage 미응답 — 추정 금지
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage", b"\r"]
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
+
+
 def test_probe_sends_no_input_when_status_line_has_no_composer(tmp_path, monkeypatch, fixture_text):
     """상태줄만으로도 입력을 열지 않는다 — composer placeholder 도 필요하다.
 

@@ -56,6 +56,20 @@ USAGE = (
     " Daily   ■■■■■■■■■■■■■■■■■■■■  0% used  · resets in 2h 7m\r\n"
     " Weekly  ■■■■■■■■■■■■■■■■■■■■  18% used  · resets Oct 11, 5:00 PM (UTC+9)\r\n"
 )
+UPDATE_MODAL = (
+    "\r\n? A new version of Devin is available. Update now?\r\n"
+    "❯ Yes, update and restart\r\n  No, remind me later\r\n"
+)
+QUESTION_PROMPT = "\r\n? Devin wants to continue the previous session. Continue? (Y/n) "
+# 입력이 시작된 '뒤'에 모달이 그려지는 모드들 — cap_replay 와 같은 바이트
+# 재생을 하되 모달 트리거가 다르다(STUB_CAPTURE 필수).
+_POST_INPUT_MODES = (
+    "cr_modal_usage",
+    "cr_q_usage",
+    "cr_modal_exit",
+    "modal_usage_wait",
+    "modal_usage_silent",
+)
 
 if mode in ("focus_adv", "require_focus", "usage_only_after_focus"):
     emit("\x1b[?2004h\x1b[?1004h")
@@ -82,7 +96,17 @@ if mode == "update_over_banner":
     # 모달을 검사하지 않는 구현은 'Yes, update' 에 /usage·Enter 를 쳐 넣는다.
     emit(BANNER + COMPOSER)
     emit("? Update now?\r\n❯ Yes, update and restart\r\n  No, remind me later\r\n")
-if mode == "cap_replay":
+if mode == "question_over_banner":
+    # 상태줄+composer 뒤에 ? 질문줄'만' 있는 화면 — chevron 이 없어도
+    # ? 브랜치 하나로 입력 게이트가 닫혀야 한다(tester S1 핀).
+    emit(BANNER + COMPOSER)
+    emit(QUESTION_PROMPT)
+if mode == "chevron_over_banner":
+    # 상태줄+composer 뒤에 chevron 옵션 목록'만' 있는 화면 — ? 가 없어도
+    # chevron 브랜치 하나로 입력 게이트가 닫혀야 한다(tester S1 핀).
+    emit(BANNER + COMPOSER)
+    emit("\r\n❯ Yes, update and restart\r\n  No, remind me later\r\n")
+if mode in ("cap_replay", *_POST_INPUT_MODES):
     # 실측 캡처 바이트 재생(v3000.11.3, tests/fixtures/devin_captureN.txt) —
     # 합성 화면이 아니라 저장된 PTY 출력 그대로다. 첫 커서주소 diff
     # (ESC[?2026h CR ESC[9A …) 앞까지를 첫 페인트로 즉시 그리고,
@@ -112,6 +136,9 @@ if mode not in (
     "update_over_banner",
     "cap_replay",
     "modal_after_gate",
+    "question_over_banner",
+    "chevron_over_banner",
+    *_POST_INPUT_MODES,
 ):
     emit(BANNER + COMPOSER)
 if mode == "crash_after_banner":
@@ -122,26 +149,53 @@ state = "wait_usage"
 typed = b""
 deadline = time.monotonic() + 60
 focus_seen = False
+modal = None  # None | "update" | "question" — 떠 있는 동안 입력은 모달이 삼킨다
+sched = []  # (t0 기준 경과초, 모달 종류) — 입력 '뒤'에 그려질 모달 예약
+
+
+def show_modal(kind):
+    global modal
+    emit({"update": UPDATE_MODAL, "question": QUESTION_PROMPT}[kind])
+    modal = kind
+    log("paint-modal-" + kind)
+
+
 while time.monotonic() < deadline:
+    now = time.monotonic() - t0
+    while sched and sched[0][0] <= now:
+        _, scheduled = sched.pop(0)
+        show_modal(scheduled)
     r, _, _ = select.select([0], [], [], 0.1)
     if not r:
         continue
     chunk = os.read(0, 4096)
     if not chunk:
         break
-    log("read", chunk)
+    # 모달이 떠 있는 동안의 printable 입력은 KEYS-INTO-MODAL 로, Enter 는
+    # MODAL-CONFIRMED <하이라이트 옵션> 으로 기록한다(ink select / y-n 프롬프트).
+    log("KEYS-INTO-MODAL" if modal else "read", chunk)
     if b"\x1b[I" in chunk:
         focus_seen = True
     data = chunk.replace(b"\x1b[I", b"")
     if not data:
         continue
     if data == b"\r":
+        if modal is not None:
+            option = {"update": "Yes, update and restart", "question": "Y (default)"}[modal]
+            log("MODAL-CONFIRMED", option.encode())
+            if modal == "update":
+                emit("\r\nUpdating Devin and restarting…\r\n")
+                log("restart-exit")
+                sys.exit(0)
+            modal = None
+            typed = b""
+            continue
         cmd, typed = typed, b""
         if state == "wait_usage" and cmd == b"/usage":
             if mode in ("require_focus",) and not focus_seen:
                 log("ignored-no-focus")
                 continue
-            if mode == "no_usage_answer" or usage_answer == "silent":
+            if mode in ("no_usage_answer", "modal_usage_silent") or usage_answer == "silent":
                 log("usage-no-answer")
             else:
                 if mode == "slow_usage":
@@ -155,6 +209,10 @@ while time.monotonic() < deadline:
                         emit(fh.read())
                 else:
                     emit(USAGE)
+            if mode in ("modal_usage_wait", "modal_usage_silent"):
+                # /usage 처리(응답 또는 침묵) 직후 모달을 예약한다 — /exit 를
+                # 치기 전에 화면이 모달로 바뀌는 경우다.
+                sched.append((time.monotonic() - t0 + modal_after, "update"))
             state = "wait_exit"
         elif state == "wait_exit" and cmd == b"/exit":
             log("exit-accepted")
@@ -169,11 +227,20 @@ while time.monotonic() < deadline:
         else:
             log("unexpected-command", cmd)
             sys.exit(9)
+    elif modal is not None:
+        continue  # printable 키는 모달이 삼킨다 — composer 에 쌓이지 않는다
     elif data.endswith(b"\r") and len(data) > 1:
         # text and Enter in ONE read: the slash palette swallows it (observed live).
         log("swallowed-merged-write", data)
         typed = b""
     else:
         typed += data
+        # 명령 텍스트가 다 치해지는 순간(Enter 전) 모달을 그리는 트리거들.
+        if mode == "cr_modal_usage" and state == "wait_usage" and typed == b"/usage":
+            show_modal("update")
+        elif mode == "cr_q_usage" and state == "wait_usage" and typed == b"/usage":
+            show_modal("question")
+        elif mode == "cr_modal_exit" and typed == b"/exit":
+            show_modal("update")
 log("deadline")
 sys.exit(0)
