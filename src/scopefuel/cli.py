@@ -1518,6 +1518,11 @@ def _reps_command(args: argparse.Namespace) -> int:
             return 0
         for rep in reps:
             print(bench.format_rep(rep))
+        if any(rep.shadowed_by is not None for rep in reps):
+            print(
+                "hint: lost:<id> rows are local copies the server now contradicts — "
+                "re-add with 'scopefuel reps add' to restore them under a new id"
+            )
         return 0
     if args.reps_command == "compare":
         try:

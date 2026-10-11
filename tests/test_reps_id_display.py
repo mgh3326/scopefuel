@@ -270,11 +270,11 @@ def test_add_learns_server_pk_and_list_shows_srv_ref(tmp_path, monkeypatch, caps
     finally:
         conn.close()
     assert len(cached) == 1
-    assert (cached[0]["server_id"], cached[0]["origin_id"], cached[0]["created_by"]) == (
-        1,
-        1,
-        CLIENT,
-    )
+    # task #1384: the origin key is a random draw in [2^62, 2^63), and the
+    # cached key is the one the server actually stored.
+    assert 2**62 <= cached[0]["origin_id"] < 2**63
+    assert cached[0]["origin_id"] == fake.reps[0]["origin_id"]
+    assert (cached[0]["server_id"], cached[0]["created_by"]) == (1, CLIENT)
 
     assert cli.main(_add_args(task="756")) == 0
     assert "recorded rep id=srv:2" in capsys.readouterr().out
@@ -546,7 +546,8 @@ def test_add_retry_never_binds_a_foreign_twin(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(bench, "_utc_now", lambda: "2026-09-26T12:00:00+00:00")
     fake.fail_next_get = True  # the first add's post-write GET dies
     assert cli.main(_add_args()) == 2
-    assert len(fake.reps) == 1  # but the write landed: (ops, origin_id=1) -> id=1
+    assert len(fake.reps) == 1  # but the write landed: (ops, origin_id) -> id=1
+    origin = fake.reps[0]["origin_id"]
 
     # A foreign twin: clone the stored wire row verbatim so every rep field
     # matches, only the client identity and pk differ. Newest on the server,
@@ -568,7 +569,7 @@ def test_add_retry_never_binds_a_foreign_twin(tmp_path, monkeypatch, capsys):
 
     assert cli.main(_add_args()) == 0
     out = capsys.readouterr().out
-    assert "recorded rep id=origin:1" in out
+    assert f"recorded rep id=origin:{origin}" in out
     assert "srv:60000" not in out
 
     # The unbound echo must not be absorbed into the twin's cache row: ours
@@ -578,17 +579,18 @@ def test_add_retry_never_binds_a_foreign_twin(tmp_path, monkeypatch, capsys):
         rows = {
             row["cache_key"]: row["server_id"]
             for row in conn.execute(
-                "SELECT cache_key, server_id FROM bench_cache_reps WHERE origin_id = 1"
+                "SELECT cache_key, server_id FROM bench_cache_reps WHERE origin_id = ?",
+                (origin,),
             ).fetchall()
         }
     finally:
         conn.close()
-    assert rows == {"other-client:1": 60000, "origin:1": None}
+    assert rows == {f"other-client:{origin}": 60000, f"origin:{origin}": None}
 
     _stamp_reps_cache_fresh()
     assert cli.main(["reps", "list"]) == 0
     out = capsys.readouterr().out
-    assert "id=origin:1" in out
+    assert f"id=origin:{origin}" in out
     assert "id=srv:60000" in out  # the twin is real remote state — labeled as such
     assert not _BARE_ID.search(out), out
 

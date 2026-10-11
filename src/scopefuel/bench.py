@@ -14,6 +14,7 @@ import math
 import os
 import pathlib
 import re
+import secrets
 import socket
 import sqlite3
 import sys
@@ -257,6 +258,52 @@ class BenchRouteMissing(BenchBackendError):
     """
 
 
+class BenchHttpStatusError(BenchBackendError):
+    """A non-2xx status the caller asked to inspect, with the parsed JSON body.
+
+    Raised only for statuses the request opted into exposing; ``payload`` is
+    the parsed body object or None when it was not a JSON object. The raw body
+    text is never retained in the message (#1280 B2).
+    """
+
+    def __init__(self, status: int, payload: dict | None):
+        super().__init__(f"handoffkeep request failed (HTTP {status})")
+        self.status = status
+        self.payload = payload
+
+
+@dataclass(frozen=True)
+class RepWriteConflict:
+    """One ``(created_by, origin_id)`` slot the server refused (task #1384)."""
+
+    index: int  # the rep's position in the PUT batch
+    origin_id: int  # the colliding client-side key
+    conflict_server_id: int  # the server row already holding that key
+    differing_fields: tuple[str, ...] = ()  # filled in when the server row is readable
+
+
+class BenchRepConflictError(BenchBackendError):
+    """PUT /v1/bench/reps answered 409 bench_rep_conflict — nothing was written.
+
+    The server rejected the whole batch atomically because a slot we sent is
+    held by a different rep. Never retried under a fresh id: that would fork
+    the rep instead of surfacing the collision.
+    """
+
+    def __init__(self, conflicts: list[RepWriteConflict]):
+        self.conflicts = conflicts
+        detail = "; ".join(
+            f"origin:{c.origin_id} is held by srv:{c.conflict_server_id}"
+            + (f" (differs: {', '.join(c.differing_fields)})" if c.differing_fields else "")
+            for c in conflicts
+        )
+        super().__init__(
+            "handoffkeep refused the rep write (bench_rep_conflict)"
+            + (f": {detail}" if detail else "")
+            + " — nothing was written; do not retry under a new origin id"
+        )
+
+
 @dataclass(frozen=True)
 class BenchBackend:
     """Resolved benchmark storage settings.
@@ -395,9 +442,13 @@ class RepRecord:
     grade: str | None
     table_grade: str | None = None
     # Store-namespaced id for display (``srv:<pk>`` | ``origin:<key>`` |
-    # ``local:<rowid>``), set by the reader that knows which store the id
-    # belongs to. Display-only — never persisted and never part of the rep key.
+    # ``lost:<key>`` | ``local:<rowid>``), set by the reader that knows which
+    # store the id belongs to. Display-only — never persisted and never part
+    # of the rep key.
     ref: str | None = None
+    # For a ``lost:<key>`` row: the server id whose fetched content contradicts
+    # this local copy (the overwrite evidence). Display-only.
+    shadowed_by: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _REP_COLUMNS}
@@ -407,10 +458,13 @@ def rep_ref(rep: RepRecord) -> str:
     """The rep's id with its store namespace — never a bare ambiguous number.
 
     ``srv:<id>`` is the server primary key; ``origin:<id>`` is the client-side
-    idempotency key of a rep whose server copy exists but whose server pk was
-    never learned locally (a write-through echo, or a cache row predating the
-    refresh pass); ``local:<id>`` is a rowid of the local ``reps`` table, the
-    same namespace ``grades`` evidence and ``reps backfill`` refs already use.
+    idempotency key of a rep whose server pk was never learned locally (a
+    write-ahead pending row, a write-through echo, or a cache row predating
+    the refresh pass); ``lost:<id>`` is a local copy whose server slot now
+    holds a different rep (hk#1384 overwrite evidence — kept for an
+    operator-reviewed re-add, never written back); ``local:<id>`` is a rowid
+    of the local ``reps`` table, the same namespace ``grades`` evidence and
+    ``reps backfill`` refs already use.
     """
 
     if rep.ref:
@@ -610,6 +664,60 @@ _CACHE_SCHEMA = """
         CREATE TABLE IF NOT EXISTS bench_cache_reps (
           cache_key      TEXT PRIMARY KEY,
           server_id      INTEGER,
+          origin_id      INTEGER NOT NULL,
+          created_by     TEXT,
+          profile        TEXT NOT NULL,
+          model_id       TEXT,
+          task_ref       TEXT,
+          tier           TEXT,
+          role           TEXT,
+          rounds         INTEGER,
+          blockers_found INTEGER,
+          completed      INTEGER,
+          input_tokens   INTEGER,
+          output_tokens  INTEGER,
+          notes          TEXT,
+          recorded_at    TEXT NOT NULL,
+          effort         TEXT,
+          grade          TEXT,
+          table_grade    TEXT
+        );
+
+        -- task #1384: write-ahead rep intents. A row is inserted before the
+        -- PUT and deleted only once the server answer is committed to the
+        -- cache, so a retry after a failed or uncertain PUT resends the same
+        -- origin_id and payload (the server's identical-resend rule then
+        -- returns the same id). Kept out of bench_cache_reps because the
+        -- cache refresh deletes that table wholesale.
+        CREATE TABLE IF NOT EXISTS bench_pending_reps (
+          origin_id      INTEGER PRIMARY KEY,
+          profile        TEXT NOT NULL,
+          model_id       TEXT,
+          task_ref       TEXT,
+          tier           TEXT,
+          role           TEXT,
+          rounds         INTEGER,
+          blockers_found INTEGER,
+          completed      INTEGER,
+          input_tokens   INTEGER,
+          output_tokens  INTEGER,
+          notes          TEXT,
+          recorded_at    TEXT NOT NULL,
+          effort         TEXT,
+          grade          TEXT,
+          table_grade    TEXT,
+          queued_at      TEXT NOT NULL
+        );
+
+        -- task #1384: cache rows the server contradicts — a fetched row at the
+        -- same server id (or same origin slot for an unbound row) carrying
+        -- different content is overwrite evidence. The local copy moves here
+        -- instead of being silently dropped, shows as lost:<origin>, and is
+        -- never written back automatically.
+        CREATE TABLE IF NOT EXISTS bench_lost_reps (
+          cache_key      TEXT PRIMARY KEY,
+          shadowed_by    INTEGER,
+          lost_at        TEXT NOT NULL,
           origin_id      INTEGER NOT NULL,
           created_by     TEXT,
           profile        TEXT NOT NULL,
@@ -1237,6 +1345,7 @@ def _handoffkeep_send(
     body: dict | None = None,
     timeout: float = 20.0,
     fetch: Callable[..., object] | None = None,
+    expose_statuses: frozenset[int] = frozenset(),
 ) -> object:
     """Send one handoffkeep request: the one helper every hk call site goes through.
 
@@ -1250,6 +1359,10 @@ def _handoffkeep_send(
     neither ``__cause__`` nor ``__context__`` keeps the original (#1280 B2) —
     ``from None`` alone would only hide it from the traceback printer.
 
+    ``expose_statuses`` (task #1384): for those statuses only, the response
+    body is kept on the re-raised HttpError so the caller can parse a
+    structured error (e.g. the reps 409 conflict list). The body still never
+    reaches an error message — the caller parses it into whitelisted fields.
     ``fetch`` lets a call site keep its own transport seam (quota_share's
     module-level ``request_json``); it defaults to this module's.
     """
@@ -1259,6 +1372,7 @@ def _handoffkeep_send(
     failure: str
     status = 0
     retry_after: float | None = None
+    exposed_body = ""
     try:
         return call(
             url,
@@ -1275,6 +1389,8 @@ def _handoffkeep_send(
         failure = "unexpected_html_response"
     except HttpError as exc:
         failure, status, retry_after = "http", exc.status, exc.retry_after
+        if exc.status in expose_statuses:
+            exposed_body = exc.body
     except BenchBackendError:
         raise
     except (OSError, TypeError, ValueError, HTTPException):
@@ -1293,7 +1409,7 @@ def _handoffkeep_send(
             f"handoffkeep answered with an HTML page instead of JSON ({failure}): {_CF_ACCESS_HINT}",
         )
     if failure == "http":
-        raise HttpError(status, "", retry_after)
+        raise HttpError(status, exposed_body, retry_after)
     raise BenchBackendError("handoffkeep request failed")
 
 
@@ -1317,20 +1433,42 @@ def _handoffkeep_request(
     method: str = "GET",
     body: dict[str, object] | None = None,
     query: dict[str, object] | None = None,
+    expose_statuses: frozenset[int] = frozenset(),
 ) -> dict:
-    """Make one authenticated bench request without exposing response bodies."""
+    """Make one authenticated bench request without exposing response bodies.
+
+    ``expose_statuses`` (task #1384): a response with one of those statuses is
+    raised as ``BenchHttpStatusError`` carrying the parsed JSON body (or None)
+    — the caller extracts whitelisted fields; the raw text is never rethrown.
+    """
 
     url = _backend_url(backend, scope)
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
     status: int | None = None
+    exposed: dict | None = None
     try:
-        payload = _handoffkeep_send(url, token=backend.token or "", method=method, body=body, timeout=20.0)
+        payload = _handoffkeep_send(
+            url,
+            token=backend.token or "",
+            method=method,
+            body=body,
+            timeout=20.0,
+            expose_statuses=expose_statuses,
+        )
     except HttpError as exc:
         status = exc.status
+        if status in expose_statuses:
+            try:
+                parsed = json.loads(exc.body) if exc.body else None
+            except ValueError:
+                parsed = None
+            exposed = parsed if isinstance(parsed, dict) else None
     # Raised after the except block so no context is retained (#1280 B2).
     if status == 404:
         raise BenchRouteMissing(f"handoffkeep has no /v1/bench/{scope} route")
+    if status is not None and status in expose_statuses:
+        raise BenchHttpStatusError(status, exposed)
     if status is not None:
         raise BenchBackendError("handoffkeep request failed")
     if not isinstance(payload, dict):
@@ -3843,10 +3981,22 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     unbound writes) — never into a row carrying a ``server_id``, which it
     cannot prove is its own server copy.
     The server row for our own write is folded by the *bound* echo —
-    ``created_by`` + ``server_id`` copied from the post-write GET by
-    ``_bind_server_ids`` — through the exact-pair branch, never anonymously.
+    ``created_by`` + ``server_id`` learned from the PUT response or copied
+    from the post-write GET by ``_bind_server_ids`` — through the exact-pair
+    branch, never anonymously. As of task #1384 a bound-by-PUT echo may carry
+    a ``server_id`` before its ``created_by`` is known; it merges by that pk —
+    a server id is unique, so the row holding it can only be this rep.
     """
-    if item.created_by is not None:
+    existing = None
+    if item.server_id is not None:
+        existing = conn.execute(
+            "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
+            "WHERE server_id = ? "
+            "ORDER BY cache_key "
+            "LIMIT 1",
+            (item.server_id,),
+        ).fetchone()
+    if existing is None and item.created_by is not None:
         existing = conn.execute(
             "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
             "WHERE origin_id = ? AND created_by IS ? "
@@ -3854,7 +4004,7 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
             "LIMIT 1",
             (item.origin_id, item.created_by),
         ).fetchone()
-    else:
+    elif existing is None:
         existing = conn.execute(
             "SELECT cache_key, server_id, created_by FROM bench_cache_reps "
             "WHERE origin_id = ? AND created_by IS NULL AND server_id IS NULL "
@@ -3914,9 +4064,200 @@ def _put_cached_rep(conn: sqlite3.Connection, item: _RemoteRep) -> None:
     )
 
 
-def _replace_cached_reps(
-    conn: sqlite3.Connection, reps: list[_RemoteRep], backend: BenchBackend, now: dt.datetime
+def _rep_record_from_row(row: sqlite3.Row) -> RepRecord:
+    """The rep fields of a bench_cache_reps / bench_pending_reps / bench_lost_reps row."""
+
+    return RepRecord(
+        id=row["origin_id"],
+        profile=row["profile"],
+        model_id=row["model_id"],
+        task_ref=row["task_ref"],
+        tier=row["tier"],
+        role=row["role"],
+        rounds=row["rounds"],
+        blockers_found=row["blockers_found"],
+        completed=row["completed"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        notes=row["notes"],
+        recorded_at=row["recorded_at"],
+        effort=row["effort"],
+        grade=row["grade"],
+        table_grade=row["table_grade"],
+    )
+
+
+_REP_MARK_FIELDS = (
+    "origin_id, profile, model_id, task_ref, tier, role, rounds, blockers_found, completed, "
+    "input_tokens, output_tokens, notes, recorded_at, effort, grade, table_grade"
+)
+
+
+def _retire_shadowed_reps(conn: sqlite3.Connection, fetched: list[_RemoteRep], now: dt.datetime) -> int:
+    """Move cache rows the fetched page contradicts into bench_lost_reps.
+
+    The server row is authoritative for a server id (consult hk#1384 Q4): a
+    bound cache row whose fetched counterpart carries different content is
+    overwrite evidence, and the same holds for a creator-known row whose
+    ``(created_by, origin_id)`` pair the page holds under a different rep —
+    the pair is the server's upsert key, so its unique fetched holder is our
+    slot. An anonymous echo (no server id, ``created_by`` NULL) has no known
+    server key at all: an ``origin_id`` twin may be another creator's rep,
+    so it is never retired on the key alone. Each copy moves to the lost
+    table — once, so the warning cannot repeat — and is never written back.
+    A slot absent from the fetched page proves nothing (the read window may
+    be truncated) and neither does an ambiguous holder, so only rows the
+    server visibly contradicts are moved.
+    """
+
+    by_server: dict[int, list[_RemoteRep]] = {}
+    by_origin: dict[int, list[_RemoteRep]] = {}
+    for item in fetched:
+        if item.server_id is not None:
+            by_server.setdefault(item.server_id, []).append(item)
+        by_origin.setdefault(item.origin_id, []).append(item)
+
+    def _unique(holders: list[_RemoteRep]) -> _RemoteRep | None:
+        """The single fetched holder of a key, or None when absent or ambiguous."""
+
+        return holders[0] if len(holders) == 1 else None
+
+    rows = conn.execute(
+        "SELECT cache_key, server_id, created_by, " + _REP_MARK_FIELDS + " FROM bench_cache_reps"
+    ).fetchall()
+    retired = 0
+    for row in rows:
+        if row["server_id"] is not None:
+            remote = _unique(by_server.get(row["server_id"], []))
+        elif row["created_by"] is None:
+            continue  # anonymous echo: no server key, so nothing can contradict it
+        else:
+            remote = _unique(
+                [item for item in by_origin.get(row["origin_id"], []) if item.created_by == row["created_by"]]
+            )
+        if remote is None or _same_rep_row(_rep_record_from_row(row), remote.record):
+            continue
+        conn.execute(
+            "INSERT INTO bench_lost_reps "
+            "(cache_key, shadowed_by, lost_at, origin_id, created_by, profile, model_id, task_ref, "
+            "tier, role, rounds, blockers_found, completed, input_tokens, output_tokens, notes, "
+            "recorded_at, effort, grade, table_grade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(cache_key) DO NOTHING",
+            (
+                row["cache_key"],
+                remote.server_id,
+                _cache_timestamp(now),
+                row["origin_id"],
+                row["created_by"],
+                row["profile"],
+                row["model_id"],
+                row["task_ref"],
+                row["tier"],
+                row["role"],
+                row["rounds"],
+                row["blockers_found"],
+                row["completed"],
+                row["input_tokens"],
+                row["output_tokens"],
+                row["notes"],
+                row["recorded_at"],
+                row["effort"],
+                row["grade"],
+                row["table_grade"],
+            ),
+        )
+        conn.execute("DELETE FROM bench_cache_reps WHERE cache_key = ?", (row["cache_key"],))
+        retired += 1
+    if retired:
+        print(
+            f"warning: {retired} cached rep(s) are shadowed on the server by a different rep — "
+            "kept locally as lost:<origin>; re-add with 'scopefuel reps add' to restore",
+            file=sys.stderr,
+        )
+    return retired
+
+
+def _reconcile_pending_reps(
+    conn: sqlite3.Connection, fetched: list[_RemoteRep], written: Iterable[_RemoteRep] = ()
 ) -> None:
+    """Drop write-ahead rows only on a write-specific confirmation.
+
+    A generic refresh proves nothing about a pending row: the server keys
+    reps on ``(created_by, origin_id)`` and bench_pending_reps stores no
+    creator, so an equal-content fetched row may be another creator's rep —
+    clearing on it would delete a write the server never confirmed. The
+    confirming identity is the one this commit's own writes carry
+    (``written`` items bound by the PUT answer or the post-write GET — empty
+    on a pure refresh, which therefore clears nothing); the PUT-answer
+    itself clears via ``pending_done`` in ``_commit_rep_cache``. Everything
+    else stays queued: it is display-deduped behind any ``srv:`` twin and
+    the next identical ``reps add`` resends the same key.
+    """
+
+    own = {item.created_by for item in written if item.created_by is not None}
+    if not own:
+        return
+    by_origin = {item.origin_id: item for item in fetched if item.created_by in own}
+    for row in conn.execute("SELECT " + _REP_MARK_FIELDS + " FROM bench_pending_reps").fetchall():
+        remote = by_origin.get(row["origin_id"])
+        if remote is not None and _same_rep_row(_rep_record_from_row(row), remote.record):
+            conn.execute("DELETE FROM bench_pending_reps WHERE origin_id = ?", (row["origin_id"],))
+
+
+def _pending_rep_items(conn: sqlite3.Connection) -> list[_RemoteRep]:
+    """Write-ahead rows awaiting a confirmed server id — displayed as origin:."""
+
+    rows = conn.execute(
+        "SELECT " + _REP_MARK_FIELDS + ", queued_at FROM bench_pending_reps ORDER BY queued_at, origin_id"
+    ).fetchall()
+    return [
+        _RemoteRep(
+            record=replace(_rep_record_from_row(row), ref=f"origin:{row['origin_id']}"),
+            origin_id=row["origin_id"],
+        )
+        for row in rows
+    ]
+
+
+def _lost_rep_records(conn: sqlite3.Connection) -> list[RepRecord]:
+    """Local copies the server contradicts — displayed as lost:<origin>."""
+
+    rows = conn.execute(
+        "SELECT " + _REP_MARK_FIELDS + ", shadowed_by FROM bench_lost_reps ORDER BY lost_at DESC, cache_key"
+    ).fetchall()
+    return [
+        replace(
+            _rep_record_from_row(row),
+            ref=f"lost:{row['origin_id']}",
+            shadowed_by=row["shadowed_by"],
+        )
+        for row in rows
+    ]
+
+
+def _local_rep_marks(
+    path: pathlib.Path | str | None,
+) -> tuple[list[_RemoteRep], list[RepRecord]]:
+    """This host's pending and lost rep rows, from the cache database."""
+
+    conn = _cache_connect(path)
+    try:
+        return _pending_rep_items(conn), _lost_rep_records(conn)
+    finally:
+        conn.close()
+
+
+def _replace_cached_reps(
+    conn: sqlite3.Connection,
+    reps: list[_RemoteRep],
+    backend: BenchBackend,
+    now: dt.datetime,
+    *,
+    written: Iterable[_RemoteRep] = (),
+) -> None:
+    _retire_shadowed_reps(conn, reps, now)
+    _reconcile_pending_reps(conn, reps, written)
     conn.execute("DELETE FROM bench_cache_reps")
     for item in reps:
         _put_cached_rep(conn, item)
@@ -3929,15 +4270,18 @@ def _commit_rep_cache(
     fetched: list[_RemoteRep],
     written: list[_RemoteRep],
     backend: BenchBackend,
+    pending_done: Iterable[int] = (),
 ) -> None:
     conn = _cache_connect(path)
     try:
         now = _cache_now()
         conn.execute("BEGIN")
-        _replace_cached_reps(conn, fetched, backend, now)
+        _replace_cached_reps(conn, fetched, backend, now, written=written)
         for item in written:
             _put_cached_rep(conn, item)
         _stamp_cache(conn, "reps", backend, now)
+        for origin_id in pending_done:
+            conn.execute("DELETE FROM bench_pending_reps WHERE origin_id = ?", (origin_id,))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -3946,18 +4290,150 @@ def _commit_rep_cache(
         conn.close()
 
 
-def _put_rep_batches(backend: BenchBackend, reps: list[_RemoteRep], *, batch_size: int = 500) -> None:
+# task #1384: rep origin ids are random draws from a dedicated 62-bit band,
+# [2^62, 2^63) — disjoint from legacy small counter ids and from the reps
+# migrate band [2^40, 2^40+2^48). Hosts sharing one bearer principal can no
+# longer pick the same key (birthday bound ~n^2/2^63), which is what let
+# per-host counter ids silently overwrite each other's server rows.
+_REP_ORIGIN_BAND_BASE = 1 << 62
+_REP_ORIGIN_BAND_SPAN = 1 << 62
+
+
+def _new_rep_origin_id() -> int:
+    """A fresh collision-free rep key: a random draw inside [2^62, 2^63)."""
+
+    return _REP_ORIGIN_BAND_BASE + secrets.randbits(62)
+
+
+def _push_local_origin_id(host: str, record: RepRecord) -> int:
+    """A stable banded origin id for one local reps row.
+
+    Derived from (host, profile, local rowid): deterministic, so a re-run of
+    ``bench push-local`` resends the same key and the server treats it as an
+    idempotent resend; per-host, so two hosts can never collide the way raw
+    local rowids did.
+    """
+
+    digest = hashlib.sha256(f"reps-push-local\x00{host}\x00{record.profile}\x00{record.id}".encode()).digest()
+    return _REP_ORIGIN_BAND_BASE + int.from_bytes(digest[:8], "big") % _REP_ORIGIN_BAND_SPAN
+
+
+# PUT /v1/bench/reps 409 responses carry the parseable conflict list.
+_REPS_PUT_EXPOSED = frozenset({409})
+
+
+def _rep_conflict_error(exc: BenchHttpStatusError, *, offset: int) -> BenchBackendError:
+    """A rejected rep PUT — a 409 body names the conflicting slots, if readable."""
+
+    if exc.status != 409:
+        return BenchBackendError("handoffkeep rejected a rep write")
+    conflicts: list[RepWriteConflict] = []
+    raw = exc.payload.get("conflicts") if isinstance(exc.payload, dict) else None
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            index, origin_id, server_id = (
+                entry.get("index"),
+                entry.get("origin_id"),
+                entry.get("conflict_server_id"),
+            )
+            if all(isinstance(v, int) and not isinstance(v, bool) for v in (index, origin_id, server_id)):
+                conflicts.append(
+                    RepWriteConflict(
+                        index=offset + index,
+                        origin_id=origin_id,
+                        conflict_server_id=server_id,
+                    )
+                )
+    return BenchRepConflictError(conflicts)
+
+
+def _put_rep_batches(
+    backend: BenchBackend, reps: list[_RemoteRep], *, batch_size: int = 500
+) -> list[int] | None:
+    """PUT the reps; answer the server ids in input order when the response has them.
+
+    Post-#1384 servers answer ``{"upserted": n, "ids": [...]}`` — the ids are
+    authoritative, the row under each provably holds the written content.
+    Older servers answer a bare count: None is returned and the caller falls
+    back to the GET bind. A 409 bench_rep_conflict surfaces as
+    ``BenchRepConflictError``; a malformed ``ids`` field fails closed.
+    """
+
+    ids: list[int] = []
+    saw_ids = False
     for start in range(0, len(reps), batch_size):
         batch = reps[start : start + batch_size]
-        payload = _handoffkeep_request(
-            backend,
-            "reps",
-            method="PUT",
-            body={"reps": [_rep_to_wire(item) for item in batch]},
-        )
+        try:
+            payload = _handoffkeep_request(
+                backend,
+                "reps",
+                method="PUT",
+                body={"reps": [_rep_to_wire(item) for item in batch]},
+                expose_statuses=_REPS_PUT_EXPOSED,
+            )
+        except BenchHttpStatusError as exc:
+            raise _rep_conflict_error(exc, offset=start) from exc
         accepted = payload.get("upserted")
         if isinstance(accepted, bool) or not isinstance(accepted, int) or accepted != len(batch):
             raise BenchBackendError("handoffkeep rejected a rep write")
+        batch_ids = payload.get("ids")
+        if batch_ids is None:
+            if saw_ids:
+                raise BenchBackendError("handoffkeep returned an inconsistent rep response")
+            continue
+        if (
+            not isinstance(batch_ids, list)
+            or len(batch_ids) != len(batch)
+            or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in batch_ids)
+        ):
+            raise BenchBackendError("handoffkeep returned invalid rep ids")
+        saw_ids = True
+        ids.extend(batch_ids)
+    return ids if saw_ids else None
+
+
+def _rep_diff_fields(ours: RepRecord, remote: RepRecord) -> list[str]:
+    """Field names on which two rep records differ (recorded_at as an instant)."""
+
+    diff = []
+    for column in _REP_COLUMNS:
+        if column == "id":
+            continue
+        if column == "recorded_at":
+            if _recorded_at_key(ours.recorded_at) != _recorded_at_key(remote.recorded_at):
+                diff.append(column)
+        elif getattr(ours, column) != getattr(remote, column):
+            diff.append(column)
+    return diff
+
+
+def _annotate_rep_conflict(
+    exc: BenchRepConflictError, written: list[_RemoteRep], backend: BenchBackend
+) -> BenchRepConflictError:
+    """Name the fields that differ, when the conflicting server row is readable.
+
+    Always returns a new exception, even when the read fails: the callers
+    raise the result ``from exc`` while handling ``exc``, and re-raising
+    ``exc`` itself there would make the exception its own ``__cause__`` —
+    a cycle for anything walking the chain (hk 1403).
+    """
+
+    try:
+        fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
+    except BenchError:
+        fetched = []
+    by_server = {item.server_id: item for item in fetched if item.server_id is not None}
+    conflicts = []
+    for conflict in exc.conflicts:
+        ours = written[conflict.index] if 0 <= conflict.index < len(written) else None
+        remote = by_server.get(conflict.conflict_server_id)
+        fields = conflict.differing_fields
+        if ours is not None and remote is not None and not fields:
+            fields = tuple(_rep_diff_fields(ours.record, remote.record))
+        conflicts.append(replace(conflict, differing_fields=fields))
+    return BenchRepConflictError(conflicts)
 
 
 def _bind_server_ids(
@@ -3966,28 +4442,30 @@ def _bind_server_ids(
     *,
     backend: BenchBackend,
     window_complete: bool | None = None,
+    put_ids: list[int] | None = None,
 ) -> list[_RemoteRep]:
-    """Attach the server pk each written rep got, proven by the post-write GET.
+    """Attach the server pk each written rep got.
 
-    A PUT response carries only an upsert count — the assigned ``id`` is only
-    observable through a read. The server's upsert key is ``(created_by,
-    origin_id)`` and it stamps ``created_by`` itself, so the client-side echo
-    cannot name its own row by key. The remote row that proves a write is the
-    *unique* holder of the rep's ``origin_id`` + content — but uniqueness is
-    only decidable inside a provably complete window: two clients may write
-    same-content reps under the same per-machine ``origin_id``, so when the
-    fetched page is full the just-written row may sit outside it while
-    another client's twin sits inside. ``fetched`` must therefore come from a
-    GET at ``_MIGRATE_REP_WINDOW``: a short page proves completeness. A full
-    page falls back to the rep's own profile page, which still contains every
-    possible twin (identical content implies identical profile); if that page
-    is full too the write stays unbound — ``origin:`` is honest, a foreign pk
-    is not.
+    ``put_ids`` (task #1384): when the PUT response carried ``ids``, each id
+    is authoritative — the server proved the row under it holds exactly the
+    written content — so the rep binds directly and ``created_by`` is learned
+    from the fetched row of the same pk when present. Old servers answer a
+    bare upsert count (``put_ids`` is None) and the GET bind below decides;
+    it is fail-closed: a rep takes a server pk only from the *unique* holder
+    of its ``origin_id`` + identical content, and only inside a provably
+    complete window — the unfiltered page under ``_MIGRATE_REP_WINDOW``, else
+    the rep's own profile page (identical content implies identical profile,
+    so every rival twin is in it). A non-unique, contradicted, or unprovable
+    match leaves the rep as ``origin:`` with a warning — an honest key, never
+    a foreign pk.
     """
 
     by_origin: dict[int, list[_RemoteRep]] = {}
+    by_server: dict[int, _RemoteRep] = {}
     for item in fetched:
         by_origin.setdefault(item.origin_id, []).append(item)
+        if item.server_id is not None:
+            by_server[item.server_id] = item
     if window_complete is None:
         window_complete = len(fetched) < _MIGRATE_REP_WINDOW
     profile_pages: dict[str, tuple[list[_RemoteRep], bool]] = {}
@@ -3998,30 +4476,45 @@ def _bind_server_ids(
             profile_pages[profile] = (page, len(page) < _MIGRATE_REP_WINDOW)
         return profile_pages[profile]
 
-    def _proven_match(item: _RemoteRep) -> _RemoteRep | None:
-        candidates = [
-            remote
-            for remote in by_origin.get(item.origin_id, ())
-            if _same_rep_row(item.record, remote.record)
-        ]
+    def _proven_match(item: _RemoteRep) -> tuple[_RemoteRep | None, str | None]:
+        """(the unique same-content holder of this origin_id, or (None, why))."""
+
+        holders = by_origin.get(item.origin_id, ())
+        candidates = [remote for remote in holders if _same_rep_row(item.record, remote.record)]
         if len(candidates) > 1:
-            return None
+            return None, "ambiguous"
+        if candidates and window_complete:
+            return candidates[0], None
         if window_complete:
-            return candidates[0] if candidates else None
+            return None, "conflict" if holders else "absent"
         page, complete = _profile_page(item.record.profile)
         if not complete:
-            return None
-        candidates = [
-            remote
-            for remote in page
-            if remote.origin_id == item.origin_id and _same_rep_row(item.record, remote.record)
-        ]
-        return candidates[0] if len(candidates) == 1 else None
+            return None, "window"
+        page_holders = [remote for remote in page if remote.origin_id == item.origin_id]
+        page_candidates = [remote for remote in page_holders if _same_rep_row(item.record, remote.record)]
+        if len(page_candidates) == 1:
+            return page_candidates[0], None
+        if len(page_candidates) > 1:
+            return None, "ambiguous"
+        return None, "conflict" if page_holders else "absent"
 
     bound: list[_RemoteRep] = []
-    for item in written:
-        remote = _proven_match(item)
+    for index, item in enumerate(written):
+        server_id = put_ids[index] if put_ids is not None else None
+        if server_id is not None:
+            remote = by_server.get(server_id)
+            bound.append(
+                _RemoteRep(
+                    record=item.record,
+                    origin_id=item.origin_id,
+                    created_by=remote.created_by if remote is not None else None,
+                    server_id=server_id,
+                )
+            )
+            continue
+        remote, reason = _proven_match(item)
         if remote is None:
+            _warn_unbound_rep(item, reason)
             bound.append(item)
             continue
         bound.append(
@@ -4035,29 +4528,134 @@ def _bind_server_ids(
     return bound
 
 
+def _warn_unbound_rep(item: _RemoteRep, reason: str | None) -> None:
+    """One stderr line per rep the fail-closed bind left as ``origin:``."""
+
+    detail = {
+        "conflict": "the server holds a different rep under that key",
+        "ambiguous": "more than one identical server row carries that key",
+        "window": "the server's read window cannot prove a unique match",
+        "absent": "the server does not show the rep that was just written",
+    }.get(reason or "", "no unique server row could be proven")
+    print(
+        f"warning: reps write left unbound as origin:{item.origin_id} — {detail}; "
+        "never bound to a foreign server id",
+        file=sys.stderr,
+    )
+
+
+def _pending_rep_matches(pending: RepRecord, candidate: RepRecord, *, caller_recorded_at: str | None) -> bool:
+    """Whether a write-ahead row is the retry of this add — same rep, same key.
+
+    Every user-supplied field must be equal; ``recorded_at`` is exempted
+    unless the caller passed it, because the auto-stamp would make every
+    retry look like a new rep. On a match the pending row's stored
+    ``recorded_at`` is resent, keeping the payload byte-identical so the
+    server's identical-resend rule returns the same id.
+    """
+
+    if caller_recorded_at is not None and pending.recorded_at != candidate.recorded_at:
+        return False
+    return all(
+        getattr(pending, column) == getattr(candidate, column)
+        for column in _REP_COLUMNS
+        if column not in ("id", "recorded_at")
+    )
+
+
+def _insert_pending_rep(conn: sqlite3.Connection, item: _RemoteRep, now: dt.datetime) -> None:
+    record = item.record
+    conn.execute(
+        "INSERT INTO bench_pending_reps "
+        "(" + _REP_MARK_FIELDS + ", queued_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            item.origin_id,
+            record.profile,
+            record.model_id,
+            record.task_ref,
+            record.tier,
+            record.role,
+            record.rounds,
+            record.blockers_found,
+            record.completed,
+            record.input_tokens,
+            record.output_tokens,
+            record.notes,
+            record.recorded_at,
+            record.effort,
+            record.grade,
+            record.table_grade,
+            _cache_timestamp(now),
+        ),
+    )
+
+
+def _open_pending_rep(
+    path: pathlib.Path | str | None,
+    *,
+    candidate: RepRecord,
+    caller_recorded_at: str | None,
+) -> _RemoteRep:
+    """The write-ahead row for this rep — a matching pending row, else a new one.
+
+    Before the PUT the rep is persisted locally (origin_id + full payload,
+    no server id). A retry after a failure or timeout finds the matching
+    pending row and resends the same origin_id and payload — never a fresh
+    id — so the server's identical-resend rule answers the same server id.
+    """
+
+    conn = _cache_connect(path)
+    try:
+        for item in _pending_rep_items(conn):
+            if _pending_rep_matches(item.record, candidate, caller_recorded_at=caller_recorded_at):
+                return item
+        origin_id = _new_rep_origin_id()
+        item = _RemoteRep(record=replace(candidate, id=origin_id), origin_id=origin_id)
+        _insert_pending_rep(conn, item, _cache_now())
+        conn.commit()
+        return item
+    finally:
+        conn.close()
+
+
 def _write_reps_handoffkeep(
     reps: list[_RemoteRep],
     *,
     path: pathlib.Path | str | None,
     backend: BenchBackend,
+    pending_done: Iterable[int] = (),
 ) -> list[_RemoteRep]:
     """PUT the reps, then re-read so each written row's server pk is learned.
 
-    The GET follows the PUT: the fetched set is the freshest state (it already
-    carries the new rows' ``id``/``created_by``), so the commit lands them
-    with ``server_id`` filled instead of an anonymous echo. If the read fails
-    the error propagates without touching the cache — a retried add then
-    derives the same ``origin_id`` and the server upsert lands on the same
-    row, so the failure cannot leave a duplicate.
+    When the PUT response carries ``ids`` (post-#1384 server) they are the
+    bind; on an old server the fail-closed GET bind decides instead. The GET
+    follows the PUT either way: the fetched set is the freshest state, so the
+    commit lands the new rows with ``server_id`` filled where provable
+    instead of an anonymous echo. A 409 surfaces as ``BenchRepConflictError``
+    naming both ids and the differing fields. If the read fails the error
+    propagates without touching the cache — a retried add resends the same
+    write-ahead ``origin_id`` and payload, so the failure cannot leave a
+    duplicate. ``pending_done`` origin ids are cleared from the write-ahead
+    table in the same commit.
     """
 
     if not reps:
         return reps
-    _put_rep_batches(backend, reps)
-    fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
-    written = _bind_server_ids(reps, fetched, backend=backend)
     try:
-        _commit_rep_cache(path=path, fetched=fetched, written=written, backend=backend)
+        put_ids = _put_rep_batches(backend, reps)
+    except BenchRepConflictError as exc:
+        raise _annotate_rep_conflict(exc, reps, backend) from exc
+    fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
+    written = _bind_server_ids(reps, fetched, backend=backend, put_ids=put_ids)
+    try:
+        _commit_rep_cache(
+            path=path,
+            fetched=fetched,
+            written=written,
+            backend=backend,
+            pending_done=pending_done,
+        )
     except (sqlite3.Error, OSError) as exc:
         raise BenchBackendError("local bench cache update failed") from exc
     return written
@@ -4095,43 +4693,30 @@ def _read_reps_handoffkeep(
     try:
         now = _cache_now()
         cached = _cached_reps(conn)
+        pending, lost = _pending_rep_items(conn), _lost_rep_records(conn)
         fresh, age_hours = _cache_state(conn, "reps", backend, now)
     finally:
         conn.close()
     cached_for_endpoint = cached if age_hours is not None else []
-    if fresh:
-        rows = cached_for_endpoint
-    else:
+    if not fresh:
         try:
             rows = _fetch_reps(backend)
             _commit_rep_cache(path=path, fetched=rows, written=[], backend=backend)
+            # The commit may have retired shadowed rows and reconciled
+            # confirmed pending rows — re-read the marks it left.
+            pending, lost = _local_rep_marks(path)
         except (BenchBackendError, sqlite3.Error, OSError, ValueError):
             _warn_cached("reps", age_hours=age_hours, has_data=bool(cached_for_endpoint))
             rows = cached_for_endpoint
-    return _filter_reps(
-        [item.record for item in rows], limit=limit, grade=grade, profile=profile, effort=effort
-    )
-
-
-def _next_origin_id(path: pathlib.Path | str | None) -> int:
-    target = pathlib.Path(path) if path is not None else db_path()
-    if str(target) == ":memory:" or not target.expanduser().exists():
-        return 1
-    conn = _readonly_connect(target)
-    try:
-        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        values: list[int] = []
-        if "reps" in tables:
-            value = conn.execute("SELECT MAX(id) FROM reps").fetchone()[0]
-            if isinstance(value, int):
-                values.append(value)
-        if "bench_cache_reps" in tables:
-            value = conn.execute("SELECT MAX(origin_id) FROM bench_cache_reps").fetchone()[0]
-            if isinstance(value, int):
-                values.append(value)
-        return max(values, default=0) + 1
-    finally:
-        conn.close()
+    else:
+        rows = cached_for_endpoint
+    confirmed = {(item.origin_id, _rep_row_key(item.record)) for item in rows}
+    records = [item.record for item in rows]
+    records += [
+        item.record for item in pending if (item.origin_id, _rep_row_key(item.record)) not in confirmed
+    ]
+    records += lost
+    return _filter_reps(records, limit=limit, grade=grade, profile=profile, effort=effort)
 
 
 def add_rep(
@@ -4173,13 +4758,13 @@ def add_rep(
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
             raise BenchError(f"{field} must be a non-negative integer")
     notes = _optional_text(notes, "notes")
+    caller_recorded_at = recorded_at
     recorded_at = _captured_at(recorded_at or _utc_now())
 
     backend = bench_backend(use="reps")
     if backend.name == BENCH_BACKEND_HANDOFFKEEP:
-        origin_id = _next_origin_id(path)
         record = RepRecord(
-            id=origin_id,
+            id=0,
             profile=profile,
             model_id=model_id,
             task_ref=task_ref,
@@ -4196,13 +4781,25 @@ def add_rep(
             grade=grade,
             table_grade=table_grade,
         )
-        written = _write_reps_handoffkeep(
-            [_RemoteRep(record=record, origin_id=origin_id)], path=path, backend=backend
-        )
+        # Write-ahead: a banded origin_id + the full payload land in
+        # bench_pending_reps before the PUT, so a retry after a failure or
+        # timeout resends the same key and the server's identical-resend
+        # rule answers the same server id.
+        item = _open_pending_rep(path, candidate=record, caller_recorded_at=caller_recorded_at)
+        try:
+            written = _write_reps_handoffkeep(
+                [item], path=path, backend=backend, pending_done=[item.origin_id]
+            )
+        except Exception:
+            print(
+                f"note: the rep stays queued locally as origin:{item.origin_id}; "
+                "re-running the same add resends it unchanged",
+                file=sys.stderr,
+            )
+            raise
         remote = written[0]
-        if remote.server_id is not None:
-            return replace(record, id=remote.server_id, ref=f"srv:{remote.server_id}")
-        return replace(record, ref=f"origin:{origin_id}")
+        ref = f"srv:{remote.server_id}" if remote.server_id is not None else f"origin:{item.origin_id}"
+        return replace(item.record, id=remote.server_id or item.origin_id, ref=ref)
 
     conn = connect(path)
     try:
@@ -4419,7 +5016,7 @@ def _commit_push_cache(
                 _put_cached_score(conn, score)
             _stamp_cache(conn, "scores", score_backend, now)
         if written_reps:
-            _replace_cached_reps(conn, fetched_reps, rep_backend, now)
+            _replace_cached_reps(conn, fetched_reps, rep_backend, now, written=written_reps)
             for item in written_reps:
                 _put_cached_rep(conn, item)
             _stamp_cache(conn, "reps", rep_backend, now)
@@ -4437,13 +5034,24 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     Scores are canonical-table writes (the ``catalog`` plaintext opt-in) while
     reps follow the ``reps`` opt-in (task #697); a scope with rows requires its
     own resolved handoffkeep backend.
+
+    Each local rep's ``origin_id`` is a stable hash of (hostname, profile,
+    local rowid) inside the task #1384 band [2^62, 2^63): deterministic, so
+    re-running ``bench push-local`` resends the same key and the server's
+    identical-resend rule lands on the same row — never a duplicate — and
+    per-host, so two machines sharing one bearer identity can no longer pin
+    the same raw rowid onto different reps. The hostname keeps two real
+    machines' rows distinct even when their local tables are identical.
     """
 
     catalog_backend = bench_backend(use="catalog")
     reps_backend = bench_backend(use="reps")
     scores = _read_local_scores(path=path)
     reps = _read_local_reps_for_push(path=path)
-    remote_reps = [_RemoteRep(record=record, origin_id=record.id) for record in reps]
+    host = socket.gethostname() or "local"
+    remote_reps = [
+        _RemoteRep(record=record, origin_id=_push_local_origin_id(host, record)) for record in reps
+    ]
 
     if scores and catalog_backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchBackendError(
@@ -4480,9 +5088,12 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     if scores:
         _put_score_batches(catalog_backend, scores)
     if remote_reps:
-        _put_rep_batches(reps_backend, remote_reps)
+        try:
+            put_ids = _put_rep_batches(reps_backend, remote_reps)
+        except BenchRepConflictError as exc:
+            raise _annotate_rep_conflict(exc, remote_reps, reps_backend) from exc
         fetched_reps = _fetch_reps(reps_backend, query={"limit": _MIGRATE_REP_WINDOW})
-        remote_reps = _bind_server_ids(remote_reps, fetched_reps, backend=reps_backend)
+        remote_reps = _bind_server_ids(remote_reps, fetched_reps, backend=reps_backend, put_ids=put_ids)
     else:
         fetched_reps = []
     try:
@@ -4812,14 +5423,22 @@ def migrate_reps(
     if len(set(origin_ids)) != len(origin_ids):
         raise BenchBackendError("reps migrate: derived origin_id collision — do not proceed")
     if written:
-        _put_rep_batches(backend, written)
+        try:
+            put_ids = _put_rep_batches(backend, written)
+        except BenchRepConflictError as exc:
+            raise _annotate_rep_conflict(exc, written, backend) from exc
+    else:
+        put_ids = None
 
     remote_after = _fetch_reps_for_migrate(backend, {rep.profile for rep in local_reps})
     if written:
         # remote_after is provably complete for these profiles — a full
         # per-profile page raises inside _fetch_reps_for_migrate — so a
-        # unique same-content match here is the migrated row itself.
-        bound = _bind_server_ids(written, remote_after, backend=backend, window_complete=True)
+        # unique same-content match here is the migrated row itself. A
+        # post-#1384 server's PUT ids make even that check unnecessary.
+        bound = _bind_server_ids(
+            written, remote_after, backend=backend, window_complete=True, put_ids=put_ids
+        )
         try:
             # Commit the post-write read: the freshly migrated rows already
             # carry their server id, so the cache shows srv: refs at once
@@ -5109,6 +5728,8 @@ def format_rep(rep: RepRecord) -> str:
         fields.append(f"output-tokens={rep.output_tokens}")
     if rep.notes:
         fields.append(f"notes={rep.notes}")
+    if rep.shadowed_by is not None:
+        fields.append(f"shadowed-by=srv:{rep.shadowed_by}")
     return " ".join(fields)
 
 

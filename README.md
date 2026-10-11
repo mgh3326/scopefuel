@@ -358,6 +358,48 @@ HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET=<service token client secret>
 이관할 때 사용합니다. 급 배치는 `scopefuel bench grades set`에서 deviation reference를 반드시
 함께 남겨야 합니다.
 
+### reps id와 쓰기 규칙 (task #1384)
+
+handoffkeep의 rep upsert 키는 `(created_by, origin_id)`이고 `created_by`는 토큰에서 오므로,
+토큰을 공유하는 호스트들은 같은 키 공간을 씁니다. 그래서 `reps add`의 `origin_id`는
+`2^62 + secrets.randbits(62)` — 예약된 밴드 `[2^62, 2^63)`의 난수 — 입니다(레거시 작은 id·
+migrate 밴드 `[2^40, 2^40+2^48)`와 겹치지 않음). `reps list`의 `id=`는 항상 저장소 네임스페이스를
+붙입니다.
+
+- `srv:<id>` — 서버가 확정한 행의 기본키.
+- `origin:<id>` — 서버 pk가 아직 확인되지 않은 로컬 rep의 클라이언트 측 멱등 키.
+- `lost:<id>` — 서버가 더 이상 인정하지 않는 로컬 사본(아래 shadow 규칙). `shadowed-by=srv:N`이
+  함께 표시됩니다.
+- `local:<id>` — local backend의 로컬 `reps` rowid.
+
+쓰기는 write-ahead입니다: PUT 전에 대기 rep(origin_id + 전체 페이로드, 서버 id 없음)이 로컬
+`bench_pending_reps`에 남고, 실패·타임아웃 후 재시도는 **같은 origin_id와 같은 페이로드**를 다시
+보냅니다(새 id를 만들지 않음) — 서버의 identical-resend 규칙이 같은 서버 id를 돌려줍니다.
+`reps list`는 대기 rep을 `origin:<id>`로만 보여 주고 srv id는 붙이지 않습니다.
+
+새 서버는 PUT 응답에 `ids`(입력 순서)를 실어 보내므로 그 id가 정본입니다. `ids`를 안 보내는
+옛 서버에서만 쓰기 후 GET으로 바인딩하며, 그 바인딩은 fail-closed입니다 — `origin_id`를 유일하게,
+그리고 동일한 내용으로 쥔 서버 행이 증명될 때만 `srv:`를 붙이고, 아니면 `origin:`로 두고 경고합니다.
+남의 srv id는 절대 출력하지 않습니다.
+
+충돌 — 새 서버가 같은 `(created_by, origin_id)` 슬롯에 다른 rep이 있음을 발견하면 PUT 전체가
+409 `bench_rep_conflict`로 거부되고, 클라이언트는 origin id와 `srv:<conflict_server_id>`를 함께
+출력하며(서버 행을 읽을 수 있으면 다른 필드명까지) 종료코드 2로 끝납니다. 새 id로의 자동 재시도는
+없습니다. 옛 서버는 충돌 시 조용히 덮어쓰므로(구버전의 결함 그대로) fail-closed 바인딩과 아래
+shadow 규칙이 로컬 정직성을 지킵니다.
+
+`bench push-local`도 같은 밴드를 씁니다: 로컬 행의 origin_id는 `(hostname, profile, 로컬
+rowid)`의 SHA-256을 밴드에 접은 안정 해시라 재실행은 같은 키를 다시 보내는 멱등 resend이고,
+로컬 rowid가 같은 다른 호스트와도 충돌하지 않습니다. `reps migrate`는 기존 migrate 밴드를 그대로
+씁니다.
+
+**shadow 규칙(캐시가 서버와 모순될 때).** refetch한 서버 행 `srv:S`의 내용이 같은 `server_id`의
+캐시 행과 다르면 그 캐시 사본은 덮어쓰인 rep의 증거입니다 — 서버 행이 `srv:S`로 표시되고 로컬
+사본은 `bench_lost_reps`로 옮겨져 `lost:<origin>`(+ 재등록 힌트)로 남으며, 경고는 한 번만 납니다.
+서버가 부인하는 srv id 아래에 캐시 내용을 보여 주지 않고, 자동으로 다시 쓰지도 않습니다.
+복구는 일회성·운영자 검토 매니페스트(re-add 대상 페이로드 목록)로만 하며 자동 복구 경로는
+없습니다.
+
 ### 정본 카탈로그 (#593)
 
 모델 id·급 배치·pool·gate는 handoffkeep `bench_catalog`가 정본이고, `recommend.py GRADE_TABLE`은
