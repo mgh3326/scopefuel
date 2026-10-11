@@ -629,8 +629,9 @@ def _pty_tui_script(
     elif banner_fixture is not None:
         lines.append("cat <<'EOF'\n" + banner_fixture + "EOF\n")
     if banner_text is not None or banner_fixture is not None:
-        # 실측 두 번째 페인트처럼 상태줄 뒤에 composer placeholder 를 다시 그린다 —
-        # 입력 게이트는 상태줄 이후의 placeholder 재확인을 요구한다.
+        # banner_text 경로에는 placeholder 가 없으므로 composer 줄을 함께 그린다.
+        # 게이트는 placeholder 가 누적 출력 어디에 있든 받아들인다 — 실측 캡처는
+        # 상태줄 뒤에 composer 를 다시 그리지 않으며(그 재생은 cap_replay 가 한다).
         lines.append("printf '%s\\r\\n' '❭ Ask Devin to build features, fix bugs, or work on your code'")
     logged = f" >> {input_log}" if input_log else ""
     lines += [
@@ -888,36 +889,110 @@ def test_probe_sends_no_input_on_placeholder_without_status_line(tmp_path, monke
     assert _stub_reads(log) == []
 
 
-def test_probe_waits_for_status_line_when_placeholder_paints_first(tmp_path, monkeypatch, fixture_text):
-    """실측 캡처 순서: placeholder(첫 페인트) → 상태줄(두 번째 페인트) → 입력.
+_CAPTURE_REPLAYS = ("devin_capture1", "devin_capture2", "devin_capture3")
 
-    상태줄이 그려질 때까지 기다렸다가 치므로 plan·양 축을 모두 읽는다.
-    """
-    log = _stub_tui_binary(tmp_path, monkeypatch, mode="real_order", models_payload=_fixture(fixture_text))
 
-    result = devin.fetch()
+def _capture_path(name: str) -> Path:
+    return Path(__file__).with_name("fixtures") / f"{name}.txt"
 
-    assert result.error is None
-    assert result.plan == "Pro"
-    labels = {b.label: b for b in result.buckets}
-    assert labels["daily"].used_pct == 0.0
-    assert labels["weekly"].used_pct == 18.0
-    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
-    # 상태줄이 그려진 뒤에만 입력이 갔다 — 첫 read 시각이 paint-status 이후다.
-    events = []
+
+def _stub_event_times(log: Path) -> list[tuple[float, str]]:
+    events: list[tuple[float, str]] = []
     for line in log.read_text().splitlines():
         head, _, rest = line.strip().partition(" ")
         try:
             events.append((float(head), rest))
         except ValueError:
             continue
+    return events
+
+
+@pytest.mark.parametrize("capture", _CAPTURE_REPLAYS)
+def test_probe_capture_replay_types_usage_once_after_status_line(
+    tmp_path, monkeypatch, fixture_text, capture
+):
+    """실측 캡처 바이트 재생(v3000.11.3): 상태줄 diff 가 그려진 뒤 /usage 를 한 번만 친다.
+
+    세 캡처 모두 composer placeholder 는 첫 페인트(상태줄보다 앞)에만 있고
+    상태줄은 커서주소 diff 로만 온다 — placeholder 를 상태줄 '뒤'에서 요구하는
+    옛 규칙(철회된 fix3 규칙 2)은 이 재생에서 입력을 영영 못 내 RED 가 된다.
+    /usage 응답이 없어도 배너가 증명한 plan Pro·weekly 축은 읽힌다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="cap_replay", models_payload=_fixture(fixture_text))
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path(capture)))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setenv("STUB_USAGE", "silent")
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 0.5)
+
+    started = time.monotonic()
+    result = devin.fetch()
+    elapsed = time.monotonic() - started
+
+    assert result.error is None
+    assert result.plan == "Pro"
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0
+    assert labels["weekly"].note == "기동 배너 weekly"
+    assert labels["daily"].used_pct is None  # 미응답 — 0/100 추정 금지
+    # ESC[I 는 ?1004h 에 대한 터미널 이벤트 응답 — 키 입력이 아니다. 실제
+    # keystroke 는 /usage·/exit 뿐이고 /usage 는 정확히 한 번 간다.
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage", b"\r", b"/exit", b"\r"]
+    events = _stub_event_times(log)
     painted_at = next(t for t, event in events if event.startswith("paint-status"))
-    first_read_at = next(t for t, event in events if event.startswith("read"))
-    assert first_read_at >= painted_at
+    usage_read_at = next(t for t, event in events if event == "read b'/usage'")
+    assert usage_read_at >= painted_at
+    assert elapsed < devin.TIMEOUT_S - 10.0  # 30 s 데드라인보다 한참 아래서 끝난다
+
+
+def test_probe_capture_replay_reads_daily_and_weekly_from_real_usage_screen(
+    tmp_path, monkeypatch, fixture_text
+):
+    """캡처 재생이 실측 /usage 화면(devin_usage 픽스처)으로 이어지면 두 축을 읽는다."""
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="cap_replay", models_payload=_fixture(fixture_text))
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path("devin_capture3")))
+    monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
+    monkeypatch.setenv("STUB_USAGE", "file")
+    monkeypatch.setenv("STUB_USAGE_FILE", str(_capture_path("devin_usage")))
+
+    started = time.monotonic()
+    result = devin.fetch()
+    elapsed = time.monotonic() - started
+
+    assert result.error is None
+    assert result.plan == "Pro"
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["daily"].note == "/usage Daily"
+    assert labels["weekly"].used_pct == 18.0
+    assert labels["weekly"].note == "/usage Weekly"
+    assert _stub_reads(log) == [b"\x1b[I", b"/usage", b"\r", b"/exit", b"\r"]
+    assert elapsed < devin.TIMEOUT_S - 10.0
+
+
+def test_probe_sends_no_input_when_modal_opens_after_gate(tmp_path, monkeypatch, fixture_text):
+    """게이트가 열린 뒤 모달이 덮으면 아무것도 치지 않는다(ready_at 리셋 핀).
+
+    상태줄+composer 로 게이트가 열리고 0.2 s 뒤 업데이트 모달이 그려진다 —
+    게이트가 닫힐 때 ready_at 을 되돌리지 않는 뮤턴트는 모달 위에 /usage 를
+    쳐 넣어 RED 가 된다.
+    """
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="modal_after_gate", models_payload=_fixture(fixture_text)
+    )
+    monkeypatch.setenv("STUB_MODAL_AFTER", "0.2")
+    monkeypatch.setattr(devin, "TIMEOUT_S", 2.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축은 쓴다
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == []
 
 
 def test_probe_sends_no_input_when_status_line_has_no_composer(tmp_path, monkeypatch, fixture_text):
-    """상태줄만으로도 입력을 열지 않는다 — placeholder 재확인이 필요하다.
+    """상태줄만으로도 입력을 열지 않는다 — composer placeholder 도 필요하다.
 
     placeholder 요구를 빼는 뮤턴트는 여기에 /usage 를 쳐 넣어 RED 가 된다.
     """

@@ -14,6 +14,10 @@ import tty
 mode = os.environ.get("STUB_MODE", "normal")
 log_path = os.environ.get("STUB_LOG", "/dev/null")
 models = os.environ.get("STUB_MODELS", "")
+capture_path = os.environ.get("STUB_CAPTURE", "")
+usage_answer = os.environ.get("STUB_USAGE", "rows")  # rows | file | silent
+usage_file = os.environ.get("STUB_USAGE_FILE", "")
+modal_after = float(os.environ.get("STUB_MODAL_AFTER", "0.2"))
 t0 = time.monotonic()
 
 
@@ -78,14 +82,27 @@ if mode == "update_over_banner":
     # 모달을 검사하지 않는 구현은 'Yes, update' 에 /usage·Enter 를 쳐 넣는다.
     emit(BANNER + COMPOSER)
     emit("? Update now?\r\n❯ Yes, update and restart\r\n  No, remind me later\r\n")
-if mode == "real_order":
-    # 실측 캡처 순서(v3000.11.3): 첫 페인트는 composer placeholder 만, 몇 초 뒤
-    # 두 번째 페인트가 상태줄을 그리고 입력창을 다시 그린다. placeholder 만
-    # 보고 입력을 여는 구현은 상태줄 전에 /usage 를 친다.
-    emit("v3000.11.3\r\n" + COMPOSER)
+if mode == "cap_replay":
+    # 실측 캡처 바이트 재생(v3000.11.3, tests/fixtures/devin_captureN.txt) —
+    # 합성 화면이 아니라 저장된 PTY 출력 그대로다. 첫 커서주소 diff
+    # (ESC[?2026h CR ESC[9A …) 앞까지를 첫 페인트로 즉시 그리고,
+    # STUB_STATUS_DELAY 초 뒤에 그 diff 부터 캡처 끝까지 흘린다. 세 캡처 모두
+    # 상태줄 뒤에 composer placeholder 리페인트가 없다 — 여기서도 없다.
+    with open(capture_path, "rb") as fh:
+        cap = fh.read()
+    cut = cap.index(b"\x1b[?2026h\r\x1b[9A")
+    emit(cap[:cut])
     time.sleep(float(os.environ.get("STUB_STATUS_DELAY", "1.5")))
     log("paint-status")
-    emit("Pro · 82% remaining (resets in 1d 2h)\r\n" + COMPOSER)
+    emit(cap[cut:])
+if mode == "modal_after_gate":
+    # 상태줄+composer 로 입력 게이트가 열린 뒤 STUB_MODAL_AFTER 초 후 업데이트
+    # 모달이 덮는 경우 — 게이트가 닫힐 때 ready_at 을 되돌리지 않는 구현은
+    # 모달 위에 /usage·Enter 를 쳐 넣는다.
+    emit(BANNER + COMPOSER)
+    time.sleep(modal_after)
+    log("paint-modal")
+    emit("? Update now?\r\n❯ Yes, update and restart\r\n  No, remind me later\r\n")
 if mode not in (
     "no_banner",
     "prompt_only",
@@ -93,7 +110,8 @@ if mode not in (
     "login_arrow_list",
     "status_only",
     "update_over_banner",
-    "real_order",
+    "cap_replay",
+    "modal_after_gate",
 ):
     emit(BANNER + COMPOSER)
 if mode == "crash_after_banner":
@@ -123,7 +141,7 @@ while time.monotonic() < deadline:
             if mode in ("require_focus",) and not focus_seen:
                 log("ignored-no-focus")
                 continue
-            if mode == "no_usage_answer":
+            if mode == "no_usage_answer" or usage_answer == "silent":
                 log("usage-no-answer")
             else:
                 if mode == "slow_usage":
@@ -131,6 +149,10 @@ while time.monotonic() < deadline:
                 if mode == "malformed":
                     # /usage 응답 자체가 범위 밖 퍼센트를 싣는 경우.
                     emit(" Daily 230% used\r\n Weekly 999% used\r\n")
+                elif usage_answer == "file":
+                    # 실측 /usage 화면 픽스처를 바이트 그대로 응답한다.
+                    with open(usage_file, "rb") as fh:
+                        emit(fh.read())
                 else:
                     emit(USAGE)
             state = "wait_exit"

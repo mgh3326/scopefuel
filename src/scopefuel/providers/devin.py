@@ -10,14 +10,16 @@
 창이 만든 가짜 쿼타 축이었다(쿼타가 아니라 모델 Free 태그 → model scope).
 
 - 배너는 두 번 그려진다 — 첫 페인트는 버전과 composer placeholder, 몇 초 뒤
-  커서이동+화면클리어 후 쿼타 상태줄이 그려지고 입력창도 다시 그려진다.
-  입력은 ①쿼타 상태줄이 확인되고 ②그 상태줄 이후에 composer placeholder
-  (``Ask Devin to build …``)가 다시 확인되며 ③상태줄 뒤 화면에 chevron 옵션
-  목록(``❯ Yes, update`` 류)이나 ``?`` 질문 프롬프트가 없을 때만 보낸다 —
-  첫 페인트의 입력창만 보고 치면 아직 쿼타 조회 전(placeholder 만으로는
-  부족), 상태줄만 보고 치면 그 위의 업데이트·로그인 모달에 Enter 가
-  들어간다(상태줄만으로도 부족). 어느 조건이든 빠지면 deadline 까지
-  아무것도 치지 않고 끝낸다(fail-closed).
+  커서주소 지정 diff 가 쿼타 상태줄만 그린다(실측 캡처 세 벌 모두 상태줄 뒤에
+  composer 를 다시 그리지 않는다 — diff 렌더러는 안 바뀐 셀을 리페인트하지
+  않는다). 입력은 ①쿼타 상태줄이 확인되고 ②composer placeholder
+  (``Ask Devin to build …``)가 누적 출력 어딘가에 있으며(첫 페인트 포함,
+  상태줄 앞뒤 무관) ③상태줄 뒤 화면에 chevron 옵션 목록(``❯ Yes, update``
+  류)이나 ``?`` 질문 프롬프트가 없을 때만 보낸다 — 첫 페인트의 입력창만
+  보고 치면 아직 쿼타 조회 전(placeholder 만으로는 부족), 상태줄만 보고
+  치면 그 위의 업데이트·로그인 모달에 Enter 가 들어간다(상태줄만으로도
+  부족). 어느 조건이든 빠지면 deadline 까지 아무것도 치지 않고 끝낸다
+  (fail-closed).
   ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
   둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
 - ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
@@ -401,7 +403,7 @@ def _probe_session() -> str:
                 with contextlib.suppress(OSError):
                     os.write(master_fd, FOCUS_IN.encode())
                 focus_sent = True
-            # 입력은 쿼타 상태줄 + 그 이후에 다시 확인된 composer placeholder +
+            # 입력은 쿼타 상태줄 + 누적 출력 어딘가의 composer placeholder +
             # 상태줄 뒤 화면에 모달(chevron 옵션·질문 프롬프트) 부재 — 세 조건이
             # 모두 갖춰진 뒤에만 보낸다. 조건이 무너지면 ready_at 을 되돌려,
             # 상태줄 위에 그려진 업데이트 모달 같은 화면에는 절대 치지 않는다.
@@ -672,18 +674,18 @@ def _input_gate_open(clean: str) -> bool:
     """/usage 를 쳐도 되는 화면인가 — 세 조건이 모두 갖춰져야 연다(fail-closed).
 
     ① 쿼타 상태줄이 보이고(계정·쿼타 조회가 끝난 화면),
-    ② 그 상태줄 이후에 composer placeholder 가 다시 그려졌으며(placeholder 는
-      첫 페인트에서 상태줄보다 먼저 나오므로, 상태줄 뒤에도 보여야 지금
-      composer 가 살아 있는 입력창이다),
+    ② composer placeholder 가 누적 출력 어딘가에 있으며(실측 캡처 세 벌 모두
+      placeholder 는 첫 페인트에만 있고 상태줄 뒤에는 리페인트되지 않는다 —
+      상태줄 앞에만 있어도 된다),
     ③ 상태줄 뒤 화면에 chevron 옵션 목록이나 ``?`` 질문 프롬프트가 없다
       (상태줄 위에 열린 업데이트·로그인 모달에 Enter 가 들어가는 것을 막는다).
     """
     banner = _banner_quota_match(clean)
     if banner is None:
         return False
-    tail = clean[banner.end() :]
-    if _INPUT_READY.search(tail) is None:
+    if _INPUT_READY.search(clean) is None:
         return False
+    tail = clean[banner.end() :]
     return _MODAL_OR_OPTION.search(tail) is None
 
 
