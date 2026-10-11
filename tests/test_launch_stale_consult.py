@@ -11,6 +11,7 @@ already admitted. recommend.py is untouched.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import sqlite3
@@ -74,6 +75,23 @@ def fresh_view(tmp_path, monkeypatch):
     assert view.source == bench.CATALOG_SOURCE_SERVER
     assert view.stale is False
     return view
+
+
+def _view_with_row_gate(profile: str, gate: str) -> bench.CatalogView:
+    """A stale view where every row of PROFILE carries GATE instead.
+
+    Pins that the stale exemption keys on the row's gate, not the profile's
+    identity: an astra-labelled escalation row under stale is still refused.
+    """
+
+    entries = tuple(
+        dataclasses.replace(e, gate=gate) if e.profile == profile else e for e in bench.catalog_snapshot()
+    )
+    return bench.CatalogView(
+        entries=entries,
+        source=bench.CATALOG_SOURCE_CACHE_STALE,
+        backend=bench.BENCH_BACKEND_HANDOFFKEEP,
+    )
 
 
 def _view_without(*profiles: str) -> bench.CatalogView:
@@ -172,12 +190,28 @@ def _refused_because_of_the_request(result: recommend.GateResult) -> bool:
 def test_stale_catalog_astra_allowed_purpose_launches(stale_view, purpose):
     """The bug: this exact call was refused by the stale rule on main."""
 
-    decision = launch.resolve_launch("codex-astra", purpose=purpose, view=stale_view)
-    assert decision.model_id == "gpt-6-astra"
-    assert decision.effort == "xhigh"
-    assert decision.gate == "consult_only"
-    assert decision.catalog_stale is True
-    assert decision.operator_request is False
+    outcome = _launch_outcome("codex-astra", view=stale_view, effort=None, purpose=purpose, request=False)
+    assert isinstance(outcome, launch.LaunchDecision)
+    assert outcome.model_id == "gpt-6-astra"
+    assert outcome.effort == "xhigh"
+    assert outcome.gate == "consult_only"
+    assert outcome.catalog_stale is True
+    assert outcome.operator_request is False
+
+
+@pytest.mark.parametrize(
+    "purpose", ["Architect", "DIRECTOR", "Operator-Request", " architect ", " operator-request "]
+)
+def test_stale_catalog_astra_normalized_purpose_launches(stale_view, purpose):
+    """The admission canonizes purpose (strip().casefold()) — the same
+    expression the quota gate uses — so these spellings launch under stale
+    too, and a pin exists so the two surfaces cannot drift apart silently."""
+
+    outcome = _launch_outcome("codex-astra", view=stale_view, effort=None, purpose=purpose, request=False)
+    assert isinstance(outcome, launch.LaunchDecision)
+    assert outcome.model_id == "gpt-6-astra"
+    assert outcome.gate == "consult_only"
+    assert not _refused_because_of_the_request(_gate("codex-astra", purpose=purpose))
 
 
 @pytest.mark.parametrize("purpose", ["operator-request", "architect", "director"])
@@ -188,10 +222,11 @@ def test_astra_resolved_from_snapshot_rows_on_a_partial_canon_launches(purpose):
 
     view = _view_without("codex-astra")
     assert view.stale is False  # the server answered; freshness is not the issue
-    decision = launch.resolve_launch("codex-astra", purpose=purpose, view=view)
-    assert decision.catalog_source == bench.CATALOG_SOURCE_SNAPSHOT
-    assert decision.catalog_stale is True  # from_snapshot marks the same caveat
-    assert decision.model_id == "gpt-6-astra"
+    outcome = _launch_outcome("codex-astra", view=view, effort=None, purpose=purpose, request=False)
+    assert isinstance(outcome, launch.LaunchDecision)
+    assert outcome.catalog_source == bench.CATALOG_SOURCE_SNAPSHOT
+    assert outcome.catalog_stale is True  # from_snapshot marks the same caveat
+    assert outcome.model_id == "gpt-6-astra"
 
 
 def test_stale_astra_operator_request_still_launches(stale_view):
@@ -245,6 +280,31 @@ def test_snapshot_resolved_escalation_row_is_unchanged():
     with pytest.raises(launch.LaunchError, match="catalog is stale"):
         launch.resolve_launch("oc-omni", view=view)
     assert launch.resolve_launch("oc-omni", operator_request=True, view=view).gate == "escalation"
+
+
+@pytest.mark.parametrize("purpose", [None, "architect"])
+def test_astra_identity_with_escalation_gate_row_still_refused(purpose):
+    """The exemption keys on the row's gate, not the astra identity: a
+    codex-astra row stamped escalation is refused under stale even with an
+    allowed purpose, exactly like any other non-default non-consult gate."""
+
+    view = _view_with_row_gate("codex-astra", "escalation")
+    outcome = _launch_outcome("codex-astra", view=view, effort=None, purpose=purpose, request=False)
+    assert isinstance(outcome, launch.LaunchError)
+    assert "catalog is stale" in str(outcome)
+    granted = _launch_outcome("codex-astra", view=view, effort=None, purpose=purpose, request=True)
+    assert isinstance(granted, launch.LaunchDecision)
+    assert granted.gate == "escalation"
+
+
+def test_custom_gate_row_under_stale_is_refused():
+    """Gate matching is exact: an unknown gate string is not default and not
+    consult_only, so the stale rule still refuses it without a request."""
+
+    view = _view_with_row_gate("codex-astra", "custom-gate")
+    outcome = _launch_outcome("codex-astra", view=view, effort=None, purpose="architect", request=False)
+    assert isinstance(outcome, launch.LaunchError)
+    assert "catalog is stale" in str(outcome)
 
 
 # --- pinned case 4: fable (consult_only, not astra) unchanged ----------------

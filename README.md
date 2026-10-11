@@ -415,7 +415,9 @@ $ scopefuel bench push-catalog seed.json   # 운영자 토큰 전용
 ```
 
 서버 불가·stale은 "마지막으로 확인된 정본의 재현"까지만 허용합니다: `consult_only`는 절대 완화되지
-않고, stale 상태의 비-`default` gate는 `--operator-request`를 요구합니다("서버 다운 ≠ 자유 배정").
+않고, stale 상태의 비-`default` gate는 `--operator-request`를 요구합니다("서버 다운 ≠ 자유 배정") —
+단, consult_only 검사가 이미 통과시킨 `consult_only` row는 stale이 다시 거부하지 않습니다(#1444,
+가장 좁은 gate는 stale이 더 넓힐 수 없음).
 
 정본이 아닌 출처는 네 가지로 구분해 표시하며, `stale`은 그중 일부입니다 — 전부를 뭉뚱그리면
 "서버가 죽었다"와 "이 호스트는 원래 서버를 안 본다"가 같은 경고가 되어 둘 다 무시됩니다.
