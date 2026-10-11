@@ -1,0 +1,6 @@
+v3000.11.3
+Pro · 82% remaining (resets in 1d 2h)
+/usage
+○ /usage              Show session usage of credits / ACUs
+ Daily   ■■■■■■■■■■■■■■■■■■■■  0% used  · resets in 2h 7m
+ Weekly  ■■■■■■■■■■■■■■■■■■■■  18% used  · resets Oct 11, 5:00 PM (UTC+9)

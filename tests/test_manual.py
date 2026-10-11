@@ -448,7 +448,8 @@ def test_missing_required_five_hour_bucket_stays_fail_closed(claude_error_regist
     assert provider["manual"]["missing_windows"] == ["5h"]
 
 
-def test_devin_weekly_observation_cannot_replace_required_daily_bucket(capsys, monkeypatch):
+def test_devin_daily_observation_cannot_replace_required_weekly_bucket(capsys, monkeypatch):
+    """#1381: devin 필수 창은 weekly(7d) — daily 관측만으로는 게이트가 안 열린다."""
     monkeypatch.setattr(
         cli,
         "registry",
@@ -460,7 +461,7 @@ def test_devin_weekly_observation_cannot_replace_required_daily_bucket(capsys, m
             )
         },
     )
-    _set_manual(capsys, pool="devin", window="weekly", used="10")
+    _set_manual(capsys, pool="devin", window="daily", used="10")
 
     rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
 
@@ -468,7 +469,7 @@ def test_devin_weekly_observation_cannot_replace_required_daily_bucket(capsys, m
     assert "측정 불가" in capsys.readouterr().err
     assert cli.main(["--json", "--no-cache", "--only", "devin"]) == 1
     provider = json.loads(capsys.readouterr().out)["providers"][0]
-    assert provider["manual"]["missing_windows"] == ["1d"]
+    assert provider["manual"]["missing_windows"] == ["7d"]
 
 
 def test_manual_used_zero_still_runs_normal_cutoff_check(claude_error_registry, capsys, monkeypatch):
@@ -579,7 +580,8 @@ def test_known_timeout_and_transport_failures_are_manual_eligible(error):
     assert kind == "transport"
 
 
-def test_devin_banner_timeout_can_use_a_complete_daily_manual_observation(capsys, monkeypatch):
+def test_devin_banner_timeout_can_use_a_complete_weekly_manual_observation(capsys, monkeypatch):
+    """#1381: devin 필수 창은 weekly(7d) 하나 — 수동 관측 7d 하나면 게이트가 열린다."""
     monkeypatch.setattr(
         cli,
         "registry",
@@ -591,7 +593,7 @@ def test_devin_banner_timeout_can_use_a_complete_daily_manual_observation(capsys
             )
         },
     )
-    _set_manual(capsys, pool="devin", window="daily", used="10")
+    _set_manual(capsys, pool="devin", window="weekly", used="10")
 
     rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
 

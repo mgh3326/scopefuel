@@ -11,6 +11,7 @@ unmeasured C; devin-ds41-max stays unmeasured C.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import pathlib
 
@@ -37,6 +38,8 @@ VARIANTS: dict[str, str] = {
 }
 EXISTING_DEVIN = ("devin-swe2", "devin-ds41")
 GATE_GOLDEN = FIXTURES / "devin_gate_golden_635.json"
+# devin_usage 픽스처의 캡처 시각 — 연도 없는 절대 리셋 해석을 고정한다.
+_FIXTURE_NOW = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.UTC)
 
 
 def _models_list(fixture_text) -> str:
@@ -173,7 +176,10 @@ def gate_outputs(monkeypatch, capsys, tmp_path, fixture_text) -> dict:
 
 
 def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, tmp_path, fixture_text):
-    # Golden captured at af2233f (main, before #635) with this same helper.
+    # Golden originally captured at af2233f (main, before #635) with this same
+    # helper; re-captured under #1381's quota semantics — devin requires the
+    # weekly (7d) window only and swe-2 is model-scoped, so models-list-only
+    # input gates fail-closed with the 7d window missing.
     expected = json.loads(GATE_GOLDEN.read_text())
     actual = gate_outputs(monkeypatch, capsys, tmp_path, fixture_text)
     assert json.dumps(actual, ensure_ascii=False, sort_keys=True) == json.dumps(
@@ -184,8 +190,13 @@ def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, 
 # -- AC3: recommend lists each variant only at its measured placement --------
 
 
+def _measured_devin(fixture_text):
+    """#1381: models list 는 쿼타를 안 주므로 측정된 devin 풀은 PTY 세션 파서로 만든다."""
+    return devin.parse_session(fixture_text("devin_usage"), now=_FIXTURE_NOW)
+
+
 def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_text):
-    providers = [devin.parse(_models_list(fixture_text))]
+    providers = [_measured_devin(fixture_text)]
     # Measured placements are A (medium), A+ (swe2-max's promoted max rung) and
     # C (the effort-less max rungs) — nowhere else. #1318-2: the A rep-measured
     # row (medium) also lists at B, tagged one-up; the unmeasured C rungs do not
@@ -208,12 +219,12 @@ def test_recommend_outside_the_measured_placements_never_lists_variants(fixture_
 
 
 def test_recommend_c_lists_only_the_still_unmeasured_variants(fixture_text):
-    providers = [devin.parse(_models_list(fixture_text))]
+    providers = [_measured_devin(fixture_text)]
     out = recommend(providers, "C")
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert "devin-swe2-medium" not in out
     for name in ("devin-swe2-max", "devin-ds41-max"):
-        rows = [line for line in ranked if line.split()[1] == name]
+        rows = [line for line in ranked if name in line.split()]
         assert len(rows) == 1, (name, out)
         assert "미측정" in rows[0], rows[0]
 
@@ -224,10 +235,10 @@ def test_recommend_a_lists_only_the_measured_variant(fixture_text):
     #1318-2: the A+ rep-measured rungs (devin-swe2@high, devin-swe2-max@max,
     devin-ds41) now list at A as one-up rows — tagged, never untagged.
     """
-    providers = [devin.parse(_models_list(fixture_text))]
+    providers = [_measured_devin(fixture_text)]
     out = recommend(providers, "A")
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    rows = [line for line in ranked if line.split()[1] == "devin-swe2-medium"]
+    rows = [line for line in ranked if "devin-swe2-medium" in line.split()]
     assert len(rows) == 1, out
     assert "[one-up" not in rows[0]
     # The promoted A+ max rung lists here only as a tagged one-up row; the
