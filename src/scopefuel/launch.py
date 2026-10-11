@@ -706,7 +706,18 @@ def resolve_launch(
             f"profile '{profile}' is consult_only; {remedy}"
             + (f" ({row.gate_reason})" if row.gate_reason else "")
         )
-    if (view.stale or from_snapshot) and row.gate != GATE_DEFAULT and not operator_request:
+    # A consult_only row that reached this point was admitted by the check
+    # above (an operator request, or an astra identity with an allowed
+    # purpose). consult_only is the narrowest gate — the canon cannot have
+    # moved anywhere more restrictive — so a stale view cannot widen it and
+    # must not refuse it again here (#1444: under staleness an astra launch
+    # otherwise had no flag combination left that the quota gate also admits).
+    if (
+        (view.stale or from_snapshot)
+        and row.gate != GATE_DEFAULT
+        and row.gate != GATE_CONSULT_ONLY
+        and not operator_request
+    ):
         raise LaunchError(
             f"profile '{profile}' has gate={row.gate} and the catalog is stale; "
             "pass --operator-request (a stale catalog cannot widen a gate)"
