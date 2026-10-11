@@ -62,11 +62,15 @@ Not fail-open and not fail-closed — the axis is *what the action does*, not
   an invented value.
 * **Widening fails closed.** A server being down is never the reason something
   became easier to start (hk:doc 2558, "a down server is not free dispatch"):
-  * `gate = consult_only` is never relaxed — `--operator-request` always required;
+  * `gate = consult_only` is never relaxed — fable needs `--operator-request`,
+    and an astra identity needs that or an allowed `--purpose` (#527);
   * while `catalog=stale`, ordinary `default`-gate launches carry on unchanged
-    (rc 0, labelled) — only a non-`default` gate additionally requires
-    `--operator-request`, even where the snapshot says the gate is `default`,
-    because the canon may have raised it since the last successful read;
+    (rc 0, labelled). A `consult_only` row the consult_only check already
+    admitted is not refused again — the narrowest gate cannot be widened by a
+    stale view (#1444) — but every other non-`default` gate additionally
+    requires `--operator-request`, even where the snapshot says the gate is
+    `default`, because the canon may have raised it since the last successful
+    read;
   * a profile absent from the snapshot is refused (`rc 3`), never defaulted.
 * **Disclosure is the precondition.** Every non-canonical path is labelled —
   `scopefuel --recommend` prints a `catalog=…` line (stderr under `--json`,
@@ -78,7 +82,8 @@ Not fail-open and not fail-closed — the axis is *what the action does*, not
 last-good cache for as long as the server is unreachable — there is no timeout
 that ever swaps those rows. What the setting bounds now is only the *label*:
 `catalog=cache` becomes `catalog=cache-stale` at the ceiling, and the
-stale rules (non-`default` gates need `--operator-request`) apply throughout.
+stale rules (non-`default` gates need `--operator-request`; an already-admitted
+`consult_only` row is the one exception) apply throughout.
 That trade is deliberate: the bundled snapshot is older than the cache and
 cannot preserve a server-side demotion it never saw, so reverting to it past
 the ceiling was the one failure mode that *resurrected* placements the canon
