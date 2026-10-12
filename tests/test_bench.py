@@ -510,7 +510,10 @@ def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, cap
     )
     # ROB-1191 ④ compact single-effort cells
     assert "78.0(AA-agent; metric=agentic; harness=codex; effort=max)" not in out
-    assert "62.0(AA-agent/codex/max)" in out
+    # Terra is barred (operator 2026-10-12 noterra): its AA-agent codex/max cell
+    # (62.0) was the old codex compact cell at S and must not surface any more.
+    assert "62.0(AA-agent/codex/max)" not in out
+    assert "codex-terra" not in out and "gpt-5.6-terra" not in out
     assert "61.0(AA-agent/kimi-code-cli)" in out
 
 

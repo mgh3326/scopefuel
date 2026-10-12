@@ -1901,6 +1901,8 @@ def test_rob1210_explain_only_shows_brake_when_below_knee():
     """The explain line names the brake source below knee and stays quiet at brake=1.
 
     ROB-591: uses codex instead of claude — see the ROB-1210 tests above.
+    Terra is barred (operator 2026-10-12 noterra) and codex-terra-max was the only
+    codex row at S, so the braked codex candidate is codex-sol at S+.
     """
     braked = recommend(
         [
@@ -1909,7 +1911,7 @@ def test_rob1210_explain_only_shows_brake_when_below_knee():
                 [(70.0, "5h", 0.5), (10.0, "7d", 68.0)],
             )
         ],
-        "S",
+        "S+",
         today=TODAY,
         now=NOW,
         explain=True,

@@ -251,10 +251,17 @@ def test_sol_profiles_stay_s_plus_in_the_snapshot():
             assert entry.grade == "S+", f"{entry.profile} left S+ in the bundled snapshot"
 
 
-@pytest.mark.parametrize("spelling", [
-    "codex-terra", "codex-terra-max", "codex-med",
-    "builder-terra-high", "builder-terra-xhigh", "builder-terra-max",
-])
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "codex-terra",
+        "codex-terra-max",
+        "codex-med",
+        "builder-terra-high",
+        "builder-terra-xhigh",
+        "builder-terra-max",
+    ],
+)
 def test_every_terra_spelling_is_refused_instead_of_resolving(spelling):
     with pytest.raises(launch.LaunchError, match="refused") as exc:
         launch.resolve_launch(spelling)

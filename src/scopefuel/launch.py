@@ -42,9 +42,9 @@ from .recommend import (
     PROFILE_ALIASES,
     REP_GRADES_ORDER,
     Grade,
+    barred_model_id_for_profile,
     e6_arm_matches,
     e6_arm_rung_for,
-    barred_model_id_for_profile,
     is_barred_model_id,
     normalize_effort,
     parse_e6_arm_marker,
@@ -591,9 +591,7 @@ def resolve_launch(
     rows = _live_rows(view, canonical)
     if any(is_barred_model_id(row.model_id) for row in rows):
         barred = next(row.model_id for row in rows if is_barred_model_id(row.model_id))
-        raise LaunchError(
-            f"profile '{profile}' refused: {barred} is barred by {BARRED_MODEL_DECISION_REF}"
-        )
+        raise LaunchError(f"profile '{profile}' refused: {barred} is barred by {BARRED_MODEL_DECISION_REF}")
 
     requested = normalize_effort(effort)
     marker = parse_e6_arm_marker(e6_arm)

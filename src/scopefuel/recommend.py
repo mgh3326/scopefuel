@@ -1830,10 +1830,7 @@ def is_barred_model_id(model_id: str | None) -> bool:
     if not model_id:
         return False
     normalized = model_id.strip().casefold()
-    return any(
-        normalized == barred or normalized.startswith(f"{barred}-")
-        for barred in BARRED_MODEL_IDS
-    )
+    return any(normalized == barred or normalized.startswith(f"{barred}-") for barred in BARRED_MODEL_IDS)
 
 
 def barred_model_id_for_profile(

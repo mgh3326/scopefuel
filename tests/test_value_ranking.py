@@ -9,8 +9,8 @@ import sqlite3
 import pytest
 
 from scopefuel import bench, cli
-from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel import recommend as recommend_mod
+from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     ASTRA_ROLE_PROFILES,
     GRADE_TABLE,
@@ -401,13 +401,15 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         # and unknown rows at equal standing, and an unmeasured exact row
         # sinks below a measured one-up (amended AC6).
         profiles = [
-            profile for profile in GRADE_TABLE[grade]
+            profile
+            for profile in GRADE_TABLE[grade]
             if profile.gate != "escalation"
             and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
         ]
         ordered = [(profile, False) for profile in profiles]
         ordered += [
-            (profile, True) for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)
+            (profile, True)
+            for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)
             if not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
         ]
         expected[grade] = [

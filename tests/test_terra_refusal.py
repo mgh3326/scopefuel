@@ -7,7 +7,8 @@ import json
 
 import pytest
 
-from scopefuel import bench, cli, launch, policy, recommend as recommend_mod
+from scopefuel import bench, cli, launch, policy
+from scopefuel import recommend as recommend_mod
 from scopefuel.recommend import GRADE_TABLE, recommend, recommend_dict
 
 TERRA_NAMES = {
@@ -68,8 +69,7 @@ def test_served_canon_promote_row_is_filtered_after_merge_for_exact_and_one_up_v
     one_up = recommend_dict([], "S", today=NOW.date(), now=NOW, grade_table=table)
     assert not any(row["profile"] == "codex-terra" for row in _all_recommendation_rows(exact))
     assert not any(
-        row["profile"] == "codex-terra" and row["one_up"]
-        for row in _all_recommendation_rows(one_up)
+        row["profile"] == "codex-terra" and row["one_up"] for row in _all_recommendation_rows(one_up)
     )
 
 
