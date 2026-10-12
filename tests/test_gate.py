@@ -662,7 +662,10 @@ def test_gate_operator_request_cli_opus_exit_3_not_applicable(monkeypatch, capsy
     assert "operator_request_not_applicable" in out.err
     assert "astra 는 --purpose" not in out.err
     assert "대안(" not in out.err
-    assert "--operator-request 는 escalation/consult_only 런그 전용 — 쿼타와 무관, 플래그 없이 다시 실행" in out.err
+    assert (
+        "--operator-request 는 escalation/consult_only 런그 전용 — 쿼타와 무관, 플래그 없이 다시 실행"
+        in out.err
+    )
 
 
 # ------------------------------------------------------------------ task #527: astra purpose gate

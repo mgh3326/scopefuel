@@ -1288,7 +1288,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             )
         else:
             print(
-                "--operator-request 는 escalation/consult_only 런그 전용 — 쿼타와 무관, 플래그 없이 다시 실행",
+                "--operator-request 는 escalation/consult_only 런그 전용 — "
+                "쿼타와 무관, 플래그 없이 다시 실행",
                 file=sys.stderr,
             )
     elif result.e6_arm and not result.ok:
