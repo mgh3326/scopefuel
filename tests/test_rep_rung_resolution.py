@@ -65,9 +65,6 @@ WRK_BUILDER_SPELLINGS: dict[str, tuple[str, str]] = {
     "builder-sol6": ("codex-sol", "high"),
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
-    "builder-terra-high": ("codex-terra", "high"),
-    "builder-terra-xhigh": ("codex-terra", "xhigh"),
-    "builder-terra-max": ("codex-terra", "max"),
     "builder-grok": ("grok-hi", "xhigh"),
     "builder-grok-low": ("grok-hi", "low"),
     "builder-grok-medium": ("grok-hi", "medium"),
@@ -167,6 +164,16 @@ def test_builder_mapping_values_match_wrk():
     """The mapped (profile, effort pin) values mirror wrk's resolver/gate
     tables — a drifted value silently lands reps on the wrong rung."""
     assert grades._BUILDER_RUNGS == WRK_BUILDER_SPELLINGS
+
+
+def test_barred_terra_spellings_have_no_live_rep_rung_aliases():
+    for spelling in (
+        "builder-terra-high",
+        "builder-terra-xhigh",
+        "builder-terra-max",
+    ):
+        assert spelling not in grades._BUILDER_RUNGS
+    assert "codex-med" not in grades._SPELLING_ALIASES
 
 
 @pytest.mark.parametrize("spelling", sorted(WRK_BUILDER_SPELLINGS))
@@ -960,21 +967,21 @@ def test_mutant_alias_dedup_would_fail(tmp_path, monkeypatch, isolated_cache):
 
 def test_recorded_max_reps_never_promote_the_medium_rung(tmp_path, isolated_cache):
     """The live regression (hk:doc 5177, #777 AC3, direct path): reps recorded
-    codex-terra@max must not promote codex-terra@medium — a measured effort
+    codex-sol@max must not promote codex-sol@medium — a measured effort
     with no exact-effort row is unrung, never judged-by-medium."""
-    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "high", "A+"))
+    view = _view(_entry("codex-sol", "medium", "A"), _entry("codex-sol", "high", "A+"))
     _seed(
         [
-            _rep("t1", profile="codex-terra", effort="max", grade="S"),
-            _rep("t2", profile="codex-terra", effort="max", grade="S"),
-            _rep("t3", profile="codex-terra", effort="max", grade="S"),
+            _rep("t1", profile="codex-sol", effort="max", grade="S"),
+            _rep("t2", profile="codex-sol", effort="max", grade="S"),
+            _rep("t3", profile="codex-sol", effort="max", grade="S"),
         ]
     )
     proposal = _propose(view)
     assert _keys(proposal) == set()  # medium keeps its A — zero counted evidence
     assert {r.rep.task_ref for r in proposal.unrung} == {"t1", "t2", "t3"}
     row = _counted(proposal, "t1")
-    assert row.rung == ("codex-terra", "max")
+    assert row.rung == ("codex-sol", "max")
     assert row.row_key is None
     assert "counts only on that effort's rung" in row.resolution_detail
     text = grades.render_proposal(proposal, view)
@@ -982,38 +989,38 @@ def test_recorded_max_reps_never_promote_the_medium_rung(tmp_path, isolated_cach
 
 
 def test_builder_pin_unrung_without_exact_effort_row(tmp_path, isolated_cache):
-    """Builder-map path: builder-terra-max pins codex-terra@max — with no max
+    """Builder-map path: builder-sol-max pins codex-sol@max — with no max
     row the rep is unrung; the pin cannot borrow the medium default."""
-    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "high", "A+"))
-    _seed([_rep("t1", profile="builder-terra-max", grade="S")])
+    view = _view(_entry("codex-sol", "medium", "A"), _entry("codex-sol", "high", "A+"))
+    _seed([_rep("t1", profile="builder-sol-max", grade="S")])
     proposal = _propose(view)
     row = _counted(proposal, "t1")
-    assert row.rung == ("codex-terra", "max")
+    assert row.rung == ("codex-sol", "max")
     assert row.row_key is None
     assert [r.rep.task_ref for r in proposal.unrung] == ["t1"]
 
 
 def test_builder_pin_recorded_effort_override_unrung(tmp_path, isolated_cache):
-    """Builder-map + recorded override: a builder-terra-max rep that recorded
+    """Builder-map + recorded override: a builder-sol-max rep that recorded
     effort=xhigh measured xhigh — unrung without an xhigh row, not adopted by
     the pinned max's sibling rungs."""
-    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "max", "C"))
-    _seed([_rep("t1", profile="builder-terra-max", effort="xhigh", grade="S")])
+    view = _view(_entry("codex-sol", "medium", "A"), _entry("codex-sol", "max", "C"))
+    _seed([_rep("t1", profile="builder-sol-max", effort="xhigh", grade="S")])
     proposal = _propose(view)
     row = _counted(proposal, "t1")
-    assert row.rung == ("codex-terra", "xhigh")
+    assert row.rung == ("codex-sol", "xhigh")
     assert row.row_key is None
 
 
 def test_alias_recorded_effort_unrung_without_exact_row(tmp_path, isolated_cache):
-    """Alias path: codex-med aliases to codex-terra@medium — a rep recorded at
+    """Alias path: codex aliases to codex-sol@medium — a rep recorded at
     xhigh on that spelling measured xhigh, and with no xhigh row it is unrung:
     the alias's medium pin cannot adopt it."""
-    view = _view(_entry("codex-terra", "medium", "A"))
-    _seed([_rep("t1", profile="codex-med", effort="xhigh", grade="S")])
+    view = _view(_entry("codex-sol", "medium", "A"))
+    _seed([_rep("t1", profile="codex", effort="xhigh", grade="S")])
     proposal = _propose(view)
     row = _counted(proposal, "t1")
-    assert row.rung == ("codex-terra", "xhigh")
+    assert row.rung == ("codex-sol", "xhigh")
     assert row.row_key is None
     assert [r.rep.task_ref for r in proposal.unrung] == ["t1"]
 
@@ -1034,20 +1041,20 @@ def test_effort_less_rung_judges_only_effort_less_reps(tmp_path, isolated_cache)
     effort-less profile measured a rung that does not exist and is unrung —
     while a rep that recorded no effort still lands on the "" row flagged
     'effort inferred'."""
-    view = _view(_entry("codex-terra-max", "", "S"))
+    view = _view(_entry("codex-sol", "", "S"))
     _seed(
         [
-            _rep("measured", profile="codex-terra-max", effort="max", grade="S"),
-            _rep("quiet", profile="codex-terra-max", grade="A+"),
+            _rep("measured", profile="codex-sol", effort="max", grade="S"),
+            _rep("quiet", profile="codex-sol", grade="A+"),
         ]
     )
     proposal = _propose(view)
     measured = _counted(proposal, "measured")
-    assert measured.rung == ("codex-terra-max", "max")
+    assert measured.rung == ("codex-sol", "max")
     assert measured.row_key is None
     quiet = _counted(proposal, "quiet")
-    assert quiet.rung == ("codex-terra-max", "")
-    assert quiet.row_key == ("codex-terra-max", "")
+    assert quiet.rung == ("codex-sol", "")
+    assert quiet.row_key == ("codex-sol", "")
     assert quiet.effort_inferred is True
 
 
@@ -1069,17 +1076,17 @@ def test_mutant_exact_effort_boundary_would_fail(tmp_path, isolated_cache):
     """assertion-RED: same effort counts, adjacent effort doesn't — a mutant
     that re-admits a different-effort row flips exactly one of the two
     assertions."""
-    view = _view(_entry("codex-terra", "medium", "A"), _entry("codex-terra", "max", "C"))
+    view = _view(_entry("codex-sol", "medium", "A"), _entry("codex-sol", "max", "C"))
     _seed(
         [
-            _rep("kept", profile="codex-terra", effort="max", grade="S"),
-            _rep("lost", profile="codex-terra", effort="high", grade="S"),
+            _rep("kept", profile="codex-sol", effort="max", grade="S"),
+            _rep("lost", profile="codex-sol", effort="high", grade="S"),
         ]
     )
     proposal = _propose(view)
-    assert _counted(proposal, "kept").row_key == ("codex-terra", "max")
+    assert _counted(proposal, "kept").row_key == ("codex-sol", "max")
     lost = _counted(proposal, "lost")
-    assert lost.rung == ("codex-terra", "high")
+    assert lost.rung == ("codex-sol", "high")
     assert lost.row_key is None
     assert [r.rep.task_ref for r in proposal.unrung] == ["lost"]
 
@@ -1088,14 +1095,14 @@ def test_mutant_cross_effort_fallback_would_promote_medium(tmp_path, isolated_ca
     """assertion-RED: restoring judged-by-default fallback re-counts max
     evidence on the medium rung — the 'no result' and unrung assertions both
     go red."""
-    view = _view(_entry("codex-terra", "medium", "C"), _entry("codex-terra", "high", "A+"))
+    view = _view(_entry("codex-sol", "medium", "C"), _entry("codex-sol", "high", "A+"))
     _seed(
         [
-            _rep("t1", profile="codex-terra", effort="max", grade="S"),
-            _rep("t2", profile="codex-terra", effort="max", grade="S"),
+            _rep("t1", profile="codex-sol", effort="max", grade="S"),
+            _rep("t2", profile="codex-sol", effort="max", grade="S"),
         ]
     )
     proposal = _propose(view)
-    assert ("codex-terra", "medium") not in _keys(proposal)  # fallback would produce it
+    assert ("codex-sol", "medium") not in _keys(proposal)  # fallback would produce it
     assert _keys(proposal) == set()
     assert {r.rep.task_ref for r in proposal.unrung} == {"t1", "t2"}

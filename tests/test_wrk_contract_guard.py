@@ -67,12 +67,6 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     # #594 E3 rung (xhigh) — same catalog profile as the worker spellings.
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
-    "codex-terra": ("codex-terra", "medium"),
-    "codex-med": ("codex-terra", "medium"),
-    "builder-terra-high": ("codex-terra", "high"),
-    "builder-terra-xhigh": ("codex-terra", "xhigh"),
-    "builder-terra-max": ("codex-terra", "max"),
-    "codex-terra-max": ("codex-terra-max", None),
     "codex-luna": ("codex-luna", "medium"),
     "codex-luna-hi": ("codex-luna", "high"),
     "codex-luna-max": ("codex-luna-max", None),
@@ -173,8 +167,6 @@ WRK_PRE_593_RESOLUTION: dict[str, tuple[str, str]] = {
     "codex": ("gpt-6.1-sol", "high"),
     "codex-sol": ("gpt-6.1-sol", "max"),
     "codex-max": ("gpt-6.1-sol", "max"),
-    "codex-terra": ("gpt-5.6-terra", "medium"),
-    "codex-terra-max": ("gpt-5.6-terra", "max"),
     "codex-luna": ("gpt-6-luna", "medium"),
     "codex-luna-hi": ("gpt-6-luna", "high"),
     "codex-luna-max": ("gpt-6-luna", "max"),
@@ -257,3 +249,21 @@ def test_sol_profiles_stay_s_plus_in_the_snapshot():
     for entry in launch.snapshot_entries():
         if entry.profile in ("codex-sol", "kiro-sol"):
             assert entry.grade == "S+", f"{entry.profile} left S+ in the bundled snapshot"
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "codex-terra",
+        "codex-terra-max",
+        "codex-med",
+        "builder-terra-high",
+        "builder-terra-xhigh",
+        "builder-terra-max",
+    ],
+)
+def test_every_terra_spelling_is_refused_instead_of_resolving(spelling):
+    with pytest.raises(launch.LaunchError, match="refused") as exc:
+        launch.resolve_launch(spelling)
+    assert "gpt-5.6-terra" in str(exc.value)
+    assert "noterra" in str(exc.value)

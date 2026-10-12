@@ -510,7 +510,10 @@ def test_recommend_fallback_bench_cells_are_labeled(monkeypatch, bench_home, cap
     )
     # ROB-1191 ④ compact single-effort cells
     assert "78.0(AA-agent; metric=agentic; harness=codex; effort=max)" not in out
-    assert "62.0(AA-agent/codex/max)" in out
+    # Terra is barred (operator 2026-10-12 noterra): its AA-agent codex/max cell
+    # (62.0) was the old codex compact cell at S and must not surface any more.
+    assert "62.0(AA-agent/codex/max)" not in out
+    assert "codex-terra" not in out and "gpt-5.6-terra" not in out
     assert "61.0(AA-agent/kimi-code-cli)" in out
 
 
@@ -802,7 +805,7 @@ def test_reps_tokens_round_trip_and_legacy_read_compat(bench_home, capsys, tmp_p
     assert migrated_rows[1].input_tokens is None
 
 
-def test_missing_db_recommend_does_not_treat_missing_scores_as_low(monkeypatch, tmp_path, capsys):
+def test_missing_db_recommend_never_restores_barred_terra(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "empty-data"))
     monkeypatch.setattr(bench, "DOTENV_PATH", tmp_path / "missing.env")
     monkeypatch.setattr(
@@ -819,8 +822,7 @@ def test_missing_db_recommend_does_not_treat_missing_scores_as_low(monkeypatch, 
     )
     assert cli.main(["--recommend", "S", "--no-cache"]) == 0
     out = capsys.readouterr().out
-    codex_line = next(line for line in out.splitlines() if "codex-terra-max" in line)
-    assert "벤치 62.0(AA-agent/codex/max)" in codex_line
+    assert "codex-terra" not in out and "gpt-5.6-terra" not in out
     assert not (tmp_path / "empty-data" / "scopefuel" / "bench.db").exists()
 
 
@@ -845,10 +847,11 @@ def test_recommend_does_not_rank_by_raw_scores_across_sources_or_metrics(bench_h
     ]
     out = recommend(providers, "S", bench_scores=scores)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. codex-terra-max")
-    assert ranked[1].startswith("2. kimi-k3")
-    assert "1.0(AA-agent/codex/max)" in ranked[0]
-    assert "61.0(AA-agent/kimi-code-cli)" in ranked[1]
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in ranked)
+    assert ranked[0].startswith("1. kimi-k3")
+    assert ranked[1].startswith("2. grok-hi")
+    assert "61.0(AA-agent/kimi-code-cli)" in ranked[0]
+    assert "99.0" not in "\n".join(ranked)
 
 
 def test_no_secret_like_response_body_is_printed(bench_home, monkeypatch, capsys):
@@ -1061,11 +1064,11 @@ def test_recommend_prefers_aa_agent_over_aa_model_fallback(monkeypatch, bench_ho
             for name in ("codex", "clinepass", "grok")
         },
     )
-    assert cli.main(["--recommend", "S", "--no-cache"]) == 0
+    assert cli.main(["--recommend", "A", "--no-cache"]) == 0
     out = capsys.readouterr().out
-    codex_line = next(line for line in out.splitlines() if "codex-terra-max" in line)
-    assert "AA-agent" in codex_line
-    assert "AA-model" not in codex_line
+    agent_line = next(line for line in out.splitlines() if "oc-dsflash" in line)
+    assert "AA-agent" in agent_line
+    assert "AA-model" not in agent_line
 
 
 def test_coverage_report_marks_unlisted_profiles_without_implying_low(bench_home):

@@ -83,7 +83,6 @@ def test_astra_is_consult_only_and_defaults_to_xhigh(capsys):
         ("codex-max", None, "gpt-6.1-sol", "max"),  # alias resolves to codex-sol
         ("codex-luna", None, "gpt-6-luna", "medium"),
         ("codex-luna", "high", "gpt-6-luna", "high"),
-        ("codex-terra", None, "gpt-5.6-terra", "medium"),
         ("grok-hi", None, "grok-4.7", "high"),
         ("grok", None, "grok-4.7", "medium"),
         ("kiro-opus", None, "claude-opus-5", "xhigh"),

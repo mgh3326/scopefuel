@@ -98,10 +98,6 @@ _EXPECTED_LABELS = {
     ("codex-luna-max", None): "codex-luna-max",
     ("codex-sol", "max"): "codex-sol --effort max",
     ("codex-sol", "xhigh"): "codex-sol --effort xhigh",
-    ("codex-terra", "high"): "codex-terra --effort high",
-    ("codex-terra", "medium"): "codex-terra --effort medium",
-    ("codex-terra", "xhigh"): "codex-terra --effort xhigh",
-    ("codex-terra-max", None): "codex-terra-max",
     ("devin-ds41", None): "devin-ds41",
     ("devin-ds41-max", None): "devin-ds41-max",
     ("devin-fusion-opus55", None): "devin-fusion-opus55",
@@ -149,9 +145,11 @@ _EXPECTED_LABELS = {
 }
 
 
-def _label(profile: Profile) -> str:
-    """Literal expected label — the pinned string for this row, never a
-    ``_text_label`` derivation."""
+def _label(profile: Profile) -> str | None:
+    """Pinned labels for candidates; barred model rows are outside the list."""
+    model_id = profile.aa_agent_model_id or profile.benchmark_model_id
+    if recommend_mod.is_barred_model_id(model_id):
+        return None
     return _EXPECTED_LABELS[(profile.name, profile.launcher_effort)]
 
 
@@ -269,6 +267,8 @@ def test_every_bundled_row_lists_only_at_its_placement_or_one_below():
             if profile.gate != "default":
                 continue  # escalation rows render in their own section
             label = _label(profile)
+            if label is None:
+                continue
             allowed = allowed_at.setdefault(label, set())
             allowed.add(grade)
             if (grade, label) in pinned:

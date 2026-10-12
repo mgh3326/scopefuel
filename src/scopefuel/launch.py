@@ -34,6 +34,7 @@ from .bench import (
 from .recommend import (
     ASTRA_ALLOWED_PURPOSES,
     ASTRA_ROLE_PROFILES,
+    BARRED_MODEL_DECISION_REF,
     E6_ARM_GRADE,
     E6_ARM_KEYS,
     E6_ARM_RUNGS,
@@ -41,8 +42,10 @@ from .recommend import (
     PROFILE_ALIASES,
     REP_GRADES_ORDER,
     Grade,
+    barred_model_id_for_profile,
     e6_arm_matches,
     e6_arm_rung_for,
+    is_barred_model_id,
     normalize_effort,
     parse_e6_arm_marker,
     profile_pool,
@@ -111,8 +114,6 @@ DEFAULT_LAUNCH_EFFORTS: dict[str, str] = {
     "sonnet": "high",
     "haiku": "low",
     "codex-sol": "max",
-    "codex-terra": "medium",
-    "codex-terra-max": "max",
     "codex-luna": "medium",
     "codex-luna-max": "max",
     "codex-astra": "xhigh",
@@ -579,9 +580,18 @@ def resolve_launch(
     ordinary again and the marker is inert.
     """
 
+    barred_model_id = barred_model_id_for_profile(profile)
+    if barred_model_id:
+        raise LaunchError(
+            f"profile '{profile}' refused: {barred_model_id} is barred by {BARRED_MODEL_DECISION_REF}"
+        )
+
     view = read_catalog(path=path) if view is None else view
     canonical = PROFILE_ALIASES.get(profile, profile)
     rows = _live_rows(view, canonical)
+    if any(is_barred_model_id(row.model_id) for row in rows):
+        barred = next(row.model_id for row in rows if is_barred_model_id(row.model_id))
+        raise LaunchError(f"profile '{profile}' refused: {barred} is barred by {BARRED_MODEL_DECISION_REF}")
 
     requested = normalize_effort(effort)
     marker = parse_e6_arm_marker(e6_arm)
