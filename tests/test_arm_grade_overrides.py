@@ -28,6 +28,7 @@ from scopefuel.recommend import (
     E6_ARM_KEYS,
     GRADE_TABLE,
     Profile,
+    barred_model_id_for_profile,
     e6_arm_rung_for,
     gate_check,
     recommend,
@@ -299,13 +300,13 @@ def test_the_e6_arms_stay_marker_gated_on_bundled_hosts():
                 assert tokens[1] != profile or f"--effort {effort}" not in line, (grade, line)
 
 
-def test_the_not_applied_rungs_keep_their_rows():
-    """The decisions reviewed but did NOT apply these — rows unchanged."""
+def test_terra_is_refused_and_the_not_applied_kimi_rung_stays():
+    """Terra is barred; the unrelated non-monotonic kimi rung stays unchanged."""
 
     rows = {entry.key: entry for entry in bench.catalog_snapshot()}
-    assert rows[("codex-terra", "medium")].grade == "A"  # its existing placement
+    assert barred_model_id_for_profile("codex-terra") == "gpt-5.6-terra"
     assert rows[("kimi-k3", "high")].grade == "C"  # 1296: refused (non-monotonic)
-    for key in (("codex-terra", "medium"), ("kimi-k3", "high")):
+    for key in (("kimi-k3", "high"),):
         assert rows[key].decided_by is None
         assert rows[key].deviation_ref != DEVIATION_REF
 

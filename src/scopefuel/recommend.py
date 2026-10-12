@@ -1811,6 +1811,55 @@ validate_grade_table()
 # wrk의 기존 codex-max 표기는 계속 gate에서 받되, 급표의 정본 표기는 canonical codex-sol로 둔다.
 PROFILE_ALIASES: dict[str, str] = {"codex-max": "codex-sol"}
 
+# Operator decision via operator-desk, 2026-10-12 (noterra): gpt-5.6-terra is
+# barred from launches and recommendations. Keep spellings resolvable so each
+# refusal can name the requested profile instead of falling through as unknown.
+BARRED_MODEL_IDS: frozenset[str] = frozenset({"gpt-5.6-terra"})
+BARRED_MODEL_DECISION_REF = "operator 2026-10-12 noterra"
+BARRED_PROFILE_ALIASES: dict[str, tuple[str, str]] = {
+    "codex-med": ("codex-terra", "medium"),
+    "builder-terra-high": ("codex-terra", "high"),
+    "builder-terra-xhigh": ("codex-terra", "xhigh"),
+    "builder-terra-max": ("codex-terra", "max"),
+}
+
+
+def is_barred_model_id(model_id: str | None) -> bool:
+    """Whether a launcher or catalog model id is barred by operator policy."""
+
+    if not model_id:
+        return False
+    normalized = model_id.strip().casefold()
+    return any(
+        normalized == barred or normalized.startswith(f"{barred}-")
+        for barred in BARRED_MODEL_IDS
+    )
+
+
+def barred_model_id_for_profile(
+    profile_name: str, *, grade_table: dict[Grade, list[Profile]] | None = None
+) -> str | None:
+    """Resolve a known profile spelling to a barred model id, if any."""
+
+    if profile_name in BARRED_PROFILE_ALIASES:
+        return next(iter(BARRED_MODEL_IDS))
+    canonical = PROFILE_ALIASES.get(profile_name, profile_name)
+    table = GRADE_TABLE if grade_table is None else grade_table
+    for profiles in table.values():
+        for profile in profiles:
+            if profile.name != canonical:
+                continue
+            for model_id in (profile.aa_agent_model_id, profile.benchmark_model_id):
+                if is_barred_model_id(model_id):
+                    return model_id
+    for profile in E6_ARM_RUNGS:
+        if profile.name != canonical:
+            continue
+        for model_id in (profile.aa_agent_model_id, profile.benchmark_model_id):
+            if is_barred_model_id(model_id):
+                return model_id
+    return None
+
 
 # Keep the oc-* route surface explicit.  In particular, an unregistered spelling
 # must not inherit the ClinePass route merely because it shares the oc- prefix.
@@ -2985,6 +3034,19 @@ def gate_check(
     urgency_hours = urgency_hours if urgency_hours is not None else get_reset_urgency_hours()
     table = GRADE_TABLE if grade_table is None else grade_table
 
+    barred_model_id = barred_model_id_for_profile(profile_name, grade_table=table)
+    if barred_model_id:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id="codex",
+            grade=None,
+            reason=(
+                f"model_refused: profile '{profile_name}' resolves to {barred_model_id}; "
+                f"barred by {BARRED_MODEL_DECISION_REF}"
+            ),
+        )
+
     # task #527: astra 판별은 ASTRA_ROLE_PROFILES 멤버십(모델 식별)이다 — 이름에
     # "astra" 가 든 무관 프로필은 여기에 걸리지 않는다. 허용 용도가 아니면 쿼타
     # 상태와 무관하게 역할 거부(role_denied → CLI exit 5) — 쿼타 거부(exit 3)와
@@ -3629,6 +3691,21 @@ def _evaluate(
     normalized_prices: Mapping[str, ModelPrice],
     table: dict[Grade, list[Profile]],
 ) -> _Evaluation:
+    # Filter the final table here, after CLI callers have merged a served canon
+    # or catalog. This single candidate boundary also covers exclusion folds,
+    # reps-measured one-up rows, local boosts, and the structured JSON output.
+    table = {
+        grade: [
+            profile
+            for profile in profiles
+            if not any(
+                is_barred_model_id(model_id)
+                for model_id in (profile.aa_agent_model_id, profile.benchmark_model_id)
+            )
+        ]
+        for grade, profiles in table.items()
+    }
+
     by_id = {r.id: r for r in providers}
     included: list[_Candidate] = []
     excluded: list[_Excluded] = []

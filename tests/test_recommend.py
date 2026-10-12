@@ -108,9 +108,7 @@ def test_profile_pool_matches_quota_guard():
     assert profile_pool("oc-oss") == ("agy", "3p")
     assert profile_pool("agy-pro") == ("agy", "gemini")
     assert profile_pool("agy-sonnet") == ("agy", "3p")
-    assert profile_pool("codex-med") == ("codex", None)
     assert profile_pool("grok-hi") == ("grok", None)
-    assert profile_pool("codex-terra-max") == ("codex", None)
     assert profile_pool("codex-luna-max") == ("codex", None)
     assert profile_pool("kiro-sol") == ("kiro", None)
     assert profile_pool("kiro-haiku") == ("kiro", None)
@@ -191,7 +189,7 @@ def test_recommend_excludes_exhausted_and_unmeasurable():
     ]
     out = recommend(providers, "S", today=TODAY, now=NOW)
     assert any("kimi-k3" in line and "측정 불가" in line for line in out.splitlines())
-    assert any("codex-terra-max" in line and "측정 불가" in line for line in out.splitlines())
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in out.splitlines())
 
 
 def test_recommend_excludes_exhausted_spend():
@@ -215,7 +213,9 @@ def test_grade_table_has_expected_a_profiles():
     assert "kimi-k3-max" not in names
     assert "kimi-k3-low" in names
     assert "oc-gflash" not in names
-    assert {"codex-luna", "codex-terra"}.issubset(names)
+    assert "codex-luna" in names
+    rendered = recommend([], "A", today=TODAY, now=NOW)
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in rendered.splitlines())
     assert "codex-sol" not in names
     assert "oc-sonnet46" not in names
 
@@ -438,7 +438,9 @@ def test_ac1_sp_recommend_with_claude_exclude():
 def test_ac2_s_grade_profiles():
     """AC2: S keeps the original profiles; measured Grok high only (medium/low moved out)."""
     names = [p.name for p in GRADE_TABLE["S"]]
-    assert {"codex-terra-max", "kimi-k3", "grok-hi"}.issubset(names)
+    assert {"kimi-k3", "grok-hi"}.issubset(names)
+    rendered = recommend([], "S", today=TODAY, now=NOW)
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in rendered.splitlines())
     assert "grok" not in names
 
 
@@ -449,7 +451,9 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     """AC3: A+ retains legacy profiles and adds the measured effort variants."""
     aplus_names = [p.name for p in GRADE_TABLE["A+"]]
     assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
-    assert {"codex-terra", "codex-luna"}.issubset(aplus_names)
+    assert "codex-luna" in aplus_names
+    rendered = recommend([], "A+", today=TODAY, now=NOW)
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in rendered.splitlines())
     # ROB-591: opus --effort low moved from A+ (escalation, 57) to S (62)
     # as part of the Opus 5.5 refresh — see test_ac1b_opus_low_moved_to_s below.
     assert not any(p.name == "opus" for p in GRADE_TABLE["A+"])
@@ -1212,9 +1216,10 @@ def test_boost_promotes_candidate_to_first_rank():
         _result("clinepass", 10.0, window="30d"),
         _result("grok", 10.0),
     ]
-    out = recommend(providers, "S", today=TODAY, now=NOW)
+    out = recommend(providers, "A+", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. codex-terra-max")
+    assert ranked[0].startswith("1. codex-luna-max")
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in ranked)
 
 
 def test_boost_none_restores_default_sort():
@@ -1310,10 +1315,11 @@ def test_imminent_reset_does_not_reverse_when_remaining_is_trivial():
             resets_at=_reset_in(0.47),  # 28분 뒤
         ),
     ]
-    out = recommend(providers, "S", today=TODAY, now=NOW)
+    out = recommend(providers, "A+", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    # boost 가 여전히 최우선 — codex 가 1위.
-    assert ranked[0].startswith("1. codex-terra-max")
+    # boost 가 여전히 최우선 — Codex Luna 가 1위.
+    assert ranked[0].startswith("1. codex-luna-max")
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in ranked)
     assert "소멸 임박 우선" not in ranked[0]
 
 
@@ -1330,9 +1336,10 @@ def test_imminent_reset_does_not_apply_when_reset_not_imminent():
             resets_at=_reset_in(2.0),
         ),
     ]
-    out = recommend(providers, "S", today=TODAY, now=NOW)
+    out = recommend(providers, "A+", today=TODAY, now=NOW)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. codex-terra-max")
+    assert ranked[0].startswith("1. codex-luna-max")
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in ranked)
     assert "소멸 임박 우선" not in ranked[0]
 
 
@@ -1612,7 +1619,7 @@ def test_rob1210_budget_window_drives_capacity_waste_and_explain():
 def test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool():
     """The short-window waste illusion no longer outranks a higher weekly budget waste.
 
-    ROB-591: uses codex (codex-terra-max) instead of claude (opus) as the weekly+5h
+    Uses the allowed codex-luna-max rung instead of claude (opus) as the weekly+5h
     pool under test — kept after #738 (opus --effort low is an ordinary S row again,
     but a claude pool here would also rank it and disturb the pinned ordering). The
     waste-score math itself is pool-agnostic, so the substitution still isolates it.
@@ -1627,14 +1634,14 @@ def test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool():
             # Weekly-only control: 80% remains and the slow pace leaves 66.4% at risk.
             _result_windows_with_resets("grok", [(20.0, "7d", 68.0)]),
         ],
-        "S",
+        "A+",
         today=TODAY,
         now=NOW,
         explain=True,
     )
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].find("grok-hi") >= 0
-    assert ranked[1].find("codex-terra-max") >= 0
+    assert ranked[0].find("grok") >= 0
+    assert ranked[1].find("codex-luna-max") >= 0
     grok_explain = next(
         line for line in out.splitlines() if line.strip().startswith("score=") and "66.40" in line
     )
@@ -1825,7 +1832,7 @@ def test_rob1210_knee_or_more_short_remaining_has_no_score_penalty():
 def test_rob1210_brake_reverses_rank_against_weekly_only_pool():
     """A progressing 5h depletion moves the braked multi-window pool below weekly-only.
 
-    ROB-591: uses codex (codex-terra-max) instead of claude (opus) — see
+    Uses codex-luna-max instead of claude (opus) — see
     test_rob1210_multi_window_ranks_by_weekly_waste_against_weekly_only_pool above.
     """
     out = recommend(
@@ -1836,14 +1843,14 @@ def test_rob1210_brake_reverses_rank_against_weekly_only_pool():
             ),
             _result_windows_with_resets("grok", [(20.0, "7d", 68.0)]),
         ],
-        "S",
+        "A+",
         today=TODAY,
         now=NOW,
         explain=True,
     )
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].find("grok-hi") >= 0
-    assert ranked[1].find("codex-terra-max") >= 0
+    assert ranked[0].find("grok") >= 0
+    assert ranked[1].find("codex-luna-max") >= 0
     assert "score=3420.00" in out
     assert "score=2554.50" in out
     assert "× brake=0.60 (5h 잔여 30% < knee 50%)" in out
@@ -2016,9 +2023,10 @@ def test_rob1191_boost_hard_override_stays_first():
         _result("clinepass", 5.0, window="30d"),  # high remaining
         _result("grok", 5.0),
     ]
-    out = recommend(providers, "S", today=TODAY, now=NOW, explain=True)
+    out = recommend(providers, "A+", today=TODAY, now=NOW, explain=True)
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert ranked[0].startswith("1. codex-terra-max")
+    assert ranked[0].startswith("1. codex-luna-max")
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in ranked)
     # negative: higher-remaining pools must not overtake boost
     assert not ranked[0].startswith("1. grok-hi")
     assert not ranked[0].startswith("1. kimi-k3")

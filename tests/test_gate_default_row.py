@@ -97,7 +97,6 @@ def test_local_table_selection_keeps_first_grade_placement():
         "opus",
         "sonnet",
         "codex-sol",
-        "codex-terra",
         "codex-luna",
         "grok",
         "devin-swe2",

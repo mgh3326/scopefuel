@@ -10,6 +10,7 @@ import pytest
 
 from scopefuel import bench, cli
 from scopefuel.model import Bucket, ProviderResult, Scope
+from scopefuel import recommend as recommend_mod
 from scopefuel.recommend import (
     ASTRA_ROLE_PROFILES,
     GRADE_TABLE,
@@ -43,10 +44,6 @@ _EXPECTED_LABELS = {
     ("codex-luna-max", None): "codex-luna-max",
     ("codex-sol", "max"): "codex-sol --effort max",
     ("codex-sol", "xhigh"): "codex-sol --effort xhigh",
-    ("codex-terra", "high"): "codex-terra --effort high",
-    ("codex-terra", "medium"): "codex-terra --effort medium",
-    ("codex-terra", "xhigh"): "codex-terra --effort xhigh",
-    ("codex-terra-max", None): "codex-terra-max",
     ("devin-ds41", None): "devin-ds41",
     ("devin-ds41-max", None): "devin-ds41-max",
     ("devin-fusion-opus55", None): "devin-fusion-opus55",
@@ -289,7 +286,7 @@ def test_ac2_invalid_prices_do_not_abort_scores_or_promote_partial_group(tmp_pat
 
     profiles = [
         Profile("codex-luna", "unknown price", 50.0, aa_model_id="bad-null-case"),
-        Profile("codex-terra", "known price", 49.0, aa_model_id="known-price-case"),
+        Profile("codex-sol", "known price", 49.0, aa_model_id="known-price-case"),
     ]
     output = recommend(
         [_provider("codex")],
@@ -299,39 +296,38 @@ def test_ac2_invalid_prices_do_not_abort_scores_or_promote_partial_group(tmp_pat
         grade_table=_table("A", profiles),
         model_prices=prices,
     )
-    assert _ranked_labels(output) == ["codex-luna", "codex-terra"]
+    assert _ranked_labels(output) == ["codex-luna", "codex-sol"]
 
 
-def test_ac3_aplus_codex_pool_orders_luna_max_before_terra_xhigh_by_value():
+def test_ac3_aplus_codex_pool_orders_luna_max_before_luna_xhigh_by_value():
     prices = {
         "gpt-6-luna": _price("gpt-6-luna", 0.1),  # ROB-591: codex-luna-max aa_model_id
-        "gpt-5-6-terra": _price("gpt-5-6-terra", 1.0),
+        "gpt-5-6-luna": _price("gpt-5-6-luna", 1.0),
     }
     output = recommend([_provider("codex")], "A+", today=TODAY, now=NOW, model_prices=prices)
     assert _ranked_labels(output) == [
         "codex-luna-max",
         "codex-luna --effort xhigh",
-        "codex-terra --effort xhigh",
-        "codex-terra --effort high",
     ]
 
 
-def test_ac4_s_has_terra_max_first_and_no_sol_in_candidates_or_alternatives():
+def test_ac4_s_has_luna_max_first_and_no_sol_in_candidates_or_alternatives():
     output = recommend(
         [_provider("codex")],
         "S",
         today=TODAY,
         now=NOW,
-        model_prices={"gpt-5-6-terra": _price("gpt-5-6-terra", 1.0)},
+        model_prices={"gpt-5-6-luna": _price("gpt-5-6-luna", 1.0)},
     )
-    assert _ranked_labels(output) == ["codex-terra-max"]
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in output.splitlines())
+    assert not any(line.startswith("1.") and "codex-sol" in line for line in output.splitlines())
     assert "codex-sol" not in output
     assert "Sol" not in output
 
 
 def test_ac5_value_sort_preserves_pool_slot_sequence_exactly():
     profiles = [
-        Profile("codex-terra", "Terra", 40.0, aa_model_id="terra"),
+        Profile("codex-sol", "Sol", 40.0, aa_model_id="sol"),
         Profile("opus", "Opus", 50.0, aa_model_id="opus"),
         Profile("codex-luna", "Luna", 60.0, aa_model_id="luna"),
         Profile("kimi-k3", "Kimi", 50.0, aa_model_id="kimi"),
@@ -346,7 +342,7 @@ def test_ac5_value_sort_preserves_pool_slot_sequence_exactly():
         now=NOW,
         grade_table=table,
         model_prices={
-            "terra": _price("terra", 10.0),
+            "sol": _price("sol", 10.0),
             "opus": _price("opus", 5.0),
             "luna": _price("luna", 1.0),
             "kimi": _price("kimi", 2.0),
@@ -359,8 +355,8 @@ def test_ac5_value_sort_preserves_pool_slot_sequence_exactly():
         == [profile_pool(name)[0] for name in after]
         == ["codex", "claude", "codex", "kimi"]
     )
-    assert before == ["codex-terra", "opus", "codex-luna", "kimi-k3"]
-    assert after == ["codex-luna", "opus", "codex-terra", "kimi-k3"]
+    assert before == ["codex-sol", "opus", "codex-luna", "kimi-k3"]
+    assert after == ["codex-luna", "opus", "codex-sol", "kimi-k3"]
 
 
 def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
@@ -404,9 +400,16 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         # rows, so position encodes exact-first, a paid row sinks below free
         # and unknown rows at equal standing, and an unmeasured exact row
         # sinks below a measured one-up (amended AC6).
-        profiles = [profile for profile in GRADE_TABLE[grade] if profile.gate != "escalation"]
+        profiles = [
+            profile for profile in GRADE_TABLE[grade]
+            if profile.gate != "escalation"
+            and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
+        ]
         ordered = [(profile, False) for profile in profiles]
-        ordered += [(profile, True) for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)]
+        ordered += [
+            (profile, True) for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)
+            if not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
+        ]
         expected[grade] = [
             label(profile)
             for profile, _one_up in sorted(
@@ -426,11 +429,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             recommend(providers, grade, today=TODAY, now=NOW, grade_table=GRADE_TABLE)
         )
 
-    assert [
-        (index, profile.launcher_effort)
-        for index, profile in enumerate(GRADE_TABLE["A+"])
-        if profile.name == "codex-terra"
-    ] == [(2, "xhigh"), (5, "high")]  # #920: sonnet high left A+ for C (Sonnet 5.5)
+    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in actual["A+"])
     assert actual == expected
 
     priced_aplus = _ranked_labels(
@@ -442,7 +441,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             grade_table=GRADE_TABLE,
             model_prices={
                 "gpt-6-luna": _price("gpt-6-luna", 0.1),  # ROB-591: codex-luna-max aa_model_id
-                "gpt-5-6-terra": _price("gpt-5-6-terra", 1.0),
+                "gpt-5-6-luna": _price("gpt-5-6-luna", 1.0),
             },
         )
     )
@@ -454,14 +453,12 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
     assert [item for item in priced_aplus if profile_pool(item.split()[0])[0] == "codex"] == [
         "codex-luna-max",
         "codex-luna --effort xhigh",
-        "codex-terra --effort xhigh",
-        "codex-terra --effort high",
     ]
 
 
 def test_value_tie_keeps_effective_table_order_and_unscored_candidate_stays_last():
     profiles = [
-        Profile("codex-terra", "Terra", 50.0, aa_model_id="terra"),
+        Profile("codex-sol", "Sol", 50.0, aa_model_id="sol"),
         Profile("codex-luna", "Luna", 100.0, aa_model_id="luna"),
         Profile("codex-luna", "Luna low", None, launcher_effort="low"),
     ]
@@ -472,12 +469,12 @@ def test_value_tie_keeps_effective_table_order_and_unscored_candidate_stays_last
         now=NOW,
         grade_table=_table("A", profiles),
         model_prices={
-            "terra": _price("terra", 2.0),
+            "sol": _price("sol", 2.0),
             "luna": _price("luna", 4.0),
         },
     )
     assert _ranked_labels(output) == [
-        "codex-terra",
+        "codex-sol",
         "codex-luna",
         "codex-luna --effort low",
     ]
@@ -578,7 +575,7 @@ def test_ac10_grok_47_remains_and_46_is_not_registered():
 
 def test_ac14_explain_shows_value_math_and_partial_unknown_reason_only_in_explain():
     profiles = [
-        Profile("codex-terra", "Terra", 50.0, aa_model_id="terra"),
+        Profile("codex-sol", "Sol", 50.0, aa_model_id="sol"),
         Profile("codex-luna", "Luna", 49.0, aa_model_id="luna"),
     ]
     kwargs = {
@@ -587,7 +584,7 @@ def test_ac14_explain_shows_value_math_and_partial_unknown_reason_only_in_explai
         "today": TODAY,
         "now": NOW,
         "grade_table": _table("A", profiles),
-        "model_prices": {"terra": _price("terra", 2.0)},
+        "model_prices": {"sol": _price("sol", 2.0)},
     }
     plain = recommend(**kwargs)
     explained = recommend(**kwargs, explain=True)
@@ -595,7 +592,7 @@ def test_ac14_explain_shows_value_math_and_partial_unknown_reason_only_in_explai
     assert "가성비:" not in plain and "혼합단가" not in plain
     assert "가성비: 벤치 50 ÷ 혼합단가 $2/1M = 25.00" in explained
     assert "단가 미상 포함 — 표 순서 유지" in explained
-    assert _ranked_labels(plain) == _ranked_labels(explained) == ["codex-terra", "codex-luna"]
+    assert _ranked_labels(plain) == _ranked_labels(explained) == ["codex-sol", "codex-luna"]
 
 
 def test_ac16_runtime_rejects_remote_sol_move_and_falls_back_without_network(monkeypatch, capsys):

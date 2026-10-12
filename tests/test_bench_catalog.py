@@ -963,13 +963,13 @@ def test_a_retired_row_counts_as_mentioned_so_the_catalog_still_passes_the_floor
     retirement takes effect instead of falling back to the snapshot."""
 
     _, fake = catalog_server
-    fake.catalog = _seed_rows_with("codex-terra-max", "", retired_at="2026-09-29T00:00:00Z")
+    fake.catalog = _seed_rows_with("codex-luna-max", "", retired_at="2026-09-29T00:00:00Z")
 
     assert bench.read_catalog().source == "server"
     table = bench.runtime_grade_table()
-    assert not any(p.name == "codex-terra-max" for profiles in table.values() for p in profiles)
+    assert not any(p.name == "codex-luna-max" for profiles in table.values() for p in profiles)
     with pytest.raises(launch.LaunchError, match="retired"):
-        launch.resolve_launch("codex-terra-max")
+        launch.resolve_launch("codex-luna-max")
 
 
 # --- #954: cache-stale — the last-good cache past the stale ceiling ---------

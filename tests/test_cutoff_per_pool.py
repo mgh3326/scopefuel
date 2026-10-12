@@ -74,12 +74,12 @@ def _fake_sink(calls: list[str]):
 
 def test_default_cutoff_99_unchanged_no_config():
     """기본값 회귀: 설정 없으면 spend 99% 차단선 그대로."""
-    result = gate_check([_result("codex", SPEND_EXCLUDE_PCT)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", SPEND_EXCLUDE_PCT)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert result.used_pct == SPEND_EXCLUDE_PCT
     assert "99% 사용 · 1% 남음 · 차단선 99%" in result.reason
 
-    ok = gate_check([_result("codex", SPEND_EXCLUDE_PCT - 0.1)], "codex-terra", today=TODAY, now=NOW)
+    ok = gate_check([_result("codex", SPEND_EXCLUDE_PCT - 0.1)], "codex-luna", today=TODAY, now=NOW)
     assert ok.ok is True
 
 
@@ -87,7 +87,7 @@ def test_no_config_no_notify_state_file(tmp_path, monkeypatch):
     """설정 없음 → 알림 싱크 미호출, dedup 상태 파일도 생기지 않는다(무접촉)."""
     calls: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
-    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert calls == []
     assert result.exhaust_notice is None
@@ -97,10 +97,10 @@ def test_no_config_no_notify_state_file(tmp_path, monkeypatch):
 def test_codex_cutoff_100_passes_99_blocks_100(tmp_path):
     """codex cutoff=100 — 99% 는 통과, 100% 는 차단."""
     _write_config(tmp_path, "[pools.codex]\ncutoff = 100\n")
-    ok = gate_check([_result("codex", 99.5)], "codex-terra", today=TODAY, now=NOW)
+    ok = gate_check([_result("codex", 99.5)], "codex-luna", today=TODAY, now=NOW)
     assert ok.ok is True
 
-    blocked = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    blocked = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert blocked.ok is False
     assert "100% 사용 · 0% 남음 · 차단선 100%" in blocked.reason
 
@@ -108,7 +108,7 @@ def test_codex_cutoff_100_passes_99_blocks_100(tmp_path):
 def test_pool_cutoff_lowers_threshold(tmp_path):
     """반대 방향도 동작 — cutoff=80 이면 85% 에서 차단."""
     _write_config(tmp_path, "[pools.codex]\ncutoff = 80\n")
-    blocked = gate_check([_result("codex", 85.0)], "codex-terra", today=TODAY, now=NOW)
+    blocked = gate_check([_result("codex", 85.0)], "codex-luna", today=TODAY, now=NOW)
     assert blocked.ok is False
     assert "차단선 80%" in blocked.reason
 
@@ -122,7 +122,7 @@ def test_invalid_cutoff_rejected_falls_back_to_default(tmp_path, raw):
     assert status is not None and "invalid cutoff" in status
 
     # 게이트도 기본 99% 차단선으로 판정하고 폴백 사유를 노출한다.
-    result = gate_check([_result("codex", 99.5)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 99.5)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert "invalid cutoff" in result.reason
 
@@ -163,7 +163,7 @@ def test_operator_switch_notifies_once_per_episode(tmp_path, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
 
-    blocked = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    blocked = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert blocked.ok is False
     assert len(calls) == 1
     assert "계정 전환 필요" in calls[0]
@@ -172,17 +172,17 @@ def test_operator_switch_notifies_once_per_episode(tmp_path, monkeypatch):
     assert blocked.exhaust_notice is not None
 
     # 같은 소진 창의 재판정 — 중복 발송 없음.
-    again = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    again = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert again.ok is False
     assert len(calls) == 1
     assert "기통지" in again.reason
 
     # 계정 전환/리셋으로 차단선 아래 관측 → 플래그 해제.
-    ok = gate_check([_result("codex", 5.0)], "codex-terra", today=TODAY, now=NOW)
+    ok = gate_check([_result("codex", 5.0)], "codex-luna", today=TODAY, now=NOW)
     assert ok.ok is True
 
     # 새 소진 에피소드 → 다시 1회 발송.
-    blocked2 = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    blocked2 = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert blocked2.ok is False
     assert len(calls) == 2
 
@@ -192,7 +192,7 @@ def test_operator_switch_block_mode_default_silent(tmp_path, monkeypatch):
     _write_config(tmp_path, "[pools.codex]\ncutoff = 100\n")
     calls: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
-    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert calls == []
     assert "계정 전환" not in result.reason
@@ -203,7 +203,7 @@ def test_on_exhaust_invalid_falls_back_to_block(tmp_path, monkeypatch):
     _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operaotr-switch"\n')
     calls: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
-    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert calls == []
     assert "invalid on_exhaust" in result.reason
@@ -219,7 +219,7 @@ def test_notify_failure_cooldown_then_retry(tmp_path, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": calls.append(text) or False)
 
-    first = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    first = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert first.ok is False
     assert "발송 실패" in first.reason
     assert len(calls) == 1  # 한 gate 호출 안의 재관측은 싱크를 다시 치지 않는다
@@ -227,7 +227,7 @@ def test_notify_failure_cooldown_then_retry(tmp_path, monkeypatch):
     # 쿨다운 안 — 발송 없이 "재시도 대기" 상태만 표시.
     soon = gate_check(
         [_result("codex", 100.0)],
-        "codex-terra",
+        "codex-luna",
         today=TODAY,
         now=NOW + dt.timedelta(seconds=30),
     )
@@ -240,7 +240,7 @@ def test_notify_failure_cooldown_then_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(retry_calls))
     later = gate_check(
         [_result("codex", 100.0)],
-        "codex-terra",
+        "codex-luna",
         today=TODAY,
         now=NOW + dt.timedelta(seconds=61),
     )
@@ -257,7 +257,7 @@ def test_sink_exception_does_not_break_gate(tmp_path, monkeypatch):
         raise RuntimeError("wedged daemon")
 
     monkeypatch.setattr(exhaust, "emit_lane_event", boom)
-    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert "발송 실패" in result.reason
 
@@ -273,7 +273,7 @@ def test_exhaust_display_shows_used_remaining_cutoff(tmp_path):
     assert "1% 남음" in line
     assert "차단선 99%" in line
 
-    gate = gate_check([_result("codex", 99.0)], "codex-terra", today=TODAY, now=NOW)
+    gate = gate_check([_result("codex", 99.0)], "codex-luna", today=TODAY, now=NOW)
     assert "99% 사용 · 1% 남음 · 차단선 99%" in gate.reason
 
 
@@ -414,7 +414,7 @@ def test_state_storage_failure_does_not_abort_gate(tmp_path, monkeypatch):
         raise OSError("read-only fs")
 
     monkeypatch.setattr(exhaust, "_locked_state", broken_lock)
-    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is False
     assert calls == []  # 저장소 없이는 dedup 보장 불가 — 발송하지 않는다
     assert "저장소 접근 불가" in result.reason
@@ -460,7 +460,7 @@ def test_block_mode_recovery_clears_episode(tmp_path):
 def test_invalid_cutoff_status_visible_on_success(tmp_path):
     """무효 cutoff 는 통과 판정의 reason 에도 폴백 상태가 노출된다."""
     _write_config(tmp_path, "[pools.codex]\ncutoff = 150\n")
-    result = gate_check([_result("codex", 50.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 50.0)], "codex-luna", today=TODAY, now=NOW)
     assert result.ok is True
     assert "invalid cutoff" in result.reason
 
@@ -591,7 +591,7 @@ def test_gate_audit_record_includes_exhaust_notice(tmp_path, monkeypatch):
     _write_config(tmp_path, '[pools.codex]\ncutoff = 100\non_exhaust = "operator-switch"\n')
     calls: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", _fake_sink(calls))
-    result = gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    result = gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     record = cli._gate_record(result, 3, NOW)
     assert record["exhaust_notice"] == result.exhaust_notice
     assert "알림 발송" in record["exhaust_notice"]
@@ -697,7 +697,7 @@ def test_autouse_fixture_intercepts_default_sink(tmp_path):
     """
     assert getattr(exhaust.emit_lane_event, "_test_stub", False)
     _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
-    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     assert exhaust._BLOCKED_EMIT_CALLS, "발송 시도가 차단 스텁에 기록돼야 한다"
 
 
@@ -755,9 +755,9 @@ def test_reentry_same_reset_window_gets_new_event_id(tmp_path, monkeypatch):
     monkeypatch.setattr(
         exhaust, "emit_lane_event", lambda text, event_id="": sent.append((text, event_id)) or True
     )
-    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
-    gate_check([_result("codex", 10.0)], "codex-terra", today=TODAY, now=NOW)  # 회복
-    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)  # 같은 reset 재소진
+    gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
+    gate_check([_result("codex", 10.0)], "codex-luna", today=TODAY, now=NOW)  # 회복
+    gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)  # 같은 reset 재소진
     assert len(sent) == 2
     assert sent[0][1] != sent[1][1], "새 에피소드는 새 event id 를 써야 한다"
 
@@ -767,7 +767,7 @@ def test_event_id_contains_key_window_reset_and_episode(tmp_path, monkeypatch):
     _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
     ids: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": ids.append(event_id) or True)
-    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     reset = _reset_almost_full("7d")
     assert len(ids) == 1
     assert ids[0].startswith(f"scopefuel.exhaust:codex:7d:{reset}:")
@@ -779,9 +779,9 @@ def test_same_episode_retry_reuses_event_id(tmp_path, monkeypatch):
     _write_config(tmp_path, '[pools.codex]\non_exhaust = "operator-switch"\n')
     ids: list[str] = []
     monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id="": ids.append(event_id) or False)
-    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=NOW)
+    gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=NOW)
     later = NOW + dt.timedelta(seconds=exhaust.RETRY_COOLDOWN_S + 1)
-    gate_check([_result("codex", 100.0)], "codex-terra", today=TODAY, now=later)
+    gate_check([_result("codex", 100.0)], "codex-luna", today=TODAY, now=later)
     assert len(ids) == 2 and ids[0] == ids[1]
 
 

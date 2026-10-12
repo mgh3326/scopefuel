@@ -481,6 +481,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     all_profiles = sorted(
         {p.name for profiles in recommend.GRADE_TABLE.values() for p in profiles}
         | set(recommend.PROFILE_ALIASES)
+        | set(recommend.BARRED_PROFILE_ALIASES)
         | set(recommend.RETIRED_PROFILES.keys())
         | set(recommend.ASTRA_ROLE_PROFILES)
         | set(recommend.CONSULT_ONLY_PROFILES)
@@ -1066,6 +1067,15 @@ def _shadow_gate(
 
 
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
+    barred_model_id = recommend.barred_model_id_for_profile(args.profile)
+    if barred_model_id:
+        print(
+            f"gate refused: profile '{args.profile}' resolves to {barred_model_id}; "
+            f"barred by {recommend.BARRED_MODEL_DECISION_REF}",
+            file=sys.stderr,
+        )
+        return 3
+
     now = dt.datetime.now(dt.UTC)
     automatic_results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
     # ``read_scores`` itself preserves the legacy local route and only enters

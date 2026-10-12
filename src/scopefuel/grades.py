@@ -313,9 +313,6 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     # #594 E3 rung (xhigh).
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
-    "builder-terra-high": ("codex-terra", "high"),
-    "builder-terra-xhigh": ("codex-terra", "xhigh"),
-    "builder-terra-max": ("codex-terra", "max"),
     # Task-240 pilot + #737 E6 rungs: grok-hi@<rung>.
     "builder-grok": ("grok-hi", "xhigh"),
     "builder-grok-low": ("grok-hi", "low"),
@@ -358,7 +355,6 @@ _SPELLING_ALIASES: dict[str, tuple[str, str]] = {
     # gpt-6.1-sol) instead of going unrung — they still never count.
     "codex-sol56": ("codex-sol", "max"),
     "codex-sol6": ("codex-sol", "max"),
-    "codex-med": ("codex-terra", "medium"),
     "codex-luna-hi": ("codex-luna", "high"),
     "sonnet-med": ("sonnet", ""),
     "grok": ("grok-hi", ""),

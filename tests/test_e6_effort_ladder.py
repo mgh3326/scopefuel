@@ -68,8 +68,6 @@ EXISTING_RUNGS: dict[tuple[str, str], str] = {
     ("codex-sol", "xhigh"): "S+",
     ("codex-sol", "max"): "S+",
     ("codex-luna", "xhigh"): "A+",
-    ("codex-terra", "high"): "A+",
-    ("codex-terra", "xhigh"): "A+",
     ("grok", "medium"): "A+",
     # #1296: graduated arm rungs, now ordinary placements.
     ("devin-swe2", "high"): "A+",
