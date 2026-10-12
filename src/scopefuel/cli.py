@@ -1278,6 +1278,19 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             "구독 해지 — 쿼타와 무관. config 의 subscribed 를 true 로 되돌리면 다시 연다",
             file=sys.stderr,
         )
+    elif result.reason.startswith("operator_request_not_applicable"):
+        # #1466: this is a flag/profile mismatch, not quota exhaustion.
+        if args.profile in recommend.ASTRA_ROLE_PROFILES:
+            purposes = "|".join(sorted(recommend.ASTRA_ALLOWED_PURPOSES))
+            print(
+                f"astra 는 --operator-request 대신 --purpose {purposes} 를 쓴다",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "--operator-request 는 escalation/consult_only 런그 전용 — 쿼타와 무관, 플래그 없이 다시 실행",
+                file=sys.stderr,
+            )
     elif result.e6_arm and not result.ok:
         # #692: an E6 rung refusal is decided on the rung (the marker is missing,
         # or the canon retired it), not on alternatives — the generic "no

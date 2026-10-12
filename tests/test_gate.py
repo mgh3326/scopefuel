@@ -105,7 +105,22 @@ def test_gate_cli_blocked_exit_3_with_stderr_alternatives(monkeypatch, capsys):
     out = capsys.readouterr()
     assert rc == 3
     assert "정책 제외" in out.err
-    assert "대안" in out.err
+    assert "대안(" in out.err
+    assert "없음 — 동일 grade 정상 후보 전부 소진/측정불가" not in out.err
+
+
+def test_gate_cli_genuine_exhaustion_still_prints_no_alternatives(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"codex": lambda: _result("codex", 95.0, pool_class="preserve")},
+    )
+    rc = cli.main(["gate", "-m", "codex-max", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 3
+    assert "소진" in out.err
+    assert "대안(" in out.err
+    assert "없음 — 동일 grade 정상 후보 전부 소진/측정불가" in out.err
 
 
 def test_gate_blocked_by_raw_used_pct_cutoff():
@@ -645,6 +660,9 @@ def test_gate_operator_request_cli_opus_exit_3_not_applicable(monkeypatch, capsy
     out = capsys.readouterr()
     assert rc == 3
     assert "operator_request_not_applicable" in out.err
+    assert "astra 는 --purpose" not in out.err
+    assert "대안(" not in out.err
+    assert "--operator-request 는 escalation/consult_only 런그 전용 — 쿼타와 무관, 플래그 없이 다시 실행" in out.err
 
 
 # ------------------------------------------------------------------ task #527: astra purpose gate
@@ -815,6 +833,34 @@ def test_gate_astra_operator_request_still_not_applicable():
     assert result.ok is False
     assert result.role_denied is False
     assert "operator_request_not_applicable" in result.reason
+
+
+def test_gate_astra_operator_request_cli_exit_3_has_purpose_hint(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "registry",
+        lambda: {"codex": lambda: _result("codex", 10.0, pool_class="preserve")},
+    )
+    rc = cli.main(
+        [
+            "gate",
+            "-m",
+            "codex-astra",
+            "--purpose",
+            "architect",
+            "--operator-request",
+            "hk:task/461",
+            "--no-cache",
+        ]
+    )
+    out = capsys.readouterr()
+    from scopefuel.recommend import ASTRA_ALLOWED_PURPOSES
+
+    purpose_list = "|".join(sorted(ASTRA_ALLOWED_PURPOSES))
+    assert rc == 3
+    assert "operator_request_not_applicable" in out.err
+    assert "대안(" not in out.err
+    assert f"astra 는 --operator-request 대신 --purpose {purpose_list} 를 쓴다" in out.err
 
 
 def test_gate_purpose_ignored_for_non_astra_profile():
