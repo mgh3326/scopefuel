@@ -7,9 +7,17 @@
 자격증명은 항상 파일에 있지는 않다. macOS 의 claude 는 로그인 방식에 따라 파일 대신
 Keychain(`Claude Code-credentials`)에만 토큰을 두며, 그 경우 파일은 아예 생기지 않는다.
 파일만 보면 로그인된 계정을 "미로그인"으로 오판해 gate 가 fail-closed 로 풀 전체를
-막아버린다 — 파일을 우선하되 없으면 Keychain 으로 폴백한다.
+막아버린다.
+
+파일과 Keychain 중 무엇을 쓸지는 만료로 고른다. 파일을 먼저 읽는다. 파일 토큰이
+쓸 수 있고 만료되지 않았으면 그것을 쓰고 Keychain 은 읽지 않는다. 파일이 없거나
+쓸 수 없거나 만료됐으면 Keychain 도 읽는다. 둘 다 읽을 수 있으면 만료되지 않은
+쪽을 고른다. 둘 다 만료되지 않았으면 expiresAt 가 더 늦은 쪽을, 둘 다 만료됐으면
+역시 더 늦은 쪽을 고른다 — 그때 fetch 는 token_expired 를 보고한다. expiresAt 가
+없는 토큰은 만료되지 않은 것으로 센다. 만료 시각이 같거나 한쪽만 있으면 파일이 이긴다.
 
 토큰 갱신은 하지 않는다(실행 중인 claude 세션이 갱신한다 — 자동 갱신은 #616 으로 금지).
+자격 파일은 쓰거나 옮기거나 지우지 않는다.
 expiresAt 가 이미 지난 자격으로는 usage API 를 호출하지 않는다 — 호출 전에
 "token expired" 로 실패시킨다(task #653: 만료가 401/429 로 오분류되던 경로 제거).
 """
@@ -130,23 +138,63 @@ def _read_keychain() -> str | None:
     return proc.stdout.strip() or None
 
 
-def _load_oauth() -> tuple[dict, str] | None:
-    """(claudeAiOauth, 출처) — 파일 우선, 없거나 쓸 수 없으면 Keychain."""
-    # reader 를 지연 호출한다 — 파일이 쓸 수 있으면 Keychain 을 건드리지 않는다.
-    for reader, origin in ((_read_file, "file"), (_read_keychain, "keychain")):
-        blob = reader()
-        if not blob:
-            continue
-        try:
-            payload = json.loads(blob)
-        except ValueError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        oauth = payload.get("claudeAiOauth")
-        if isinstance(oauth, dict) and (oauth.get("accessToken") or "").strip():
-            return oauth, origin
+def _oauth_from_blob(blob: str | None) -> dict | None:
+    """blob 에서 쓸 수 있는 claudeAiOauth. 없거나 깨졌거나 토큰이 비면 None."""
+    if not blob:
+        return None
+    try:
+        payload = json.loads(blob)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    oauth = payload.get("claudeAiOauth")
+    if isinstance(oauth, dict) and (oauth.get("accessToken") or "").strip():
+        return oauth
     return None
+
+
+def _token_expired(oauth: dict, now: float | None = None) -> bool:
+    """expiresAt 가 now 이전이면 만료. 없거나 해석할 수 없으면 만료가 아니다."""
+    expiry = _expiry_epoch(oauth)
+    if expiry is None:
+        return False
+    return expiry <= (time.time() if now is None else now)
+
+
+def _prefer_oauth(file_oauth: dict | None, keychain_oauth: dict | None) -> tuple[dict, str] | None:
+    """둘 다 읽힌 뒤의 선택. 반환 출처는 실제로 고른 쪽이다.
+
+    만료되지 않은 쪽을 고른다. 둘 다 만료되지 않았거나 둘 다 만료됐으면
+    expiresAt(epoch)가 더 늦은 쪽. 같거나, 한쪽이라도 expiresAt 가 없으면
+    파일 — 없는 시각은 만료가 아닐 뿐 더 늦은 시각은 아니다.
+    """
+    if file_oauth is None and keychain_oauth is None:
+        return None
+    if file_oauth is None:
+        return keychain_oauth, "keychain"
+    if keychain_oauth is None:
+        return file_oauth, "file"
+    now = time.time()
+    file_expired = _token_expired(file_oauth, now)
+    keychain_expired = _token_expired(keychain_oauth, now)
+    if file_expired != keychain_expired:
+        if file_expired:
+            return keychain_oauth, "keychain"
+        return file_oauth, "file"
+    file_epoch = _expiry_epoch(file_oauth)
+    keychain_epoch = _expiry_epoch(keychain_oauth)
+    if file_epoch is not None and keychain_epoch is not None and keychain_epoch > file_epoch:
+        return keychain_oauth, "keychain"
+    return file_oauth, "file"
+
+
+def _load_oauth() -> tuple[dict, str] | None:
+    """(claudeAiOauth, 출처) — 만료로 고르고, 멀쩡한 파일은 Keychain 을 읽지 않는다."""
+    file_oauth = _oauth_from_blob(_read_file())
+    if file_oauth is not None and not _token_expired(file_oauth):
+        return file_oauth, "file"
+    return _prefer_oauth(file_oauth, _oauth_from_blob(_read_keychain()))
 
 
 def _claude_json_path() -> pathlib.Path:

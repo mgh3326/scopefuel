@@ -120,6 +120,203 @@ def _unexpected_security_call(*a, **k):
     raise AssertionError("darwin 이 아니면 security 를 실행하지 않아야 한다")
 
 
+def _plant_claude_file(monkeypatch, tmp_path, oauth: dict, *, dirname: str = "cfg"):
+    """자격 blob 을 임시 컨텍스트에 심는다. 경로 문자열은 프로덕션 규칙이 만든다."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / dirname))
+    path = claude._credentials_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps({"claudeAiOauth": oauth})
+    path.write_text(text)
+    return path, text
+
+
+def _keychain_spy(monkeypatch, blob: str | None):
+    calls: list[int] = []
+
+    def _read():
+        calls.append(1)
+        return blob
+
+    monkeypatch.setattr(claude, "_read_keychain", _read)
+    return calls
+
+
+def _usage_capture(monkeypatch, fixture_json):
+    seen: dict[str, str] = {}
+
+    def _capture(url, headers=None, **_kw):
+        seen["url"] = url
+        seen["auth"] = (headers or {}).get("Authorization", "")
+        return fixture_json("claude_usage")
+
+    monkeypatch.setattr(claude, "request_json", _capture)
+    return seen
+
+
+def test_claude_expired_file_uses_valid_keychain(fixture_json, monkeypatch, tmp_path):
+    """만료된 파일이 유효한 Keychain 토큰을 가리면 안 된다 — 데스크 케이스."""
+    file_oauth = {"accessToken": "file-expired", "expiresAt": 1000, "subscriptionType": "pro"}
+    keychain_oauth = {
+        "accessToken": "kc-live",
+        "expiresAt": 4_000_000_000_000,
+        "subscriptionType": "max",
+    }
+    path, before = _plant_claude_file(monkeypatch, tmp_path, file_oauth)
+    calls = _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": keychain_oauth}))
+    seen = _usage_capture(monkeypatch, fixture_json)
+
+    result = claude.fetch()
+
+    assert calls == [1]
+    assert seen["auth"] == "Bearer kc-live"
+    assert seen["url"] == claude.USAGE_URL
+    assert result.error is None
+    assert result.error_kind is None
+    assert result.plan == "max"
+    assert result.source == "oauth-usage-api+keychain"
+    assert result.session_fp == claude._session_fp(keychain_oauth)
+    assert result.account_fp == claude._account_fp(keychain_oauth)
+    assert result.session_fp != claude._session_fp(file_oauth)
+    assert path.read_text() == before
+    assert path.is_file()
+
+
+def test_claude_valid_file_does_not_read_keychain(fixture_json, monkeypatch, tmp_path):
+    """멀쩡한 파일은 Keychain 을 읽지 않는다. Keychain 쪽이 더 늦게 만료돼도 같다."""
+    file_oauth = {"accessToken": "from-file", "expiresAt": 4_000_000_000_000, "subscriptionType": "pro"}
+    keychain_oauth = {
+        "accessToken": "from-kc",
+        "expiresAt": 5_000_000_000_000,
+        "subscriptionType": "max",
+    }
+    _plant_claude_file(monkeypatch, tmp_path, file_oauth)
+    calls = _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": keychain_oauth}))
+    seen = _usage_capture(monkeypatch, fixture_json)
+
+    result = claude.fetch()
+
+    assert calls == []
+    assert seen["auth"] == "Bearer from-file"
+    assert result.plan == "pro"
+    assert result.source == "oauth-usage-api"
+    assert result.session_fp == claude._session_fp(file_oauth)
+    assert result.error_kind is None
+
+
+def test_claude_both_valid_later_expires_at_wins():
+    """둘 다 만료 전이면 epoch 가 더 늦은 쪽. 같거나 expiresAt 가 없으면 파일.
+
+    파일이 이미 만료 전이면 _load_oauth 는 Keychain 을 읽지 않는다. 이 비교는
+    둘 다 읽힌 뒤에 적용된다.
+    """
+    earlier = {"accessToken": "earlier", "expiresAt": 4_000_000_000_000, "subscriptionType": "pro"}
+    later = {"accessToken": "later", "expiresAt": 5_000_000_000_000, "subscriptionType": "max"}
+    chosen, origin = claude._prefer_oauth(earlier, later)
+    assert (origin, chosen["accessToken"]) == ("keychain", "later")
+    chosen, origin = claude._prefer_oauth(later, earlier)
+    assert (origin, chosen["accessToken"]) == ("file", "later")
+
+    file_tie = {"accessToken": "file-tie", "expiresAt": 4_000_000_000, "subscriptionType": "pro"}
+    kc_tie = {"accessToken": "kc-tie", "expiresAt": 4_000_000_000_000, "subscriptionType": "max"}
+    chosen, origin = claude._prefer_oauth(file_tie, kc_tie)
+    assert (origin, chosen["accessToken"]) == ("file", "file-tie")
+
+    no_expiry = {"accessToken": "no-expiry", "subscriptionType": "pro"}
+    chosen, origin = claude._prefer_oauth(no_expiry, later)
+    assert (origin, chosen["accessToken"]) == ("file", "no-expiry")
+
+
+def test_claude_both_expired_reports_token_expired(monkeypatch, tmp_path):
+    """둘 다 만료면 token_expired. 고른 토큰은 epoch 가 더 늦은 쪽이고, 같으면 파일."""
+    calls_http: list[int] = []
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: calls_http.append(1) or {})
+
+    file_sooner = {"accessToken": "file-sooner", "expiresAt": 1_100_000_000_000, "subscriptionType": "pro"}
+    kc_later = {"accessToken": "kc-later", "expiresAt": 1_600_000_000, "subscriptionType": "max"}
+    path, before = _plant_claude_file(monkeypatch, tmp_path, file_sooner)
+    _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": kc_later}))
+    result = claude.fetch()
+    assert calls_http == []
+    assert result.error_kind == "token_expired"
+    assert result.session_fp == claude._session_fp(kc_later)
+    assert result.account_fp == claude._account_fp(kc_later)
+    assert result.session_fp != claude._session_fp(file_sooner)
+    assert path.read_text() == before
+
+    file_later = {"accessToken": "file-later", "expiresAt": 1_600_000_000, "subscriptionType": "pro"}
+    kc_sooner = {"accessToken": "kc-sooner", "expiresAt": 1_100_000_000_000, "subscriptionType": "max"}
+    path, before = _plant_claude_file(monkeypatch, tmp_path, file_later, dirname="cfg-file-later")
+    _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": kc_sooner}))
+    result = claude.fetch()
+    assert calls_http == []
+    assert result.error_kind == "token_expired"
+    assert result.session_fp == claude._session_fp(file_later)
+    assert result.account_fp == claude._account_fp(file_later)
+
+    file_tie = {"accessToken": "file-tie", "expiresAt": 1_200_000_000, "subscriptionType": "pro"}
+    kc_tie = {"accessToken": "kc-tie", "expiresAt": 1_200_000_000_000, "subscriptionType": "max"}
+    _plant_claude_file(monkeypatch, tmp_path, file_tie, dirname="cfg-tie")
+    _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": kc_tie}))
+    result = claude.fetch()
+    assert result.error_kind == "token_expired"
+    assert result.session_fp == claude._session_fp(file_tie)
+    assert result.account_fp == claude._account_fp(file_tie)
+
+
+def test_claude_expired_file_unreadable_keychain_is_token_expired(monkeypatch, tmp_path):
+    """파일은 만료, Keychain 은 못 읽음 — credentials 가 아니라 token_expired."""
+    file_oauth = {"accessToken": "file-expired", "expiresAt": 1000, "subscriptionType": "pro"}
+    path, before = _plant_claude_file(monkeypatch, tmp_path, file_oauth)
+    _keychain_spy(monkeypatch, None)
+    calls_http: list[int] = []
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: calls_http.append(1) or {})
+
+    result = claude.fetch()
+
+    assert calls_http == []
+    assert result.error_kind == "token_expired"
+    assert result.session_fp == claude._session_fp(file_oauth)
+    assert result.account_fp == claude._account_fp(file_oauth)
+    assert path.read_text() == before
+    assert path.is_file()
+
+
+def test_claude_expired_not_chosen_while_unexpired_readable(fixture_json, monkeypatch, tmp_path):
+    """만료 토큰은, 만료되지 않은 토큰을 읽을 수 있는 동안 선택되지 않는다.
+
+    파일 만료·Keychain 유효, 그리고 출처를 맞바꾼 경우.
+    """
+    past = {"accessToken": "expired-side", "expiresAt": 1000, "subscriptionType": "pro"}
+    future = {"accessToken": "live-side", "expiresAt": 4_000_000_000_000, "subscriptionType": "max"}
+    chosen, origin = claude._prefer_oauth(past, future)
+    assert origin == "keychain"
+    assert chosen["accessToken"] == "live-side"
+    assert claude._token_expired(chosen) is False
+    chosen, origin = claude._prefer_oauth(future, past)
+    assert origin == "file"
+    assert chosen["accessToken"] == "live-side"
+    assert claude._token_expired(chosen) is False
+
+    _plant_claude_file(monkeypatch, tmp_path, past, dirname="cfg-file-expired")
+    _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": future}))
+    seen = _usage_capture(monkeypatch, fixture_json)
+    result = claude.fetch()
+    assert seen["auth"] == "Bearer live-side"
+    assert result.error_kind is None
+    assert result.source == "oauth-usage-api+keychain"
+    assert result.session_fp == claude._session_fp(future)
+
+    _plant_claude_file(monkeypatch, tmp_path, future, dirname="cfg-file-live")
+    calls = _keychain_spy(monkeypatch, json.dumps({"claudeAiOauth": past}))
+    seen = _usage_capture(monkeypatch, fixture_json)
+    result = claude.fetch()
+    assert calls == []
+    assert seen["auth"] == "Bearer live-side"
+    assert result.error_kind is None
+    assert result.source == "oauth-usage-api"
+    assert result.session_fp == claude._session_fp(future)
+
+
 def test_codex_separates_additional_rate_limits(fixture_json, monkeypatch, tmp_path):
     auth = tmp_path / "auth.json"
     auth.write_text(json.dumps({"tokens": {"access_token": "x", "account_id": "acc"}}))
