@@ -149,7 +149,10 @@ def _oauth_from_blob(blob: str | None) -> dict | None:
     if not isinstance(payload, dict):
         return None
     oauth = payload.get("claudeAiOauth")
-    if isinstance(oauth, dict) and (oauth.get("accessToken") or "").strip():
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    if isinstance(token, str) and token.strip():
         return oauth
     return None
 
