@@ -3057,9 +3057,7 @@ def _swe2_probe_is_current(result: ProviderResult, now: dt.datetime) -> bool:
 def _swe2_model_bucket(result: ProviderResult) -> Bucket | None:
     """The single model-scope swe-2 bucket, or None when it is missing, duplicated, or unreadable."""
     found = [
-        bucket
-        for bucket in result.buckets
-        if bucket.scope.kind == "model" and bucket.scope.name == "swe-2"
+        bucket for bucket in result.buckets if bucket.scope.kind == "model" and bucket.scope.name == "swe-2"
     ]
     if len(found) != 1:
         return None

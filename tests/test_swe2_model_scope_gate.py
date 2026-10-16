@@ -48,9 +48,7 @@ def _parsed_pool(line: str) -> str:
     return pool
 
 
-def _account(
-    label: str, window: str, used: float | None, horizon: Literal["now", "week", "month"]
-) -> Bucket:
+def _account(label: str, window: str, used: float | None, horizon: Literal["now", "week", "month"]) -> Bucket:
     return Bucket(
         label=label,
         window=window,
