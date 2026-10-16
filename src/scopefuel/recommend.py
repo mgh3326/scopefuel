@@ -8,7 +8,7 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 - ``oc-sonnet46`` and ``oc-oss`` route to ``agy/3p``
 - the explicitly registered remaining ``oc-*`` profiles route to their listed pools;
   unknown ``oc-*`` spellings are fail-closed as unknown
-- ``devin-swe2`` routes to ``devin`` (account; SWE-2 Free tag only)
+- ``devin-swe2`` routes to ``devin`` (account; SWE-2 allowlist may use the current Free model-scope bucket)
 - ``oc-solar4`` routes to ``upstage`` (account; A 운영자 배치 #1297, T1 한정, tester 금지)
 """
 
@@ -20,7 +20,7 @@ import math
 import os
 import pathlib
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -28,6 +28,7 @@ from . import cache, exhaust, manual
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
+    Bucket,
     PoolClass,
     ProviderResult,
     _is_valid_used_pct,
@@ -1934,8 +1935,41 @@ def resolved_pool(profile: Profile) -> tuple[str, str | None]:
     return (profile.catalog_pool or ""), None
 
 
+# SWE-2 family only. The gate judges these names on the model-scope swe-2
+# bucket when the current devin probe observed the Free tag. Every other
+# spelling, including paid Devin rungs and other Free-tagged models, stays on
+# the account Daily/Weekly axis. Membership is this set, not billing and not
+# a "not paid" test. The builder seats are the grades.py _BUILDER_RUNGS
+# spellings that map onto the three SWE-2 profiles.
+SWE2_MODEL_SCOPE_PROFILES: frozenset[str] = frozenset(
+    {
+        "devin-swe2",
+        "devin-swe2-medium",
+        "devin-swe2-max",
+        "builder-devin",
+        "builder-devin-medium",
+        "builder-devin-max",
+    }
+)
+_SWE2_SEAT_CANONICAL: dict[str, str] = {
+    "builder-devin": "devin-swe2",
+    "builder-devin-medium": "devin-swe2-medium",
+    "builder-devin-max": "devin-swe2-max",
+}
+SWE2_MODEL_SCOPE_BASIS = "model-scope:swe-2"
+SWE2_FREE_TAG_OBSERVED = "observed"
+
+
+def _swe2_lookup_name(profile_name: str) -> str:
+    """Catalog spelling for an allowlisted builder seat. Every other name is unchanged."""
+    if profile_name not in SWE2_MODEL_SCOPE_PROFILES:
+        return profile_name
+    return _SWE2_SEAT_CANONICAL.get(profile_name, profile_name)
+
+
 def profile_pool(profile: str) -> tuple[str, str | None]:
     """Return (provider_id, group_name_if_group_scope)."""
+    profile = _swe2_lookup_name(profile)
     if profile in ("opus", "sonnet", "fable", "haiku"):
         return "claude", None
     # ASTRA_ROLE_PROFILES 멤버(런처 철자 + 모델 id gpt-6-astra)는 전부 같은
@@ -2834,6 +2868,13 @@ class GateResult:
     # 역할 거부(exit 5)와 다른 전용 코드다 — 구독 자체가 없는 판정을 "reset 을
     # 기다리면 풀리는 quota 차단"으로 오독하지 않게 한다.
     unsubscribed: bool = False
+    # SWE-2 allowlist only. Set when this decision used the current model-scope
+    # swe-2 bucket. Absent on the account path so older gate records stay the
+    # same shape.
+    gate_basis: str | None = None
+    free_tag: str | None = None
+    account_daily_pct: float | None = None
+    account_weekly_pct: float | None = None
 
 
 def _find_profile(
@@ -2845,7 +2886,8 @@ def _find_profile(
     reviewed grade order. Keeping that order among ordinary rows preserves
     local defaults without letting an earlier escalation rung shadow one.
     """
-    profile_name = PROFILE_ALIASES.get(profile_name, profile_name)
+    looked_up = _swe2_lookup_name(profile_name)
+    profile_name = PROFILE_ALIASES.get(looked_up, looked_up)
     table = GRADE_TABLE if grade_table is None else grade_table
     escalation = None
     for grade, profiles in table.items():
@@ -2872,7 +2914,8 @@ def _find_rung(
     normalized = normalize_effort(effort)
     if normalized is None:
         return None
-    canonical = PROFILE_ALIASES.get(profile_name, profile_name)
+    looked_up = _swe2_lookup_name(profile_name)
+    canonical = PROFILE_ALIASES.get(looked_up, looked_up)
     table = GRADE_TABLE if grade_table is None else grade_table
     for grade, profiles in table.items():
         for profile in profiles:
@@ -2965,6 +3008,166 @@ def _operator_request_audit(operator_request: str, requested_by: str, override: 
         f"escalation_override={'true' if override else 'false'} "
         f"operator_request={operator_request} requested_by={requested_by} "
         "ref_resolution=unverified — 기록된 주장이며 신원·동의 증명이 아니다"
+    )
+
+
+def _info_pct(value: float | None) -> str:
+    return "unmeasured" if value is None else f"{value:g}"
+
+
+def _account_axis_pct(
+    result: ProviderResult, labels: tuple[str, ...], windows: tuple[str, ...]
+) -> float | None:
+    """First valid account-scope reading of one axis. Missing stays unmeasured."""
+    for bucket in result.buckets:
+        if bucket.scope.kind != "account":
+            continue
+        if bucket.label not in labels and bucket.window not in windows:
+            continue
+        if not _is_valid_used_pct(bucket.used_pct):
+            continue
+        assert isinstance(bucket.used_pct, (int, float))
+        return float(bucket.used_pct)
+    return None
+
+
+def _probe_age_s(result: ProviderResult, now: dt.datetime) -> float | None:
+    """age_s when the cache stamped it, otherwise age from fetched_at. Live probes are None."""
+    if result.age_s is not None:
+        return result.age_s
+    if result.fetched_at is None:
+        return None
+    return now.timestamp() - float(result.fetched_at)
+
+
+def _swe2_probe_is_current(result: ProviderResult, now: dt.datetime) -> bool:
+    """True only for a clean probe inside the provider TTL.
+
+    A warning, an error, or a stale snapshot is not current.
+    """
+    if result.error or result.warning or result.stale or result.status != "ok":
+        return False
+    age = _probe_age_s(result, now)
+    if age is None:
+        return True
+    ttl = cache.PROVIDER_TTL_S.get(result.id, cache.DEFAULT_TTL_S)
+    return age <= ttl
+
+
+def _swe2_model_bucket(result: ProviderResult) -> Bucket | None:
+    """The single model-scope swe-2 bucket, or None when it is missing, duplicated, or unreadable."""
+    found = [
+        bucket for bucket in result.buckets if bucket.scope.kind == "model" and bucket.scope.name == "swe-2"
+    ]
+    if len(found) != 1:
+        return None
+    bucket = found[0]
+    if not _is_valid_used_pct(bucket.used_pct):
+        return None
+    return bucket
+
+
+def _maybe_swe2_model_scope_gate(
+    *,
+    profile_name: str,
+    provider_id: str,
+    result: ProviderResult | None,
+    now: dt.datetime,
+    today: dt.date,
+    grade: Grade | None,
+    rung_suffix: str,
+    e6_admitted: str | None,
+    missing: tuple[str, ...],
+    audit: Mapping[str, object],
+    alternatives_fn: Callable[[], tuple[str, ...]] | None,
+    operator_request: str | None,
+    audit_requested_by: str | None,
+    escalation_override: bool,
+) -> GateResult | None:
+    """Judge an allowlisted SWE-2 name on the current Free model-scope bucket.
+
+    None means this probe keeps today's account Daily/Weekly judgment: the
+    name is outside the allowlist, the probe is not current, the Free bucket
+    is missing or ambiguous, or an active policy exclude must not be bypassed.
+    Account Daily and Weekly never enter the cutoff comparison on this path.
+    Static billing is not read.
+    """
+    if result is None or profile_name not in SWE2_MODEL_SCOPE_PROFILES:
+        return None
+    fallback: PoolClass = result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
+    effective_class = get_policy(provider_id, fallback, today=today)[0]
+    if effective_class == "exclude":
+        return None
+    if not _swe2_probe_is_current(result, now):
+        return None
+    bucket = _swe2_model_bucket(result)
+    if bucket is None:
+        return None
+    assert isinstance(bucket.used_pct, (int, float))
+    used = float(bucket.used_pct)
+    states = _window_states([(used, bucket.window, bucket.resets_at)], now)
+    cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
+    over = _any_window_over_cutoff(states, cutoff)
+    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope="model:swe-2")
+    daily = _account_axis_pct(result, ("daily",), ("1d",))
+    weekly = _account_axis_pct(result, ("weekly",), ("7d",))
+    basis = (
+        f"basis={SWE2_MODEL_SCOPE_BASIS} free_tag={SWE2_FREE_TAG_OBSERVED} "
+        f"account_daily={_info_pct(daily)} account_weekly={_info_pct(weekly)}"
+    )
+    fields = dict(audit)
+    if over is not None:
+        alts = alternatives_fn() if alternatives_fn is not None else ()
+        reason = (
+            f"{_exhaust_display(over, cutoff)} (class={effective_class})"
+            f"{_exhaust_suffix(cutoff_status, notify_status)} "
+            f"profile={profile_name} pool={provider_id} used_pct={over.used_pct:g} "
+            f"class={effective_class} {basis}{rung_suffix}"
+        )
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=reason,
+            used_pct=over.used_pct,
+            pool_class=effective_class,
+            alternatives=alts,
+            exhaust_notice=notify_status,
+            missing_windows=missing,
+            e6_arm=e6_admitted,
+            gate_basis=SWE2_MODEL_SCOPE_BASIS,
+            free_tag=SWE2_FREE_TAG_OBSERVED,
+            account_daily_pct=daily,
+            account_weekly_pct=weekly,
+            **fields,
+        )
+    reason = f"{profile_name} pool={provider_id} used_pct={used:g} class={effective_class} {basis}"
+    reason += _exhaust_suffix(cutoff_status, notify_status)
+    if operator_request is not None:
+        audit_tag = _operator_request_audit(
+            operator_request, audit_requested_by or "unknown", escalation_override
+        )
+        reason += f" [{audit_tag}]"
+    reason += _e6_arm_suffix(e6_admitted)
+    reason += rung_suffix
+    return GateResult(
+        ok=True,
+        profile=profile_name,
+        provider_id=provider_id,
+        grade=grade,
+        reason=reason,
+        used_pct=used,
+        pool_class=effective_class,
+        stale_accepted=False,
+        exhaust_notice=notify_status,
+        missing_windows=missing,
+        e6_arm=e6_admitted,
+        gate_basis=SWE2_MODEL_SCOPE_BASIS,
+        free_tag=SWE2_FREE_TAG_OBSERVED,
+        account_daily_pct=daily,
+        account_weekly_pct=weekly,
+        **fields,
     )
 
 
@@ -3123,7 +3326,8 @@ def gate_check(
     # #692: 어떤 런그를 판정하는가. --effort 가 런그를 지명하고, 없으면 E6 표식이
     # 지명한다(스포너가 런그를 알려 주는 유일한 경로 — wrk 는 gate 에 --effort 를
     # 넘기지 않는다). 둘 다 없으면 프로필 기본 배치로 답한다 — 기존 동작 그대로다.
-    canonical_profile = PROFILE_ALIASES.get(profile_name, profile_name)
+    looked_up = _swe2_lookup_name(profile_name)
+    canonical_profile = PROFILE_ALIASES.get(looked_up, looked_up)
     e6_marker = parse_e6_arm_marker(e6_arm)
     marker_rung = (
         e6_marker.effort if e6_marker is not None and e6_marker.profile == canonical_profile else None
@@ -3259,6 +3463,24 @@ def gate_check(
                 missing_windows=missing,
                 **audit,
             )
+        swe2_decision = _maybe_swe2_model_scope_gate(
+            profile_name=profile_name,
+            provider_id=provider_id,
+            result=result,
+            now=now,
+            today=today,
+            grade=None,
+            rung_suffix="",
+            e6_admitted=e6_admitted,
+            missing=missing,
+            audit=audit,
+            alternatives_fn=None,
+            operator_request=operator_request,
+            audit_requested_by=audit_requested_by,
+            escalation_override=False,
+        )
+        if swe2_decision is not None:
+            return swe2_decision
         matches = _matching_buckets(result, group_name)
         if not matches:
             return GateResult(
@@ -3451,6 +3673,25 @@ def gate_check(
             missing_windows=missing,
             **audit,
         )
+
+    swe2_decision = _maybe_swe2_model_scope_gate(
+        profile_name=profile_name,
+        provider_id=provider_id,
+        result=result,
+        now=now,
+        today=today,
+        grade=grade,
+        rung_suffix=rung_suffix,
+        e6_admitted=e6_admitted,
+        missing=missing,
+        audit=audit,
+        alternatives_fn=alternatives,
+        operator_request=operator_request,
+        audit_requested_by=audit_requested_by,
+        escalation_override=escalation_override,
+    )
+    if swe2_decision is not None:
+        return swe2_decision
 
     matches = _matching_buckets(result, group_name)
     if not matches:

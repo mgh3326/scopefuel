@@ -485,6 +485,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         | set(recommend.RETIRED_PROFILES.keys())
         | set(recommend.ASTRA_ROLE_PROFILES)
         | set(recommend.CONSULT_ONLY_PROFILES)
+        | set(recommend.SWE2_MODEL_SCOPE_PROFILES)
     )
     gate_parser = subparsers.add_parser(
         "gate",
@@ -939,6 +940,17 @@ def _gate_record(
             # record stays byte-identical (same #635 golden contract as e6_arm).
             {"unsubscribed": True} if result.unsubscribed else {}
         )
+        | (
+            # SWE-2 model-scope decisions only. Account-path records stay byte-identical.
+            {
+                "gate_basis": result.gate_basis,
+                "free_tag": result.free_tag,
+                "account_daily_pct": result.account_daily_pct,
+                "account_weekly_pct": result.account_weekly_pct,
+            }
+            if result.gate_basis
+            else {}
+        )
     )
 
 
@@ -1228,6 +1240,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             f"profile={result.profile} pool={result.provider_id} "
             f"used_pct={result.used_pct} class={result.pool_class}"
         )
+        if result.gate_basis:
+            daily = "unmeasured" if result.account_daily_pct is None else f"{result.account_daily_pct:g}"
+            weekly = "unmeasured" if result.account_weekly_pct is None else f"{result.account_weekly_pct:g}"
+            first_line += (
+                f" basis={result.gate_basis} free_tag={result.free_tag}"
+                f" account_daily={daily} account_weekly={weekly}"
+            )
         if tag:
             first_line += f' account="{tag}"'
         # #692: an opened E6 measurement rung says so on the allow line itself —

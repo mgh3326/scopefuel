@@ -31,8 +31,8 @@ from scopefuel.recommend import (
     recommend,
 )
 
-FREE_NOTE = "free until ~2026-10-10"
 NEW_DEVIN_PROFILES = ("devin-glm52", "devin-swe17", "devin-ds41")
+_FREE_OBSERVED = dt.datetime(2026, 10, 16, 7, 16, 42, tzinfo=dt.UTC)
 UNMEASURED_DEVIN_PROFILES = ("devin-glm52", "devin-swe17")
 # 픽스처가 캡처된 시각 — parse_session 이 리셋을 해석할 때 쓰는 고정 시계.
 # devin_usage 의 ``resets Oct 11, 5:00 PM (UTC+9)`` 는 연도가 없으므로
@@ -93,12 +93,14 @@ def test_registry_exposes_devin_as_spend():
 
 
 def test_parse_swe2_free_fixture_is_model_scoped_zero(fixture_text):
-    result = devin.parse(_fixture(fixture_text))
+    result = devin.parse(_fixture(fixture_text), now=_FREE_OBSERVED)
     assert result.error is None
     assert result.id == "devin"
     assert result.pool_class == "spend"
     assert result.source == "cli:models list"
-    assert result.note == FREE_NOTE
+    assert result.note == devin.free_note(_FREE_OBSERVED)
+    assert result.note.startswith(devin.FREE_NOTE_PREFIX)
+    assert "until" not in result.note
     assert len(result.buckets) == 1
     bucket = result.buckets[0]
     assert bucket.used_pct == 0.0
@@ -106,7 +108,7 @@ def test_parse_swe2_free_fixture_is_model_scoped_zero(fixture_text):
     # 렌더돼 /usage 에 없는 창이 생긴다(1381 desk 의 '월 0%' 오독).
     assert bucket.scope.kind == "model"
     assert bucket.scope.label == "swe-2"
-    assert bucket.note == FREE_NOTE
+    assert bucket.note == result.note
     assert bucket.label == "swe-2"
     # N1: 쿼타 창이 아니므로 '30d'/'month' 를 싣지 않는다 — 표에 'month swe-2'
     # 행이 나오면 desk 의 '월 0%' 오독이 재현된다.
@@ -144,7 +146,7 @@ def test_swe2_free_tag_removed_is_unknown_not_zero(fixture_text):
     result = devin.parse(mutant)
     assert result.error
     assert result.buckets == []
-    assert result.note != FREE_NOTE
+    assert not (result.note or "").startswith(devin.FREE_NOTE_PREFIX)
     assert result.verdict.mark == "degraded"
 
 
@@ -171,7 +173,9 @@ def test_fetch_fake_binary_parses_fixture(tmp_path, monkeypatch, fixture_text):
     result = devin.fetch()
     assert result.error is None
     assert result.buckets[0].used_pct == 0.0
-    assert result.note == FREE_NOTE
+    assert result.note is not None
+    assert result.note.startswith(devin.FREE_NOTE_PREFIX)
+    assert "until" not in result.note
 
 
 def test_fetch_rejects_nonzero_exit_even_with_swe2_free(tmp_path, monkeypatch, fixture_text):
@@ -249,14 +253,23 @@ def test_gate_cli_ok_on_measured_quota_fixture(monkeypatch, capsys, fixture_text
     assert "class=spend" in out.out
 
 
-def test_gate_cli_fail_closed_on_free_fixture_without_quota(monkeypatch, capsys, fixture_text):
-    """모델 Free 태그만으로는 계정 쿼타를 증명할 수 없다 — 게이트는 fail-closed."""
-    result = devin.parse(_fixture(fixture_text))
+def test_gate_cli_allows_devin_swe2_on_current_models_list_free_tag(monkeypatch, capsys, fixture_text):
+    """A current models-list Free tag is the model-scope axis for devin-swe2.
+
+    Account windows are absent on this fixture, so they are reported as
+    unmeasured and do not block.
+    """
+    result = devin.parse(_fixture(fixture_text), now=_FREE_OBSERVED)
     monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
     rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
     out = capsys.readouterr()
-    assert rc == 4
-    assert "측정 불가" in out.err
+    assert rc == 0
+    assert "basis=model-scope:swe-2" in out.out
+    assert "free_tag=observed" in out.out
+    assert "account_daily=unmeasured" in out.out
+    assert "account_weekly=unmeasured" in out.out
+    assert "pool=devin" in out.out
+    assert "class=spend" in out.out
 
 
 def test_gate_cli_exit_4_when_swe2_free_removed(monkeypatch, capsys, fixture_text):

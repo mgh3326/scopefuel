@@ -23,7 +23,8 @@
   ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
   둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
 - ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
-  버킷을 낸다(계정 쿼타 창이 아니므로 창 표시·게이트 축에서 제외).
+  버킷을 낸다. 그 버킷은 이번 프로브에서 Free 태그가 보였을 때만 SWE-2
+  allowlist 의 게이트 축이다. 노트는 관측 시각이며 종료일을 주장하지 않는다.
 
 못 읽는 축은 0%/100% 로 추정하지 않고 ``used_pct=None`` 으로 명시한다
 (fail-closed): ``/usage`` 를 못 읽으면 배너가 증명한 축만 쓰고 나머지는 None.
@@ -72,7 +73,16 @@ USAGE_TYPE_SETTLE_S = 0.6
 EXIT_TYPE_SETTLE_S = 0.4
 SOURCE = "cli:models list"
 SOURCE_QUOTA = "cli:banner+/usage"
-FREE_NOTE = "free until ~2026-10-10"
+FREE_NOTE_PREFIX = "Free tag observed in devin models list at "
+
+
+def free_note(observed_at: dt.datetime) -> str:
+    """Observation note. The stamp is the probe time, not an end-date claim."""
+    moment = observed_at if observed_at.tzinfo is not None else observed_at.replace(tzinfo=dt.UTC)
+    stamp = moment.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"{FREE_NOTE_PREFIX}{stamp}"
+
+
 PROVIDER_ID = "devin"
 PROBE_WORKDIR = Path.home() / ".local" / "share" / "scopefuel" / "devin-probe-workdir"
 # A/B 실측(grok/kimi): 크기 미설정 PTY에서는 TUI가 배너/패널을 렌더하지 않아 timeout한다.
@@ -721,8 +731,10 @@ def _unknown_quota_buckets() -> list[Bucket]:
     ]
 
 
-def parse(text: str) -> ProviderResult:
+def parse(text: str, *, now: dt.datetime | None = None) -> ProviderResult:
     """SWE-2 패밀리의 Free 태그만 인정한다. 못 읽으면 0% 를 지어내지 않는다."""
+    observed = now or dt.datetime.now(dt.UTC)
+    note = free_note(observed)
     clean = _clean(text)
     block = _swe2_family_block(clean)
     if block is None:
@@ -747,16 +759,16 @@ def parse(text: str) -> ProviderResult:
                 label="swe-2",
                 # Free 태그는 쿼타 창이 아니다 — '30d'·'month' 로 그리면 '월' 축
                 # 오독이 다시 생긴다(1381: desk 의 '월 0%'). 창을 비우고 non-month
-                # 지평만 둔다; model scope 이므로 어느 축에도 합산되지 않는다.
+                # 지평만 둔다. SWE-2 allowlist 만 이 버킷으로 판정한다.
                 window="",
                 used_pct=0.0,
                 resets_at=None,
                 scope=Scope("model", "swe-2"),
                 horizon="now",
-                note=FREE_NOTE,
+                note=note,
             )
         ],
-        note=FREE_NOTE,
+        note=note,
         source=SOURCE,
         raw={"stdout": clean},
         pool_class="spend",
