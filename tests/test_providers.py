@@ -317,6 +317,56 @@ def test_claude_expired_not_chosen_while_unexpired_readable(fixture_json, monkey
     assert result.session_fp == claude._session_fp(future)
 
 
+def test_claude_nonstring_file_token_falls_back_to_keychain(fixture_json, monkeypatch, tmp_path):
+    """hk 1603 — 파일 accessToken 이 숫자면 그 소스는 '쓸 수 없음'이지 크래시가 아니다."""
+    _plant_claude_file(monkeypatch, tmp_path, {"accessToken": 42, "subscriptionType": "pro"})
+    _keychain_spy(
+        monkeypatch,
+        json.dumps({"claudeAiOauth": {"accessToken": "kc-live", "subscriptionType": "max"}}),
+    )
+    seen = _usage_capture(monkeypatch, fixture_json)
+
+    result = claude.fetch()
+
+    assert result.error is None
+    assert result.error_kind is None
+    assert seen["auth"] == "Bearer kc-live"
+    assert result.source == "oauth-usage-api+keychain"
+
+
+def test_claude_list_file_token_unreadable_keychain_is_credentials(monkeypatch, tmp_path):
+    """hk 1603 — 파일 토큰이 list 이고 Keychain 도 못 읽으면 credentials, 예외 없음."""
+    path, before = _plant_claude_file(
+        monkeypatch, tmp_path, {"accessToken": ["tok"], "subscriptionType": "pro"}
+    )
+    _keychain_spy(monkeypatch, None)
+    calls_http: list[int] = []
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: calls_http.append(1) or {})
+
+    result = claude.fetch()
+
+    assert calls_http == []
+    assert result.error_kind == "credentials"
+    assert path.read_text() == before
+    assert path.is_file()
+
+
+def test_claude_nonstring_keychain_token_is_credentials(monkeypatch, tmp_path):
+    """hk 1603 — Keychain 쪽 accessToken 이 문자열이 아니면 credentials, 예외 없음."""
+    monkeypatch.setattr(claude, "CREDENTIALS", tmp_path / "nope.json")
+    _keychain_spy(
+        monkeypatch,
+        json.dumps({"claudeAiOauth": {"accessToken": {"tok": 1}, "subscriptionType": "max"}}),
+    )
+    calls_http: list[int] = []
+    monkeypatch.setattr(claude, "request_json", lambda *a, **k: calls_http.append(1) or {})
+
+    result = claude.fetch()
+
+    assert calls_http == []
+    assert result.error_kind == "credentials"
+
+
 def test_codex_separates_additional_rate_limits(fixture_json, monkeypatch, tmp_path):
     auth = tmp_path / "auth.json"
     auth.write_text(json.dumps({"tokens": {"access_token": "x", "account_id": "acc"}}))
