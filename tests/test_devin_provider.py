@@ -101,19 +101,19 @@ def test_parse_swe2_free_fixture_is_model_scoped_zero(fixture_text):
     assert result.note == devin.free_note(_FREE_OBSERVED)
     assert result.note.startswith(devin.FREE_NOTE_PREFIX)
     assert "until" not in result.note
-    assert len(result.buckets) == 1
-    bucket = result.buckets[0]
-    assert bucket.used_pct == 0.0
-    # Free 태그는 SWE-2 패밀리 한정 — account 로 두면 30d 창이 '월' 쿼타 축으로
-    # 렌더돼 /usage 에 없는 창이 생긴다(1381 desk 의 '월 0%' 오독).
-    assert bucket.scope.kind == "model"
-    assert bucket.scope.label == "swe-2"
-    assert bucket.note == result.note
-    assert bucket.label == "swe-2"
-    # N1: 쿼타 창이 아니므로 '30d'/'month' 를 싣지 않는다 — 표에 'month swe-2'
-    # 행이 나오면 desk 의 '월 0%' 오독이 재현된다.
-    assert bucket.window != "30d"
-    assert bucket.horizon != "month"
+    # hk 1614: Free 태그가 붙은 SWE-2 행마다 그 행 id 로 버킷 하나.
+    assert [bucket.scope.label for bucket in result.buckets] == ["swe-2-high", "swe-2-medium", "swe-2-max"]
+    for bucket in result.buckets:
+        assert bucket.used_pct == 0.0
+        # Free 태그는 SWE-2 패밀리 한정 — account 로 두면 30d 창이 '월' 쿼타 축으로
+        # 렌더돼 /usage 에 없는 창이 생긴다(1381 desk 의 '월 0%' 오독).
+        assert bucket.scope.kind == "model"
+        assert bucket.note == result.note
+        assert bucket.label == bucket.scope.name
+        # N1: 쿼타 창이 아니므로 '30d'/'month' 를 싣지 않는다 — 표에 'month swe-2'
+        # 행이 나오면 desk 의 '월 0%' 오독이 재현된다.
+        assert bucket.window != "30d"
+        assert bucket.horizon != "month"
 
 
 def test_swe2_model_tag_does_not_render_a_month_axis(fixture_text):
@@ -129,6 +129,7 @@ def test_parse_strips_ansi_before_swe2_free_check():
     result = devin.parse(noisy)
     assert result.error is None
     assert result.buckets[0].used_pct == 0.0
+    assert [bucket.scope.name for bucket in result.buckets] == ["swe-2-high"]
 
 
 def test_other_models_free_without_swe2_is_unknown(fixture_text):
@@ -725,7 +726,8 @@ def test_fetch_probes_session_and_appends_swe2_bucket(tmp_path, monkeypatch, fix
     labels = [(b.label, b.used_pct, b.horizon) for b in result.buckets]
     assert ("daily", 0.0, "now") in labels
     assert ("weekly", 18.0, "week") in labels
-    assert ("swe-2", 0.0, "now") in labels
+    for rung in ("swe-2-high", "swe-2-medium", "swe-2-max"):
+        assert (rung, 0.0, "now") in labels
 
 
 def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(tmp_path, monkeypatch, fixture_text):
@@ -751,7 +753,8 @@ def test_fetch_probes_observed_3000_11_1_fixture_and_appends_swe2_bucket(tmp_pat
     labels = {(b.label, b.used_pct, b.horizon) for b in result.buckets}
     assert ("daily", 0.0, "now") in labels
     assert ("weekly", 18.0, "week") in labels
-    assert ("swe-2", 0.0, "now") in labels
+    for rung in ("swe-2-high", "swe-2-medium", "swe-2-max"):
+        assert (rung, 0.0, "now") in labels
 
 
 def test_fetch_session_failure_falls_back_to_models_list_with_warning(tmp_path, monkeypatch, fixture_text):
@@ -768,7 +771,8 @@ def test_fetch_session_failure_falls_back_to_models_list_with_warning(tmp_path, 
     assert result.warning is not None
     assert result.source == "cli:models list"
     labels = [(b.label, b.used_pct, b.horizon) for b in result.buckets]
-    assert ("swe-2", 0.0, "now") in labels
+    for rung in ("swe-2-high", "swe-2-medium", "swe-2-max"):
+        assert (rung, 0.0, "now") in labels
     assert ("daily", None, "now") in labels
     assert ("weekly", None, "week") in labels
 

@@ -8,7 +8,8 @@ operator relay (OpenRouter rankings 2026-07-31). Profile-to-pool routing matches
 - ``oc-sonnet46`` and ``oc-oss`` route to ``agy/3p``
 - the explicitly registered remaining ``oc-*`` profiles route to their listed pools;
   unknown ``oc-*`` spellings are fail-closed as unknown
-- ``devin-swe2`` routes to ``devin`` (account; SWE-2 allowlist may use the current Free model-scope bucket)
+- ``devin-swe2`` routes to ``devin`` (account; SWE-2 allowlist may use its own rung's current Free
+  model-scope bucket)
 - ``oc-solar4`` routes to ``upstage`` (account; A 운영자 배치 #1297, T1 한정, tester 금지)
 """
 
@@ -1935,29 +1936,37 @@ def resolved_pool(profile: Profile) -> tuple[str, str | None]:
     return (profile.catalog_pool or ""), None
 
 
-# SWE-2 family only. The gate judges these names on the model-scope swe-2
-# bucket when the current devin probe observed the Free tag. Every other
-# spelling, including paid Devin rungs and other Free-tagged models, stays on
-# the account Daily/Weekly axis. Membership is this set, not billing and not
-# a "not paid" test. The builder seats are the grades.py _BUILDER_RUNGS
-# spellings that map onto the three SWE-2 profiles.
-SWE2_MODEL_SCOPE_PROFILES: frozenset[str] = frozenset(
-    {
-        "devin-swe2",
-        "devin-swe2-medium",
-        "devin-swe2-max",
-        "builder-devin",
-        "builder-devin-medium",
-        "builder-devin-max",
-    }
-)
+# SWE-2 family only. Each name is judged on the model-scope bucket of its own
+# rung (the devin models list row id) when the current devin probe observed the
+# Free tag on that row. hk 1614: one rung's Free tag never admits a sibling
+# rung, so a paid swe-2-max cannot ride a Free swe-2-high. devin-swe2 launches
+# the family slug swe-2 (launch.py), which serves the SWE-2 High row — its
+# catalog row is "SWE-2 (high)". Every other spelling, including paid Devin
+# rungs and other Free-tagged models, stays on the account Daily/Weekly axis.
+# Membership is this map, not billing and not a "not paid" test. The builder
+# seats are the grades.py _BUILDER_RUNGS spellings that map onto the three
+# SWE-2 profiles.
+SWE2_PROFILE_RUNG: dict[str, str] = {
+    "devin-swe2": "swe-2-high",
+    "builder-devin": "swe-2-high",
+    "devin-swe2-medium": "swe-2-medium",
+    "builder-devin-medium": "swe-2-medium",
+    "devin-swe2-max": "swe-2-max",
+    "builder-devin-max": "swe-2-max",
+}
+SWE2_MODEL_SCOPE_PROFILES: frozenset[str] = frozenset(SWE2_PROFILE_RUNG)
 _SWE2_SEAT_CANONICAL: dict[str, str] = {
     "builder-devin": "devin-swe2",
     "builder-devin-medium": "devin-swe2-medium",
     "builder-devin-max": "devin-swe2-max",
 }
-SWE2_MODEL_SCOPE_BASIS = "model-scope:swe-2"
+SWE2_MODEL_SCOPE_BASIS_PREFIX = "model-scope:"
 SWE2_FREE_TAG_OBSERVED = "observed"
+
+
+def swe2_model_scope_basis(rung: str) -> str:
+    """Gate basis for a decision on one rung's bucket, e.g. ``model-scope:swe-2-max``."""
+    return f"{SWE2_MODEL_SCOPE_BASIS_PREFIX}{rung}"
 
 
 def _swe2_lookup_name(profile_name: str) -> str:
@@ -2869,8 +2878,8 @@ class GateResult:
     # 기다리면 풀리는 quota 차단"으로 오독하지 않게 한다.
     unsubscribed: bool = False
     # SWE-2 allowlist only. Set when this decision used the current model-scope
-    # swe-2 bucket. Absent on the account path so older gate records stay the
-    # same shape.
+    # bucket of the name's own rung (model-scope:<rung>). Absent on the account
+    # path so older gate records stay the same shape.
     gate_basis: str | None = None
     free_tag: str | None = None
     account_daily_pct: float | None = None
@@ -3054,10 +3063,14 @@ def _swe2_probe_is_current(result: ProviderResult, now: dt.datetime) -> bool:
     return age <= ttl
 
 
-def _swe2_model_bucket(result: ProviderResult) -> Bucket | None:
-    """The single model-scope swe-2 bucket, or None when it is missing, duplicated, or unreadable."""
+def _swe2_model_bucket(result: ProviderResult, rung: str) -> Bucket | None:
+    """The single model-scope bucket of this rung, or None when it is missing, duplicated, or unreadable.
+
+    Only a bucket whose scope name is exactly ``rung`` counts. A sibling rung's
+    bucket is never a stand-in.
+    """
     found = [
-        bucket for bucket in result.buckets if bucket.scope.kind == "model" and bucket.scope.name == "swe-2"
+        bucket for bucket in result.buckets if bucket.scope.kind == "model" and bucket.scope.name == rung
     ]
     if len(found) != 1:
         return None
@@ -3084,15 +3097,17 @@ def _maybe_swe2_model_scope_gate(
     audit_requested_by: str | None,
     escalation_override: bool,
 ) -> GateResult | None:
-    """Judge an allowlisted SWE-2 name on the current Free model-scope bucket.
+    """Judge an allowlisted SWE-2 name on its own rung's current Free model-scope bucket.
 
     None means this probe keeps today's account Daily/Weekly judgment: the
     name is outside the allowlist, the probe is not current, the Free bucket
-    is missing or ambiguous, or an active policy exclude must not be bypassed.
+    for its rung is missing or ambiguous (a sibling rung's bucket does not
+    count), or an active policy exclude must not be bypassed.
     Account Daily and Weekly never enter the cutoff comparison on this path.
     Static billing is not read.
     """
-    if result is None or profile_name not in SWE2_MODEL_SCOPE_PROFILES:
+    rung = SWE2_PROFILE_RUNG.get(profile_name)
+    if result is None or rung is None:
         return None
     fallback: PoolClass = result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
     effective_class = get_policy(provider_id, fallback, today=today)[0]
@@ -3100,7 +3115,7 @@ def _maybe_swe2_model_scope_gate(
         return None
     if not _swe2_probe_is_current(result, now):
         return None
-    bucket = _swe2_model_bucket(result)
+    bucket = _swe2_model_bucket(result, rung)
     if bucket is None:
         return None
     assert isinstance(bucket.used_pct, (int, float))
@@ -3108,11 +3123,12 @@ def _maybe_swe2_model_scope_gate(
     states = _window_states([(used, bucket.window, bucket.resets_at)], now)
     cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
-    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope="model:swe-2")
+    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=f"model:{rung}")
     daily = _account_axis_pct(result, ("daily",), ("1d",))
     weekly = _account_axis_pct(result, ("weekly",), ("7d",))
+    gate_basis = swe2_model_scope_basis(rung)
     basis = (
-        f"basis={SWE2_MODEL_SCOPE_BASIS} free_tag={SWE2_FREE_TAG_OBSERVED} "
+        f"basis={gate_basis} free_tag={SWE2_FREE_TAG_OBSERVED} "
         f"account_daily={_info_pct(daily)} account_weekly={_info_pct(weekly)}"
     )
     fields = dict(audit)
@@ -3136,7 +3152,7 @@ def _maybe_swe2_model_scope_gate(
             exhaust_notice=notify_status,
             missing_windows=missing,
             e6_arm=e6_admitted,
-            gate_basis=SWE2_MODEL_SCOPE_BASIS,
+            gate_basis=gate_basis,
             free_tag=SWE2_FREE_TAG_OBSERVED,
             account_daily_pct=daily,
             account_weekly_pct=weekly,
@@ -3163,7 +3179,7 @@ def _maybe_swe2_model_scope_gate(
         exhaust_notice=notify_status,
         missing_windows=missing,
         e6_arm=e6_admitted,
-        gate_basis=SWE2_MODEL_SCOPE_BASIS,
+        gate_basis=gate_basis,
         free_tag=SWE2_FREE_TAG_OBSERVED,
         account_daily_pct=daily,
         account_weekly_pct=weekly,
