@@ -22,9 +22,12 @@
   (fail-closed).
   ``/usage`` 를 보내고 축이 읽히면 ``/exit`` 로 끝낸다. 보내는 입력은 이
   둘뿐이다 — 쿼타를 쓰는 프롬프트는 절대 보내지 않는다.
-- ``devin models list`` 는 SWE-2 패밀리 행에 Free 태그가 있을 때 model-scope
-  버킷을 낸다. 그 버킷은 이번 프로브에서 Free 태그가 보였을 때만 SWE-2
-  allowlist 의 게이트 축이다. 노트는 관측 시각이며 종료일을 주장하지 않는다.
+- ``devin models list`` 는 Free 태그가 붙은 SWE-2 패밀리 행마다 그 행 id 로
+  model-scope 버킷을 하나씩 낸다(``swe-2-high``·``swe-2-medium``·``swe-2-max``).
+  Free 태그가 없는 행에는 버킷이 없다. 각 버킷은 이번 프로브에서 그 rung 에
+  Free 태그가 보였을 때만 그 rung 의 SWE-2 allowlist 이름의 게이트 축이다
+  (hk 1614: 형제 rung 의 Free 로 유료 rung 을 통과시키지 않는다). 노트는 관측
+  시각이며 종료일을 주장하지 않는다.
 
 못 읽는 축은 0%/100% 로 추정하지 않고 ``used_pct=None`` 으로 명시한다
 (fail-closed): ``/usage`` 를 못 읽으면 배너가 증명한 축만 쓰고 나머지는 None.
@@ -94,6 +97,8 @@ _ANSI = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\(
 _SWE2_FAMILY = re.compile(r"^SWE-2\s+\(swe-2\)\s*$")
 _FAMILY_HEADER = re.compile(r"^\S.*\([^)]+\)\s*$")
 _BRACKET_TAGS = re.compile(r"\[([^\[\]]*)\]\s*$")
+# 패밀리 행의 첫 토큰이 모델 UID 다(``  swe-2-max   SWE-2 Max  [...]``).
+_ROW_ID = re.compile(r"^\s+([a-z0-9][a-z0-9._-]*)\s")
 # 기동 배너 두 번째 페인트의 구분자는 U+00B7 middle dot.
 _BANNER_VERSION = r"v\d+\.\d+\.\d+"
 _BANNER_PLAN = r"Pro"
@@ -744,8 +749,8 @@ def parse(text: str, *, now: dt.datetime | None = None) -> ProviderResult:
             stdout=clean,
         )
 
-    free_rows = [line for line in _model_rows(block) if _has_free_tag(line)]
-    if not free_rows:
+    free_ids = [row_id for line in _model_rows(block) if _has_free_tag(line) and (row_id := _row_id(line))]
+    if not free_ids:
         return _failed(
             "SWE-2 행에 Free 태그가 없음",
             hint="유료 SWE-2 는 이 provider 범위 밖이다 — 추정 used_pct 를 넣지 않는다",
@@ -756,17 +761,19 @@ def parse(text: str, *, now: dt.datetime | None = None) -> ProviderResult:
         id=PROVIDER_ID,
         buckets=[
             Bucket(
-                label="swe-2",
+                label=row_id,
                 # Free 태그는 쿼타 창이 아니다 — '30d'·'month' 로 그리면 '월' 축
                 # 오독이 다시 생긴다(1381: desk 의 '월 0%'). 창을 비우고 non-month
-                # 지평만 둔다. SWE-2 allowlist 만 이 버킷으로 판정한다.
+                # 지평만 둔다. 이 rung 의 SWE-2 allowlist 이름만 이 버킷으로
+                # 판정한다(hk 1614: rung 마다 버킷 하나, 행 id 가 scope 이름).
                 window="",
                 used_pct=0.0,
                 resets_at=None,
-                scope=Scope("model", "swe-2"),
+                scope=Scope("model", row_id),
                 horizon="now",
                 note=note,
             )
+            for row_id in free_ids
         ],
         note=note,
         source=SOURCE,
@@ -803,6 +810,12 @@ def _model_rows(block: str) -> list[str]:
         if line[:1].isspace():
             rows.append(line)
     return rows
+
+
+def _row_id(line: str) -> str | None:
+    """The model UID that starts a family row (``swe-2-max``), or None when unreadable."""
+    match = _ROW_ID.match(line)
+    return match.group(1) if match else None
 
 
 def _has_free_tag(line: str) -> bool:

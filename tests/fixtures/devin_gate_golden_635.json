@@ -88,7 +88,7 @@
       "exit_code": 0,
       "expires_at": null,
       "free_tag": "observed",
-      "gate_basis": "model-scope:swe-2",
+      "gate_basis": "model-scope:swe-2-high",
       "grade": "A+",
       "last_auto_error": null,
       "manual_observation_ids": [],
@@ -104,7 +104,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin-swe2 pool=devin used_pct=0 class=spend basis=model-scope:swe-2 free_tag=observed account_daily=unmeasured account_weekly=unmeasured",
+      "reason": "devin-swe2 pool=devin used_pct=0 class=spend basis=model-scope:swe-2-high free_tag=observed account_daily=unmeasured account_weekly=unmeasured",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -118,7 +118,7 @@
       "used_pct": 0.0
     },
     "stderr": "",
-    "stdout": "profile=devin-swe2 pool=devin used_pct=0.0 class=spend basis=model-scope:swe-2 free_tag=observed account_daily=unmeasured account_weekly=unmeasured\ndevin-swe2 pool=devin used_pct=0 class=spend basis=model-scope:swe-2 free_tag=observed account_daily=unmeasured account_weekly=unmeasured\n"
+    "stdout": "profile=devin-swe2 pool=devin used_pct=0.0 class=spend basis=model-scope:swe-2-high free_tag=observed account_daily=unmeasured account_weekly=unmeasured\ndevin-swe2 pool=devin used_pct=0 class=spend basis=model-scope:swe-2-high free_tag=observed account_daily=unmeasured account_weekly=unmeasured\n"
   },
   "devin-swe2/swe2_not_free": {
     "rc": 4,
