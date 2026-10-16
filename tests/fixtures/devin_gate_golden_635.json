@@ -78,13 +78,17 @@
     "stdout": ""
   },
   "devin-swe2/free": {
-    "rc": 4,
+    "rc": 0,
     "record": {
+      "account_daily_pct": null,
+      "account_weekly_pct": null,
       "alternatives": [],
       "escalation_override": false,
       "exhaust_notice": null,
-      "exit_code": 4,
+      "exit_code": 0,
       "expires_at": null,
+      "free_tag": "observed",
+      "gate_basis": "model-scope:swe-2",
       "grade": "A+",
       "last_auto_error": null,
       "manual_observation_ids": [],
@@ -94,13 +98,13 @@
         "7d"
       ],
       "observed_age_s": null,
-      "ok": false,
+      "ok": true,
       "operator_request_ref": null,
-      "pool_class": null,
+      "pool_class": "spend",
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]",
+      "reason": "devin-swe2 pool=devin used_pct=0 class=spend basis=model-scope:swe-2 free_tag=observed account_daily=unmeasured account_weekly=unmeasured",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -110,11 +114,11 @@
       "source_label": null,
       "source_verification": null,
       "stale_accepted": false,
-      "unmeasurable": true,
-      "used_pct": null
+      "unmeasurable": false,
+      "used_pct": 0.0
     },
-    "stderr": "devin bucket 측정 불가 (scope 불일치 또는 값 없음) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
-    "stdout": ""
+    "stderr": "",
+    "stdout": "profile=devin-swe2 pool=devin used_pct=0.0 class=spend basis=model-scope:swe-2 free_tag=observed account_daily=unmeasured account_weekly=unmeasured\ndevin-swe2 pool=devin used_pct=0 class=spend basis=model-scope:swe-2 free_tag=observed account_daily=unmeasured account_weekly=unmeasured\n"
   },
   "devin-swe2/swe2_not_free": {
     "rc": 4,
