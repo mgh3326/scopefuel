@@ -486,6 +486,9 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         | set(recommend.ASTRA_ROLE_PROFILES)
         | set(recommend.CONSULT_ONLY_PROFILES)
         | set(recommend.SWE2_MODEL_SCOPE_PROFILES)
+        # #1620: the ungraded Argon trial spellings are gate choices — they
+        # are gate-able catalog rows, never GRADE_TABLE entries.
+        | set(recommend.UNGRADED_TRIAL_PROFILE_NAMES)
     )
     gate_parser = subparsers.add_parser(
         "gate",

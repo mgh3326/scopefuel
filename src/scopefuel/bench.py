@@ -384,11 +384,12 @@ class ModelPrice:
 
 
 # operator decision 2026-09-09 doc1144. These are the only approved static
-# price seeds: AA-model rows plus, since #1380, the two fusion-claude-* seeds —
-# those are Devin price-list seeds (devin models list, 10-10), not AA rows, so
-# the 09-09 "AA seeds" approval does not cover them by itself; their approval
-# is the #1380 paid-lane decision. A synchronized DB row takes precedence at
-# read time.
+# price seeds: AA-model rows plus, since #1380, the two fusion-claude-* seeds
+# and, since #1620, the three gemini-4-argon-* seeds — those are Devin
+# price-list seeds (devin models list, 10-10 / 10-18), not AA rows, so the
+# 09-09 "AA seeds" approval does not cover them by itself; their approvals
+# are the #1380 paid-lane decision and the #1620 phase-1 Argon decision.
+# A synchronized DB row takes precedence at read time.
 AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
     ModelPrice("kimi-k2-7-code", 1.7125, 0.95, 4.0, "2026-09-09T00:00:00+00:00"),
     ModelPrice("grok-4-6", 3.0, 2.0, 6.0, "2026-09-09T00:00:00+00:00"),
@@ -420,6 +421,14 @@ AA_MODEL_PRICE_SEEDS: tuple[ModelPrice, ...] = (
         10.0,
         "2026-10-10T00:00:00+00:00",
     ),
+    # #1620: the paid devin Argon trial lane — vendor list prices from the
+    # 10-18 devin models list (desk 10-18 price line): every Argon rung is
+    # input $1 / output $5 / cached $0.05 per 1M (the 75% launch discount,
+    # to ~10-27); blended by the #920 3:1 formula ((3·1+5)/4 = 2.0). Not AA
+    # rows — the seeds carry the price the rows' billing=paid flag reports.
+    ModelPrice("gemini-4-argon-high", 2.0, 1.0, 5.0, "2026-10-18T00:00:00+00:00"),
+    ModelPrice("gemini-4-argon-medium", 2.0, 1.0, 5.0, "2026-10-18T00:00:00+00:00"),
+    ModelPrice("gemini-4-argon-low", 2.0, 1.0, 5.0, "2026-10-18T00:00:00+00:00"),
 )
 
 
@@ -3585,7 +3594,13 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
     one, because nothing downstream could tell which half it got.
     """
 
-    from .recommend import E6_ARM_GRADE, E6_ARM_KEYS, GRADE_TABLE, validate_grade_table
+    from .recommend import (
+        E6_ARM_GRADE,
+        E6_ARM_KEYS,
+        GRADE_TABLE,
+        UNGRADED_TRIAL_PROFILE_NAMES,
+        validate_grade_table,
+    )
 
     if not view.entries:
         # Nothing seeded yet. A catalog that has said nothing cannot be the
@@ -3614,6 +3629,12 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
     proposed: dict[str, list] = {grade: [] for grade in GRADE_TABLE}
     for entry in sorted(live, key=_catalog_sort_key):
         if entry.gate == "consult_only":
+            continue
+        # #1620: the ungraded phase-1 trial rows (the Argon spellings) are
+        # gate-able catalog rows, never placements — the operator placed no
+        # grade, so a canon row's inert C carrier must not become a
+        # recommendation candidate either.
+        if entry.profile in UNGRADED_TRIAL_PROFILE_NAMES:
             continue
         # #692: an unmeasured E6 measurement rung is a catalog row, not a
         # candidate. A canon that carries the row (the seed emits them) must not

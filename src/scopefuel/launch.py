@@ -41,6 +41,7 @@ from .recommend import (
     GRADE_TABLE,
     PROFILE_ALIASES,
     REP_GRADES_ORDER,
+    UNGRADED_TRIAL_PROFILES,
     Grade,
     barred_model_id_for_profile,
     e6_arm_matches,
@@ -97,6 +98,12 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     # pool; the rung is baked into the model id like every devin spelling.
     "devin-fusion-opus55": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
     "devin-fusion-sonnet55": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+    # #1620: the paid Argon trial lane (phase 1) — Gemini 4 Argon rungs served
+    # on the devin pool; the rung is baked into the model id. devin-argon is
+    # the high default, the same shape devin-swe2 -> swe-2 (high) follows.
+    "devin-argon": "gemini-4-argon-high",
+    "devin-argon-medium": "gemini-4-argon-medium",
+    "devin-argon-low": "gemini-4-argon-low",
     # Same model as kimi-k3; the differentiator is KIMI_CODE_HOME, not the model.
     "kimi-k3-low": "kimi-k3",
     "oc-qwen37-max": "qwen3.7-max",
@@ -191,6 +198,31 @@ CONSULT_ONLY_SNAPSHOT: tuple[CatalogEntry, ...] = (
     ),
 )
 
+# #1620 (operator decision hk:doc owner/fleet/decision/2026-10-18/devin-argon-trial,
+# phase 1, approved by operator-desk 10-18 r1018b953go): the paid Argon trial
+# lane is gate-able but carries NO grade placement — the operator placed none,
+# and phase 1 is spawn plumbing only. The catalog grade column is NOT NULL, so
+# the rows carry C as an inert carrier — the weakest rung and the same "not a
+# placement" value the E6 measurement rows use — never an actual placement:
+# the profiles are absent from GRADE_TABLE and
+# ``bench._catalog_grade_table`` skips them, so ``--recommend`` can never offer
+# one even when the canon is seeded with these rows. ``gate=default`` means
+# ``gate -m`` judges each spelling on the devin pool's account Daily/Weekly
+# axis (the D3 not-in-table path) — never on a SWE-2 Free model-scope bucket.
+UNGRADED_TRIAL_SNAPSHOT: tuple[CatalogEntry, ...] = tuple(
+    CatalogEntry(
+        profile=profile.name,
+        effort="",
+        model_id=LAUNCH_MODEL_IDS[profile.name],
+        pool=profile_pool(profile.name)[0],
+        grade="C",
+        score=None,
+        gate=GATE_DEFAULT,
+        benchmark_annotation=profile.benchmark_annotation,
+    )
+    for profile in UNGRADED_TRIAL_PROFILES
+)
+
 
 def _snapshot_model_id(profile_name: str, profile) -> str:
     override = LAUNCH_MODEL_IDS.get(profile_name)
@@ -237,6 +269,9 @@ def snapshot_entries() -> tuple[CatalogEntry, ...]:
                 best[key] = (rank, entry)
     entries = [_arm_grade_override(entry) for _, entry in best.values()]
     entries.extend(CONSULT_ONLY_SNAPSHOT)
+    # #1620: the ungraded Argon trial rows ride the same append — launchable
+    # and gate-able, never placements.
+    entries.extend(UNGRADED_TRIAL_SNAPSHOT)
     return tuple(sorted(entries, key=lambda e: (e.profile, CATALOG_EFFORT_RANKS.get(e.effort, 99))))
 
 
@@ -552,6 +587,11 @@ def _bundled_billing(profile_name: str) -> str:
         for profile in profiles:
             if profile.name == profile_name:
                 return profile.billing
+    # #1620: the ungraded trial lane rows hold their billing flag outside
+    # GRADE_TABLE — the launch verdict still reports "paid", not "unknown".
+    for profile in UNGRADED_TRIAL_PROFILES:
+        if profile.name == profile_name:
+            return profile.billing
     return "unknown"
 
 
