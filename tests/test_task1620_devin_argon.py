@@ -34,8 +34,8 @@ from scopefuel.recommend import (
     PROFILE_ALIASES,
     SWE2_MODEL_SCOPE_PROFILES,
     SWE2_PROFILE_RUNG,
-    UNGRADED_TRIAL_PROFILES,
     UNGRADED_TRIAL_PROFILE_NAMES,
+    UNGRADED_TRIAL_PROFILES,
     gate_check,
     is_rep_measured,
     profile_pool,
@@ -150,7 +150,7 @@ def test_argon_profile_row_is_unmeasured_paid(name):
 
 
 def test_ungraded_trial_names_are_exactly_the_argon_spellings():
-    assert UNGRADED_TRIAL_PROFILE_NAMES == frozenset(ARGON_PROFILES)
+    assert frozenset(ARGON_PROFILES) == UNGRADED_TRIAL_PROFILE_NAMES
 
 
 def test_argon_annotation_claims_no_rep_evidence():
@@ -229,7 +229,7 @@ def test_argon_model_ids_are_real_devin_model_uids(fixture_text):
     for line in fixture_text("devin_models_list").splitlines():
         if line.startswith("  ") and "[" in line:
             listed[line.split()[0]] = line
-    for name, uid in ARGON_IDS.items():
+    for _name, uid in ARGON_IDS.items():
         assert uid in listed
         assert "$1 / 1M Input" in listed[uid]
         assert "Free" not in listed[uid]
@@ -238,7 +238,7 @@ def test_argon_model_ids_are_real_devin_model_uids(fixture_text):
 def test_price_seeds_carry_the_argon_prices(tmp_path):
     """Input, output AND blended — pinned separately (a 2.0->20.0 mutant is red)."""
     prices = bench.read_prices(path=tmp_path / "missing.db")
-    for name, uid in ARGON_IDS.items():
+    for _name, uid in ARGON_IDS.items():
         price = prices[uid]
         assert price.price_1m_input_tokens == ARGON_INPUT_PRICE
         assert price.price_1m_output_tokens == ARGON_INPUT_PRICE * 5
