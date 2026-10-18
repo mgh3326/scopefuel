@@ -209,8 +209,11 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     launch_parser.add_argument("--json", action="store_true", help="JSON 한 줄로 출력")
     launch_parser.add_argument(
         "--operator-request",
-        action="store_true",
-        help="운영자 명시 요청 — consult_only 및 stale 상태의 비-default gate 에 필요",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REF",
+        help="운영자 명시 요청 — round-extension은 hk:doc round-ext REF 필수; 기존 bare flag도 허용",
     )
     launch_parser.add_argument(
         "--purpose",
@@ -1353,7 +1356,7 @@ def _policy_launch_command(args: argparse.Namespace) -> int:
         decision = launch.resolve_launch(
             args.profile,
             effort=args.effort,
-            operator_request=bool(args.operator_request),
+            operator_request=args.operator_request,
             purpose=getattr(args, "purpose", None),
             e6_arm=_e6_arm_marker(),
         )

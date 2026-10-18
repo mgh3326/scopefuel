@@ -1794,6 +1794,21 @@ ASTRA_ROLE_PROFILES = frozenset({"codex-astra", "builder-astra", "captain-astra"
 # 자문. Compared after strip().casefold(); anything else (including a missing
 # purpose) is a role denial, independent of quota state.
 ASTRA_ALLOWED_PURPOSES = frozenset({"director", "architect", "operator-request"})
+ASTRA_FORBIDDEN_SEATS = frozenset({"builder-astra", "captain-astra"})
+
+# hk 1632: the verified document reference is the key, never the purpose alone.
+# wrk verifies existence and binds the final job component to --parent-job.
+ROUND_EXT_REF = re.compile(r"^hk:doc/(?:round-extension|round-ext|[a-z0-9-]+/round-ext)/[A-Za-z0-9._-]+$")
+
+
+def astra_purpose_allowed(profile: str, purpose: str | None, ref: object = None) -> bool:
+    if profile in ASTRA_FORBIDDEN_SEATS:
+        return False
+    normalized = (purpose or "").strip().casefold()
+    return normalized in ASTRA_ALLOWED_PURPOSES or (
+        normalized == "round-extension" and isinstance(ref, str) and ROUND_EXT_REF.fullmatch(ref) is not None
+    )
+
 
 # ROB-591: profiles that are operator-explicit consultation-only — never a
 # GRADE_TABLE entry, never a recommendation/escalation candidate, but an
@@ -3342,21 +3357,23 @@ def gate_check(
     # "astra" 가 든 무관 프로필은 여기에 걸리지 않는다. 허용 용도가 아니면 쿼타
     # 상태와 무관하게 역할 거부(role_denied → CLI exit 5) — 쿼타 거부(exit 3)와
     # 같은 rc 로 나가면 호출자가 "쿼타 소진"으로 오독한다(ARCHITECT.md:6 결함).
-    if profile_name in ASTRA_ROLE_PROFILES:
-        normalized_purpose = (purpose or "").strip().casefold()
-        if normalized_purpose not in ASTRA_ALLOWED_PURPOSES:
-            shown = purpose.strip() if purpose and purpose.strip() else "미지정"
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id="codex",
-                grade=None,
-                reason=(
-                    f"role_restricted: {profile_name} — astra 는 허용 용도 전용 "
-                    f"({', '.join(sorted(ASTRA_ALLOWED_PURPOSES))}); purpose={shown}"
-                ),
-                role_denied=True,
-            )
+    if profile_name in ASTRA_ROLE_PROFILES and not astra_purpose_allowed(
+        profile_name, purpose, operator_request
+    ):
+        shown = purpose.strip() if purpose and purpose.strip() else "미지정"
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id="codex",
+            grade=None,
+            reason=(
+                f"role_restricted: {profile_name} — astra 는 허용 용도 전용 "
+                f"({', '.join(sorted(ASTRA_ALLOWED_PURPOSES))}, round-extension + round-ext ref); "
+                f"purpose={shown}"
+            ),
+            role_denied=True,
+            operator_request_ref=operator_request,
+        )
 
     provider_id, group_name = profile_pool(profile_name)
 
@@ -3482,12 +3499,17 @@ def gate_check(
     # 범용 우회 플래그로 오인되는 것을 막기 위한 fail-closed. task #625: 단
     # CONSULT_ONLY_PROFILES(fable)은 예외다 — ``policy launch`` 가 요구하는 바로 그
     # 요청을 게이트가 거부하면 정상 경로가 성립하지 않는다(fable 은 #591 이후
-    # GRADE_TABLE 밖이라 found=None 으로 여기 도달한다). astra 철자는 계속
-    # not_applicable — 그 자격은 purpose 축이고 요청이 대신하지 않는다(#527).
+    # GRADE_TABLE 밖이라 found=None 으로 여기 도달한다). hk 1632 astra의
+    # round-extension만 검증된 round-ext REF를 함께 받는다.
     if (
         operator_request is not None
         and (found is None or found[1].gate != "escalation")
         and profile_name not in CONSULT_ONLY_PROFILES
+        and not (
+            profile_name in ASTRA_ROLE_PROFILES
+            and (purpose or "").strip().casefold() == "round-extension"
+            and astra_purpose_allowed(profile_name, purpose, operator_request)
+        )
     ):
         grade_of_found = found[0] if found is not None else None
         return GateResult(

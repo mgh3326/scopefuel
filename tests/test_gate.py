@@ -692,10 +692,9 @@ def test_astra_allowed_purposes_pinned():
     assert frozenset({"director", "architect", "operator-request"}) == ASTRA_ALLOWED_PURPOSES
 
 
-@pytest.mark.parametrize("profile_name", ["codex-astra", "builder-astra", "captain-astra", "gpt-6-astra"])
+@pytest.mark.parametrize("profile_name", ["codex-astra", "gpt-6-astra"])
 def test_gate_astra_allowed_purpose_passes_quota_check(profile_name):
-    """AC: 허용 용도 + 쿼타 여유 → 통과. builder-*/captain-* 는 런처 철자가 아니라
-    역할 세트 멤버십으로 판별된다(wrk 측 tombstone 과 별개)."""
+    """Allowed counsel identities reach quota; builder/captain stay forbidden."""
     providers = [_result("codex", 10.0, pool_class="preserve")]
     for purpose in ("director", "architect", "operator-request"):
         result = gate_check(providers, profile_name, today=TODAY, now=NOW, purpose=purpose)

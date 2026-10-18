@@ -33,6 +33,7 @@ from .bench import (
 )
 from .recommend import (
     ASTRA_ALLOWED_PURPOSES,
+    ASTRA_FORBIDDEN_SEATS,
     ASTRA_ROLE_PROFILES,
     BARRED_MODEL_DECISION_REF,
     E6_ARM_GRADE,
@@ -43,6 +44,7 @@ from .recommend import (
     REP_GRADES_ORDER,
     UNGRADED_TRIAL_PROFILES,
     Grade,
+    astra_purpose_allowed,
     barred_model_id_for_profile,
     e6_arm_matches,
     e6_arm_rung_for,
@@ -544,7 +546,7 @@ def _known_rung(effort: str, entries: tuple[CatalogEntry, ...] | list[CatalogEnt
     return effort in CATALOG_EFFORT_RANKS or any(entry.effort == effort for entry in entries)
 
 
-def _consult_only_satisfied(profile: str, *, operator_request: bool, purpose: str | None) -> bool:
+def _consult_only_satisfied(profile: str, *, operator_request: bool | str, purpose: str | None) -> bool:
     """Whether a ``consult_only`` row may proceed.
 
     An explicit operator request always satisfies it. For an **astra** identity
@@ -560,11 +562,15 @@ def _consult_only_satisfied(profile: str, *, operator_request: bool, purpose: st
     escalation gate, and a purpose string must never become a second key to it.
     """
 
+    if profile in ASTRA_ROLE_PROFILES and (
+        profile in ASTRA_FORBIDDEN_SEATS or (purpose or "").strip().casefold() == "round-extension"
+    ):
+        return astra_purpose_allowed(profile, purpose, operator_request)
     if operator_request:
         return True
     if profile not in ASTRA_ROLE_PROFILES:
         return False
-    return (purpose or "").strip().casefold() in ASTRA_ALLOWED_PURPOSES
+    return astra_purpose_allowed(profile, purpose)
 
 
 def _retired_rung(view: CatalogView, profile: str, effort: str) -> bool:
@@ -599,7 +605,7 @@ def resolve_launch(
     profile: str,
     *,
     effort: str | None = None,
-    operator_request: bool = False,
+    operator_request: bool | str = False,
     purpose: str | None = None,
     path: str | None = None,
     view: CatalogView | None = None,
@@ -624,6 +630,16 @@ def resolve_launch(
     if barred_model_id:
         raise LaunchError(
             f"profile '{profile}' refused: {barred_model_id} is barred by {BARRED_MODEL_DECISION_REF}"
+        )
+
+    if (
+        profile in ASTRA_ROLE_PROFILES
+        and (profile in ASTRA_FORBIDDEN_SEATS or (purpose or "").strip().casefold() == "round-extension")
+        and not astra_purpose_allowed(profile, purpose, operator_request)
+    ):
+        raise LaunchError(
+            f"role_restricted: {profile}: round-extension requires a round-ext document ref; "
+            "builder/captain astra forbidden"
         )
 
     view = read_catalog(path=path) if view is None else view
@@ -784,7 +800,7 @@ def resolve_launch(
         catalog_source=CATALOG_SOURCE_SNAPSHOT if from_snapshot else view.source,
         catalog_stale=view.stale or from_snapshot,
         catalog_age_s=view.age_s,
-        operator_request=operator_request,
+        operator_request=bool(operator_request),
         e6_arm=opened_arm,
         billing=_bundled_billing(canonical),
         family=provider_family(canonical),
