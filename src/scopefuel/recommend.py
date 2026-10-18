@@ -435,6 +435,19 @@ DEVIN_SWE2_MAX_GRADE_ANNOTATION = (
 DEVIN_FUSION_ANNOTATION = (
     "미측정(유료 Devin fusion 레인 · Claude 패밀리 · pool devin · hk 1382 첫 reps 대기 · #1380)"
 )
+# #1620 (operator decision hk:doc owner/fleet/decision/2026-10-18/devin-argon-trial,
+# phase 1, approved by operator-desk 10-18 r1018b953go): the Devin PAID Argon
+# trial lane — spawn plumbing only. The Argon rows serve Gemini models under
+# the hood (provider family google — never anthropic, never the devin-swe2
+# family) while the spend bills the devin pool (the Devin Pro account
+# Daily/Weekly axes, never a SWE-2 Free model-scope bucket), so billing is
+# paid. No rep evidence exists — director-1 runs 2 tester/checker reps before
+# 10-27 — and the operator placed no grade, so the rows are gate-able catalog
+# rows (launch.UNGRADED_TRIAL_SNAPSHOT) that never enter GRADE_TABLE:
+# --recommend never offers them and gate -m judges them on the account axis.
+DEVIN_ARGON_ANNOTATION = (
+    "미측정(유료 Devin Argon 레인 · Gemini/google 패밀리 · pool devin · trial reps 대기 · phase 1 · hk 1620)"
+)
 
 # task210: Upstage Solar Pro 4, AA Intelligence Index 42(모델지수, 08-06 발표) —
 # opencode 하네스 AA-agent 실측 없음. 환각률 24%로 reps 3건 전까지 tester 투입 금지.
@@ -511,6 +524,62 @@ def _devin_fusion_sonnet55_profile() -> Profile:
         benchmark_annotation=DEVIN_FUSION_ANNOTATION,
         billing="paid",
     )
+
+
+def _devin_argon_profile() -> Profile:
+    """Canonical devin-argon row — ungraded phase-1 trial lane (hk 1620).
+
+    Launch id ``gemini-4-argon-high`` (devin models list 10-18 — Gemini 4
+    Argon High, $1 / 1M input). devin-argon is the high rung, the same
+    default shape devin-swe2 -> swe-2 (high) follows.
+    """
+
+    return Profile(
+        "devin-argon",
+        "Gemini 4 Argon (high)",
+        None,
+        benchmark_annotation=DEVIN_ARGON_ANNOTATION,
+        billing="paid",
+    )
+
+
+def _devin_argon_medium_profile() -> Profile:
+    """Canonical devin-argon-medium row — ``gemini-4-argon-medium``, $1 / 1M."""
+
+    return Profile(
+        "devin-argon-medium",
+        "Gemini 4 Argon (medium)",
+        None,
+        benchmark_annotation=DEVIN_ARGON_ANNOTATION,
+        billing="paid",
+    )
+
+
+def _devin_argon_low_profile() -> Profile:
+    """Canonical devin-argon-low row — ``gemini-4-argon-low``, $1 / 1M."""
+
+    return Profile(
+        "devin-argon-low",
+        "Gemini 4 Argon (low)",
+        None,
+        benchmark_annotation=DEVIN_ARGON_ANNOTATION,
+        billing="paid",
+    )
+
+
+# #1620 phase 1: gate-able profiles that carry no grade placement. Each is a
+# catalog row via launch.UNGRADED_TRIAL_SNAPSHOT (so `policy launch` resolves
+# the model id and `gate -m` judges the devin pool's account Daily/Weekly on
+# the D3 not-in-table path), but none is in GRADE_TABLE — --recommend never
+# offers them, and bench._catalog_grade_table skips their rows so a seeded
+# canon cannot make them candidates either. Worker/tester-only spellings on
+# the wrk side; no builder seat exists.
+UNGRADED_TRIAL_PROFILES: tuple[Profile, ...] = (
+    _devin_argon_profile(),
+    _devin_argon_medium_profile(),
+    _devin_argon_low_profile(),
+)
+UNGRADED_TRIAL_PROFILE_NAMES: frozenset[str] = frozenset(profile.name for profile in UNGRADED_TRIAL_PROFILES)
 
 
 def _profile_actual_harness(profile: Profile) -> str | None:
@@ -2015,9 +2084,14 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
 # claude rows get from profile_pool — the spend stays Devin credits while the
 # model being measured is Claude. cognition is deliberately NOT a family: it
 # is Cognition's brand, not a tester-ratable model vendor.
+# #1620: the paid Argon trial rungs serve Gemini models — family "google"
+# (never anthropic, never the devin-swe2 family), pool still devin.
 PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
     "devin-fusion-opus55": "claude",
     "devin-fusion-sonnet55": "claude",
+    "devin-argon": "google",
+    "devin-argon-medium": "google",
+    "devin-argon-low": "google",
 }
 
 
@@ -2028,9 +2102,10 @@ def provider_family(profile: str) -> str:
     provider id verbatim (devin-ds41 -> "devin" though the model is DeepSeek,
     kiro-opus -> "kiro", oc-sonnet46 -> "agy") — it is NOT a per-model vendor
     lookup. ``PROVIDER_FAMILY_OVERRIDES`` names the only exceptions where the
-    underlying model vendor is known to diverge from the pool: today only the
-    paid devin fusion rungs, which serve Claude models (family "claude") while
-    the spend stays Devin credits.
+    underlying model vendor is known to diverge from the pool: the paid devin
+    fusion rungs, which serve Claude models (family "claude"), and the paid
+    devin Argon trial rungs, which serve Gemini models (family "google") —
+    both while the spend stays Devin credits.
     """
 
     canonical = PROFILE_ALIASES.get(profile, profile)

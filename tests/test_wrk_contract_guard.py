@@ -142,6 +142,11 @@ WRK_CATALOG_EXEMPT: dict[str, str] = {
     # both sides so the two repos' drift guard stays a byte comparison.
     "devin-fusion-opus55": "fixed argv; #1380 paid fusion rung (family claude, pool devin)",
     "devin-fusion-sonnet55": "fixed argv; #1380 paid fusion rung (family claude, pool devin)",
+    # #1620 part B (agent-skills) keeps these fixed-argv too — same names on
+    # both sides so the two repos' drift guard stays a byte comparison.
+    "devin-argon": "fixed argv; #1620 paid Argon rung (family google, pool devin)",
+    "devin-argon-medium": "fixed argv; #1620 paid Argon rung (family google, pool devin)",
+    "devin-argon-low": "fixed argv; #1620 paid Argon rung (family google, pool devin)",
     "cc-dsflash": "experimental alias; the CLI is given the alias, not a model id",
     "cc-dspro": "ditto",
     "cc-glm53": "ditto",
