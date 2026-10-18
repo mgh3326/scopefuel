@@ -1798,7 +1798,27 @@ ASTRA_FORBIDDEN_SEATS = frozenset({"builder-astra", "captain-astra"})
 
 # hk 1632: the verified document reference is the key, never the purpose alone.
 # wrk verifies existence and binds the final job component to --parent-job.
-ROUND_EXT_REF = re.compile(r"^hk:doc/(?:round-extension|round-ext|[a-z0-9-]+/round-ext)/[A-Za-z0-9._-]+$")
+OPERATOR_REQUEST_REF_MAX = 128
+_OPERATOR_REQUEST_DOC_SEGMENT_PATTERN = r"[a-z0-9][a-z0-9._-]*"
+_OPERATOR_REQUEST_DOC_SEGMENT_RE = re.compile(_OPERATOR_REQUEST_DOC_SEGMENT_PATTERN)
+ROUND_EXT_REF = re.compile(
+    rf"(?=.{{1,{OPERATOR_REQUEST_REF_MAX}}}\Z)hk:doc/"
+    rf"(?:round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/"
+    rf"{_OPERATOR_REQUEST_DOC_SEGMENT_PATTERN}\Z"
+)
+
+
+def round_ext_role_allowed(profile: str, role: str | None, purpose: str | None, ref: object) -> bool:
+    """Tester/reviewer seats cannot reuse the ordinary counsel-purpose grant."""
+    return (
+        profile not in ASTRA_ROLE_PROFILES | {"fable", "claude-fable-5-1"}
+        or (role or "").strip().casefold() not in {"tester", "reviewer"}
+        or (
+            (purpose or "").strip().casefold() == "round-extension"
+            and isinstance(ref, str)
+            and ROUND_EXT_REF.fullmatch(ref) is not None
+        )
+    )
 
 
 def astra_purpose_allowed(profile: str, purpose: str | None, ref: object = None) -> bool:
@@ -3073,8 +3093,6 @@ _ESCALATION_SKIPS_QUOTA_CHECK = frozenset({"oc-omni"})
 # --operator-request 는 durable 참조만 받는다: ``hk:doc/<key>`` 또는
 # ``hk:task/<정수>``. 자유 텍스트·경로 탐색·허용 문자 밖 입력은 전부 거부한다.
 # 이 경로는 감사 가능한 "주장"을 기록할 뿐 신원이나 동의를 증명하지 않는다.
-OPERATOR_REQUEST_REF_MAX = 128
-_OPERATOR_REQUEST_DOC_SEGMENT_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _OPERATOR_REQUEST_TASK_RE = re.compile(r"[0-9]{1,10}")
 _REQUESTED_BY_MAX = 64
 _REQUESTED_BY_RE = re.compile(r"\S+")
@@ -3290,6 +3308,7 @@ def gate_check(
     operator_request: str | None = None,
     requested_by: str | None = None,
     purpose: str | None = None,
+    role: str | None = None,
     effort: str | None = None,
     e6_arm: str | None = None,
     retired_rungs: frozenset[tuple[str, str]] | None = None,
@@ -3357,17 +3376,18 @@ def gate_check(
     # "astra" 가 든 무관 프로필은 여기에 걸리지 않는다. 허용 용도가 아니면 쿼타
     # 상태와 무관하게 역할 거부(role_denied → CLI exit 5) — 쿼타 거부(exit 3)와
     # 같은 rc 로 나가면 호출자가 "쿼타 소진"으로 오독한다(ARCHITECT.md:6 결함).
-    if profile_name in ASTRA_ROLE_PROFILES and not astra_purpose_allowed(
-        profile_name, purpose, operator_request
+    if not round_ext_role_allowed(profile_name, role, purpose, operator_request) or (
+        profile_name in ASTRA_ROLE_PROFILES
+        and not astra_purpose_allowed(profile_name, purpose, operator_request)
     ):
         shown = purpose.strip() if purpose and purpose.strip() else "미지정"
         return GateResult(
             ok=False,
             profile=profile_name,
-            provider_id="codex",
+            provider_id="claude" if profile_name in {"fable", "claude-fable-5-1"} else "codex",
             grade=None,
             reason=(
-                f"role_restricted: {profile_name} — astra 는 허용 용도 전용 "
+                f"role_restricted: {profile_name} — tester/reviewer requires round-extension with ref; "
                 f"({', '.join(sorted(ASTRA_ALLOWED_PURPOSES))}, round-extension + round-ext ref); "
                 f"purpose={shown}"
             ),

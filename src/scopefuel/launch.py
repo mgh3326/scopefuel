@@ -54,6 +54,7 @@ from .recommend import (
     profile_pool,
     profile_subscription,
     provider_family,
+    round_ext_role_allowed,
 )
 
 GATE_DEFAULT = "default"
@@ -607,6 +608,7 @@ def resolve_launch(
     effort: str | None = None,
     operator_request: bool | str = False,
     purpose: str | None = None,
+    role: str | None = None,
     path: str | None = None,
     view: CatalogView | None = None,
     e6_arm: str | None = None,
@@ -630,6 +632,11 @@ def resolve_launch(
     if barred_model_id:
         raise LaunchError(
             f"profile '{profile}' refused: {barred_model_id} is barred by {BARRED_MODEL_DECISION_REF}"
+        )
+
+    if not round_ext_role_allowed(profile, role, purpose, operator_request):
+        raise LaunchError(
+            "role_restricted: astra/fable tester/reviewer requires round-extension + round-ext ref"
         )
 
     if (
