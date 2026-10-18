@@ -208,9 +208,15 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     launch_parser.add_argument("--json", action="store_true", help="JSON 한 줄로 출력")
     launch_parser.add_argument(
+        "--role", help="spawn seat; astra/fable tester/reviewer requires round-extension REF"
+    )
+    launch_parser.add_argument(
         "--operator-request",
-        action="store_true",
-        help="운영자 명시 요청 — consult_only 및 stale 상태의 비-default gate 에 필요",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REF",
+        help="운영자 명시 요청 — round-extension은 hk:doc round-ext REF 필수; 기존 bare flag도 허용",
     )
     launch_parser.add_argument(
         "--purpose",
@@ -496,6 +502,9 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     gate_parser.add_argument(
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
+    )
+    gate_parser.add_argument(
+        "--role", help="spawn seat; astra/fable tester/reviewer requires round-extension REF"
     )
     gate_parser.add_argument(
         "--purpose",
@@ -962,6 +971,7 @@ def _gate_args(args: argparse.Namespace) -> dict:
         "operator_request": args.operator_request,
         "requested_by": args.requested_by,
         "purpose": args.purpose,
+        "role": args.role,
     }
 
 
@@ -1353,8 +1363,9 @@ def _policy_launch_command(args: argparse.Namespace) -> int:
         decision = launch.resolve_launch(
             args.profile,
             effort=args.effort,
-            operator_request=bool(args.operator_request),
+            operator_request=args.operator_request,
             purpose=getattr(args, "purpose", None),
+            role=getattr(args, "role", None),
             e6_arm=_e6_arm_marker(),
         )
     except launch.LaunchError as exc:
