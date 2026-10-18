@@ -496,6 +496,7 @@ def evaluate(
     operator_request: str | None = None,
     requested_by: str | None = None,
     purpose: str | None = None,
+    role: str | None = None,
 ) -> Evaluation:
     """§6 + §6G for the provider of `profile` (or the snapshot's single provider)."""
     if not isinstance(snapshot, Mapping) or snapshot.get("schema") != SNAPSHOT_SCHEMA:
@@ -538,6 +539,7 @@ def evaluate(
         operator_request=operator_request,
         requested_by=requested_by,
         purpose=purpose,
+        role=role,
     )
     if gate.ok:
         code = "STALE_ACCEPTED" if outcome.kind == "stale" else "OK"

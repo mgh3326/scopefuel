@@ -191,9 +191,11 @@ def test_unenrolled_node_writes_no_v2_state(slot_env, monkeypatch, capsys):
     assert not quota_v2.v2_dir().exists()
 
 
-def test_enrolled_gate_records_and_shadows(slot_env, monkeypatch, capsys):
+@pytest.mark.parametrize("role", [None, "counsel"])
+def test_enrolled_gate_records_and_shadows(slot_env, monkeypatch, capsys, role):
     enroll(slot_env)
-    rc, _out, _err = run_gate(monkeypatch, capsys, claude_fetch(), "--no-cache")
+    seat = ("--role", role) if role else ()
+    rc, _out, _err = run_gate(monkeypatch, capsys, claude_fetch(), "--no-cache", *seat)
     assert rc == 0
     rows = quota_v2.account_observations("claude", ACCOUNT_A)
     assert len(rows) == 1 and valid_stored(rows[0]) and rows[0]["status"] == "success"
@@ -201,6 +203,29 @@ def test_enrolled_gate_records_and_shadows(slot_env, monkeypatch, capsys):
     record = shadow_records()[-1]
     assert record["v2"]["code"] == "OK" and record["match"] is True
     assert record["clock"] == {"skew_bound_s": None, "source": "unknown"}
+
+
+@pytest.mark.parametrize(
+    "purpose,ref,expected,code",
+    [("architect", None, 5, "ROLE_DENIED"), ("round-extension", "hk:doc/round-ext/job", 0, "OK")],
+)
+def test_round_extension_role_shadow_keeps_gate_verdict(
+    slot_env, monkeypatch, capsys, purpose, ref, expected, code
+):
+    enroll(slot_env)
+    monkeypatch.setattr(cli, "registry", lambda: {"claude": claude_fetch()})
+    monkeypatch.setattr(bench, "read_scores", lambda: None)
+    args = ["gate", "-m", "fable", "--role", "tester", "--purpose", purpose, "--no-cache"]
+    if ref:
+        args += ["--operator-request", ref]
+    assert cli.main(args) == expected
+    capsys.readouterr()
+    record = shadow_records()[-1]
+    assert record["v2"]["code"] == code
+    assert record["v2"]["exit_code"] == record["legacy"]["exit_code"] == expected
+    assert record["v2"]["role_denied"] == record["legacy"]["role_denied"] == (expected == 5)
+    if expected == 0:
+        assert record["match"] is True
 
 
 # ------------------------------------------------------------------ identity and binding
