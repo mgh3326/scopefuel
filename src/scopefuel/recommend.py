@@ -1816,8 +1816,6 @@ def round_ext_role_allowed(profile: str, role: str | None, purpose: str | None, 
     normalized = (purpose or "").strip().casefold()
     if profile in ASTRA_FORBIDDEN_SEATS or seat in {"worker", "captain"}:
         return False
-    if normalized in {"builder", "worker", "captain"}:
-        return False
     if seat not in {"builder", "tester", "reviewer"}:
         return True
     return (

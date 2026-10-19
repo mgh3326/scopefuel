@@ -405,3 +405,19 @@ def test_ordinary_defaults_and_recommendations_byte_identical_to_base():
         )
         assert actual.encode() == expected.encode(), grade
         assert not any(name in actual for name in ("codex-astra", "fable", "builder-astra", "builder-fable"))
+
+
+def test_ordinary_purpose_only_refusal_keeps_consult_diagnostics():
+    for profile in ("codex-astra", "fable"):
+        for purpose in ("builder", "worker", "captain"):
+            result = recommend.gate_check(
+                _healthy_s_plus_providers(),
+                profile,
+                today=TODAY,
+                now=NOW,
+                purpose=purpose,
+            )
+            assert not result.ok
+            assert result.role_denied if profile == "codex-astra" else "consult_only" in result.reason
+            with pytest.raises(launch.LaunchError, match="consult_only"):
+                launch.resolve_launch(profile, purpose=purpose)
