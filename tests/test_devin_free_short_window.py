@@ -821,6 +821,150 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.assertIn("free_rate_limited", stderr.getvalue())
         self.assertNotIn("정상 후보 전부 소진/측정불가", stderr.getvalue())
 
+    def call_clear(self, *extra):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = cli.main(["observe", "devin-free-limit", "--clear", *extra])
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def test_clear_removes_live_record_and_gate_matches_no_record(self):
+        self.freeze_cli()
+        self.freeze_free_window()
+        self.gate_stubs()
+        baseline = {profile: self.call_gate(profile) for profile in FREE_PROFILES}
+        record = free_window.FreeLimitRecord(
+            FIXED_NOW + dt.timedelta(minutes=45),
+            FIXED_NOW - dt.timedelta(minutes=5),
+            "devin-swe2-medium",
+            "job:clear-me",
+        )
+        self.seed_record(record)
+        self.assertEqual(self.call_gate("devin-swe2")[0], 3)
+        identity = free_window._identity_key()
+
+        rc, stdout, stderr = self.call_clear()
+        self.assertEqual(rc, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("2026-10-19T08:45:00Z", stdout)
+        self.assertIn("2026-10-19T07:55:00Z", stdout)
+        self.assertIn("job:clear-me", stdout)
+        self.assertIn("devin-swe2-medium", stdout)
+        self.assertNotIn(identity, stdout)
+        self.assertNotIn("host-user-", stdout)
+        self.assertNotIn("account-", stdout)
+        self.assertIsNone(free_window.active_record(now=FIXED_NOW))
+        self.assertEqual(json.loads(free_window.state_path().read_text())["records"], {})
+        for profile in FREE_PROFILES:
+            self.assertEqual(self.call_gate(profile), baseline[profile], profile)
+
+    def test_clear_with_no_record_or_only_expired_exits_zero(self):
+        self.freeze_free_window()
+        rc, stdout, stderr = self.call_clear()
+        self.assertEqual(rc, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("no live", stdout)
+        self.assertFalse(free_window.state_path().exists())
+
+        expired = free_window.FreeLimitRecord(
+            FIXED_NOW - dt.timedelta(minutes=5),
+            FIXED_NOW - dt.timedelta(minutes=55),
+            "devin-swe2",
+            "job:already-expired",
+        )
+        self.seed_record(expired)
+        rc, stdout, _ = self.call_clear()
+        self.assertEqual(rc, 0)
+        self.assertIn("no live", stdout)
+        self.assertEqual(json.loads(free_window.state_path().read_text())["records"], {})
+
+    def test_clear_account_key_and_field_validation(self):
+        self.freeze_free_window()
+        key = "host-user-" + "ab" * 16
+        other = free_window.FreeLimitRecord(
+            FIXED_NOW + dt.timedelta(minutes=45),
+            FIXED_NOW - dt.timedelta(minutes=5),
+            "devin-swe2",
+            "job:other-host",
+        )
+        path = free_window.state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"schema": free_window.SCHEMA, "records": {key: other.as_dict()}}),
+            encoding="utf-8",
+        )
+        rc, stdout, _ = self.call_clear()
+        self.assertEqual(rc, 0)
+        self.assertIn("no live", stdout)
+        self.assertEqual(json.loads(path.read_text())["records"], {key: other.as_dict()})
+        rc, stdout, _ = self.call_clear("--account-key", key)
+        self.assertEqual(rc, 0)
+        self.assertIn("job:other-host", stdout)
+        self.assertNotIn(key, stdout)
+        self.assertEqual(json.loads(path.read_text())["records"], {})
+
+        rc, _, stderr = self.call_clear("--account-key", "bogus")
+        self.assertEqual(rc, 2)
+        self.assertNotEqual(stderr, "")
+
+    def test_clear_rejects_mixed_flags_and_missing_fields(self):
+        for argv, fragment in (
+            (["observe", "devin-free-limit", "--clear", "--reset", "2026-10-19T09:00:00Z"], "--clear"),
+            (
+                [
+                    "observe",
+                    "devin-free-limit",
+                    "--clear",
+                    "--account-key",
+                    "host-user-" + "ab" * 16,
+                    "--rung",
+                    "devin-swe2",
+                ],
+                "--clear",
+            ),
+            (["observe", "devin-free-limit", "--account-key", "host-user-" + "ab" * 16], "--account-key"),
+            (["observe", "devin-free-limit", "--reset", "2026-10-19T09:00:00Z"], "required"),
+        ):
+            with self.subTest(argv=argv):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    cli.main(argv)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(fragment, stderr.getvalue())
+
+    def test_concurrent_clear_and_observe_leave_valid_state(self):
+        self.freeze_free_window()
+        record = free_window.FreeLimitRecord(
+            FIXED_NOW + dt.timedelta(minutes=45),
+            FIXED_NOW - dt.timedelta(minutes=5),
+            "devin-swe2",
+            "job:racy",
+        )
+        self.seed_record(record)
+
+        def write(index):
+            observed = FIXED_NOW - dt.timedelta(minutes=index)
+            return free_window.record_observation(
+                reset=free_window.format_utc(FIXED_NOW + dt.timedelta(minutes=50)),
+                observed=free_window.format_utc(observed),
+                rung="devin-swe2",
+                source=f"job:racy-{index}",
+                now=FIXED_NOW,
+            )
+
+        def clear(index):
+            return free_window.clear_hold(now=FIXED_NOW)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda i: write(i) if i % 2 else clear(i), range(16)))
+        payload = json.loads(free_window.state_path().read_text())
+        self.assertEqual(payload["schema"], free_window.SCHEMA)
+        record = free_window.active_record(now=FIXED_NOW)
+        self.assertEqual(list(payload["records"]), [] if record is None else [free_window._identity_key()])
+
     def test_json_and_table_add_short_window_without_changing_used_pct(self):
         self.freeze_cli()
         self.patcher.setattr(cli, "_stale_build_verdict", lambda: None)
