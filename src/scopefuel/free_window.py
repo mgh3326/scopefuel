@@ -22,9 +22,9 @@ import pathlib
 import re
 import socket
 import tempfile
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from typing import Iterator
 
 from . import cache
 
@@ -161,8 +161,10 @@ def _load_records(*, warn: bool = True) -> dict[str, FreeLimitRecord]:
         if warn:
             _LOG.warning("ignoring corrupt Devin free-window state: %s", exc)
         return {}
-    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA or not isinstance(
-        payload.get("records"), dict
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != SCHEMA
+        or not isinstance(payload.get("records"), dict)
     ):
         if warn:
             _LOG.warning("ignoring corrupt Devin free-window state: invalid schema")
@@ -216,14 +218,10 @@ def _save_records(records: dict[str, FreeLimitRecord]) -> None:
         finally:
             os.close(directory_fd)
     except BaseException:
-        try:
+        with suppress(OSError):
             os.close(fd)
-        except OSError:
-            pass
-        try:
+        with suppress(OSError):
             os.unlink(temporary)
-        except OSError:
-            pass
         raise
 
 

@@ -555,9 +555,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "observe", help="기존 Devin worker pane의 SWE-2 free 단기 제한 관측 저장"
     )
     observe_sub = observe_parser.add_subparsers(dest="observe_command", required=True)
-    observe_free = observe_sub.add_parser(
-        "devin-free-limit", help="Devin SWE-2 free short-window reset 기록"
-    )
+    observe_free = observe_sub.add_parser("devin-free-limit", help="Devin SWE-2 free short-window reset 기록")
     observe_free.add_argument("--reset", required=True, help="timezone-aware ISO-8601 reset time")
     observe_free.add_argument("--observed", required=True, help="timezone-aware ISO-8601 observation time")
     observe_free.add_argument("--rung", required=True, help="Devin SWE-2 free profile UID")

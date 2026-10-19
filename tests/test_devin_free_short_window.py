@@ -4,7 +4,6 @@ import contextlib
 import datetime as dt
 import io
 import json
-import logging
 import os
 import tempfile
 import unittest
@@ -15,7 +14,7 @@ from types import SimpleNamespace
 from scopefuel import cli, free_window, recommend
 from scopefuel.model import Bucket, ProviderResult, Scope
 
-UTC = dt.timezone.utc
+UTC = dt.UTC
 FIXED_NOW = dt.datetime(2026, 10, 19, 8, 0, tzinfo=UTC)
 FREE_PROFILES = (
     "devin-swe2",
@@ -49,16 +48,12 @@ class Patcher:
         old = os.environ.get(name)
         os.environ[name] = value
         self.undo.append(
-            lambda: os.environ.__setitem__(name, old)
-            if old is not None
-            else os.environ.pop(name, None)
+            lambda: os.environ.__setitem__(name, old) if old is not None else os.environ.pop(name, None)
         )
 
     def delenv(self, name):
         old = os.environ.pop(name, None)
-        self.undo.append(
-            lambda: os.environ.__setitem__(name, old) if old is not None else None
-        )
+        self.undo.append(lambda: os.environ.__setitem__(name, old) if old is not None else None)
 
     def restore(self):
         for action in reversed(self.undo):
@@ -238,9 +233,12 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{broken", encoding="utf-8")
         stdout, stderr = io.StringIO(), io.StringIO()
-        with self.assertLogs("scopefuel.free_window", level="WARNING") as records:
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+        with (
+            self.assertLogs("scopefuel.free_window", level="WARNING") as records,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
         self.assertEqual(rc, 0)
         self.assertNotIn("free_rate_limited", stdout.getvalue() + stderr.getvalue())
         self.assertIn("corrupt Devin free-window state", "\n".join(records.output))
@@ -314,9 +312,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
 
     def _recommend_setup(self):
         profile_by_name = {
-            profile.name: profile
-            for rows in recommend.GRADE_TABLE.values()
-            for profile in rows
+            profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows
         }
         custom_table = {grade: [] for grade in recommend.GRADE_TABLE}
         custom_table["A+"] = [profile_by_name[name] for name in FREE_PROFILES[:3]] + [
@@ -326,9 +322,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             _devin_result(),
             ProviderResult(
                 id="codex",
-                buckets=[
-                    Bucket("week", "7d", 10.0, "2026-10-26T08:00:00Z", Scope("account"), "week")
-                ],
+                buckets=[Bucket("week", "7d", 10.0, "2026-10-26T08:00:00Z", Scope("account"), "week")],
                 pool_class="preserve",
             ),
         ]
@@ -336,9 +330,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
 
     def test_recommend_demotes_free_rows_and_drops_them_without_an_alternative(self):
         profile_by_name = {
-            profile.name: profile
-            for rows in recommend.GRADE_TABLE.values()
-            for profile in rows
+            profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows
         }
         custom_table = {grade: [] for grade in recommend.GRADE_TABLE}
         custom_table["A+"] = [profile_by_name[name] for name in FREE_PROFILES[:3]] + [
@@ -348,13 +340,14 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             _devin_result(),
             ProviderResult(
                 id="codex",
-                buckets=[
-                    Bucket("week", "7d", 10.0, "2026-10-26T08:00:00Z", Scope("account"), "week")
-                ],
+                buckets=[Bucket("week", "7d", 10.0, "2026-10-26T08:00:00Z", Scope("account"), "week")],
                 pool_class="preserve",
             ),
         ]
-        reason = "free_rate_limited until 2026-10-19T08:45:00Z (observed 2026-10-19T07:55:00Z via job:known-limit; rung devin-swe2)"
+        reason = (
+            "free_rate_limited until 2026-10-19T08:45:00Z "
+            "(observed 2026-10-19T07:55:00Z via job:known-limit; rung devin-swe2)"
+        )
         base = recommend.recommend_dict(
             providers, "A+", today=FIXED_NOW.date(), now=FIXED_NOW, grade_table=custom_table
         )

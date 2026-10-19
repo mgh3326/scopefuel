@@ -152,7 +152,8 @@ def table(
             horizon = {"now": "now ", "week": "week", "month": "month"}[bucket.horizon]
             lines.append(
                 f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>11}"
-                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket, now=now)}{tag_s}{short_window}"
+                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket, now=now)}"
+                f"{tag_s}{short_window}"
             )
 
         for bucket in verdict.exhausted:
