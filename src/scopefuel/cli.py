@@ -208,7 +208,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     launch_parser.add_argument("--json", action="store_true", help="JSON 한 줄로 출력")
     launch_parser.add_argument(
-        "--role", help="spawn seat; astra/fable tester/reviewer requires round-extension REF"
+        "--role", help="spawn seat; astra/fable builder/tester/reviewer requires round-extension REF"
     )
     launch_parser.add_argument(
         "--operator-request",
@@ -504,7 +504,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
     )
     gate_parser.add_argument(
-        "--role", help="spawn seat; astra/fable tester/reviewer requires round-extension REF"
+        "--role", help="spawn seat; astra/fable builder/tester/reviewer requires round-extension REF"
     )
     gate_parser.add_argument(
         "--purpose",

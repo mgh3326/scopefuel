@@ -1,11 +1,29 @@
 """hk 1632: a round-extension reference is the key, never a purpose string."""
 
 import json
+from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 from test_gate import NOW, TODAY, _healthy_s_plus_providers, _result
 
 from scopefuel import cli, launch, recommend
+from scopefuel.bench import CATALOG_SOURCE_SNAPSHOT, CatalogView
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    for name in (
+        "HOME",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+    ):
+        monkeypatch.setenv(name, str(tmp_path / name))
+
 
 REFS = [
     "hk:doc/round-extension/b1632-sol",
@@ -289,3 +307,154 @@ def test_gate_audit_keeps_purpose_and_ref(monkeypatch, tmp_path):
     record = json.loads(path.read_text())
     assert record["purpose"] == "round-extension"
     assert record["operator_request_ref"] == REFS[0]
+
+
+@pytest.mark.parametrize("profile", ["codex-astra", "fable"])
+@pytest.mark.parametrize("ref", REFS)
+def test_builder_requires_exact_purpose_and_reference(profile, ref, capsys):
+    result = recommend.gate_check(
+        _healthy_s_plus_providers(),
+        profile,
+        today=TODAY,
+        now=NOW,
+        role="builder",
+        purpose="round-extension",
+        operator_request=ref,
+    )
+    assert result.ok and not result.role_denied
+    assert (
+        cli.main(
+            [
+                "policy",
+                "launch",
+                profile,
+                "--role",
+                "builder",
+                "--purpose",
+                "round-extension",
+                "--operator-request",
+                ref,
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("round_extension_builder") == {
+        "policy": "hk1672/v1",
+        "profile": profile,
+        "role": "builder",
+        "purpose": "round-extension",
+        "ref": ref,
+    }
+    assert payload["model_id"] == {"codex-astra": "gpt-6-astra", "fable": "claude-fable-5-1"}[profile]
+    assert payload["effort"] == ("xhigh" if profile == "codex-astra" else "")
+
+
+@pytest.mark.parametrize("profile", ["codex-astra", "fable"])
+@pytest.mark.parametrize(
+    "purpose",
+    [None, "builder", "director", "architect", "operator-request", "round-extension", " Round-Extension "],
+)
+@pytest.mark.parametrize("ref", [None, True, "hk:doc/ordinary/request", REFS[0]])
+def test_builder_counsel_purposes_never_unlock(profile, purpose, ref):
+    if purpose == "round-extension" and ref == REFS[0]:
+        return
+    result = recommend.gate_check(
+        _healthy_s_plus_providers(),
+        profile,
+        today=TODAY,
+        now=NOW,
+        role="builder",
+        purpose=purpose,
+        operator_request=ref,
+    )
+    assert result.role_denied
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch(profile, role="builder", purpose=purpose, operator_request=ref or False)
+
+
+@pytest.mark.parametrize("profile", ["codex-astra", "fable"])
+@pytest.mark.parametrize("role", ["worker", "captain"])
+@pytest.mark.parametrize("purpose", [None, "director", "architect", "operator-request", "round-extension"])
+@pytest.mark.parametrize("ref", [None, "hk:doc/ordinary/request", REFS[0]])
+def test_worker_and_captain_roles_always_denied(profile, role, purpose, ref):
+    result = recommend.gate_check(
+        _healthy_s_plus_providers(),
+        profile,
+        today=TODAY,
+        now=NOW,
+        role=role,
+        purpose=purpose,
+        operator_request=ref,
+    )
+    assert result.role_denied
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch(profile, role=role, purpose=purpose, operator_request=ref or False)
+
+
+@pytest.mark.parametrize("profile", ["gpt-6-astra", "claude-fable-5-1"])
+@pytest.mark.parametrize("ref", REFS)
+def test_builder_model_id_spellings_never_unlock(profile, ref):
+    result = recommend.gate_check(
+        _healthy_s_plus_providers(),
+        profile,
+        today=TODAY,
+        now=NOW,
+        role="builder",
+        purpose="round-extension",
+        operator_request=ref,
+    )
+    assert result.role_denied
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch(profile, role="builder", purpose="round-extension", operator_request=ref)
+
+
+def test_ordinary_defaults_and_recommendations_byte_identical_to_base():
+    baseline = json.loads((Path(__file__).parent / "fixtures/round_extension_ordinary.json").read_text())
+    view = CatalogView(entries=launch.snapshot_entries(), source=CATALOG_SOURCE_SNAPSHOT)
+    for profile, expected in baseline["launch"].items():
+        actual = json.dumps(
+            asdict(
+                launch.resolve_launch(
+                    profile.split("@")[0], effort=profile.split("@")[1] if "@" in profile else None, view=view
+                )
+            ),
+            sort_keys=True,
+        )
+        assert actual.encode() == json.dumps(expected, sort_keys=True).encode(), profile
+        decision = launch.resolve_launch(
+            profile.split("@")[0],
+            effort=profile.split("@")[1] if "@" in profile else None,
+            view=view,
+        )
+        assert (
+            json.dumps(decision.as_dict(), sort_keys=True).encode()
+            == json.dumps(
+                baseline["launch_wire"][profile],
+                sort_keys=True,
+            ).encode()
+        ), profile
+        assert decision.render().encode() == baseline["launch_text"][profile].encode(), profile
+    for grade, expected in baseline["recommend"].items():
+        actual = recommend.recommend(
+            _healthy_s_plus_providers(), grade, today=TODAY, now=NOW, bench_scores=[]
+        )
+        assert actual.encode() == expected.encode(), grade
+        assert not any(name in actual for name in ("codex-astra", "fable", "builder-astra", "builder-fable"))
+
+
+def test_ordinary_purpose_only_refusal_keeps_consult_diagnostics():
+    for profile in ("codex-astra", "fable"):
+        for purpose in ("builder", "worker", "captain"):
+            result = recommend.gate_check(
+                _healthy_s_plus_providers(),
+                profile,
+                today=TODAY,
+                now=NOW,
+                purpose=purpose,
+            )
+            assert not result.ok
+            assert result.role_denied if profile == "codex-astra" else "consult_only" in result.reason
+            with pytest.raises(launch.LaunchError, match="consult_only"):
+                launch.resolve_launch(profile, purpose=purpose)
