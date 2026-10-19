@@ -393,6 +393,23 @@ def test_worker_and_captain_roles_always_denied(profile, role, purpose, ref):
         launch.resolve_launch(profile, role=role, purpose=purpose, operator_request=ref or False)
 
 
+@pytest.mark.parametrize("profile", ["gpt-6-astra", "claude-fable-5-1"])
+@pytest.mark.parametrize("ref", REFS)
+def test_builder_model_id_spellings_never_unlock(profile, ref):
+    result = recommend.gate_check(
+        _healthy_s_plus_providers(),
+        profile,
+        today=TODAY,
+        now=NOW,
+        role="builder",
+        purpose="round-extension",
+        operator_request=ref,
+    )
+    assert result.role_denied
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch(profile, role="builder", purpose="round-extension", operator_request=ref)
+
+
 def test_ordinary_defaults_and_recommendations_byte_identical_to_base():
     baseline = json.loads((Path(__file__).parent / "fixtures/round_extension_ordinary.json").read_text())
     view = CatalogView(entries=launch.snapshot_entries(), source=CATALOG_SOURCE_SNAPSHOT)
