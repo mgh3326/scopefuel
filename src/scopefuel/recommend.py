@@ -1809,15 +1809,22 @@ ROUND_EXT_REF = re.compile(
 
 
 def round_ext_role_allowed(profile: str, role: str | None, purpose: str | None, ref: object) -> bool:
-    """Tester/reviewer seats cannot reuse the ordinary counsel-purpose grant."""
+    """Exceptional seats require the paired grant; worker and removed seats stay shut."""
+    if profile not in ASTRA_ROLE_PROFILES | {"fable", "claude-fable-5-1"}:
+        return True
+    seat = (role or "").strip().casefold()
+    normalized = (purpose or "").strip().casefold()
+    if profile in ASTRA_FORBIDDEN_SEATS or seat in {"worker", "captain"}:
+        return False
+    if normalized in {"builder", "worker", "captain"}:
+        return False
+    if seat not in {"builder", "tester", "reviewer"}:
+        return True
     return (
-        profile not in ASTRA_ROLE_PROFILES | {"fable", "claude-fable-5-1"}
-        or (role or "").strip().casefold() not in {"tester", "reviewer"}
-        or (
-            (purpose or "").strip().casefold() == "round-extension"
-            and isinstance(ref, str)
-            and ROUND_EXT_REF.fullmatch(ref) is not None
-        )
+        (seat != "builder" or profile in {"codex-astra", "fable"})
+        and (purpose == "round-extension" if seat == "builder" else normalized == "round-extension")
+        and isinstance(ref, str)
+        and ROUND_EXT_REF.fullmatch(ref) is not None
     )
 
 
@@ -3387,7 +3394,8 @@ def gate_check(
             provider_id="claude" if profile_name in {"fable", "claude-fable-5-1"} else "codex",
             grade=None,
             reason=(
-                f"role_restricted: {profile_name} — tester/reviewer requires round-extension with ref; "
+                f"role_restricted: {profile_name} — builder/tester/reviewer requires "
+                "round-extension with ref; "
                 f"({', '.join(sorted(ASTRA_ALLOWED_PURPOSES))}, round-extension + round-ext ref); "
                 f"purpose={shown}"
             ),

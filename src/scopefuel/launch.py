@@ -636,7 +636,8 @@ def resolve_launch(
 
     if not round_ext_role_allowed(profile, role, purpose, operator_request):
         raise LaunchError(
-            "role_restricted: astra/fable tester/reviewer requires round-extension + round-ext ref"
+            "role_restricted: astra/fable builder/tester/reviewer requires round-extension + round-ext ref; "
+            "worker/captain and removed astra aliases forbidden"
         )
 
     if (
