@@ -97,7 +97,10 @@ def parse_aware(value: str) -> dt.datetime:
         raise ValueError(f"invalid ISO timestamp: {value!r}") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"timestamp must include a timezone: {value!r}")
-    return parsed.astimezone(dt.UTC)
+    try:
+        return parsed.astimezone(dt.UTC)
+    except OverflowError as exc:
+        raise ValueError(f"timestamp is outside the UTC datetime range: {value!r}") from exc
 
 
 def format_utc(value: dt.datetime) -> str:

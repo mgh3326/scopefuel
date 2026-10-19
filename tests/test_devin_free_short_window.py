@@ -87,6 +87,27 @@ def _devin_result() -> ProviderResult:
 
 
 class DevinFreeShortWindowTests(unittest.TestCase):
+    def test_corrupt_timezone_overflow_is_ignored(self):
+        for stamp in ("0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-12:00"):
+            with self.subTest(stamp=stamp):
+                payload = {
+                    "schema": free_window.SCHEMA,
+                    "records": {
+                        "host-user-corrupt": {
+                            "reset_at": stamp,
+                            "observed_at": stamp,
+                            "rung": "devin-swe2",
+                            "source": "job:corrupt-time",
+                        }
+                    },
+                }
+                free_window.state_path().parent.mkdir(parents=True, exist_ok=True)
+                free_window.state_path().write_text(json.dumps(payload))
+                with self.assertLogs("scopefuel.free_window", level="WARNING"):
+                    self.assertIsNone(free_window.active_record(now=FIXED_NOW))
+                with self.assertRaises(ValueError):
+                    free_window.parse_aware(stamp)
+
     def setUp(self):
         self.patcher = Patcher()
         self.temp = tempfile.TemporaryDirectory()
