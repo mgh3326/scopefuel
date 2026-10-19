@@ -18,6 +18,7 @@ from dataclasses import replace
 
 from . import (
     bench,
+    free_window,
     grades,
     herdr,
     launch,
@@ -550,6 +551,19 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         ),
     )
 
+    observe_parser = subparsers.add_parser(
+        "observe", help="기존 Devin worker pane의 SWE-2 free 단기 제한 관측 저장"
+    )
+    observe_sub = observe_parser.add_subparsers(dest="observe_command", required=True)
+    observe_free = observe_sub.add_parser(
+        "devin-free-limit", help="Devin SWE-2 free short-window reset 기록"
+    )
+    observe_free.add_argument("--reset", required=True, help="timezone-aware ISO-8601 reset time")
+    observe_free.add_argument("--observed", required=True, help="timezone-aware ISO-8601 observation time")
+    observe_free.add_argument("--rung", required=True, help="Devin SWE-2 free profile UID")
+    observe_free.add_argument("--source", required=True, help="job:<job>")
+    observe_free.add_argument("--unparsed", action="store_true", help="reset message was not parseable")
+
     refresh_parser = subparsers.add_parser("refresh", help="한 pool만 이벤트 기반으로 캐시 갱신")
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
     refresh_parser.add_argument("--background", action="store_true", help="즉시 반환하고 백그라운드 갱신")
@@ -671,6 +685,20 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
         return json.dumps({r.id: r.raw for r in results}, indent=2, ensure_ascii=False)
     if args.json:
         stale = _stale_build_verdict()
+        free_short_window = free_window.display_value(free_window.active_record(now=now))
+        providers = []
+        for result in results:
+            item = result.as_dict(now=now)
+            if result.id == "devin":
+                for bucket in item["buckets"]:
+                    scope = bucket.get("scope") or {}
+                    if scope.get("kind") == "model" and scope.get("name") in {
+                        "swe-2-high",
+                        "swe-2-medium",
+                        "swe-2-max",
+                    }:
+                        bucket["free_short_window"] = free_short_window
+            providers.append(item)
         payload = {
             "schema": SCHEMA,
             "generated_at": now.isoformat(),
@@ -678,13 +706,18 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
                 "mark": overall_mark(results, now=now),
                 "usage_mark": overall_usage_mark(results, now=now),
             },
-            "providers": [r.as_dict(now=now) for r in results],
+            "providers": providers,
             "stale_build": stale.as_field() if stale is not None else None,
         }
         return json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)
     if args.brief:
         return render.brief(results, color=color, horizon=args.horizon, now=now)
-    return render.table(results, color=color, now=now)
+    return render.table(
+        results,
+        color=color,
+        now=now,
+        devin_free_short_window=free_window.display_value(free_window.active_record(now=now)),
+    )
 
 
 def _policy_command(
@@ -857,6 +890,7 @@ def _manual_command(args: argparse.Namespace) -> int:
 
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
+    free_limit = free_window.active_record(now=now)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
     results = manual.apply_for_display(results, now=now)
     bench_scores = bench.read_scores()
@@ -872,6 +906,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             bench_scores=bench_scores,
             model_prices=model_prices,
             grade_table=grade_table,
+            free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
         )
         payload["catalog"] = catalog.label
         print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
@@ -889,6 +924,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
                 explain=bool(getattr(args, "explain", False)),
                 hide_excluded=bool(getattr(args, "hide_excluded", False)),
                 grade_table=grade_table,
+                free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
             )
         )
         # Provenance line, always printed: a table that silently came from the
@@ -1213,6 +1249,19 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 else None
             ),
             observed_age_s=remote_used.age_s,
+        )
+    free_limit = free_window.active_record(now=now)
+    if free_limit is not None and free_window.is_free_profile(args.profile):
+        # Preserve the observed usage fields while applying this independent
+        # provider refusal, including when the ordinary Devin snapshot is absent.
+        result = replace(
+            result,
+            ok=False,
+            reason=free_window.reason(free_limit),
+            unmeasurable=False,
+            alternatives=(),
+            role_denied=False,
+            unsubscribed=False,
         )
     # #742 — 구독 해지 거부는 전용 exit 6: 쿼타 차단(3)·측정불가(4)·역할 거부(5)와
     # 다른 rc 로 "reset 을 기다리면 풀리는" quota 답과 섞이지 않는다.
@@ -1969,9 +2018,35 @@ def _models_command(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # The passive observer accepts pane-derived values and writes local state.
+    # Return before provider registry construction so this path cannot inspect
+    # provider credentials or start a provider probe.
+    if arguments and arguments[0] == "observe":
+        parser = build_parser([])
+        args = parser.parse_args(arguments)
+        if args.observe_command != "devin-free-limit":
+            parser.error("unsupported observe command")
+        try:
+            saved = free_window.record_observation(
+                reset=args.reset,
+                observed=args.observed,
+                rung=args.rung,
+                source=args.source,
+                unparsed=args.unparsed,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if saved:
+            print("recorded Devin free short-window limit")
+        else:
+            print("expired or older Devin free short-window observation ignored")
+        return 0
+
     fetchers = registry()
     parser = build_parser(list(fetchers))
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
 
     if args.command == "bench":
         return _bench_command(args)
