@@ -4057,6 +4057,18 @@ def _recommend_rank_key(
     )
 
 
+DEVIN_SWE2_FREE_PROFILES = frozenset(
+    {
+        "devin-swe2",
+        "devin-swe2-medium",
+        "devin-swe2-max",
+        "builder-devin",
+        "builder-devin-medium",
+        "builder-devin-max",
+    }
+)
+
+
 def _evaluate(
     providers: list[ProviderResult],
     grade: Grade,
@@ -4067,6 +4079,7 @@ def _evaluate(
     bench_scores: list[ModelScore] | None,
     normalized_prices: Mapping[str, ModelPrice],
     table: dict[Grade, list[Profile]],
+    free_rate_limit: str | None = None,
 ) -> _Evaluation:
     # Filter the final table here, after CLI callers have merged a served canon
     # or catalog. This single candidate boundary also covers exclusion folds,
@@ -4231,6 +4244,22 @@ def _evaluate(
             and remaining_pct >= get_imminent_remaining_pct()
         )
 
+        # Apply the independent free-window hold only after the ordinary
+        # subscription, measurement, policy, and quota decisions admitted this
+        # row. Existing exclusion reasons therefore remain authoritative.
+        if free_rate_limit and profile.name in DEVIN_SWE2_FREE_PROFILES:
+            excluded.append(
+                _Excluded(
+                    profile,
+                    free_rate_limit,
+                    provider_id="devin",
+                    kind="free_rate_limited",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                )
+            )
+            continue
+
         included.append(
             _Candidate(
                 profile=profile,
@@ -4361,6 +4390,7 @@ def recommend(
     explain: bool = False,
     hide_excluded: bool = False,
     grade_table: dict[Grade, list[Profile]] | None = None,
+    free_rate_limit: str | None = None,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -4378,6 +4408,7 @@ def recommend(
         bench_scores=bench_scores,
         normalized_prices=normalized_prices,
         table=table,
+        free_rate_limit=free_rate_limit,
     )
     included = evaluation.included
     excluded = evaluation.excluded
@@ -4772,6 +4803,7 @@ def recommend_dict(
     bench_scores: list[ModelScore] | None = None,
     model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
+    free_rate_limit: str | None = None,
 ) -> dict[str, object]:
     """Structured ``--recommend`` rows — the same fold ``recommend()`` renders.
 
@@ -4798,6 +4830,7 @@ def recommend_dict(
         bench_scores=bench_scores,
         normalized_prices=normalized_prices,
         table=table,
+        free_rate_limit=free_rate_limit,
     )
 
     def _row(

@@ -91,7 +91,13 @@ def _basis_text(result: ProviderResult, verdict) -> str:
     return "한도 정보 없음"
 
 
-def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime | None = None) -> str:
+def table(
+    results: list[ProviderResult],
+    *,
+    color: bool = True,
+    now: dt.datetime | None = None,
+    devin_free_short_window: str = "not observed",
+) -> str:
     lines: list[str] = []
     for result in results:
         display_id = _display_id(result)
@@ -131,15 +137,23 @@ def table(results: list[ProviderResult], *, color: bool = True, now: dt.datetime
 
         for bucket in result.buckets:
             tags = [t for t in (bucket.note,) if t]
+            short_window = ""
             if bucket.scope.kind == "model":
                 tags.append("이 모델만")
+                if result.id == "devin" and bucket.scope.name in {
+                    "swe-2-high",
+                    "swe-2-medium",
+                    "swe-2-max",
+                }:
+                    short_window = f" free_short_window={devin_free_short_window}"
             elif bucket.scope.kind == "group" and verdict.basis != "group":
                 tags.append("이 그룹만")
             tag_s = f"  [{', '.join(tags)}]" if tags else ""
             horizon = {"now": "now ", "week": "week", "month": "month"}[bucket.horizon]
             lines.append(
                 f"  {horizon} {bucket.label:<24} {_pct(bucket.used_pct):>11}"
-                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket, now=now)}{tag_s}"
+                f"   reset {iso_to_local(bucket.resets_at)}{_table_pace(bucket, now=now)}"
+                f"{tag_s}{short_window}"
             )
 
         for bucket in verdict.exhausted:
