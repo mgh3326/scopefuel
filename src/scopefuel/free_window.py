@@ -180,7 +180,7 @@ def _load_records(*, warn: bool = True) -> dict[str, FreeLimitRecord]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError, RecursionError, MemoryError) as exc:
         if warn:
             _LOG.warning("ignoring corrupt Devin free-window state: %s", exc)
         return {}
@@ -275,6 +275,8 @@ def record_observation(
     if current.tzinfo is None or current.utcoffset() is None:
         raise ValueError("now must include a timezone")
     current = current.astimezone(dt.UTC)
+    if observed_at > current:
+        raise ValueError("observed time cannot be in the future")
     if reset_at <= current:
         return False
 
@@ -282,7 +284,11 @@ def record_observation(
     new_record = FreeLimitRecord(reset_at, observed_at, rung, source, unparsed)
     with _exclusive_lock():
         records = _load_records()
-        records = {identity: item for identity, item in records.items() if item.reset_at > current}
+        records = {
+            identity: item
+            for identity, item in records.items()
+            if item.observed_at <= current < item.reset_at
+        }
         previous = records.get(key)
         if previous is not None:
             old_order = (previous.observed_at, previous.reset_at, previous.source, previous.rung)
@@ -300,4 +306,4 @@ def active_record(*, now: dt.datetime | None = None) -> FreeLimitRecord | None:
         raise ValueError("now must include a timezone")
     current = current.astimezone(dt.UTC)
     record = _load_records().get(_identity_key())
-    return record if record is not None and current < record.reset_at else None
+    return record if record is not None and record.observed_at <= current < record.reset_at else None

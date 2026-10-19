@@ -1248,10 +1248,13 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             ),
             observed_age_s=remote_used.age_s,
         )
-    free_limit = free_window.active_record(now=now)
-    if free_limit is not None and free_window.is_free_profile(args.profile):
+    free_limit = None
+    if result.ok and free_window.is_free_profile(args.profile):
+        free_limit = free_window.active_record(now=now)
+    if free_limit is not None:
         # Preserve the observed usage fields while applying this independent
-        # provider refusal, including when the ordinary Devin snapshot is absent.
+        # provider refusal. Existing gate refusals keep their original reason,
+        # output, and exit code; this only replaces a base admission.
         result = replace(
             result,
             ok=False,
@@ -1260,6 +1263,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             alternatives=(),
             role_denied=False,
             unsubscribed=False,
+            e6_arm=None,
         )
     # #742 — 구독 해지 거부는 전용 exit 6: 쿼타 차단(3)·측정불가(4)·역할 거부(5)와
     # 다른 rc 로 "reset 을 기다리면 풀리는" quota 답과 섞이지 않는다.

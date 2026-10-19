@@ -264,6 +264,183 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.assertNotIn("free_rate_limited", stdout.getvalue() + stderr.getvalue())
         self.assertIn("corrupt Devin free-window state", "\n".join(records.output))
 
+    def test_deep_json_and_oversized_integer_fail_open(self):
+        path = free_window.state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for label, contents in (
+            ("deep nesting", "[" * 300_000),
+            ("oversized integer", "9" * 5_000),
+        ):
+            with self.subTest(label=label):
+                path.write_text(contents, encoding="utf-8")
+                with self.assertLogs("scopefuel.free_window", level="WARNING"):
+                    self.assertIsNone(free_window.active_record(now=FIXED_NOW))
+
+    def test_future_observation_is_rejected_and_future_record_cannot_win(self):
+        with self.assertRaisesRegex(ValueError, "future"):
+            free_window.record_observation(
+                reset="2030-01-01T12:00:00Z",
+                observed="2030-01-01T00:00:00Z",
+                rung="devin-swe2",
+                source="job:future-input",
+                now=FIXED_NOW,
+            )
+
+        future = free_window.FreeLimitRecord(
+            dt.datetime(2030, 1, 1, 12, tzinfo=UTC),
+            dt.datetime(2030, 1, 1, 0, tzinfo=UTC),
+            "devin-swe2",
+            "job:future-record",
+        )
+        self.seed_record(future)
+        self.assertIsNone(free_window.active_record(now=FIXED_NOW))
+
+        self.assertTrue(
+            free_window.record_observation(
+                reset="2026-10-19T08:45:00Z",
+                observed="2026-10-19T07:59:00Z",
+                rung="devin-swe2-medium",
+                source="job:real-current",
+                now=FIXED_NOW,
+            )
+        )
+        current = free_window.active_record(now=FIXED_NOW)
+        self.assertIsNotNone(current)
+        self.assertEqual(current.source, "job:real-current")
+        payload = json.loads(free_window.state_path().read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["records"]), 1)
+
+    def test_live_hold_preserves_base_refusal_tuples_without_record_lookup(self):
+        self.freeze_cli()
+        self.gate_stubs()
+        original_active_record = free_window.active_record
+        lookups = []
+
+        def tracked_active_record(*, now=None):
+            lookups.append(now)
+            return original_active_record(now=now)
+
+        self.patcher.setattr(free_window, "active_record", tracked_active_record)
+        refusals = (
+            ("role", "role_restricted: base refusal", {"role_denied": True}, 5),
+            ("subscription", "unsubscribed: base refusal", {"unsubscribed": True}, 6),
+            (
+                "quota",
+                "ordinary quota refusal",
+                {"alternatives": ("devin-swe2-medium", "codex-luna")},
+                3,
+            ),
+        )
+        for profile in FREE_PROFILES:
+            for label, reason, flags, expected_rc in refusals:
+                with self.subTest(profile=profile, refusal=label):
+                    result = recommend.GateResult(
+                        ok=False,
+                        profile=profile,
+                        provider_id="devin",
+                        grade="A",
+                        reason=reason,
+                        **flags,
+                    )
+                    self.patcher.setattr(
+                        cli.recommend,
+                        "gate_check",
+                        lambda *args, result=result, **kwargs: result,
+                    )
+                    self.patcher.setattr(free_window, "active_record", tracked_active_record)
+                    self._save_empty_records()
+                    baseline = self.call_gate(profile)
+                    self.assertEqual(baseline[0], expected_rc)
+                    before_hold_lookups = len(lookups)
+                    self.seed_record(
+                        free_window.FreeLimitRecord(
+                            FIXED_NOW + dt.timedelta(minutes=45),
+                            FIXED_NOW - dt.timedelta(minutes=5),
+                            "devin-swe2",
+                            "job:known-limit",
+                        )
+                    )
+                    self.assertEqual(self.call_gate(profile), baseline)
+                    self.assertEqual(len(lookups), before_hold_lookups)
+
+    def _save_empty_records(self):
+        free_window._save_records({})
+
+    def test_paid_and_non_devin_gate_paths_do_not_read_free_window_state(self):
+        self.freeze_cli()
+        self.gate_stubs()
+        original_active_record = free_window.active_record
+        lookups = []
+
+        def tracked_active_record(*, now=None):
+            lookups.append(now)
+            return original_active_record(now=now)
+
+        self.patcher.setattr(free_window, "active_record", tracked_active_record)
+
+        def allow(profile_name, *args, **kwargs):
+            return recommend.GateResult(
+                ok=True,
+                profile=profile_name,
+                provider_id="codex" if profile_name == "codex-luna" else "devin",
+                grade="A",
+                reason="base admitted",
+                used_pct=0.0,
+                pool_class="spend",
+            )
+
+        self.patcher.setattr(cli.recommend, "gate_check", allow)
+        allowed = []
+        for profile in (*PAID_PROFILES, "codex-luna"):
+            before = len(lookups)
+            baseline = self.call_gate(profile)
+            allowed.append((profile, baseline))
+            self.assertEqual(len(lookups), before, profile)
+        self.seed_record(
+            free_window.FreeLimitRecord(
+                FIXED_NOW + dt.timedelta(minutes=45),
+                FIXED_NOW - dt.timedelta(minutes=5),
+                "devin-swe2",
+                "job:known-limit",
+            )
+        )
+        for profile, baseline in allowed:
+            with self.subTest(profile=profile):
+                before = len(lookups)
+                self.assertEqual(self.call_gate(profile), baseline)
+                self.assertEqual(len(lookups), before, profile)
+
+        def refuse(profile_name, *args, **kwargs):
+            return recommend.GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id="codex" if profile_name == "codex-luna" else "devin",
+                grade="A",
+                reason="base quota refusal",
+                alternatives=("devin-swe2", "codex-luna"),
+            )
+
+        self.patcher.setattr(cli.recommend, "gate_check", refuse)
+        for profile in (*PAID_PROFILES, "codex-luna"):
+            with self.subTest(refusal_profile=profile):
+                self._save_empty_records()
+                before = len(lookups)
+                baseline = self.call_gate(profile)
+                self.assertEqual(baseline[0], 3)
+                self.assertIn("대안(A): devin-swe2, codex-luna", baseline[2])
+                self.assertEqual(len(lookups), before, profile)
+                self.seed_record(
+                    free_window.FreeLimitRecord(
+                        FIXED_NOW + dt.timedelta(minutes=45),
+                        FIXED_NOW - dt.timedelta(minutes=5),
+                        "devin-swe2",
+                        "job:known-limit",
+                    )
+                )
+                before_hold = len(lookups)
+                self.assertEqual(self.call_gate(profile), baseline)
+                self.assertEqual(len(lookups), before_hold, profile)
+
     def test_live_record_refuses_every_free_spelling_and_paid_outputs_match_base(self):
         self.freeze_cli()
         self.gate_stubs()
@@ -276,12 +453,17 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.seed_record(free_window.FreeLimitRecord(reset, observed, "devin-swe2", "job:known-limit"))
 
         for profile in FREE_PROFILES:
-            rc, stdout, stderr = self.call_gate(profile)
-            self.assertEqual(rc, 3, profile)
-            self.assertIn("free_rate_limited", stderr, profile)
-            self.assertIn("until 2026-10-19T08:45:00Z", stderr, profile)
-            self.assertIn("observed 2026-10-19T07:55:00Z via job:known-limit", stderr, profile)
-            self.assertNotIn("used_pct=0.0", stdout)
+            actual = self.call_gate(profile)
+            self.assertNotEqual(actual[0], 0, profile)
+            if baseline_free[profile][0] == 0:
+                rc, stdout, stderr = actual
+                self.assertEqual(rc, 3, profile)
+                self.assertIn("free_rate_limited", stderr, profile)
+                self.assertIn("until 2026-10-19T08:45:00Z", stderr, profile)
+                self.assertIn("observed 2026-10-19T07:55:00Z via job:known-limit", stderr, profile)
+                self.assertNotIn("used_pct=0.0", stdout)
+            else:
+                self.assertEqual(actual, baseline_free[profile], profile)
 
         for profile in PAID_PROFILES:
             actual = self.call_gate(profile)
@@ -354,6 +536,16 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.freeze_cli()
         self.gate_stubs()
         reset = FIXED_NOW + dt.timedelta(minutes=45)
+        self.patcher.setattr(cli, "collect", lambda *args, **kwargs: [])
+
+        def run():
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = cli.main(["gate", "-m", "devin-swe2-medium", "--no-cache"])
+            return rc, stdout.getvalue(), stderr.getvalue()
+
+        baseline = run()
+        self.assertEqual(baseline[0], 4)
         self.seed_record(
             free_window.FreeLimitRecord(
                 reset,
@@ -362,12 +554,125 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                 "job:no-provider-data",
             )
         )
-        self.patcher.setattr(cli, "collect", lambda *args, **kwargs: [])
-        stdout, stderr = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            rc = cli.main(["gate", "-m", "devin-swe2-medium", "--no-cache"])
-        self.assertEqual(rc, 3)
-        self.assertIn("free_rate_limited until 2026-10-19T08:45:00Z", stderr.getvalue())
+        self.assertEqual(run(), baseline)
+
+    def test_recommendation_only_holds_base_admissible_rows(self):
+        profile_by_name = {
+            profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows
+        }
+        table = {grade: [] for grade in recommend.GRADE_TABLE}
+        table["A+"] = [
+            profile_by_name["devin-swe2"],
+            profile_by_name["devin-swe2-medium"],
+            profile_by_name["codex-luna"],
+        ]
+        providers = [
+            _devin_result(),
+            ProviderResult(
+                id="codex",
+                buckets=[Bucket("week", "7d", 10.0, "2026-10-26T08:00:00Z", Scope("account"), "week")],
+                pool_class="preserve",
+            ),
+        ]
+        reason = (
+            "free_rate_limited until 2026-10-19T08:45:00Z "
+            "(observed 2026-10-19T07:55:00Z via job:known-limit; rung devin-swe2)"
+        )
+        original_subscription = recommend.profile_subscription
+
+        def mixed_subscription(name, provider_id=None):
+            if name == "devin-swe2-medium":
+                return recommend.Subscription(False, "profile", "profiles.devin-swe2-medium", "devin")
+            return original_subscription(name, provider_id)
+
+        self.patcher.setattr(recommend, "profile_subscription", mixed_subscription)
+        baseline = recommend.recommend_dict(
+            providers, "A+", today=FIXED_NOW.date(), now=FIXED_NOW, grade_table=table
+        )
+        limited = recommend.recommend_dict(
+            providers,
+            "A+",
+            today=FIXED_NOW.date(),
+            now=FIXED_NOW,
+            grade_table=table,
+            free_rate_limit=reason,
+        )
+        baseline_rows = {row["profile"]: row for row in baseline["rows"]}
+        limited_rows = {row["profile"]: row for row in limited["rows"]}
+        self.assertEqual(baseline_rows["devin-swe2-medium"]["kind"], "unsubscribed")
+        self.assertEqual(limited_rows["devin-swe2-medium"], baseline_rows["devin-swe2-medium"])
+        self.assertEqual(baseline_rows["devin-swe2"]["kind"], "candidate")
+        self.assertEqual(limited_rows["devin-swe2"]["kind"], "free_rate_limited")
+        self.assertIn("free_rate_limited", limited_rows["devin-swe2"]["reason"])
+
+    def test_recommendation_keeps_unsubscribed_unmeasurable_and_exhausted_reasons(self):
+        profile_by_name = {
+            profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows
+        }
+        table = {grade: [] for grade in recommend.GRADE_TABLE}
+        table["A+"] = [profile_by_name["devin-swe2"], profile_by_name["codex-luna"]]
+        codex = ProviderResult(
+            id="codex",
+            buckets=[Bucket("week", "7d", 10.0, "2026-10-26T08:00:00Z", Scope("account"), "week")],
+            pool_class="preserve",
+        )
+        reason = (
+            "free_rate_limited until 2026-10-19T08:45:00Z "
+            "(observed 2026-10-19T07:55:00Z via job:known-limit; rung devin-swe2)"
+        )
+        original_subscription = recommend.profile_subscription
+        self.patcher.setattr(
+            recommend,
+            "profile_subscription",
+            lambda name, provider_id=None: (
+                recommend.Subscription(False, "profile", "profiles.devin-swe2", "devin")
+                if name == "devin-swe2"
+                else original_subscription(name, provider_id)
+            ),
+        )
+        self.patcher.setattr(recommend, "_observe_exhaustion", lambda *args, **kwargs: None)
+        for label, providers, restore_subscription in (
+            ("unsubscribed", [_devin_result(), codex], False),
+            ("unmeasurable", [codex], True),
+        ):
+            with self.subTest(reason=label):
+                if restore_subscription:
+                    self.patcher.setattr(recommend, "profile_subscription", original_subscription)
+                baseline = recommend.recommend_dict(
+                    providers, "A+", today=FIXED_NOW.date(), now=FIXED_NOW, grade_table=table
+                )
+                limited = recommend.recommend_dict(
+                    providers,
+                    "A+",
+                    today=FIXED_NOW.date(),
+                    now=FIXED_NOW,
+                    grade_table=table,
+                    free_rate_limit=reason,
+                )
+                self.assertEqual(limited, baseline)
+                self.assertNotEqual(baseline["rows"][0]["kind"], "free_rate_limited")
+
+        saturated = _devin_result()
+        saturated.buckets[2] = Bucket(
+            "swe-2-high", "", 100.0, "2026-10-20T08:00:00Z", Scope("model", "swe-2-high"), "now"
+        )
+        self.patcher.setattr(recommend, "_pool_cutoff", lambda *args, **kwargs: (0.5, None))
+        baseline = recommend.recommend_dict(
+            [saturated, codex], "A+", today=FIXED_NOW.date(), now=FIXED_NOW, grade_table=table
+        )
+        limited = recommend.recommend_dict(
+            [saturated, codex],
+            "A+",
+            today=FIXED_NOW.date(),
+            now=FIXED_NOW,
+            grade_table=table,
+            free_rate_limit=reason,
+        )
+        self.assertEqual(limited, baseline)
+        self.assertEqual(
+            next(row for row in baseline["rows"] if row["profile"] == "devin-swe2")["kind"],
+            "exhausted",
+        )
 
     def _recommend_setup(self):
         profile_by_name = {

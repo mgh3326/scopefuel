@@ -4113,18 +4113,6 @@ def _evaluate(
     for profile, placed_grade in entries:
         one_up = placed_grade != grade
         provider_id, group_name = resolved_pool(profile)
-        if free_rate_limit and profile.name in DEVIN_SWE2_FREE_PROFILES:
-            excluded.append(
-                _Excluded(
-                    profile,
-                    free_rate_limit,
-                    provider_id="devin",
-                    kind="free_rate_limited",
-                    placed_grade=placed_grade,
-                    one_up=one_up,
-                )
-            )
-            continue
         # task #742 — 구독 해지(풀 또는 프로필 플래그)는 후보·승급·비상 후보 어떤
         # 경로로도 추천되지 않는다. 행은 지우지 않고 후보 평가만 건너뛴다 —
         # 정책 제외와 달리 자기 전용 fold 로 이름낸다.
@@ -4255,6 +4243,22 @@ def _evaluate(
             and hours <= get_imminent_reset_hours()
             and remaining_pct >= get_imminent_remaining_pct()
         )
+
+        # Apply the independent free-window hold only after the ordinary
+        # subscription, measurement, policy, and quota decisions admitted this
+        # row. Existing exclusion reasons therefore remain authoritative.
+        if free_rate_limit and profile.name in DEVIN_SWE2_FREE_PROFILES:
+            excluded.append(
+                _Excluded(
+                    profile,
+                    free_rate_limit,
+                    provider_id="devin",
+                    kind="free_rate_limited",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                )
+            )
+            continue
 
         included.append(
             _Candidate(
