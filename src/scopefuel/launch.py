@@ -477,6 +477,13 @@ class LaunchDecision:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True, kw_only=True)
+class _RoundExtensionBuilderLaunch(LaunchDecision):
+    """Only exceptional builder responses attest the hk 1672 role policy."""
+
+    round_extension_builder: dict[str, str]
+
+
 def _live_rows(view: CatalogView, profile: str) -> list[CatalogEntry]:
     return [e for e in view.entries if e.profile == profile and not e.retired_at]
 
@@ -797,7 +804,7 @@ def resolve_launch(
             "pass --operator-request (a stale catalog cannot widen a gate)"
         )
 
-    return LaunchDecision(
+    decision = LaunchDecision(
         profile=canonical,
         model_id=row.model_id,
         effort=resolved_effort,
@@ -813,3 +820,15 @@ def resolve_launch(
         billing=_bundled_billing(canonical),
         family=provider_family(canonical),
     )
+    if profile in {"codex-astra", "fable"} and (role or "").strip().casefold() == "builder":
+        return _RoundExtensionBuilderLaunch(
+            **dataclasses.asdict(decision),
+            round_extension_builder={
+                "policy": "hk1672/v1",
+                "profile": canonical,
+                "role": "builder",
+                "purpose": "round-extension",
+                "ref": str(operator_request),
+            },
+        )
+    return decision

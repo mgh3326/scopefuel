@@ -340,6 +340,13 @@ def test_builder_requires_exact_purpose_and_reference(profile, ref, capsys):
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
+    assert payload.get("round_extension_builder") == {
+        "policy": "hk1672/v1",
+        "profile": profile,
+        "role": "builder",
+        "purpose": "round-extension",
+        "ref": ref,
+    }
     assert payload["model_id"] == {"codex-astra": "gpt-6-astra", "fable": "claude-fable-5-1"}[profile]
     assert payload["effort"] == ("xhigh" if profile == "codex-astra" else "")
 
@@ -399,6 +406,19 @@ def test_ordinary_defaults_and_recommendations_byte_identical_to_base():
             sort_keys=True,
         )
         assert actual.encode() == json.dumps(expected, sort_keys=True).encode(), profile
+        decision = launch.resolve_launch(
+            profile.split("@")[0],
+            effort=profile.split("@")[1] if "@" in profile else None,
+            view=view,
+        )
+        assert (
+            json.dumps(decision.as_dict(), sort_keys=True).encode()
+            == json.dumps(
+                baseline["launch_wire"][profile],
+                sort_keys=True,
+            ).encode()
+        ), profile
+        assert decision.render().encode() == baseline["launch_text"][profile].encode(), profile
     for grade, expected in baseline["recommend"].items():
         actual = recommend.recommend(
             _healthy_s_plus_providers(), grade, today=TODAY, now=NOW, bench_scores=[]
