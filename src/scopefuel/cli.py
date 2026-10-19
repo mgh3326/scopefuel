@@ -1392,7 +1392,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         )
     elif result.alternatives:
         print(f"대안({result.grade}): {', '.join(result.alternatives)}", file=sys.stderr)
-    else:
+    elif not result.reason.startswith("free_rate_limited until "):
+        # This independent hold does not establish exhaustion of other pools.
         print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)
     _emit_stale_build_warning()
     return exit_code

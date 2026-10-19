@@ -469,6 +469,32 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             all("free_rate_limited until 2026-10-19T08:45:00Z" in row["reason"] for row in limited_rows)
         )
 
+    def test_free_limit_does_not_claim_healthy_alternatives_are_exhausted(self):
+        self.freeze_cli()
+        self.gate_stubs()
+        table, providers = self._recommend_setup()
+        self.patcher.setattr(cli, "collect", lambda *args, **kwargs: providers)
+        self.patcher.setattr(cli.bench, "runtime_grade_table", lambda: table)
+        record = free_window.FreeLimitRecord(
+            FIXED_NOW + dt.timedelta(minutes=45), FIXED_NOW, "devin-swe2", "job:free-only"
+        )
+        self.seed_record(record)
+        rows = recommend.recommend_dict(
+            providers,
+            "A+",
+            today=FIXED_NOW.date(),
+            now=FIXED_NOW,
+            grade_table=table,
+            free_rate_limit=free_window.reason(record),
+        )["rows"]
+        self.assertTrue(any(row["profile"] == "codex-luna" and row["kind"] == "candidate" for row in rows))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+        self.assertEqual(rc, 3)
+        self.assertIn("free_rate_limited", stderr.getvalue())
+        self.assertNotIn("정상 후보 전부 소진/측정불가", stderr.getvalue())
+
     def test_json_and_table_add_short_window_without_changing_used_pct(self):
         self.freeze_cli()
         self.patcher.setattr(cli, "_stale_build_verdict", lambda: None)
