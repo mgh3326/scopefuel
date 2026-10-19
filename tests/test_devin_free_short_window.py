@@ -266,6 +266,44 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             actual = self.call_gate(profile)
             self.assertEqual(actual, baseline_paid[profile], profile)
 
+    def test_paid_devin_observation_records_actual_rung_but_only_gates_free_profiles(self):
+        self.freeze_cli()
+        self.freeze_free_window()
+        self.gate_stubs()
+        baseline_paid = {profile: self.call_gate(profile) for profile in PAID_PROFILES}
+        observed = "2026-10-19T07:55:00Z"
+        reset = "2026-10-19T08:45:00Z"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = cli.main(
+                [
+                    "observe",
+                    "devin-free-limit",
+                    "--reset",
+                    reset,
+                    "--observed",
+                    observed,
+                    "--rung",
+                    "devin-ds41",
+                    "--source",
+                    "job:paid-devin-observation",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("recorded", stdout.getvalue())
+        record = free_window.active_record(now=FIXED_NOW)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.rung, "devin-ds41")
+
+        for profile in FREE_PROFILES:
+            rc, _, gate_stderr = self.call_gate(profile)
+            self.assertEqual(rc, 3, profile)
+            self.assertIn("free_rate_limited", gate_stderr, profile)
+            self.assertIn("rung devin-ds41", gate_stderr, profile)
+        for profile in PAID_PROFILES:
+            self.assertEqual(self.call_gate(profile), baseline_paid[profile], profile)
+        self.assertFalse(free_window.is_free_profile("devin-ds41"))
+
     def test_expired_yesterday_and_after_reset_gate_outputs_match_base(self):
         self.freeze_cli()
         self.gate_stubs()

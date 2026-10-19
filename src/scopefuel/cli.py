@@ -558,7 +558,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     observe_free = observe_sub.add_parser("devin-free-limit", help="Devin SWE-2 free short-window reset 기록")
     observe_free.add_argument("--reset", required=True, help="timezone-aware ISO-8601 reset time")
     observe_free.add_argument("--observed", required=True, help="timezone-aware ISO-8601 observation time")
-    observe_free.add_argument("--rung", required=True, help="Devin SWE-2 free profile UID")
+    observe_free.add_argument("--rung", required=True, help="observed Devin profile UID")
     observe_free.add_argument("--source", required=True, help="job:<job>")
     observe_free.add_argument("--unparsed", action="store_true", help="reset message was not parseable")
 

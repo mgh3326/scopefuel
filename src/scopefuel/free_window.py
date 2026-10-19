@@ -42,7 +42,27 @@ FREE_PROFILES = frozenset(
         "builder-devin-max",
     }
 )
-RUNG_IDS = frozenset(FREE_PROFILES)
+# Observation is selected by provider kind, so paid Devin workers can report
+# the same free-pool refusal text without being refused by this signal. Keep
+# this input allowlist separate from FREE_PROFILES, which alone controls gate
+# and recommendation denial membership.
+OBSERVED_RUNG_IDS = frozenset(
+    FREE_PROFILES
+    | {
+        "devin-glm52",
+        "devin-swe17",
+        "devin-ds41",
+        "devin-ds41-max",
+        "builder-ds41",
+        "builder-ds41-max",
+        "devin-fusion-opus55",
+        "devin-fusion-sonnet55",
+        "devin-argon",
+        "devin-argon-medium",
+        "devin-argon-low",
+    }
+)
+RUNG_IDS = OBSERVED_RUNG_IDS
 SOURCE_RE = re.compile(r"job:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _LOG = logging.getLogger(__name__)
 
@@ -140,7 +160,7 @@ def _record_from_dict(value: object) -> FreeLimitRecord | None:
         unparsed = value.get("unparsed", False)
     except (KeyError, TypeError, ValueError):
         return None
-    if not isinstance(rung, str) or rung not in RUNG_IDS:
+    if not isinstance(rung, str) or rung not in OBSERVED_RUNG_IDS:
         return None
     if not isinstance(source, str) or not SOURCE_RE.fullmatch(source):
         return None
@@ -238,8 +258,8 @@ def record_observation(
 
     reset_at = parse_aware(reset)
     observed_at = parse_aware(observed)
-    if rung not in RUNG_IDS:
-        raise ValueError(f"unsupported SWE-2 free rung: {rung!r}")
+    if rung not in OBSERVED_RUNG_IDS:
+        raise ValueError(f"unsupported Devin profile rung: {rung!r}")
     if not SOURCE_RE.fullmatch(source):
         raise ValueError("source must be job:<job>")
     if not isinstance(unparsed, bool):
