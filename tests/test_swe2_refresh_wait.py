@@ -120,10 +120,7 @@ def test_swe2_worker_lock_held_reports_distinct_rc(monkeypatch, tmp_path):
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
     with refresh.pool_lock("devin") as acquired:
         assert acquired
-        assert (
-            refresh.run_worker({"devin": lambda: probe()}, "devin", swe2=True)
-            == refresh.SWE2_RC_LOCK_HELD
-        )
+        assert refresh.run_worker({"devin": lambda: probe()}, "devin", swe2=True) == refresh.SWE2_RC_LOCK_HELD
         # Every other caller keeps rc 0 for the same skip.
         assert refresh.run_worker({"devin": lambda: probe()}, "devin") == 0
 
@@ -132,10 +129,7 @@ def test_swe2_worker_backoff_reports_distinct_rc(monkeypatch, tmp_path):
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
     stub_signals(monkeypatch)
     seed_backoff(300.0)
-    assert (
-        refresh.run_worker({"devin": lambda: probe()}, "devin", swe2=True)
-        == refresh.SWE2_RC_BACKOFF
-    )
+    assert refresh.run_worker({"devin": lambda: probe()}, "devin", swe2=True) == refresh.SWE2_RC_BACKOFF
     assert refresh.run_worker({"devin": lambda: probe()}, "devin") == 0
 
 

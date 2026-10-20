@@ -258,10 +258,7 @@ def _wait_for_in_flight(before_fetched: float | None, now: float | None) -> Prov
         if time.monotonic() >= deadline:
             return ProviderResult(
                 id="devin",
-                error=(
-                    "in-flight probe did not land in time "
-                    f"(waited up to {SWE2_IN_FLIGHT_WAIT_S:.0f}s)"
-                ),
+                error=(f"in-flight probe did not land in time (waited up to {SWE2_IN_FLIGHT_WAIT_S:.0f}s)"),
                 error_kind=SWE2_IN_FLIGHT_TIMEOUT,
             )
         time.sleep(SWE2_IN_FLIGHT_POLL_S)
