@@ -291,9 +291,16 @@ def test_no_or_expired_hold_keeps_sol61_gate_and_recommend_output_unchanged(monk
     monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
     _install_cli_stubs(monkeypatch)
     providers = _providers()
+    providers[1].buckets[0] = Bucket("daily", "1d", 99.0, RESET_1D, Scope("account"), "now")
+    providers[1].buckets[1] = Bucket("weekly", "7d", 99.0, RESET_7D, Scope("account"), "week")
+    monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: providers)
 
     baseline_gates = {name: _capture_cli(["gate", "-m", name]) for name in PROFILES}
-    _base_payload, baseline_recommend = _recommend_output(providers, PROFILES)
+    assert all(rc == 0 and "pool=codex" in out for rc, out, _err in baseline_gates.values())
+    base_payload, baseline_recommend = _recommend_output(providers, PROFILES)
+    base_rows = {row["profile"]: row for row in base_payload["rows"]}
+    assert set(base_rows) == set(PROFILES)
+    assert all(row["kind"] == "candidate" and row["provider"] == "codex" for row in base_rows.values())
     assert free_window.active_record(now=NOW) is None
 
     expired = free_window.FreeLimitRecord(
