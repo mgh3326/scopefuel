@@ -1319,7 +1319,9 @@ def test_probe_timeout_is_finite():
     assert devin.TIMEOUT_S > 0
 
 
-def test_unreadable_session_keeps_provider_and_gate_fail_closed(tmp_path, monkeypatch, capsys, fixture_text):
+def test_unreadable_account_session_does_not_hide_observed_free_models(
+    tmp_path, monkeypatch, capsys, fixture_text
+):
     payload = _fixture(fixture_text)
     binary = tmp_path / "fake-devin-unreadable-banner"
     binary.write_text(
@@ -1341,8 +1343,8 @@ def test_unreadable_session_keeps_provider_and_gate_fail_closed(tmp_path, monkey
     monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
     rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
     out = capsys.readouterr()
-    assert rc == 4
-    assert "측정 불가" in out.err
+    assert rc == 0
+    assert "basis=model-scope:swe-2-high" in out.out
 
 
 def test_child_env_sets_term_and_pty_dimensions(monkeypatch):

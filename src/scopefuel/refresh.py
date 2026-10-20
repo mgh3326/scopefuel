@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import fcntl
 import os
 import pathlib
@@ -13,7 +14,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from . import cache, proctrack, quota_share, quota_v2
+from . import cache, proctrack, quota_share, quota_v2, recommend
 from .http import classify_error
 from .model import PROBE_IN_PROGRESS, ProviderResult
 from .providers import BUILTIN
@@ -101,7 +102,7 @@ def _v2_record(pool: str, result, started_at: float, completed_at: float, identi
         quota_v2.record_attempts({pool: (result, completed_at)}, started_at=started_at, identities=identities)
 
 
-def run_worker(fetchers: dict[str, object], pool: str) -> int:
+def run_worker(fetchers: dict[str, object], pool: str, *, swe2: bool = False) -> int:
     """Fetch one pool and merge only that pool into the cache."""
 
     if pool not in REFRESH_POOLS:
@@ -131,7 +132,16 @@ def run_worker(fetchers: dict[str, object], pool: str) -> int:
                 # 측정 실패가 아니므로 캐시·v2 감사도 남기지 않는다(#639).
                 print(f"refresh: pool={pool} probe in progress; skipped")
                 return 0
-            if result.error or result.warning:
+            usable_models = (
+                swe2
+                and pool == "devin"
+                and recommend._swe2_probe_is_current(result, dt.datetime.now(dt.UTC))
+                and any(
+                    recommend._swe2_model_bucket(result, rung) is not None
+                    for rung in ("swe-2-high", "swe-2-medium", "swe-2-max")
+                )
+            )
+            if result.error or (result.warning and not usable_models):
                 detail = result.error or result.warning
                 cache.record_failure(pool, result, now)
                 _v2_record(pool, result, started_at, completed_at, v2_identities)
@@ -196,3 +206,50 @@ def spawn(pool: str, *, background: bool) -> int:
         return 0
 
     return subprocess.run(command, check=False).returncode
+
+
+def refresh_swe2_result(now: float | None = None) -> ProviderResult | None:
+    """Run the existing bounded worker once, then read its fresh successful entry."""
+    command = [sys.executable, "-m", "scopefuel.cli", "refresh", "devin", "--_worker", "--_swe2"]
+    started = time.time()
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    try:
+        code = process.wait(timeout=_timeout_seconds() + 5)
+    except subprocess.TimeoutExpired:
+        # Only signal the session we created; never a name/pattern-matched process.
+        with contextlib.suppress(OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            process.wait(timeout=5)
+        return None
+    if code != 0:
+        return None
+    now = time.time() if now is None else now
+    entry = cache._load().get("devin")
+    if not isinstance(entry, dict):
+        return None
+    # Lock/backoff/probe-in-progress skips also return zero. An older cache hit
+    # is not evidence that this refresh measured the models list.
+    fetched = entry.get("fetched_at")
+    if not isinstance(fetched, (int, float)) or not started <= fetched <= now:
+        return None
+    failed = entry.get("last_error_at")
+    if isinstance(failed, (int, float)) and failed >= fetched:
+        return None
+    result = cache._from_entry(entry, "devin", now)
+    if result.error:
+        return None
+    ttl = cache.PROVIDER_TTL_S.get("devin", cache.DEFAULT_TTL_S)
+    if result.age_s is None or result.age_s > ttl:
+        return None
+    result.stale = False
+    return result

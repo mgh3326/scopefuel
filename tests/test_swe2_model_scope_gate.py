@@ -199,7 +199,7 @@ def test_models_list_timeout_uses_account_gate():
     assert "basis=model-scope" not in result.reason
 
 
-def test_stale_probe_with_free_bucket_uses_account_gate():
+def test_stale_probe_with_free_bucket_is_measurement_unavailable():
     stale = _probe(
         daily=99.0,
         weekly=10.0,
@@ -212,23 +212,26 @@ def test_stale_probe_with_free_bucket_uses_account_gate():
     result = _gate(stale, "devin-swe2")
     assert result.ok is False
     assert result.gate_basis is None
-    assert result.used_pct == 99.0
+    assert result.unmeasurable is True
+    assert result.used_pct is None
     assert "model-scope" not in result.reason
-    assert "소진" in result.reason
+    assert "swe2_measurement_unavailable" in result.reason
 
 
-def test_aged_past_freshness_with_free_bucket_uses_account_gate():
+def test_aged_past_freshness_with_free_bucket_is_measurement_unavailable():
     aged = _probe(daily=99.0, age_s=120.0)
     denied = _gate(aged, "devin-swe2")
     assert denied.ok is False
     assert denied.gate_basis is None
-    assert denied.used_pct == 99.0
+    assert denied.unmeasurable is True
+    assert denied.used_pct is None
 
     from_stamp = _probe(daily=99.0, fetched_at=NOW.timestamp() - 1000.0)
     denied_stamp = _gate(from_stamp, "devin-swe2")
     assert denied_stamp.ok is False
     assert denied_stamp.gate_basis is None
-    assert denied_stamp.used_pct == 99.0
+    assert denied_stamp.unmeasurable is True
+    assert denied_stamp.used_pct is None
 
     fresh = _gate(_probe(daily=99.0, age_s=10.0), "devin-swe2")
     assert fresh.ok is True
@@ -241,12 +244,12 @@ def test_aged_past_freshness_with_free_bucket_uses_account_gate():
     assert live.account_daily_pct == 99.0
 
 
-def test_warning_probe_with_free_bucket_stays_unmeasurable():
+def test_account_warning_does_not_disqualify_current_free_bucket():
     warned = _probe(daily=None, weekly=None, warning="quota probe failed")
     result = _gate(warned, "devin-swe2")
-    assert result.ok is False
-    assert result.unmeasurable is True
-    assert result.gate_basis is None
+    assert result.ok is True
+    assert result.unmeasurable is False
+    assert result.gate_basis == _HIGH_BASIS
 
 
 def test_invalid_or_ambiguous_swe2_bucket_uses_account_gate():
@@ -551,12 +554,14 @@ def test_legacy_family_bucket_admits_no_name():
         assert result.gate_basis is None, name
 
 
-def test_non_current_probe_with_own_rung_bucket_falls_back(fixture_text):
+def test_non_current_probe_with_own_rung_bucket_is_unavailable(fixture_text):
     for name in sorted(_SIX):
         stale = _probe(daily=99.0, age_s=120.0)
         result = _gate(stale, name)
         assert result.ok is False, name
         assert result.gate_basis is None, name
+        assert result.unmeasurable is True, name
+        assert "swe2_measurement_unavailable" in result.reason, name
 
 
 def test_paid_devin_rungs_stay_on_account_with_every_fixture(fixture_text):
