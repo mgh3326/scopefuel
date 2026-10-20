@@ -79,14 +79,16 @@ retired. A profile **hard-deleted** on the server — its rows removed rather
 than marked `retired_at` — therefore makes every host that cached it reject
 every later catalog, indefinitely. Recovery is one of:
 
-* **Retire the profile instead of deleting it** — the supported path. A
-  retired row still *mentions* its profile, so the catalog passes the floor
-  and the retirement takes effect.
+* **Restore the profile's rows with `retired_at` set** — retiring, not
+  deleting, is the supported path. A retired row still *mentions* its
+  profile, so the catalog passes the floor and the retirement takes effect.
+  For a profile already hard-deleted, push its rows back retired.
 * **Clear that host's catalog cache** — delete the `catalog` scope's rows
-  (`bench_cache_catalog` plus its `bench_cache_meta` stamp), or remove
-  `~/.local/share/scopefuel/bench.db` outright. With no last-good cache the
-  bundle floor applies again, and a catalog covering the bundled snapshot is
-  accepted.
+  (`bench_cache_catalog` plus its `bench_cache_meta` stamp). With no
+  last-good cache the bundle floor applies again — which rescues the host
+  only when the deleted profile was server-only: a hard-deleted *bundled*
+  profile is still refused by the floor, so only restoring its rows (retired
+  or live) fixes that case.
 
 Tunables live in `~/.config/scopefuel/config.toml`:
 

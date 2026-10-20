@@ -1755,7 +1755,11 @@ def test_commit_cache_false_survives_a_db_lacking_snapshot_fill(catalog_server):
     view = bench.read_catalog(commit_cache=False)
     assert view.source == "server"  # fetched; the ratchet read the rows anyway
     assert _db_sha() == before
-    cols = [r[1] for r in sqlite3.connect(bench.db_path()).execute("PRAGMA table_info(bench_cache_meta)")]
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bench_cache_meta)")]
+    finally:
+        conn.close()
     assert "snapshot_fill" not in cols
 
     # The TTL serve on the same legacy DB attests no fill.
@@ -2038,22 +2042,30 @@ def test_the_last_good_gate_unit_matrix(catalog_server):
     assert bench._last_good_catalog(path=None, backend=backend) == []
 
 
-def test_a_tampered_fill_never_names_a_covered_profile(catalog_server, capsys):
-    """R2: hand-edited meta naming a covered profile is not echoed.
+@pytest.mark.parametrize("serve", ["ttl", "rejected", "offline", "stale"])
+def test_a_tampered_fill_never_names_a_covered_profile(catalog_server, capsys, serve):
+    """R2: hand-edited meta naming a covered profile is not echoed — on any
+    of the serve paths that use the stored fill (TTL, rejected-to-cache,
+    offline-to-cache, cache-stale)."""
 
-    The stored fill is meta a writer could corrupt; the served profiles are
-    subtracted before it can be warned or reported, so a covered profile is
-    never named.
-    """
-
-    _setup_pre_bundle(catalog_server[1], age=60)
+    _, fake = catalog_server
+    canon = _setup_pre_bundle(fake)  # aged 3601 by default
     _set_meta(snapshot_fill="opus,devin-argon")
+    if serve == "ttl":
+        _age_catalog_cache(60)
+    elif serve == "rejected":
+        fake.catalog = [row for row in canon if row["profile"] != "kimi-k3"]
+    elif serve == "offline":
+        fake.offline = True
+    else:  # stale
+        _age_catalog_cache(90000)
+        fake.offline = True
+    bench.reset_catalog_memo()
     capsys.readouterr()
 
     view = bench.read_catalog()
-    assert view.source == "cache"
-    assert "opus" not in view.snapshot_fill
-    assert "devin-argon" in view.snapshot_fill
+    assert view.source == ("cache-stale" if serve == "stale" else "cache")
+    assert view.snapshot_fill == ("devin-argon",)
     warned = "".join(_fill_lines(capsys.readouterr().err))
     assert "devin-argon" in warned
     assert "opus" not in warned
@@ -2065,13 +2077,16 @@ def test_a_tampered_fill_never_names_a_covered_profile(catalog_server, capsys):
     assert "devin-argon-low" in uncovered
 
 
-def test_a_commit_landing_mid_read_never_names_a_covered_profile(catalog_server, capsys, monkeypatch):
-    """R1: the torn read cannot echo a covered profile.
+@pytest.mark.parametrize("serve", ["ttl", "rejected", "offline", "stale"])
+def test_a_commit_landing_mid_read_never_names_a_covered_profile(catalog_server, capsys, monkeypatch, serve):
+    """R1: the torn read cannot echo a covered profile — on any serve path.
 
     The rows SELECT and the meta SELECT are separate statements; a commit
     landing between them yields rows from one commit and the stamp+fill from
     another. The served profiles are subtracted from the stored fill, so the
     warning and the view still cannot name a profile the served entries cover.
+    The racing commit's stamp is backdated so each case really takes its own
+    serve path rather than always the TTL serve.
     """
 
     _, fake = catalog_server
@@ -2079,9 +2094,9 @@ def test_a_commit_landing_mid_read_never_names_a_covered_profile(catalog_server,
     canon_a = _canon_without(NEW_TO_BUNDLE)  # covers oc-solar4
     canon_b = _canon_without(NEW_TO_BUNDLE + ("oc-solar4",))
     _commit_canon(canon_a, snapshot_fill=NEW_TO_BUNDLE)
-    _age_catalog_cache(60)
     real = bench._catalog_meta_row
     state = {"done": False}
+    age_s = {"ttl": 60, "rejected": 3601, "offline": 3601, "stale": 90000}[serve]
 
     def racing(conn):
         if not state["done"]:
@@ -2092,16 +2107,103 @@ def test_a_commit_landing_mid_read_never_names_a_covered_profile(catalog_server,
                 backend=backend,
                 snapshot_fill=tuple(sorted(NEW_TO_BUNDLE + ("oc-solar4",))),
             )
+            import datetime as dt
+
+            stamp = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=age_s)).isoformat()
+            conn.execute("UPDATE bench_cache_meta SET fetched_at = ? WHERE scope = 'catalog'", (stamp,))
         return real(conn)
 
     monkeypatch.setattr(bench, "_catalog_meta_row", racing)
+    if serve == "rejected":
+        fake.catalog = canon_b  # drops canon_a's oc-solar4 -> the fetch is refused
+    if serve in ("offline", "stale"):
+        fake.offline = True
     bench.reset_catalog_memo()
     capsys.readouterr()
 
     view = bench.read_catalog()
+    assert state["done"] is True
+    assert view.source == ("cache-stale" if serve == "stale" else "cache")
     served = {entry.profile for entry in view.entries}
     assert "oc-solar4" in served
     assert "oc-solar4" not in view.snapshot_fill
     assert set(view.snapshot_fill) == set(NEW_TO_BUNDLE)
     warned = "".join(_fill_lines(capsys.readouterr().err))
     assert "oc-solar4" not in warned
+    assert "devin-argon" in warned
+
+
+@pytest.mark.parametrize("bad_stamp", ["not-a-timestamp", "", "2026-13-45T00:00:00Z"])
+def test_the_read_path_distrusts_an_unparseable_stamp(catalog_server, bad_stamp):
+    """N8, read path: an unparseable stamp is no baseline and no cache.
+
+    The cache holds a server-only profile; the fetched catalog covers the
+    whole bundle but lacks it — only a trusted baseline could reject that
+    catalog. With the stamp unparseable the bundle floor accepts it, and an
+    unreachable server means the snapshot, not the unreadable cache.
+    """
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [_row("srv-only", "high", "srv-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    _set_meta(fetched_at=bad_stamp)
+
+    fake.offline = True
+    view = bench.read_catalog()
+    assert view.source == "snapshot"
+    fake.offline = False
+    fake.catalog = _seed_rows()
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "server"
+
+
+def test_the_fill_warning_is_grammatical_in_the_singular(catalog_server, capsys):
+    """The singular reads "filling it ... to add it"; the plural keeps
+    "filling them ... to add them"."""
+
+    _, fake = catalog_server
+    canon = _canon_without(("devin-argon",))
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+
+    view = bench.read_catalog()
+    assert view.snapshot_fill == ("devin-argon",)
+    (line,) = _fill_lines(capsys.readouterr().err)
+    assert "bundled profile devin-argon;" in line
+    assert "filling it from the bundled snapshot" in line
+    assert "to add it to the canon" in line
+
+    _setup_pre_bundle(fake)
+    capsys.readouterr()
+    view = bench.read_catalog()
+    assert len(view.snapshot_fill) == len(NEW_TO_BUNDLE)
+    (line,) = _fill_lines(capsys.readouterr().err)
+    assert "bundled profiles" in line
+    assert "filling them from the bundled snapshot" in line
+    assert "to add them to the canon" in line
+
+
+def test_push_refetch_ratchet_counts_a_retired_only_cached_profile(catalog_server, tmp_path, capsys):
+    """M01 on the push path: a cached profile whose rows are all retired
+    still counts toward the baseline — the server serves the complete
+    bundle, so only the cache ratchet can reject the refetch."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [
+        _row("srv-only", "high", "srv-1", "codex", "S", score=63.0, retired_at="2026-10-20T00:00:00Z")
+    ]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = _seed_rows()  # full bundle; srv-only hard-deleted
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    err = capsys.readouterr().err
+    assert "refetched catalog was rejected" in err
+    assert "missing 1 cached profile" in err
+    assert "srv-only" in _cache_profiles()
