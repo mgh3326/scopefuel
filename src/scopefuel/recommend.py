@@ -3067,6 +3067,10 @@ class GateResult:
     # 안전 라벨). Fusion GPT 행이 선언된 청구 계정으로 판정될 때만 설정한다 —
     # 다른 프로필은 None 이라 기존 출력과 바이트 동일하다.
     account: str | None = None
+    # hk 1769 — 성공한 codex 판독의 미등재 plan_type (없으면 "<absent>"). 측정이
+    # 살아 있는 판정 경로에서만 채운다 — provider error·버킷 없음 경로의 출력은
+    # base 와 동일하게 유지된다. CLI 가 결정 출력 뒤에 warning 한 줄로 인쇄한다.
+    unknown_plan: str | None = None
 
 
 def _find_profile(
@@ -3949,6 +3953,7 @@ def gate_check(
                 missing_windows=missing,
                 **audit,
             )
+        unknown_plan = manual.unknown_codex_plan(result)
         states = _window_states(matches, now)
         constraint = _select_constraint(states)
         used_pct = constraint.used_pct
@@ -3976,6 +3981,7 @@ def gate_check(
                 used_pct=used_pct,
                 pool_class=effective_class,
                 missing_windows=missing,
+                unknown_plan=unknown_plan,
                 **audit,
             )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
@@ -3997,6 +4003,7 @@ def gate_check(
                 pool_class=effective_class,
                 exhaust_notice=notify_status,
                 missing_windows=missing,
+                unknown_plan=unknown_plan,
                 **audit,
             )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
@@ -4022,6 +4029,7 @@ def gate_check(
             stale_accepted=accepted is not None,
             missing_windows=missing,
             e6_arm=e6_admitted,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4211,6 +4219,7 @@ def gate_check(
             **audit,
         )
 
+    unknown_plan = manual.unknown_codex_plan(result)
     states = _window_states(matches, now)
     constraint = _select_constraint(states)
     used_pct = constraint.used_pct
@@ -4237,6 +4246,7 @@ def gate_check(
             pool_class=effective_class,
             alternatives=alts,
             missing_windows=missing,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4261,6 +4271,7 @@ def gate_check(
             alternatives=alts,
             exhaust_notice=notify_status,
             missing_windows=missing,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4291,6 +4302,7 @@ def gate_check(
             stale_accepted=accepted is not None,
             missing_windows=missing,
             e6_arm=e6_admitted,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4314,6 +4326,7 @@ def gate_check(
         stale_accepted=accepted is not None,
         missing_windows=missing,
         e6_arm=e6_admitted,
+        unknown_plan=unknown_plan,
         **audit,
     )
 

@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import datetime as dt
 
-import pytest
-
 from scopefuel import cli, manual
 from scopefuel.model import Bucket, ProviderResult, Scope, window_label
 from scopefuel.recommend import gate_check, recommend, recommend_dict
@@ -54,8 +52,11 @@ def _codex(plan: str | None, *buckets: tuple[str, float]) -> ProviderResult:
     )
 
 
-def _fresh_warned_set(monkeypatch) -> None:
-    monkeypatch.setattr(manual, "_CODEX_UNKNOWN_PLAN_WARNED", set())
+def _gate_cli(monkeypatch, capsys, result: ProviderResult) -> tuple[int, str, str]:
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: result})
+    rc = cli.main(["gate", "-m", "codex-max", "--no-cache"])
+    out = capsys.readouterr()
+    return rc, out.out, out.err
 
 
 def _ordinary_codex_rows(rows: list[dict]) -> list[dict]:
@@ -186,30 +187,112 @@ def test_plan_team_output_is_base_byte_for_byte():
     assert result.reason == BASE_TAGGED_REASON
 
 
-def test_unknown_plan_warns_once_naming_the_plan(monkeypatch):
-    _fresh_warned_set(monkeypatch)
-    with pytest.warns(UserWarning, match="pro"):
-        gate_check([_codex("pro", ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+def test_unknown_plan_trailing_warning_names_the_plan(monkeypatch, capsys):
+    """The warning prints after the decision line — stdout stays base."""
+    rc, out, err = _gate_cli(monkeypatch, capsys, _codex("pro", ("7d", 10.0)))
+    assert rc == 0
+    assert "profile=codex-max pool=codex used_pct=10.0 class=preserve" in out.splitlines()[0]
+    assert out.splitlines()[1] == BASE_TAGGED_REASON
+    warnings = [line for line in err.splitlines() if "plan_type" in line]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("warning: codex plan_type 'pro'")
+    assert "CODEX_PLAN_REQUIRED_WINDOWS" in warnings[0]
 
 
-def test_absent_plan_warns_once(monkeypatch):
-    _fresh_warned_set(monkeypatch)
-    with pytest.warns(UserWarning, match="absent"):
-        gate_check([_codex(None, ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+def test_absent_plan_on_succeeded_reading_warns(monkeypatch, capsys):
+    rc, out, err = _gate_cli(monkeypatch, capsys, _codex(None, ("7d", 10.0)))
+    assert rc == 0
+    warnings = [line for line in err.splitlines() if "plan_type" in line]
+    assert len(warnings) == 1
+    assert "absent" in warnings[0]
 
 
-def test_plan_comparison_is_normalized_equality_not_substring(monkeypatch):
+def test_no_warning_on_provider_error(monkeypatch, capsys):
+    """Error and no-bucket paths keep base output exactly — no warning."""
+    rc, out, err = _gate_cli(monkeypatch, capsys, ProviderResult(id="codex", plan=None, error="HTTP 503"))
+    assert rc == 4
+    assert "plan_type" not in err
+
+
+def test_no_warning_on_no_bucket_path(monkeypatch, capsys):
+    rc, out, err = _gate_cli(monkeypatch, capsys, _codex("pro"))
+    assert rc == 4
+    assert "plan_type" not in err
+
+
+def test_deny_stderr_line1_is_base_reason(monkeypatch, capsys):
+    """On deny paths the reason keeps stderr line 1; the warning trails."""
+    rc, out, err = _gate_cli(monkeypatch, capsys, _codex("pro", ("5h", 100.0)))
+    assert rc == 3
+    lines = err.splitlines()
+    assert lines[0] == "100% 사용 · 0% 남음 · 차단선 90% — 소진 (class=preserve)"
+    assert "plan_type" not in lines[0]
+    assert any(line.startswith("warning: codex plan_type 'pro'") for line in lines[1:])
+
+
+def test_strict_refusal_precedes_cutoff():
+    """F2 pin: missing required window on a listed plan is unmeasurable (rc4)
+    even when a measured window is over the cutoff — exhaustion is not
+    reported on an incomplete measurement."""
+    result = gate_check([_codex("plus", ("5h", 100.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.unmeasurable is True
+    assert "codex_required_window_missing:7d" in result.reason
+    assert "소진" not in result.reason
+
+
+def test_strict_reason_exact_text():
+    result = gate_check([_codex("plus", ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.reason == ("codex_required_window_missing:5h plan=plus [필수 창 미측정: 5h]")
+
+
+def test_d3_profile_not_in_grade_table_is_strict():
+    """The D3 path (profile outside GRADE_TABLE) applies the same floor."""
+    result = gate_check([_codex("plus", ("7d", 10.0))], "claudex", today=TODAY, now=NOW)
+    assert result.provider_id == "codex"
+    assert result.unmeasurable is True
+    assert "codex_required_window_missing:5h" in result.reason
+
+
+def test_plan_table_never_moves_other_providers():
+    """A plan value must not change claude/kimi floors (mutant M21)."""
+    assert manual.required_windows_for(ProviderResult(id="claude", plan="free")) == frozenset({"5h", "7d"})
+    assert manual.required_windows_for(ProviderResult(id="kimi", plan="prolite")) == frozenset({"5h", "7d"})
+
+
+def test_plan_comparison_is_normalized_equality_not_substring():
     """'Plus' normalises onto the plus row; 'prol' and 'teamplus' do not."""
     strict = gate_check([_codex(" Plus ", ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
     assert strict.unmeasurable is True
     assert "plan=plus" in strict.reason
 
-    _fresh_warned_set(monkeypatch)
     for plan in ("prol", "teamplus", "plusx"):
-        with pytest.warns(UserWarning):
-            base = gate_check([_codex(plan, ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+        base = gate_check([_codex(plan, ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
         assert base.ok is True
         assert base.reason == BASE_TAGGED_REASON
+
+
+def test_manual_fallback_follows_the_stored_plan():
+    """mutant M09 pin: manual coverage is plan-aware on resolve_result."""
+    measured = NOW - dt.timedelta(minutes=2)
+    automatic = _codex("free")
+    automatic.error = "network unreachable"
+    automatic.error_kind = "transport"
+    manual.record_observation(
+        pool="codex",
+        used_pct=74.0,
+        window="30d",
+        measured_at=measured,
+        reason="hk1769 free fallback coverage",
+    )
+    resolution = manual.resolve_result(automatic, now=NOW)
+    assert resolution.applied is True
+
+    automatic2 = _codex("plus")
+    automatic2.error = "network unreachable"
+    automatic2.error_kind = "transport"
+    resolution2 = manual.resolve_result(automatic2, now=NOW)
+    assert resolution2.applied is False
+    assert "5h" in (resolution2.summary or {}).get("missing_windows", [])
 
 
 # ------------------------------------------------------------ recommend agrees

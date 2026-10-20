@@ -19,7 +19,6 @@ import socket
 import subprocess
 import sys
 import uuid
-import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -74,7 +73,6 @@ CODEX_PLAN_REQUIRED_WINDOWS = {
     "prolite": frozenset({"7d"}),
     "free": frozenset({"30d"}),
 }
-_CODEX_UNKNOWN_PLAN_WARNED: set[str] = set()
 
 _DURATION_PART = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([smhdw])", re.IGNORECASE)
 _AUTH_FAILURE = re.compile(
@@ -776,24 +774,20 @@ def normalize_codex_plan(plan: object) -> str | None:
     return normalized or None
 
 
-def _warn_unknown_codex_plan(plan: str | None) -> None:
-    """One warning per process per distinct plan — the table needs a row."""
-    key = plan if plan is not None else "<absent>"
-    if key in _CODEX_UNKNOWN_PLAN_WARNED:
-        return
-    _CODEX_UNKNOWN_PLAN_WARNED.add(key)
-    if plan is None:
-        warnings.warn(
-            "codex plan_type is absent — required windows fall back to {5h, 7d} "
-            "(hk 1769, CODEX_PLAN_REQUIRED_WINDOWS)",
-            stacklevel=4,
-        )
-    else:
-        warnings.warn(
-            f"codex plan_type {plan!r} is not in CODEX_PLAN_REQUIRED_WINDOWS — "
-            "required windows fall back to {5h, 7d}; extend the table (hk 1769)",
-            stacklevel=4,
-        )
+def unknown_codex_plan(result: ProviderResult | None) -> str | None:
+    """The judged codex plan when the table does not know it (hk 1769).
+
+    Returns the normalised plan value, ``"<absent>"`` for a missing or
+    non-string plan_type, or None when the result is not codex or the plan
+    has a table row. Naming the value lets the gate surface one warning so
+    ``CODEX_PLAN_REQUIRED_WINDOWS`` gets extended.
+    """
+    if result is None or result.id != "codex":
+        return None
+    plan = normalize_codex_plan(result.plan)
+    if plan in CODEX_PLAN_REQUIRED_WINDOWS:
+        return None
+    return plan if plan is not None else "<absent>"
 
 
 def required_windows_for(result: ProviderResult | None) -> frozenset[str]:
@@ -811,7 +805,6 @@ def required_windows_for(result: ProviderResult | None) -> frozenset[str]:
         plan = normalize_codex_plan(result.plan)
         if plan in CODEX_PLAN_REQUIRED_WINDOWS:
             return CODEX_PLAN_REQUIRED_WINDOWS[plan]
-        _warn_unknown_codex_plan(plan)
     return REQUIRED_WINDOWS.get(result.id, frozenset())
 
 
