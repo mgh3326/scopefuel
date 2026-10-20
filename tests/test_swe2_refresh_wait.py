@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 import threading
 import time
 from types import SimpleNamespace
@@ -531,7 +532,12 @@ def test_poll_cadence_and_no_network(monkeypatch):
     # loads[0] is the pre-Popen snapshot read; the gaps are poll-to-poll.
     gaps = [round(b - a, 2) for a, b in zip(loads[1:], loads[2:], strict=False)]
     assert result.error_kind == SWE2_IN_FLIGHT_TIMEOUT
-    assert gaps and all(0.2 < g < 0.4 for g in gaps)
+    assert gaps
+    # Every gap above a floor kills the no-sleep mutants (M2m, M3a); the median
+    # near the named interval kills the slow-poll mutant (M3b) while tolerating
+    # scheduler jitter on shared CI runners.
+    assert all(g > 0.15 for g in gaps)
+    assert statistics.median(gaps) < 0.6
 
 
 # --- worker-code and dispatch seams (R2-3) ---
