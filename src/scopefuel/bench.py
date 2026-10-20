@@ -644,9 +644,10 @@ def _backfill_table_grade(conn: sqlite3.Connection) -> None:
 
 _CACHE_SCHEMA = """
         CREATE TABLE IF NOT EXISTS bench_cache_meta (
-          scope       TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
-          fetched_at  TEXT NOT NULL,
-          endpoint_id TEXT NOT NULL DEFAULT ''
+          scope         TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
+          fetched_at    TEXT NOT NULL,
+          endpoint_id   TEXT NOT NULL DEFAULT '',
+          snapshot_fill TEXT NOT NULL DEFAULT ''
         );
 
         -- Remote score rows are separate from the historical local source
@@ -800,9 +801,10 @@ def _migrate_cache_meta_scopes(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE TABLE bench_cache_meta_new (
-          scope       TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
-          fetched_at  TEXT NOT NULL,
-          endpoint_id TEXT NOT NULL DEFAULT ''
+          scope         TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
+          fetched_at    TEXT NOT NULL,
+          endpoint_id   TEXT NOT NULL DEFAULT '',
+          snapshot_fill TEXT NOT NULL DEFAULT ''
         );
         INSERT INTO bench_cache_meta_new(scope, fetched_at, endpoint_id)
           SELECT scope, fetched_at, endpoint_id FROM bench_cache_meta;
@@ -820,6 +822,9 @@ def _cache_schema(conn: sqlite3.Connection) -> None:
     }
     if "provenance" not in existing_score_cache_columns:
         conn.execute("ALTER TABLE bench_cache_scores ADD COLUMN provenance TEXT NOT NULL DEFAULT ''")
+    existing_meta_columns = {row[1] for row in conn.execute("PRAGMA table_info(bench_cache_meta)").fetchall()}
+    if "snapshot_fill" not in existing_meta_columns:
+        conn.execute("ALTER TABLE bench_cache_meta ADD COLUMN snapshot_fill TEXT NOT NULL DEFAULT ''")
 
 
 def _schema(conn: sqlite3.Connection) -> None:
@@ -2767,6 +2772,12 @@ class CatalogView:
     # when the fetch degraded (``server catalog rejected: …``, or ``server
     # unreachable`` on a stale cache). Surfaced inside the label's parentheses.
     detail: str = ""
+    # Bundled-snapshot profiles the canon provably does not cover: on a server
+    # view, the profiles that passed the ratchet as new-to-bundle at fetch
+    # time; on a cache view, the attestation the last commit stored. They are
+    # filled from the bundled snapshot until a ``bench push-catalog`` lands
+    # them — disclosed on ``bench catalog status`` under their own heading.
+    snapshot_fill: tuple[str, ...] = ()
 
     @property
     def local_only(self) -> bool:
@@ -2972,27 +2983,69 @@ def _fetch_catalog_exact(backend: BenchBackend) -> list[CatalogEntry]:
     return [_catalog_entry_exact(row) for row in rows]
 
 
-def _server_catalog_rejection(entries: list[CatalogEntry]) -> str | None:
+def _server_catalog_rejection(
+    entries: list[CatalogEntry], last_good: list[CatalogEntry] | None = None
+) -> str | None:
     """The validity floor a fetched catalog must pass before it may be canon.
 
     Returns the rejection detail, or ``None`` when the catalog stands. Two
     rejections: an empty catalog, and a catalog that never mentions a profile
-    the bundled snapshot places — *mentioned* means present as a row, live or
-    retired, so a legitimate server-side retirement still passes. Anything
-    smaller than that is not a canon, it is an accident of seeding: #667 was a
-    1-row catalog silently becoming the fleet's placements. Per-profile gaps
-    below this floor stay the launcher's problem — ``resolve_launch`` fills
-    them from the snapshot.
+    the ratchet covers — *mentioned* means present as a row, live or retired,
+    so a legitimate server-side retirement still passes.
+
+    The ratchet is the **last-good committed cache** (#1768): a fetched
+    catalog that drops a profile the fleet already trusted is the #667
+    failure — a 1-row catalog silently becoming the placements — no matter
+    what the bundle says. Membership is not freshness: the ratchet applies
+    to a cache of any age, including one past ``catalog_stale_max_s``. With
+    no last-good cache (first run, unreadable rows, or a different endpoint —
+    the stamp's endpoint check already threw those away) there is nothing to
+    ratchet against, so the floor stays the bundled snapshot and fails
+    closed exactly as it did before.
+
+    A snapshot profile that neither the fetched catalog nor the last-good
+    cache mentions is new to the bundle: it does not reject the catalog. It
+    is served from the snapshot exactly as ``resolve_launch`` fills a
+    per-profile gap — and the commit records the attested set so a
+    cache-served run can keep disclosing it.
     """
 
     if not entries:
         return "empty catalog"
-    missing = snapshot_profiles() - {entry.profile for entry in entries}
+    fetched = {entry.profile for entry in entries}
+    row_word = "row" if len(entries) == 1 else "rows"
+    if last_good:
+        missing = {entry.profile for entry in last_good} - fetched
+        if not missing:
+            return None
+        profile_word = "profile" if len(missing) == 1 else "profiles"
+        # The ratchet set is the last-good cache, not the snapshot — the
+        # "snapshot" noun only applies when every dropped profile is also a
+        # bundled one; a cache profile the bundle never carried is "cached".
+        covered = "snapshot" if missing <= snapshot_profiles() else "cached"
+        return f"{len(entries)} {row_word}, missing {len(missing)} {covered} {profile_word}"
+    missing = snapshot_profiles() - fetched
     if not missing:
         return None
-    row_word = "row" if len(entries) == 1 else "rows"
     profile_word = "profile" if len(missing) == 1 else "profiles"
     return f"{len(entries)} {row_word}, missing {len(missing)} snapshot {profile_word}"
+
+
+def _warn_snapshot_fill(fill: tuple[str, ...] | list[str]) -> None:
+    """Disclose bundled profiles the canon does not cover (one line, stderr).
+
+    The profiles are served from the bundled snapshot — ``resolve_launch``
+    fills them exactly like any per-profile gap — and stay named until
+    ``bench push-catalog`` lands their rows on the server.
+    """
+
+    word = "profile" if len(fill) == 1 else "profiles"
+    print(
+        f"warning: catalog canon does not cover bundled {word} {', '.join(fill)}; "
+        "filling them from the bundled snapshot — bench push-catalog is needed "
+        "to add them to the canon",
+        file=sys.stderr,
+    )
 
 
 def _catalog_to_wire(entry: CatalogEntry) -> dict[str, object]:
@@ -3022,7 +3075,11 @@ def _put_cached_catalog(conn: sqlite3.Connection, entry: CatalogEntry) -> None:
 
 
 def _commit_catalog_cache(
-    *, path: pathlib.Path | str | None, entries: list[CatalogEntry], backend: BenchBackend
+    *,
+    path: pathlib.Path | str | None,
+    entries: list[CatalogEntry],
+    backend: BenchBackend,
+    snapshot_fill: tuple[str, ...] = (),
 ) -> None:
     conn = _cache_connect(path)
     try:
@@ -3032,12 +3089,74 @@ def _commit_catalog_cache(
         for entry in entries:
             _put_cached_catalog(conn, entry)
         _stamp_cache(conn, "catalog", backend, now)
+        # The attested new-to-bundle set rides the same transaction as the
+        # rows and the stamp: a concurrent second committer can only replace
+        # the triple whole — the rows, their age, and which profiles the
+        # canon legitimately lacked are never torn apart.
+        conn.execute(
+            "UPDATE bench_cache_meta SET snapshot_fill = ? WHERE scope = 'catalog'",
+            (",".join(snapshot_fill),),
+        )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _catalog_meta_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The catalog meta stamp: age columns plus the snapshot-fill attestation.
+
+    ``snapshot_fill`` was added after the table (an old read-only database may
+    still lack the column), so the SELECT degrades to the two original
+    columns rather than failing the probe — a missing column reads as no
+    attestation, never as a broken cache.
+    """
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(bench_cache_meta)").fetchall()}
+    fill = ", snapshot_fill" if "snapshot_fill" in columns else ""
+    return conn.execute(
+        f"SELECT fetched_at, endpoint_id{fill} FROM bench_cache_meta WHERE scope = 'catalog'"
+    ).fetchone()
+
+
+def _stored_snapshot_fill(row: sqlite3.Row | None) -> tuple[str, ...]:
+    if row is None:
+        return ()
+    try:
+        text = row["snapshot_fill"]
+    except IndexError:
+        return ()
+    return tuple(profile for profile in text.split(",") if profile)
+
+
+def _last_good_catalog(*, path: pathlib.Path | str | None, backend: BenchBackend) -> list[CatalogEntry]:
+    """The last-good committed cache rows, gated exactly like a cache serve.
+
+    Empty when the cache is unusable as a ratchet baseline: no meta stamp,
+    another endpoint's rows, or an unparseable/future stamp — the same
+    conditions that empty ``cached`` in ``_read_catalog_uncached`` (freshness
+    itself is irrelevant: membership is not freshness).
+    """
+
+    try:
+        conn = _cache_connect(path)
+        try:
+            cached = _cached_catalog(conn)
+            row = _catalog_meta_row(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    if row is None or row["endpoint_id"] != backend.endpoint_id:
+        return []
+    fetched_at = _cached_at(row["fetched_at"])
+    if fetched_at is None:
+        return []
+    if (_cache_now() - fetched_at).total_seconds() < -_CACHE_CLOCK_SKEW_S:
+        return []
+    return cached
 
 
 # One resolved catalog per process. Without this, ``--recommend`` and a gate
@@ -3101,9 +3220,7 @@ def _read_catalog_uncached(
         conn = _cache_connect(path)
         try:
             cached = _cached_catalog(conn)
-            row = conn.execute(
-                "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = 'catalog'"
-            ).fetchone()
+            row = _catalog_meta_row(conn)
         except sqlite3.Error:
             cached, row = [], None
         finally:
@@ -3118,9 +3235,7 @@ def _read_catalog_uncached(
                 conn = _readonly_connect(target)
                 try:
                     cached = _cached_catalog(conn)
-                    row = conn.execute(
-                        "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = 'catalog'"
-                    ).fetchone()
+                    row = _catalog_meta_row(conn)
                 finally:
                     conn.close()
             except sqlite3.Error:
@@ -3139,18 +3254,29 @@ def _read_catalog_uncached(
                 age_s = max(0.0, age_s)
     if age_s is None:
         cached = []
+    # The last-good attestation: which bundled profiles the canon legitimately
+    # lacked at the last commit. It shares the cache's trust gate — a stamp
+    # that failed the endpoint/age checks attests nothing — and only profiles
+    # still in this build's bundle can still be new to it.
+    stored_fill: tuple[str, ...] = ()
+    if age_s is not None:
+        bundled = snapshot_profiles()
+        stored_fill = tuple(p for p in _stored_snapshot_fill(row) if p in bundled)
 
     # ``catalog_stale_max_s`` is a ceiling on trusting the cache at all, so a TTL
     # configured above it must not be able to keep serving a cache the ceiling
     # has already condemned.
     fresh_before = min(backend.catalog_ttl_s, backend.catalog_stale_max_s)
     if cached and age_s is not None and age_s < fresh_before:
+        if stored_fill:
+            _warn_snapshot_fill(stored_fill)
         return CatalogView(
             entries=tuple(cached),
             source=CATALOG_SOURCE_CACHE,
             age_s=age_s,
             backend=backend.name,
             reason=backend.reason,
+            snapshot_fill=stored_fill,
         )
 
     # Why the canon cannot be served this run — an unreachable server, or a
@@ -3162,17 +3288,26 @@ def _read_catalog_uncached(
         # The floor runs after the schema decode (inside _fetch_catalog) and
         # before the response may replace the last-good cache: a refused
         # catalog is never committed, and the host degrades exactly as if the
-        # server were unreachable.
-        rejection = _server_catalog_rejection(entries)
+        # server were unreachable. The ratchet is the last-good cache itself —
+        # ``cached`` is already empty when the endpoint or the stamp failed.
+        rejection = _server_catalog_rejection(entries, cached)
         if rejection is None:
+            # Profiles the bundle places but the canon does not: new to the
+            # bundle, served from the snapshot, attested on the commit so the
+            # next cache-served run can keep naming them. The cache holds
+            # server rows only — the fill is meta, not rows.
+            fill = tuple(sorted(snapshot_profiles() - {entry.profile for entry in entries}))
             if commit_cache:
-                _commit_catalog_cache(path=path, entries=entries, backend=backend)
+                _commit_catalog_cache(path=path, entries=entries, backend=backend, snapshot_fill=fill)
+            if fill:
+                _warn_snapshot_fill(fill)
             return CatalogView(
                 entries=tuple(entries),
                 source=CATALOG_SOURCE_SERVER,
                 age_s=0.0,
                 backend=backend.name,
                 reason=backend.reason,
+                snapshot_fill=fill,
             )
         degraded = f"server catalog rejected: {rejection}"
     except BenchRouteMissing:
@@ -3199,6 +3334,8 @@ def _read_catalog_uncached(
             )
         else:
             _warn_cached("catalog", age_hours=age_s / 3600.0, has_data=True)
+        if stored_fill:
+            _warn_snapshot_fill(stored_fill)
         return CatalogView(
             entries=tuple(cached),
             source=CATALOG_SOURCE_CACHE,
@@ -3206,6 +3343,7 @@ def _read_catalog_uncached(
             backend=backend.name,
             reason=backend.reason,
             detail=degraded if rejected else "",
+            snapshot_fill=stored_fill,
         )
 
     if cached and age_s is not None:
@@ -3220,6 +3358,8 @@ def _read_catalog_uncached(
             )
         else:
             _warn_cached("catalog", age_hours=age_s / 3600.0, has_data=True)
+        if stored_fill:
+            _warn_snapshot_fill(stored_fill)
         return CatalogView(
             entries=tuple(cached),
             source=CATALOG_SOURCE_CACHE_STALE,
@@ -3227,6 +3367,7 @@ def _read_catalog_uncached(
             backend=backend.name,
             reason=backend.reason,
             detail=degraded,
+            snapshot_fill=stored_fill,
         )
 
     if rejected:
@@ -3381,7 +3522,23 @@ def push_catalog(
         raise BenchBackendError("handoffkeep rejected the catalog write")
     reset_catalog_memo()
     try:
-        _commit_catalog_cache(path=path, entries=_fetch_catalog(backend), backend=backend)
+        refetched = _fetch_catalog(backend)
+        fill = tuple(sorted(snapshot_profiles() - {entry.profile for entry in refetched}))
+        # #1768: the post-write refetch clears the same floor a fresh fetch
+        # does before it may replace the last-good cache. Committing an
+        # unfloored canon here would overwrite a healthy cache with a
+        # regressed one — and the next read's ratchet would then vouch for
+        # the regression. A rejection only forfeits the refresh.
+        last_good = _last_good_catalog(path=path, backend=backend)
+        rejection = _server_catalog_rejection(refetched, last_good)
+        if rejection is not None:
+            print(
+                f"warning: catalog written but the refetched catalog was rejected "
+                f"({rejection}); the local cache was not refreshed",
+                file=sys.stderr,
+            )
+        else:
+            _commit_catalog_cache(path=path, entries=refetched, backend=backend, snapshot_fill=fill)
     except (BenchBackendError, sqlite3.Error, OSError, ValueError):
         # The write landed; a cache refresh failure only costs one extra read.
         print("warning: catalog written but the local cache was not refreshed", file=sys.stderr)
@@ -3503,9 +3660,19 @@ def catalog_status_report(*, path: pathlib.Path | str | None = None) -> str:
     # view has nothing uncovered by definition, while a cache-stale view —
     # stale like the snapshot but still carrying the last-good rows — must
     # keep listing the profiles its (possibly pre-floor, partial) canon omits.
-    uncovered = (
-        sorted(snapshot_profiles() - view.profiles()) if view.source != CATALOG_SOURCE_SNAPSHOT else []
-    )
+    # Two headings, kept apart: profiles the canon *attested* it does not
+    # cover (bundle additions that passed the ratchet — the fill set the
+    # commit recorded) are expected and name their fix, while every other
+    # gap is an uncovered profile the report cannot vouch for.
+    gap = sorted(snapshot_profiles() - view.profiles()) if view.source != CATALOG_SOURCE_SNAPSHOT else []
+    fill = set(view.snapshot_fill)
+    new_to_bundle = [profile for profile in gap if profile in fill]
+    uncovered = [profile for profile in gap if profile not in fill]
+    if new_to_bundle:
+        lines.append(
+            "new to the bundle (filled from the bundled snapshot; bench push-catalog needed): "
+            + ", ".join(new_to_bundle)
+        )
     if uncovered:
         lines.append("uncovered (snapshot-only, catalog has no row): " + ", ".join(uncovered))
     return "\n".join(lines)
