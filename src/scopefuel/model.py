@@ -263,6 +263,12 @@ class ProviderResult:
     # task #659 — 계정의 안전한 표시 라벨(org/display 이름, 정제됨).
     # 이메일·토큰·uuid 원문은 절대 들어가지 않는다.
     account_label: str | None = None
+    # hk 1753 (b953) — 게시 전용 계정 지문. account_fp 와 달리 로컬 지문 게이트
+    # (account_fp_match·remote_eligible·_current_identity) 를 열지 않는다:
+    # codex 는 이 필드로 quota-share 에 게시하면서 호스트-로컬 계정 일치
+    # 규칙에는 비활성 상태를 유지한다. 읽는 쪽은 publish_fp or account_fp.
+    publish_fp: str | None = None
+    publish_fp_kind: str | None = None
     last_error_at: float | None = None
     # host-local backoff 창의 끝(epoch). 창 안에서는 어느 경로도 네트워크를 치지 않는다.
     backoff_until: float | None = None

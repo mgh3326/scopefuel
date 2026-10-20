@@ -152,12 +152,12 @@ def _safe_host(host: object) -> str:
     return f"{host[: _HOST_MAX_LEN - 9]}-{digest}"
 
 
-def _measured_by(host: str, session_fp: str | None, result: ProviderResult) -> dict:
+def _measured_by(host: str, session_fp: str | None, result: ProviderResult, fp: str) -> dict:
     """측정 주체 provenance — 어느 호스트·세션·계정이 관측했는지 (AC2/AC5)."""
     return {
         "host": host,
         "session_fp": session_fp,
-        "account_fp": result.account_fp,
+        "account_fp": fp,
         "account_label": safe_label(result.account_label),
     }
 
@@ -182,12 +182,14 @@ def _bucket_payload(bucket: Bucket, measured_by: dict) -> dict:
     return payload
 
 
-def _payload(pool: str, result: ProviderResult, host: str, session_fp: str | None, epoch: float) -> dict:
-    measured_by = _measured_by(host, session_fp, result)
+def _payload(
+    pool: str, result: ProviderResult, fp: str, host: str, session_fp: str | None, epoch: float
+) -> dict:
+    measured_by = _measured_by(host, session_fp, result, fp)
     return {
         "schema": SCHEMA,
         "pool": pool,
-        "account_fp": result.account_fp,
+        "account_fp": fp,
         "measured_at": dt.datetime.fromtimestamp(epoch, dt.UTC).isoformat(),
         "measured_at_epoch": float(epoch),
         "measured_by": measured_by,
@@ -206,7 +208,10 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
     try:
         if not enabled() or result.error or result.warning:
             return False
-        fp = result.account_fp
+        # hk 1753 — 게시 지문은 publish_fp 우선이다: codex 처럼 로컬 지문
+        # 게이트를 열지 않으면서 게시만 하는 결과가 쓴다.
+        fp = result.publish_fp or result.account_fp
+        kind = result.publish_fp_kind or result.account_fp_kind
         if not isinstance(fp, str) or not fp:
             return False
         # task #659 — 계정 uuid 에 묶인 지문만 게시한다. 토큰 해시 폴백 지문은
@@ -215,7 +220,7 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
         # config 컨텍스트가 어긋난 토큰+uuid 조합의 오귀속을 막는 게이트다.
         # 건너뛴 사유는 ProviderResult.account_fp_kind="token" 과
         # docs/quota-share.md 에 명시된다.
-        if result.account_fp_kind != "account":
+        if kind != "account":
             return False
         if not any(_is_valid_used_pct(b.used_pct) for b in result.buckets):
             return False
@@ -230,7 +235,14 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
             "session": DOC_SESSION,
             "job": "",
             "body": json.dumps(
-                _payload(pool, result, _safe_host(socket.gethostname()), session_fp, float(epoch)),
+                _payload(
+                    pool,
+                    result,
+                    fp,
+                    _safe_host(socket.gethostname()),
+                    session_fp,
+                    float(epoch),
+                ),
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -317,6 +329,50 @@ def _bucket(data: dict) -> Bucket:
     )
 
 
+def _snapshot_result(
+    snap: dict,
+    pool: str,
+    fp: str,
+    local: ProviderResult,
+    policy_class: PoolClass,
+    now: float,
+) -> ProviderResult | None:
+    """검증된 스냅샷 → ProviderResult — remote_result/declared_result 공통 꼬리.
+
+    측정이 REMOTE_MAX_AGE_S 이내이고 유효 used_pct 가 하나라도 있을 때만
+    결과를 돌려준다. class 는 로컬 측정과 같은 경로(호출자의 policy_class)를
+    쓴다 — 발행자의 pool_class 를 신뢰해 복사하지 않는다.
+    """
+    measured_at = snap["measured_at_epoch"]
+    age = now - measured_at
+    if age > REMOTE_MAX_AGE_S or age < -MAX_FUTURE_SKEW_S:
+        return None
+    buckets = [_bucket(b) for b in snap["buckets"]]
+    if not any(_is_valid_used_pct(b.used_pct) for b in buckets):
+        return None
+    return ProviderResult(
+        id=pool,
+        plan=snap["plan"],
+        buckets=buckets,
+        note=remote_label(snap["host"], account_tag(fp, snap["account_label"], "account")),
+        source=REMOTE_SOURCE,
+        fetched_at=measured_at,
+        age_s=max(0.0, age),
+        stale=False,
+        pool_class=policy_class,
+        account_fp=fp,
+        account_fp_match=True,
+        account_fp_kind="account",
+        account_label=snap["account_label"],
+        session_fp=snap["session_fp"],
+        # 대체된 로컬 실패는 감사로 남긴다 — 원격 성공이 '로컬이 건강하다'
+        # 는 뜻이 아니므로.
+        last_error=local.last_error or local.error,
+        last_error_at=local.last_error_at,
+        backoff_until=local.backoff_until,
+    )
+
+
 def remote_result(
     pool: str,
     fetcher: object,
@@ -346,33 +402,38 @@ def remote_result(
         snap = _snapshot(_request("GET", key_for(pool, fp)))
         if snap is None or snap["pool"] != pool or snap["account_fp"] != fp:
             return None
-        measured_at = snap["measured_at_epoch"]
-        age = now - measured_at
-        if age > REMOTE_MAX_AGE_S or age < -MAX_FUTURE_SKEW_S:
-            return None
-        buckets = [_bucket(b) for b in snap["buckets"]]
-        if not any(_is_valid_used_pct(b.used_pct) for b in buckets):
-            return None
-        return ProviderResult(
-            id=pool,
-            plan=snap["plan"],
-            buckets=buckets,
-            note=remote_label(snap["host"], account_tag(fp, snap["account_label"], "account")),
-            source=REMOTE_SOURCE,
-            fetched_at=measured_at,
-            age_s=max(0.0, age),
-            stale=False,
-            pool_class=policy_class,
-            account_fp=fp,
-            account_fp_match=True,
-            account_fp_kind="account",
-            account_label=snap["account_label"],
-            session_fp=snap["session_fp"],
-            # 대체된 로컬 실패는 감사로 남긴다 — 원격 성공이 '로컬이 건강하다'
-            # 는 뜻이 아니므로.
-            last_error=local.last_error or local.error,
-            last_error_at=local.last_error_at,
-            backoff_until=local.backoff_until,
-        )
+        return _snapshot_result(snap, pool, fp, local, policy_class, now)
     except Exception:
         return None
+
+
+def declared_result(
+    pool: str,
+    account_fp: str,
+    local: ProviderResult | None,
+    policy_class: PoolClass,
+    *,
+    now: float,
+) -> tuple[ProviderResult | None, dict | None]:
+    """``quota/<pool>/<선언된 지문>/latest`` 를 읽는다 — hk 1753 (b953).
+
+    remote_result 의 변형이다: 키의 지문이 *이 호스트의* 계정 지문이 아니라
+    config 에 선언된 청구 계정 지문이다 — 호스트 지문 일치 규칙(remote_result
+    안의 _current_identity 검사)은 이 경로에 적용되지 않는다. 문서 검증·
+    pool/지문 일치·REMOTE_MAX_AGE_S 연령 한도는 동일하다.
+
+    반환 ``(result, snapshot)``: 신선한 문서면 result 와 그 snapshot. 문서는
+    검증됐지만 오래됐거나 유효 사용량이 없으면 ``(None, snapshot)`` — 호출자가
+    거부 사유에 측정 호스트·나이를 이름 붙일 수 있게 한다. 문서 부재·
+    미검증·기능 off 는 ``(None, None)``.
+    """
+    try:
+        if not enabled():
+            return None, None
+        snap = _snapshot(_request("GET", key_for(pool, account_fp)))
+        if snap is None or snap["pool"] != pool or snap["account_fp"] != account_fp:
+            return None, None
+        local = local if isinstance(local, ProviderResult) else ProviderResult(id=pool)
+        return _snapshot_result(snap, pool, account_fp, local, policy_class, now), snap
+    except Exception:
+        return None, None

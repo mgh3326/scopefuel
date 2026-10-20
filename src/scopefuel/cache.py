@@ -217,6 +217,11 @@ def _to_entry(result: ProviderResult, now: float) -> dict:
     # 지문은 로컬 캐시 파일에만 둔다 — 계정 동일성 증명용이며 출력 계약이 아니다.
     if result.account_fp:
         payload["account_fp"] = result.account_fp
+    # hk 1753 — 게시 전용 지문도 같은 TTL 로 복원한다: 캐시 히트가 매칭 호스트의
+    # 선언-계정 판정(로컬 측정 사용)을 잃지 않게 한다.
+    if result.publish_fp:
+        payload["publish_fp"] = result.publish_fp
+        payload["publish_fp_kind"] = result.publish_fp_kind
     return {"fetched_at": now, "result": payload}
 
 
@@ -279,6 +284,8 @@ def _from_entry(
         # stale 표시가 오락가락하지 않게 kind·label 도 복원한다).
         account_fp_kind=payload.get("account_fp_kind"),
         account_label=payload.get("account_label"),
+        publish_fp=payload.get("publish_fp"),
+        publish_fp_kind=payload.get("publish_fp_kind"),
     )
 
 

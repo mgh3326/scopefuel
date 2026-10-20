@@ -903,6 +903,7 @@ def set_policy(
     note: str | None = None,
     boost: int | None | Literal["__unset__"] = "__unset__",
     subscribed: bool | None | Literal["__unset__"] = "__unset__",
+    fusion_billing_fp: str | None | Literal["__unset__"] = "__unset__",
 ) -> None:
     """Set pool class and/or numeric boost and/or the subscribed flag.
 
@@ -914,7 +915,9 @@ def set_policy(
     clear it. ``subscribed`` follows the same rule: the sentinel leaves the
     key alone, ``True``/``False`` writes it, ``None`` removes just that key —
     merged into the same locked edit so a combined ``policy set`` applies as
-    one atomic transaction (#751 B3). ``plan``/``price_usd``/
+    one atomic transaction (#751 B3). ``fusion_billing_fp`` (hk 1753, b953)
+    follows it too: ``str`` writes the declared Fusion GPT billing-account
+    fingerprint, ``None`` removes just that key. ``plan``/``price_usd``/
     ``capacity_weight`` are read-only from this module's perspective — they
     are config.toml-only fields with no CLI setter (operator-edited).
     """
@@ -937,6 +940,13 @@ def set_policy(
             ops["until"] = until
     if subscribed != "__unset__":
         ops["subscribed"] = _DELETE if subscribed is None else subscribed
+    if fusion_billing_fp != "__unset__":
+        if fusion_billing_fp is None:
+            ops["fusion_billing_fp"] = _DELETE
+        else:
+            if not _FUSION_BILLING_FP_RE.fullmatch(fusion_billing_fp):
+                raise ValueError(f"fusion_billing_fp 는 지문 문자열만 받습니다: {fusion_billing_fp!r}")
+            ops["fusion_billing_fp"] = fusion_billing_fp
     if not ops:
         return
     base = ("pools", pool)
@@ -1075,6 +1085,27 @@ def get_capacity_weight(pool: str) -> tuple[float, str | None]:
         return price / 20.0, None
 
     return 1.0, None
+
+
+# hk 1753 (b953) — ``[pools.<pool>] fusion_billing_fp``: 이 풀의 Fusion GPT
+# 행이 게이트되는 선언 청구 계정 지문(비가역 해시). 지문만 싣는다 — 토큰·
+# 이메일은 절대 아니다. 지문은 hk 문서 키 ``quota/<pool>/<fp>/latest`` 와
+# 게이트 사유의 계정 태그(앞 8자)에 들어가므로, 설정하는 쪽에서 안전 문자만
+# 받는다 — 읽는 쪽은 값 형태를 검사하지 않고 그대로 키에 쓴다.
+_FUSION_BILLING_FP_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def get_fusion_billing_fp(pool: str) -> str | None:
+    """``[pools.<pool>] fusion_billing_fp`` — 선언된 Fusion GPT 청구 계정 지문.
+
+    미설정·빈 문자열·비문자열은 None — 선언이 없는 풀의 Fusion GPT 행은
+    측정 불가(rc 4)로 닫힌다(호스트의 codex 풀로 절대 폴백하지 않는다).
+    """
+    entry = _pools_table(load_config()).get(pool)
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("fusion_billing_fp")
+    return raw if isinstance(raw, str) and raw.strip() else None
 
 
 def get_pool_plan(pool: str) -> str | None:

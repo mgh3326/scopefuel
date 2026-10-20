@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from . import cache, exhaust, free_window, manual
+from . import cache, exhaust, free_window, manual, quota_share
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
@@ -35,12 +35,14 @@ from .model import (
     _is_valid_used_pct,
     _parse_reset,
     _window_seconds,
+    account_tag,
 )
 from .policy import (
     get_active_override,
     get_boost,
     get_capacity_weight,
     get_cutoff,
+    get_fusion_billing_fp,
     get_imminent_remaining_pct,
     get_imminent_reset_hours,
     get_policy,
@@ -439,6 +441,13 @@ DEVIN_FUSION_ANNOTATION = (
 # fusion-gpt-6-1-sol ids is present in this repository, so neither row claims
 # one. The annotation records the unmeasured state without a grade prefix.
 DEVIN_FUSION_SOL61_ANNOTATION = "미측정(Fusion-Sol · pool codex · openai 패밀리 · hk 1729 · reps 대기)"
+# hk 1753 (b953): the Fusion GPT rows bill the ChatGPT account linked in
+# Devin — the mbp codex account — not each host's codex login. Gate and
+# recommend for exactly these spellings judge on the declared billing
+# account: ``[pools.codex] fusion_billing_fp`` names it (fingerprint only,
+# set via ``policy set codex --fusion-billing-fp``).
+FUSION_BILLING_PROFILES = frozenset({"devin-fusion-sol61", "devin-fusion-sol61-xhigh"})
+FUSION_BILLING_UNMEASURED = "fusion_billing_unmeasured"
 # #1620 (operator decision hk:doc owner/fleet/decision/2026-10-18/devin-argon-trial,
 # phase 1, approved by operator-desk 10-18 r1018b953go): the Devin PAID Argon
 # trial lane — spawn plumbing only. The Argon rows serve Gemini models under
@@ -3025,6 +3034,10 @@ class GateResult:
     free_tag: str | None = None
     account_daily_pct: float | None = None
     account_weekly_pct: float | None = None
+    # hk 1753 (b953) — 이 판정이 실제로 읽은 계정의 표시 태그(지문 앞 8자 +
+    # 안전 라벨). Fusion GPT 행이 선언된 청구 계정으로 판정될 때만 설정한다 —
+    # 다른 프로필은 None 이라 기존 출력과 바이트 동일하다.
+    account: str | None = None
 
 
 def _find_profile(
@@ -3412,6 +3425,131 @@ def _maybe_swe2_model_scope_gate(
     )
 
 
+# ── hk 1753 (b953): Fusion GPT billing-account resolution ──────────────────
+# The Fusion GPT lead bills the ChatGPT account linked in Devin, not the
+# host's codex login. The declared account is ``[pools.<pool>]
+# fusion_billing_fp`` — a fingerprint only, set through ``policy set``.
+
+
+@dataclass(frozen=True)
+class _BillingGate:
+    """The measurement a Fusion GPT row is judged on.
+
+    ``result`` is the ProviderResult the ordinary quota checks run against;
+    None means the declared account could not be measured and ``reason``
+    carries the refusal detail (``_fusion_billing_gate`` names the profile
+    when it composes ``fusion_billing_unmeasured``). ``fields`` are GateResult
+    audit extras — the billing account tag and, for a remote read, the
+    remote-source provenance fields.
+    """
+
+    result: ProviderResult | None
+    reason: str | None = None
+    fields: dict[str, object] | None = None
+    declared: str | None = None
+
+
+def _resolve_fusion_billing(
+    provider_id: str,
+    local: ProviderResult | None,
+    now: dt.datetime,
+) -> _BillingGate:
+    declared = get_fusion_billing_fp(provider_id)
+    if not declared:
+        return _BillingGate(
+            None,
+            reason=f"declared billing account 없음 ([pools.{provider_id}] fusion_billing_fp 미설정)",
+        )
+    # Matching host (mbp today): the local measurement already reads the
+    # billing account — judge on it exactly as before. codex carries its
+    # account identity in publish_fp so the generic fp gates stay inert.
+    if local is not None and (local.publish_fp or local.account_fp) == declared:
+        return _BillingGate(
+            local,
+            fields={"account": account_tag(declared, local.account_label, "account")},
+        )
+    policy_class: PoolClass = (
+        local.pool_class if local is not None and local.pool_class in ("preserve", "spend") else "preserve"
+    )
+    remote, snap = quota_share.declared_result(
+        provider_id, declared, local, policy_class, now=now.timestamp()
+    )
+    tag = account_tag(declared, snap["account_label"] if snap is not None else None, "account")
+    if remote is not None:
+        return _BillingGate(
+            remote,
+            fields={
+                "account": tag,
+                "source": quota_share.REMOTE_SOURCE,
+                "source_label": remote.note,
+                "measured_at": (
+                    dt.datetime.fromtimestamp(remote.fetched_at, dt.UTC).isoformat()
+                    if remote.fetched_at is not None
+                    else None
+                ),
+                "observed_age_s": remote.age_s,
+            },
+            declared=declared,
+        )
+    if snap is None:
+        detail = f"account {tag} — quota/{provider_id}/{declared[:8]}/latest 문서 없음 또는 읽기 불가"
+    else:
+        label = quota_share.remote_label(snap["host"], tag)
+        age = now.timestamp() - snap["measured_at_epoch"]
+        if age > quota_share.REMOTE_MAX_AGE_S:
+            detail = f"{label} — 측정 {cache.format_age(age)} 경과(15분 한도)"
+        elif age < -quota_share.MAX_FUTURE_SKEW_S:
+            detail = f"{label} — 측정 시각이 미래(클록 드리프트 한도 초과)"
+        else:
+            detail = f"{label} — 스냅샷에 유효 사용량 없음"
+    return _BillingGate(None, reason=detail, fields={"account": tag}, declared=declared)
+
+
+def _fusion_billing_gate(
+    profile_name: str,
+    provider_id: str,
+    local: ProviderResult | None,
+    now: dt.datetime,
+    memo: dict[str, _BillingGate] | None = None,
+) -> _BillingGate | None:
+    """Resolve the measurement a Fusion GPT row is gated on (hk 1753, b953).
+
+    None for every other profile — the ordinary host-pool path is unchanged.
+    For a Fusion GPT row the declared billing account is the only quota
+    source; ``memo`` dedups the shared-document read across sibling rows in
+    one evaluation. The refusal reason is composed per row — the memoized
+    resolution keeps only the profile-agnostic detail.
+    """
+    if profile_name not in FUSION_BILLING_PROFILES:
+        return None
+    if memo is not None and provider_id in memo:
+        gate = memo[provider_id]
+    else:
+        gate = _resolve_fusion_billing(provider_id, local, now)
+        if memo is not None:
+            memo[provider_id] = gate
+    if gate.result is None and gate.reason is not None:
+        return _BillingGate(
+            None,
+            reason=f"{FUSION_BILLING_UNMEASURED}: {profile_name} pool={provider_id} {gate.reason}",
+            fields=gate.fields,
+            declared=gate.declared,
+        )
+    return gate
+
+
+def _billing_observe_scope(billing: _BillingGate | None, group_name: str | None) -> str | None:
+    """D8 — 선언 계정 판정의 소진 에피소드는 호스트 자체 풀 에피소드와 분리한다.
+
+    exhaust.observe 는 pool@scope 로 dedup 한다 — 비매칭 호스트에서 선언
+    계정의 소진이 이 호스트 자체 codex 로그인의 에피소드를 열고 닫으면
+    operator-switch 알림이 헛돈다. billing 판정만 전용 scope 로 보낸다.
+    """
+    if billing is not None and billing.declared:
+        return f"fusion-billing:{billing.declared[:8]}"
+    return group_name
+
+
 def gate_check(
     providers: list[ProviderResult],
     profile_name: str,
@@ -3701,6 +3839,10 @@ def gate_check(
         # Profile known to profile_pool but not in GRADE_TABLE: check quota only.
         by_id = {r.id: r for r in providers}
         result = by_id.get(provider_id)
+        billing = _fusion_billing_gate(profile_name, provider_id, result, now)
+        if billing is not None:
+            result = billing.result
+            audit = {**(billing.fields or {}), **audit}
         accepted = _stale_accepted(result, group_name, now)
         missing = _missing_required_windows(result, group_name)
         swe2_decision = _maybe_swe2_model_scope_gate(
@@ -3721,6 +3863,17 @@ def gate_check(
         )
         if swe2_decision is not None:
             return swe2_decision
+        if billing is not None and billing.result is None:
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=billing.reason + _missing_windows_tag(missing),
+                unmeasurable=True,
+                missing_windows=missing,
+                **audit,
+            )
         if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
             return GateResult(
                 ok=False,
@@ -3778,7 +3931,9 @@ def gate_check(
             )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
-        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
+        notify_status = _observe_exhaustion(
+            provider_id, over, cutoff, now, scope=_billing_observe_scope(billing, group_name)
+        )
         if over is not None:
             return GateResult(
                 ok=False,
@@ -3824,6 +3979,13 @@ def gate_check(
     grade, profile = found
     by_id = {r.id: r for r in providers}
     result = by_id.get(provider_id)
+    # hk 1753 (b953): a Fusion GPT row judges on the declared billing
+    # account — the local codex pool only when its fingerprint is the
+    # declared one, else the account's shared snapshot. Never the host's
+    # codex pool under another account.
+    billing = _fusion_billing_gate(profile_name, provider_id, result, now)
+    if billing is not None:
+        result = billing.result
     missing = _missing_required_windows(result, group_name)
 
     # #716: 지명된 런그가 판정 대상이면 사유에 그 런그를 적는다 — 레코드와
@@ -3910,6 +4072,12 @@ def gate_check(
                 **audit,
             )
 
+    if billing is not None:
+        # hk 1753: the billing account tag and remote-source provenance ride
+        # the audit splat so every downstream verdict names the account it
+        # actually read (never silently the host's codex account).
+        audit = {**(billing.fields or {}), **audit}
+
     accepted = _stale_accepted(result, group_name, now)
     swe2_decision = _maybe_swe2_model_scope_gate(
         profile_name=profile_name,
@@ -3929,6 +4097,21 @@ def gate_check(
     )
     if swe2_decision is not None:
         return swe2_decision
+
+    if billing is not None and billing.result is None:
+        alts = alternatives()
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=billing.reason + _missing_windows_tag(missing) + rung_suffix,
+            unmeasurable=True,
+            alternatives=alts,
+            missing_windows=missing,
+            e6_arm=e6_admitted,
+            **audit,
+        )
 
     if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
         alts = alternatives()
@@ -3993,7 +4176,9 @@ def gate_check(
 
     cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
-    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
+    notify_status = _observe_exhaustion(
+        provider_id, over, cutoff, now, scope=_billing_observe_scope(billing, group_name)
+    )
     if over is not None:
         alts = alternatives()
         return GateResult(
@@ -4204,6 +4389,9 @@ def _evaluate(
     policy_excluded: list[_PolicyExcluded] = []
     unsubscribed: list[_Unsubscribed] = []
     escalation: list[_EscalationEntry] = []
+    # hk 1753 (b953): Fusion GPT rows judge on the declared billing account —
+    # one shared-document read covers both sibling rungs.
+    billing_memo: dict[str, _BillingGate] = {}
 
     # #1318-2 (operator A, hk 1321): exact-grade rows first, then the
     # rep-measured rows placed one grade up. A one-up row flows through the
@@ -4245,6 +4433,21 @@ def _evaluate(
             if profile.name in SWE2_MODEL_SCOPE_PROFILES and swe2_result is not None
             else by_id.get(provider_id)
         )
+        billing = _fusion_billing_gate(profile.name, provider_id, result, now, memo=billing_memo)
+        if billing is not None:
+            if billing.result is None:
+                excluded.append(
+                    _Excluded(
+                        profile,
+                        billing.reason,
+                        provider_id=provider_id,
+                        kind="unmeasurable",
+                        placed_grade=placed_grade,
+                        one_up=one_up,
+                    )
+                )
+                continue
+            result = billing.result
         accepted = _stale_accepted(result, group_name, now)
 
         # SWE-2 allowlist only (hk 1731): a current own-rung Free model-scope
@@ -4337,6 +4540,7 @@ def _evaluate(
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
         observe_scope = f"model:{swe2_rung}" if model_bucket is not None else group_name
+        observe_scope = _billing_observe_scope(billing, observe_scope)
         notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=observe_scope)
         if over is not None:
             excluded.append(

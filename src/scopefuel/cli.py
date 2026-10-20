@@ -182,6 +182,14 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
             "제외(행은 유지). 'none' 은 subscribed 키만 제거"
         ),
     )
+    set_parser.add_argument(
+        "--fusion-billing-fp",
+        metavar="FP|none",
+        help=(
+            "hk 1753 Fusion GPT 청구 계정 지문 ([pools.<pool>] fusion_billing_fp) — "
+            "지문만, 토큰·이메일 금지. 'none' 은 키만 제거"
+        ),
+    )
 
     clear_parser = policy_sub.add_parser("clear", help="pool 정책 제거")
     clear_parser.add_argument("pool", help="provider pool 이름")
@@ -776,8 +784,18 @@ def _policy_command(
                 boost_arg = args.boost
                 if args.until is None:
                     parser.error("--until 은 --boost 로 값을 지정할 때 필수입니다")
-        if args.pool_class is None and boost_arg == "__unset__" and args.subscribed is None:
-            parser.error("class, --boost, --subscribed 중 하나는 지정해야 합니다")
+        # hk 1753 — 'none' 은 fusion_billing_fp 키만 제거한다(나머지 필드 보존).
+        billing_fp_arg = "__unset__"
+        if args.fusion_billing_fp is not None:
+            stripped = args.fusion_billing_fp.strip()
+            billing_fp_arg = None if stripped.lower() == "none" else stripped
+        if (
+            args.pool_class is None
+            and boost_arg == "__unset__"
+            and args.subscribed is None
+            and billing_fp_arg == "__unset__"
+        ):
+            parser.error("class, --boost, --subscribed, --fusion-billing-fp 중 하나는 지정해야 합니다")
 
         # #751 — class/boost/subscribed go through one locked edit so the
         # combined command commits atomically instead of leaving a partial
@@ -794,8 +812,12 @@ def _policy_command(
                 note=args.note,
                 boost=boost_arg,
                 subscribed=subscribed_arg,
+                fusion_billing_fp=billing_fp_arg,
             )
         except ConfigEditError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         parts = []
@@ -809,6 +831,12 @@ def _policy_command(
                 "subscribed key removed"
                 if args.subscribed == "none"
                 else f"subscribed={args.subscribed == 'on'}"
+            )
+        if billing_fp_arg != "__unset__":
+            parts.append(
+                "fusion_billing_fp removed"
+                if billing_fp_arg is None
+                else f"fusion_billing_fp={billing_fp_arg[:8]}"
             )
         print(f"{args.pool} -> {', '.join(parts)}")
         return 0
@@ -1296,7 +1324,10 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         ),
         None,
     )
-    if remote_used is not None and result.source != manual.SOURCE:
+    # hk 1753 — a Fusion GPT verdict already carries its own remote
+    # provenance (the declared account's doc); do not overwrite it with the
+    # host's own remote-substituted codex result.
+    if remote_used is not None and result.source != manual.SOURCE and not result.account:
         result = replace(
             result,
             source=quota_share.REMOTE_SOURCE,
@@ -1343,7 +1374,9 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     # task #659 — 이 판정이 어느 계정의 측정에 기반하는지 통과·거부 모두 보인다
     # (지문 앞 8자 + 안전 라벨 — 이메일·토큰은 절대 표시하지 않는다).
     measured = next((item for item in automatic_results if item.id == provider_id), None)
-    tag = (
+    # hk 1753: a Fusion GPT verdict names the billing account it read —
+    # for every other profile the tag still comes from the local measurement.
+    tag = result.account or (
         account_tag(measured.account_fp, measured.account_label, measured.account_fp_kind)
         if measured is not None
         else ""
