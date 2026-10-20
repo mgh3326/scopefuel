@@ -48,12 +48,15 @@ the bundled snapshot itself and fails closed exactly as it did before: any
 snapshot profile the catalog never mentions rejects it, e.g.
 `catalog=stale (server catalog rejected: 1 row, missing 36 snapshot profiles)`.
 
-A snapshot profile that **neither** the fetched catalog **nor** the last-good
-cache mentions is *new to the bundle*: it does not reject the catalog. It is
-served from the bundled snapshot — exactly the snapshot placement, gate
-included, never wider — the same way `resolve_launch` fills any per-profile
-gap. When a catalog is accepted with new-to-bundle profiles, every
-gate/recommend/`bench catalog status` call prints one stderr line naming them:
+While a usable last-good cache exists, a snapshot profile that **neither** the
+fetched catalog **nor** that cache mentions is *new to the bundle*: it does
+not reject the catalog. (With no usable last-good cache the bundle floor
+above applies instead — an unmentioned snapshot profile rejects the catalog
+outright.) It is served from the bundled snapshot — exactly the snapshot
+placement, gate included, never wider — the same way `resolve_launch` fills
+any per-profile gap. When a catalog is accepted with new-to-bundle profiles,
+every gate/recommend/`bench catalog status` call prints one stderr line
+naming them:
 
 ```
 warning: catalog canon does not cover bundled profiles devin-argon, ...;
@@ -69,6 +72,21 @@ records only the server rows plus the attested set in the cache meta, so the
 warning and the heading persist on cache-served runs until `bench
 push-catalog` adds the rows; nothing snapshot-side ever lands in
 `bench_cache_catalog`.
+
+The ratchet never forgets: membership does not age out, so a profile the
+last-good cache mentions must be mentioned by every later catalog, live or
+retired. A profile **hard-deleted** on the server — its rows removed rather
+than marked `retired_at` — therefore makes every host that cached it reject
+every later catalog, indefinitely. Recovery is one of:
+
+* **Retire the profile instead of deleting it** — the supported path. A
+  retired row still *mentions* its profile, so the catalog passes the floor
+  and the retirement takes effect.
+* **Clear that host's catalog cache** — delete the `catalog` scope's rows
+  (`bench_cache_catalog` plus its `bench_cache_meta` stamp), or remove
+  `~/.local/share/scopefuel/bench.db` outright. With no last-good cache the
+  bundle floor applies again, and a catalog covering the bundled snapshot is
+  accepted.
 
 Tunables live in `~/.config/scopefuel/config.toml`:
 
