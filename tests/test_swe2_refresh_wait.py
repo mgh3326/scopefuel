@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import signal
 import statistics
 import threading
 import time
@@ -46,6 +48,36 @@ def isolated_gate(monkeypatch):
     monkeypatch.setattr(cli.bench, "read_scores", lambda: [])
     monkeypatch.setattr(cli.bench, "read_prices", lambda: {})
     monkeypatch.setattr(cli.bench, "runtime_grade_table", lambda: recommend.GRADE_TABLE)
+
+
+# hk 1766 (b953 addendum B1) — a regressed wait loop must fail the test in
+# seconds, not spin until the CI kill. The per-test cap is a real POSIX timer;
+# the real signal functions are captured at import because tests may stub
+# ``refresh.signal`` (the same module object) via stub_signals.
+WALL_CAP_S = 120.0
+_SIGALRM = getattr(signal, "SIGALRM", None)
+_ITIMER_REAL = getattr(signal, "ITIMER_REAL", None)
+_REAL_SIGNAL = signal.signal
+_REAL_SETITIMER = getattr(signal, "setitimer", None)
+
+
+@pytest.fixture(autouse=True)
+def _per_test_wall_cap(request):
+    """Arm SIGALRM for the test's duration; no-op where POSIX timers are absent."""
+    if _SIGALRM is None or _REAL_SETITIMER is None:
+        yield
+        return
+
+    def _cap_exceeded(_signum, _frame):
+        raise AssertionError(f"{request.node.name} exceeded the {WALL_CAP_S:.0f} s wall cap")
+
+    previous = _REAL_SIGNAL(_SIGALRM, _cap_exceeded)
+    _REAL_SETITIMER(_ITIMER_REAL, WALL_CAP_S)
+    try:
+        yield
+    finally:
+        _REAL_SETITIMER(_ITIMER_REAL, 0)
+        _REAL_SIGNAL(_SIGALRM, previous)
 
 
 def cli_probe(monkeypatch, result):
@@ -235,7 +267,7 @@ def test_wait_never_admits_the_entry_seen_before_waiting(monkeypatch):
 def test_wait_bound_is_worker_timeout_plus_margin(monkeypatch):
     """R2-1: the bound derives from the worker hard cap, not one probe phase."""
     monkeypatch.setenv("SCOPEFUEL_REFRESH_TIMEOUT_S", "60")
-    assert refresh.SWE2_IN_FLIGHT_WAIT_MARGIN_S >= 5.0
+    assert refresh.SWE2_IN_FLIGHT_WAIT_MARGIN_S == 5.0  # kills R1f: exact pin
     assert refresh._in_flight_wait_s() == refresh._timeout_seconds() + refresh.SWE2_IN_FLIGHT_WAIT_MARGIN_S
     monkeypatch.setenv("SCOPEFUEL_REFRESH_TIMEOUT_S", "12")
     assert refresh._in_flight_wait_s() == 12 + refresh.SWE2_IN_FLIGHT_WAIT_MARGIN_S
@@ -255,7 +287,18 @@ def test_landing_at_1_7x_probe_timeout_is_admitted(monkeypatch):
     monkeypatch.setattr(refresh.time, "monotonic", lambda: clock["mono"])
     monkeypatch.setattr(refresh.time, "time", lambda: clock["wall"])
 
+    # B1/S1 loop guard — the fake clock only advances inside fake_sleep, so a
+    # bounded call count bounds the loop itself: M2m (no sleep) exhausts the
+    # fake_load cap, M3a (interval 0.0) trips the non-positive interval check —
+    # both fail by assertion in milliseconds instead of spinning to the CI kill.
+    calls = {"sleeps": 0, "loads": 0}
+
     def fake_sleep(seconds: float) -> None:
+        calls["sleeps"] += 1
+        if seconds <= 0 or calls["sleeps"] > 1000:
+            raise AssertionError(
+                f"wait loop did not advance the fake clock (sleep #{calls['sleeps']}, interval {seconds}s)"
+            )
         clock["mono"] += seconds
         clock["wall"] += seconds
 
@@ -266,6 +309,9 @@ def test_landing_at_1_7x_probe_timeout_is_admitted(monkeypatch):
     landed = cache._to_entry(probe(), clock["wall"] + late)
 
     def fake_load() -> dict:
+        calls["loads"] += 1
+        if calls["loads"] > 1000:
+            raise AssertionError("wait loop polled the cache 1000 times without converging")
         data = real_load()
         if clock["mono"] - 1000.0 >= late:
             data["devin"] = landed
@@ -349,6 +395,62 @@ def test_backoff_on_disk_short_circuits_lock_held_wait(monkeypatch):
     assert result is not None
     assert result.error_kind == SWE2_BACKOFF
     assert "backoff" in result.error
+    # Kills B2e: the wait-path refusal names the remaining seconds, exactly
+    # like the rc-12 path through the same _backoff_refusal.
+    seconds = re.search(r"(\d+)s 뒤", result.error)
+    assert seconds is not None and 295 <= int(seconds.group(1)) <= 300
+
+
+def test_backoff_check_runs_before_any_poll_or_sleep(monkeypatch):
+    """Kills B2j (check starts on iteration 2) and B2i (refusal sleeps first):
+    with backoff already on disk the refusal returns before the first cache
+    poll or sleep — the only ``_load`` is the pre-Popen snapshot."""
+    seed_backoff(300.0)
+    stub_worker(monkeypatch, refresh.SWE2_RC_LOCK_HELD)
+    loads = []
+    real_load = cache._load
+    monkeypatch.setattr(cache, "_load", lambda: loads.append(1) or real_load())
+    sleeps = []
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: sleeps.append(s))
+    result = REFRESH_SWE2()
+    assert result is not None and result.error_kind == SWE2_BACKOFF
+    assert loads == [1]
+    assert sleeps == []
+
+
+def test_expired_backoff_record_does_not_short_circuit_the_wait(monkeypatch):
+    """Kills B2g (the check compares a monotonic clock to the wall-clock
+    ``next_allowed_at``): an expired record is not backoff — the wait still
+    polls for a landing and ends in the named in-flight timeout."""
+    small_wait(monkeypatch)
+    seed_backoff(-10.0)  # next_allowed_at already in the past
+    stub_worker(monkeypatch, refresh.SWE2_RC_LOCK_HELD)
+    result = REFRESH_SWE2()
+    assert result is not None and result.error_kind == SWE2_IN_FLIGHT_TIMEOUT
+
+
+def test_timeout_message_names_the_bound_it_waited(monkeypatch):
+    """Kills R1i: the refusal prints the bound it actually waited, which
+    tracks SCOPEFUEL_REFRESH_TIMEOUT_S — not a stale or hard-coded number."""
+    monkeypatch.setenv("SCOPEFUEL_REFRESH_TIMEOUT_S", "7")
+    wait_s = refresh._in_flight_wait_s()
+    clock = {"mono": 1000.0, "wall": 1_700_000_000.0}
+    monkeypatch.setattr(refresh.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(refresh.time, "time", lambda: clock["wall"])
+    sleeps = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if seconds <= 0 or len(sleeps) > 1000:
+            raise AssertionError("wait loop did not advance the fake clock")
+        clock["mono"] += seconds
+        clock["wall"] += seconds
+
+    monkeypatch.setattr(refresh.time, "sleep", fake_sleep)
+    stub_worker(monkeypatch, refresh.SWE2_RC_LOCK_HELD)
+    result = REFRESH_SWE2()
+    assert result is not None and result.error_kind == SWE2_IN_FLIGHT_TIMEOUT
+    assert f"waited up to {wait_s:.0f}s" in result.error
 
 
 def test_backoff_recorded_by_in_flight_probe_refuses_quickly(monkeypatch):

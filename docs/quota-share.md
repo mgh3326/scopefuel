@@ -221,6 +221,10 @@ substitution and no widened stale acceptance.
   fingerprint-match rule in `remote_result` does not apply — the match is
   against the declared fingerprint. The host's own codex pool is never used
   for these rows.
+- On a non-matching host an exhausted declared account opens a separate
+  operator-switch episode keyed `codex@fusion-billing:<fp8>` — never the
+  host's own `codex` episode — and the alert reads
+  `codex (fusion-billing:<fp8>) 계정 전환 필요`.
 - **No declaration, or the document missing/stale/unreadable**: the gate
   returns the measurement-unavailable exit (rc 4) with reason
   `fusion_billing_unmeasured`, naming the account tag (fp8) and the measuring
