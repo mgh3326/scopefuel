@@ -64,6 +64,7 @@ OBSERVED_RUNG_IDS = frozenset(
 )
 RUNG_IDS = OBSERVED_RUNG_IDS
 SOURCE_RE = re.compile(r"job:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+IDENTITY_KEY_RE = re.compile(r"(?:account|host-user)-[0-9a-f]{32}\Z")
 _LOG = logging.getLogger(__name__)
 
 
@@ -298,6 +299,36 @@ def record_observation(
         records[key] = new_record
         _save_records(records)
     return True
+
+
+def clear_hold(*, account_key: str | None = None, now: dt.datetime | None = None) -> FreeLimitRecord | None:
+    """Remove the live hold under one identity key; return it, or None.
+
+    Runs under the same exclusive lock and atomic replace as the writer, so a
+    clear racing an observe lands cleanly: whichever commits last wins. Only a
+    live record counts; an absent or already-expired record is nothing to
+    clear (expired entries are still pruned on the way out).
+    """
+
+    current = now or dt.datetime.now(dt.UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+    current = current.astimezone(dt.UTC)
+    key = _identity_key() if account_key is None else account_key
+    if not isinstance(key, str) or not IDENTITY_KEY_RE.fullmatch(key):
+        raise ValueError("account key must be account-<hex> or host-user-<hex>")
+    removed: FreeLimitRecord | None = None
+    with _exclusive_lock():
+        records = _load_records()
+        live = {
+            identity: item
+            for identity, item in records.items()
+            if item.observed_at <= current < item.reset_at
+        }
+        removed = live.pop(key, None)
+        if live != records:
+            _save_records(live)
+    return removed
 
 
 def active_record(*, now: dt.datetime | None = None) -> FreeLimitRecord | None:

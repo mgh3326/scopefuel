@@ -555,12 +555,24 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         "observe", help="기존 Devin worker pane의 SWE-2 free 단기 제한 관측 저장"
     )
     observe_sub = observe_parser.add_subparsers(dest="observe_command", required=True)
-    observe_free = observe_sub.add_parser("devin-free-limit", help="Devin SWE-2 free short-window reset 기록")
-    observe_free.add_argument("--reset", required=True, help="timezone-aware ISO-8601 reset time")
-    observe_free.add_argument("--observed", required=True, help="timezone-aware ISO-8601 observation time")
-    observe_free.add_argument("--rung", required=True, help="observed Devin profile UID")
-    observe_free.add_argument("--source", required=True, help="job:<job>")
+    observe_free = observe_sub.add_parser(
+        "devin-free-limit", help="Devin SWE-2 free short-window reset 기록/해제"
+    )
+    observe_free.add_argument("--reset", help="timezone-aware ISO-8601 reset time")
+    observe_free.add_argument("--observed", help="timezone-aware ISO-8601 observation time")
+    observe_free.add_argument("--rung", help="observed Devin profile UID")
+    observe_free.add_argument("--source", help="job:<job>")
     observe_free.add_argument("--unparsed", action="store_true", help="reset message was not parseable")
+    observe_free.add_argument(
+        "--clear",
+        action="store_true",
+        help="기록 대신 live hold 를 제거 (reset/observed/rung/source 와 병용 불가)",
+    )
+    observe_free.add_argument(
+        "--account-key",
+        metavar="KEY",
+        help="--clear 대상 identity key (기본: 캐시된 account fingerprint 또는 host/user fallback)",
+    )
 
     refresh_parser = subparsers.add_parser("refresh", help="한 pool만 이벤트 기반으로 캐시 갱신")
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
@@ -2030,6 +2042,27 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(arguments)
         if args.observe_command != "devin-free-limit":
             parser.error("unsupported observe command")
+        if args.account_key is not None and not args.clear:
+            parser.error("--account-key requires --clear")
+        if args.clear:
+            if (
+                any(getattr(args, field) is not None for field in ("reset", "observed", "rung", "source"))
+                or args.unparsed
+            ):
+                parser.error("--clear cannot be combined with observation fields")
+            try:
+                removed = free_window.clear_hold(account_key=args.account_key)
+            except (OSError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            if removed is None:
+                print("no live Devin free short-window limit to clear")
+            else:
+                print(f"cleared {free_window.reason(removed)}")
+            return 0
+        missing = [field for field in ("reset", "observed", "rung", "source") if getattr(args, field) is None]
+        if missing:
+            parser.error("required: " + ", ".join(f"--{field}" for field in missing))
         try:
             saved = free_window.record_observation(
                 reset=args.reset,
