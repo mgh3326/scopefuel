@@ -437,17 +437,30 @@ def test_timeout_message_names_the_bound_it_waited(monkeypatch):
     clock = {"mono": 1000.0, "wall": 1_700_000_000.0}
     monkeypatch.setattr(refresh.time, "monotonic", lambda: clock["mono"])
     monkeypatch.setattr(refresh.time, "time", lambda: clock["wall"])
-    sleeps = []
+
+    # B1/S1 loop guard, same as the 1.7x test — under M2m fake_sleep is never
+    # called so the fake clock never advances; the load cap is what bounds the
+    # loop and fails by assertion in ms instead of the 120 s wall cap.
+    calls = {"sleeps": 0, "loads": 0}
 
     def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        if seconds <= 0 or len(sleeps) > 1000:
+        calls["sleeps"] += 1
+        if seconds <= 0 or calls["sleeps"] > 1000:
             raise AssertionError("wait loop did not advance the fake clock")
         clock["mono"] += seconds
         clock["wall"] += seconds
 
     monkeypatch.setattr(refresh.time, "sleep", fake_sleep)
     stub_worker(monkeypatch, refresh.SWE2_RC_LOCK_HELD)
+    real_load = cache._load
+
+    def fake_load() -> dict:
+        calls["loads"] += 1
+        if calls["loads"] > 1000:
+            raise AssertionError("wait loop polled the cache 1000 times without converging")
+        return real_load()
+
+    monkeypatch.setattr(cache, "_load", fake_load)
     result = REFRESH_SWE2()
     assert result is not None and result.error_kind == SWE2_IN_FLIGHT_TIMEOUT
     assert f"waited up to {wait_s:.0f}s" in result.error
