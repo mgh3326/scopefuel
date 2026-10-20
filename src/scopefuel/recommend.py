@@ -3437,9 +3437,10 @@ class _BillingGate:
 
     ``result`` is the ProviderResult the ordinary quota checks run against;
     None means the declared account could not be measured and ``reason``
-    carries the named refusal (``fusion_billing_unmeasured``). ``fields`` are
-    GateResult audit extras — the billing account tag and, for a remote read,
-    the remote-source provenance fields.
+    carries the refusal detail (``_fusion_billing_gate`` names the profile
+    when it composes ``fusion_billing_unmeasured``). ``fields`` are GateResult
+    audit extras — the billing account tag and, for a remote read, the
+    remote-source provenance fields.
     """
 
     result: ProviderResult | None
@@ -3448,7 +3449,6 @@ class _BillingGate:
 
 
 def _resolve_fusion_billing(
-    profile_name: str,
     provider_id: str,
     local: ProviderResult | None,
     now: dt.datetime,
@@ -3457,14 +3457,12 @@ def _resolve_fusion_billing(
     if not declared:
         return _BillingGate(
             None,
-            reason=(
-                f"{FUSION_BILLING_UNMEASURED}: {profile_name} pool={provider_id} — "
-                f"declared billing account 없음 ([pools.{provider_id}] fusion_billing_fp 미설정)"
-            ),
+            reason=f"declared billing account 없음 ([pools.{provider_id}] fusion_billing_fp 미설정)",
         )
     # Matching host (mbp today): the local measurement already reads the
-    # billing account — judge on it exactly as before.
-    if local is not None and local.account_fp == declared:
+    # billing account — judge on it exactly as before. codex carries its
+    # account identity in publish_fp so the generic fp gates stay inert.
+    if local is not None and (local.publish_fp or local.account_fp) == declared:
         return _BillingGate(local, fields={"account": account_tag(declared, local.account_label, "account")})
     policy_class: PoolClass = (
         local.pool_class if local is not None and local.pool_class in ("preserve", "spend") else "preserve"
@@ -3499,11 +3497,7 @@ def _resolve_fusion_billing(
             detail = f"{label} — 측정 시각이 미래(클록 드리프트 한도 초과)"
         else:
             detail = f"{label} — 스냅샷에 유효 사용량 없음"
-    return _BillingGate(
-        None,
-        reason=f"{FUSION_BILLING_UNMEASURED}: {profile_name} pool={provider_id} {detail}",
-        fields={"account": tag},
-    )
+    return _BillingGate(None, reason=detail, fields={"account": tag})
 
 
 def _fusion_billing_gate(
@@ -3518,15 +3512,23 @@ def _fusion_billing_gate(
     None for every other profile — the ordinary host-pool path is unchanged.
     For a Fusion GPT row the declared billing account is the only quota
     source; ``memo`` dedups the shared-document read across sibling rows in
-    one evaluation.
+    one evaluation. The refusal reason is composed per row — the memoized
+    resolution keeps only the profile-agnostic detail.
     """
     if profile_name not in FUSION_BILLING_PROFILES:
         return None
     if memo is not None and provider_id in memo:
-        return memo[provider_id]
-    gate = _resolve_fusion_billing(profile_name, provider_id, local, now)
-    if memo is not None:
-        memo[provider_id] = gate
+        gate = memo[provider_id]
+    else:
+        gate = _resolve_fusion_billing(provider_id, local, now)
+        if memo is not None:
+            memo[provider_id] = gate
+    if gate.result is None and gate.reason is not None:
+        return _BillingGate(
+            None,
+            reason=f"{FUSION_BILLING_UNMEASURED}: {profile_name} pool={provider_id} {gate.reason}",
+            fields=gate.fields,
+        )
     return gate
 
 
@@ -3852,7 +3854,6 @@ def gate_check(
                 reason=billing.reason + _missing_windows_tag(missing),
                 unmeasurable=True,
                 missing_windows=missing,
-                **(billing.fields or {}),
                 **audit,
             )
         if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):

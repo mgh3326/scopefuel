@@ -29,6 +29,7 @@ from scopefuel import bench, cli, free_window, launch, policy, quota_share
 from scopefuel.free_window import FREE_PROFILES
 from scopefuel.http import HttpError
 from scopefuel.model import Bucket, ProviderResult, Scope
+from scopefuel.providers import codex
 from scopefuel.recommend import (
     FUSION_BILLING_PROFILES,
     FUSION_BILLING_UNMEASURED,
@@ -153,8 +154,8 @@ def _codex_result(used_5h: float = 10.0, used_7d: float = 30.0, fp: str = LOCAL_
             Bucket("7d", "7d", used_7d, RESET_7D, Scope("account"), "week"),
         ],
         source="wham-usage-api",
-        account_fp=fp,
-        account_fp_kind="account",
+        publish_fp=fp,
+        publish_fp_kind="account",
     )
 
 
@@ -459,3 +460,117 @@ def test_policy_set_rejects_non_fingerprint_values():
         policy.set_policy("codex", None, fusion_billing_fp="has space/token@like")
     with pytest.raises(ValueError):
         policy.set_policy("codex", None, fusion_billing_fp="../escape")
+
+
+def test_policy_set_rejects_jwt_shaped_and_uppercase_values():
+    """D5 — 지문은 provider 가 내는 형태(16자 소문자 hex)뿐이다."""
+    with pytest.raises(ValueError):
+        policy.set_policy("codex", None, fusion_billing_fp="aaaaaaaa.bbbbbbbb.cccccccc")
+    with pytest.raises(ValueError):
+        policy.set_policy("codex", None, fusion_billing_fp=DECLARED_FP.upper())
+    # 정상 hex 지문은 통과.
+    policy.set_policy("codex", None, fusion_billing_fp=DECLARED_FP)
+    assert policy.get_fusion_billing_fp("codex") == DECLARED_FP
+
+
+def test_policy_set_none_removal_is_case_and_space_tolerant(monkeypatch):
+    """D5 — 'NONE'·' none ' 도 키 제거다(지문으로 저장되지 않는다)."""
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": object()})
+    for spelling in ("NONE", " none ", "None"):
+        policy.set_policy("codex", None, fusion_billing_fp=DECLARED_FP)
+        rc, out, err = _capture_cli(["policy", "set", "codex", "--fusion-billing-fp", spelling])
+        assert rc == 0, (spelling, out, err)
+        assert policy.get_fusion_billing_fp("codex") is None
+
+
+# ------------------------------------------------------------ tester round-2 regressions
+
+
+def test_d3_path_unmeasured_declared_account_does_not_crash(monkeypatch):
+    """D1 회귀 — runtime table 이 sol61 을 빼도(D3 경로) crash 없이 rc 4."""
+    _enable(monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    _install_cli_stubs(monkeypatch, [_codex_result()])
+    monkeypatch.setattr(
+        cli.bench,
+        "runtime_grade_table",
+        lambda: {grade: [p for p in rows if p.name not in PROFILES] for grade, rows in GRADE_TABLE.items()},
+    )
+    _declare()  # doc is missing → unmeasured D3 path (fields + audit splat)
+
+    for name in PROFILES:
+        rc, out, err = _capture_cli(["gate", "-m", name])
+        assert rc == 4, (name, out, err)
+        assert FUSION_BILLING_UNMEASURED in err
+        assert "Traceback" not in err
+
+
+def test_fusion_verdict_provenance_not_overwritten_by_host_remote_result(monkeypatch):
+    """D3 회귀 — 호스트 자체 remote 결과가 Fusion 판정 provenance 를 덮지 않는다."""
+    hk = _enable(monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    host_remote = ProviderResult(
+        id="codex",
+        pool_class="spend",
+        source=quota_share.REMOTE_SOURCE,
+        note="remote measured (other-host) · account aa11bb22",
+        fetched_at=EPOCH - 600,
+        age_s=600.0,
+        buckets=[Bucket("7d", "7d", 74.0, RESET_7D, Scope("account"), "week")],
+        publish_fp=LOCAL_FP,
+        publish_fp_kind="account",
+    )
+    _install_cli_stubs(monkeypatch, [host_remote])
+    _declare()
+    _seed_codex_remote(hk, used_5h=10.0, used_7d=30.0)
+
+    rc, out, err = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
+    assert rc == 0, (out, err)
+    assert MEASURING_HOST in out
+    assert "other-host" not in out
+
+
+def test_recommend_memoized_refusal_names_each_sibling_row(monkeypatch):
+    """D4 회귀 — 같은 문서를 공유해도 각 행 사유는 자기 프로필을 이름 붙인다."""
+    _enable(monkeypatch)
+    _declare()  # no doc → both rows fold to the same memoized resolution
+    payload = recommend_dict(
+        [_codex_result()],
+        "B",
+        today=NOW.date(),
+        now=NOW,
+        grade_table=_table_for_sol61(),
+    )
+    rows = {row["profile"]: row for row in payload["rows"]}
+    assert set(rows) == set(PROFILES)
+    for name in PROFILES:
+        assert f"{FUSION_BILLING_UNMEASURED}: {name} pool=codex" in rows[name]["reason"]
+
+
+def test_codex_fetch_survives_corrupt_auth_json(tmp_path, monkeypatch):
+    """D6 회귀 — 깨진 auth.json(비-dict 최상위·비문자열 account_id)도 crash 없음."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text("[]")
+    result = codex.fetch()
+    assert result.error and result.publish_fp is None
+    (tmp_path / "auth.json").write_text(json.dumps({"tokens": {"account_id": 123, "access_token": "tok"}}))
+    monkeypatch.setattr(codex, "request_json", lambda *a, **k: {"rate_limit": {}})
+    result = codex.fetch()
+    assert result.publish_fp_kind == "token"  # non-str account_id fell to token hash
+
+
+def test_codex_result_does_not_open_generic_fp_gates(monkeypatch):
+    """D2 — codex 결과는 게시만 하고 로컬 지문 게이트는 그대로 닫혀 있다.
+
+    account_fp 를 싣지 않으므로 stale 수용 일치(account_fp_match)와 같은-계정
+    원격 폴백(remote_eligible → _current_identity)이 codex 에 대해 활성화되지
+    않는다 — 비-Fusion codex 프로필의 호스트-로컬 판정이 byte-identical 한 근거.
+    """
+    local = _codex_result()
+    assert local.account_fp is None
+    assert local.account_fp_match is None
+    assert local.publish_fp == LOCAL_FP
+    # 게시 지문 해석은 publish_fp 우선 — codex 결과도 게시된다.
+    hk = _enable(monkeypatch)
+    assert quota_share.publish_result("codex", local, now=EPOCH)
+    assert quota_share.key_for("codex", LOCAL_FP) in hk.docs

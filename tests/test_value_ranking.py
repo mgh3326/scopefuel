@@ -391,12 +391,13 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
                 buckets=buckets,
                 # hk 1753 (b953): Fusion GPT rows judge on the declared billing
                 # account — this codex result is the matching host's own
-                # measurement so the oracle table is unchanged.
-                account_fp="billingfp00000000" if provider_id == "codex" else None,
-                account_fp_kind="account",
+                # measurement so the oracle table is unchanged. codex carries
+                # the identity in publish_fp, not account_fp.
+                publish_fp="c0605596eeff0011" if provider_id == "codex" else None,
+                publish_fp_kind="account",
             )
         )
-    policy.set_policy("codex", None, fusion_billing_fp="billingfp00000000")
+    policy.set_policy("codex", None, fusion_billing_fp="c0605596eeff0011")
 
     def label(profile: Profile) -> str:
         """Literal expected label — the pinned string for this row, never a

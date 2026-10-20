@@ -49,9 +49,10 @@ def _providers() -> list[ProviderResult]:
             buckets=[Bucket("week", "7d", 30.0, RESET_7D, Scope("account"), "week")],
             # hk 1753 (b953): declared billing account — this host is the
             # matching host (mbp), so sol61 rows judge on the local
-            # measurement exactly as before.
-            account_fp=BILLING_FP,
-            account_fp_kind="account",
+            # measurement exactly as before. codex carries the identity in
+            # publish_fp so the generic account-fp gates stay inert.
+            publish_fp=BILLING_FP,
+            publish_fp_kind="account",
         ),
         ProviderResult(
             id="devin",

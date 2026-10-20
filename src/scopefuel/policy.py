@@ -1092,7 +1092,7 @@ def get_capacity_weight(pool: str) -> tuple[float, str | None]:
 # 이메일은 절대 아니다. 지문은 hk 문서 키 ``quota/<pool>/<fp>/latest`` 와
 # 게이트 사유의 계정 태그(앞 8자)에 들어가므로, 설정하는 쪽에서 안전 문자만
 # 받는다 — 읽는 쪽은 값 형태를 검사하지 않고 그대로 키에 쓴다.
-_FUSION_BILLING_FP_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{3,127}")
+_FUSION_BILLING_FP_RE = re.compile(r"[0-9a-f]{16}")
 
 
 def get_fusion_billing_fp(pool: str) -> str | None:

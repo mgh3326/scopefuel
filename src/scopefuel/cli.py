@@ -787,7 +787,8 @@ def _policy_command(
         # hk 1753 — 'none' 은 fusion_billing_fp 키만 제거한다(나머지 필드 보존).
         billing_fp_arg = "__unset__"
         if args.fusion_billing_fp is not None:
-            billing_fp_arg = None if args.fusion_billing_fp == "none" else args.fusion_billing_fp.strip()
+            stripped = args.fusion_billing_fp.strip()
+            billing_fp_arg = None if stripped.lower() == "none" else stripped
         if (
             args.pool_class is None
             and boost_arg == "__unset__"
@@ -1323,7 +1324,10 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         ),
         None,
     )
-    if remote_used is not None and result.source != manual.SOURCE:
+    # hk 1753 — a Fusion GPT verdict already carries its own remote
+    # provenance (the declared account's doc); do not overwrite it with the
+    # host's own remote-substituted codex result.
+    if remote_used is not None and result.source != manual.SOURCE and not result.account:
         result = replace(
             result,
             source=quota_share.REMOTE_SOURCE,

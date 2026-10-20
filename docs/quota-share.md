@@ -202,10 +202,18 @@ scopefuel policy set codex --fusion-billing-fp none   # removes the key
 
 The config key is `[pools.codex] fusion_billing_fp`; it holds **only the
 account fingerprint** (`sha256("codex-account|<ChatGPT account_id>")[:16]`,
-kind `account` — the same `account_fp` the codex provider now emits), never a
-token or an email.
+kind `account` — the same fingerprint the codex provider emits in
+`publish_fp`), never a token or an email.
 
-- **Matching host** (local codex `account_fp` == declared — mbp today): the
+Codex carries the identity in a dedicated `publish_fp` field rather than
+`account_fp`: publish reads `publish_fp or account_fp`, so the codex result is
+published like any other account-bound measurement, while the host-local
+fingerprint gates (`account_fp_match` on stale acceptance, same-account
+`remote_result` fallback, `_current_identity`) stay **inactive for codex** —
+plain codex profiles keep byte-identical host-local judgment: no remote
+substitution and no widened stale acceptance.
+
+- **Matching host** (local codex `publish_fp` == declared — mbp today): the
   rows judge on the local measurement exactly as before.
 - **Any other host**: gate and recommend read
   `quota/codex/<declared fp>/latest` directly through this module

@@ -152,12 +152,12 @@ def _safe_host(host: object) -> str:
     return f"{host[: _HOST_MAX_LEN - 9]}-{digest}"
 
 
-def _measured_by(host: str, session_fp: str | None, result: ProviderResult) -> dict:
+def _measured_by(host: str, session_fp: str | None, result: ProviderResult, fp: str) -> dict:
     """측정 주체 provenance — 어느 호스트·세션·계정이 관측했는지 (AC2/AC5)."""
     return {
         "host": host,
         "session_fp": session_fp,
-        "account_fp": result.account_fp,
+        "account_fp": fp,
         "account_label": safe_label(result.account_label),
     }
 
@@ -182,12 +182,14 @@ def _bucket_payload(bucket: Bucket, measured_by: dict) -> dict:
     return payload
 
 
-def _payload(pool: str, result: ProviderResult, host: str, session_fp: str | None, epoch: float) -> dict:
-    measured_by = _measured_by(host, session_fp, result)
+def _payload(
+    pool: str, result: ProviderResult, fp: str, host: str, session_fp: str | None, epoch: float
+) -> dict:
+    measured_by = _measured_by(host, session_fp, result, fp)
     return {
         "schema": SCHEMA,
         "pool": pool,
-        "account_fp": result.account_fp,
+        "account_fp": fp,
         "measured_at": dt.datetime.fromtimestamp(epoch, dt.UTC).isoformat(),
         "measured_at_epoch": float(epoch),
         "measured_by": measured_by,
@@ -206,7 +208,10 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
     try:
         if not enabled() or result.error or result.warning:
             return False
-        fp = result.account_fp
+        # hk 1753 — 게시 지문은 publish_fp 우선이다: codex 처럼 로컬 지문
+        # 게이트를 열지 않으면서 게시만 하는 결과가 쓴다.
+        fp = result.publish_fp or result.account_fp
+        kind = result.publish_fp_kind or result.account_fp_kind
         if not isinstance(fp, str) or not fp:
             return False
         # task #659 — 계정 uuid 에 묶인 지문만 게시한다. 토큰 해시 폴백 지문은
@@ -215,7 +220,7 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
         # config 컨텍스트가 어긋난 토큰+uuid 조합의 오귀속을 막는 게이트다.
         # 건너뛴 사유는 ProviderResult.account_fp_kind="token" 과
         # docs/quota-share.md 에 명시된다.
-        if result.account_fp_kind != "account":
+        if kind != "account":
             return False
         if not any(_is_valid_used_pct(b.used_pct) for b in result.buckets):
             return False
@@ -230,7 +235,14 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
             "session": DOC_SESSION,
             "job": "",
             "body": json.dumps(
-                _payload(pool, result, _safe_host(socket.gethostname()), session_fp, float(epoch)),
+                _payload(
+                    pool,
+                    result,
+                    fp,
+                    _safe_host(socket.gethostname()),
+                    session_fp,
+                    float(epoch),
+                ),
                 ensure_ascii=False,
                 sort_keys=True,
             ),
