@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import fcntl
 import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -964,6 +966,37 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.assertEqual(payload["schema"], free_window.SCHEMA)
         record = free_window.active_record(now=FIXED_NOW)
         self.assertEqual(list(payload["records"]), [] if record is None else [free_window._identity_key()])
+
+    def test_clear_waits_for_the_writer_lock(self):
+        self.freeze_free_window()
+        record = free_window.FreeLimitRecord(
+            FIXED_NOW + dt.timedelta(minutes=45),
+            FIXED_NOW - dt.timedelta(minutes=5),
+            "devin-swe2",
+            "job:lock-pinned",
+        )
+        self.seed_record(record)
+        lock_handle = free_window.lock_path().open("a+")
+        outcome = []
+
+        def clear():
+            outcome.append(free_window.clear_hold(now=FIXED_NOW))
+
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            thread = threading.Thread(target=clear)
+            thread.start()
+            thread.join(2)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(outcome, [])
+            self.assertIsNotNone(free_window.active_record(now=FIXED_NOW))
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertIsNone(free_window.active_record(now=FIXED_NOW))
 
     def test_json_and_table_add_short_window_without_changing_used_pct(self):
         self.freeze_cli()
