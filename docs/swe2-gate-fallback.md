@@ -49,6 +49,19 @@ bound and tracked-session cleanup. A zero exit from a skipped refresh cannot
 reuse an old cache entry: the entry must have been successfully fetched during
 this attempt and be inside TTL.
 
+The `--_swe2` worker reports each skip cause on a distinct exit code — another
+refresh worker holds the pool lock, the provider single-probe lock reports a
+probe already in progress, or host backoff — so the parent tells a skip apart
+from a run without parsing free text. Plain `refresh` keeps rc 0 for skips.
+On a lock-held or probe-in-progress skip the parent waits for the in-flight
+probe: a short fixed-interval poll of the cache file only, never a network
+call, accepting the first devin entry fetched strictly after the pre-wait
+entry, with no newer `last_error_at`, inside TTL, passing the same
+current-probe checks. The wait is bounded by `SWE2_IN_FLIGHT_WAIT_S` (the
+devin probe timeout plus a small margin); on expiry the refusal stays rc 4
+with `state=in-flight-timeout`. A backoff skip never waits: rc 4 at once with
+`state=backoff` and the remaining seconds in the reason.
+
 The internal `--_swe2` worker mode permits an unrelated account warning only
 when usable model buckets were observed. Ordinary refresh behavior is unchanged.
 The warning remains in the cache; paid consumers still see it as degraded.
