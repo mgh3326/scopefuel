@@ -1449,3 +1449,45 @@ def test_a_snapshot_filled_profile_keeps_the_snapshot_gate_not_a_wider_one(catal
     decision = launch.resolve_launch("oc-omni", operator_request=True)
     assert decision.gate == "escalation"
     assert decision.catalog_source == "snapshot"
+
+
+def test_push_catalog_refetch_clears_the_same_floor(catalog_server, tmp_path, capsys):
+    """B1 (tester round 1): the post-write refetch may not launder a
+    regressed canon into the last-good cache.
+
+    The server drops a cached profile *before* the push; the write succeeds
+    but the refetched catalog fails the ratchet, so the refresh is skipped —
+    the cache still holds the dropped profile and the next read keeps
+    rejecting the regressed canon.
+    """
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE)
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    regressed = [row for row in canon if row["profile"] != "kimi-k3"]
+    fake.catalog = regressed
+    bench.reset_catalog_memo()
+
+    payload = tmp_path / "push.json"
+    payload.write_text(
+        json.dumps({"catalog": [_row("push-fresh", "high", "m-1", "codex", "A")]}),
+        encoding="utf-8",
+    )
+    assert bench.push_catalog(payload) == 1
+
+    assert "refetched catalog was rejected" in capsys.readouterr().err
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        cached_profiles = {row[0] for row in conn.execute("SELECT profile FROM bench_cache_catalog")}
+    finally:
+        conn.close()
+    assert "kimi-k3" in cached_profiles, "the regressed refetch must not overwrite the cache"
+
+    # And the next read still rejects the regressed canon — the ratchet's
+    # baseline was never laundered.
+    _age_catalog_cache(3601)
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert "server catalog rejected" in view.detail
+    assert "kimi-k3" not in {entry.profile for entry in view.entries} or view.source != "server"

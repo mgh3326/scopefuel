@@ -3131,6 +3131,34 @@ def _stored_snapshot_fill(row: sqlite3.Row | None) -> tuple[str, ...]:
     return tuple(profile for profile in text.split(",") if profile)
 
 
+def _last_good_catalog(*, path: pathlib.Path | str | None, backend: BenchBackend) -> list[CatalogEntry]:
+    """The last-good committed cache rows, gated exactly like a cache serve.
+
+    Empty when the cache is unusable as a ratchet baseline: no meta stamp,
+    another endpoint's rows, or an unparseable/future stamp — the same
+    conditions that empty ``cached`` in ``_read_catalog_uncached`` (freshness
+    itself is irrelevant: membership is not freshness).
+    """
+
+    try:
+        conn = _cache_connect(path)
+        try:
+            cached = _cached_catalog(conn)
+            row = _catalog_meta_row(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    if row is None or row["endpoint_id"] != backend.endpoint_id:
+        return []
+    fetched_at = _cached_at(row["fetched_at"])
+    if fetched_at is None:
+        return []
+    if (_cache_now() - fetched_at).total_seconds() < -_CACHE_CLOCK_SKEW_S:
+        return []
+    return cached
+
+
 # One resolved catalog per process. Without this, ``--recommend`` and a gate
 # check inside the same command can straddle the TTL boundary and disagree —
 # one admitting on the old grade while the other launches the new model.
@@ -3496,7 +3524,21 @@ def push_catalog(
     try:
         refetched = _fetch_catalog(backend)
         fill = tuple(sorted(snapshot_profiles() - {entry.profile for entry in refetched}))
-        _commit_catalog_cache(path=path, entries=refetched, backend=backend, snapshot_fill=fill)
+        # #1768: the post-write refetch clears the same floor a fresh fetch
+        # does before it may replace the last-good cache. Committing an
+        # unfloored canon here would overwrite a healthy cache with a
+        # regressed one — and the next read's ratchet would then vouch for
+        # the regression. A rejection only forfeits the refresh.
+        last_good = _last_good_catalog(path=path, backend=backend)
+        rejection = _server_catalog_rejection(refetched, last_good)
+        if rejection is not None:
+            print(
+                f"warning: catalog written but the refetched catalog was rejected "
+                f"({rejection}); the local cache was not refreshed",
+                file=sys.stderr,
+            )
+        else:
+            _commit_catalog_cache(path=path, entries=refetched, backend=backend, snapshot_fill=fill)
     except (BenchBackendError, sqlite3.Error, OSError, ValueError):
         # The write landed; a cache refresh failure only costs one extra read.
         print("warning: catalog written but the local cache was not refreshed", file=sys.stderr)
