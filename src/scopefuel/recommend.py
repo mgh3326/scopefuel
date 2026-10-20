@@ -3074,6 +3074,8 @@ def _alt_candidates(
         bench_scores=bench_scores,
         model_prices=model_prices,
         grade_table=grade_table,
+        # Non-SWE2 gates retain their existing alternatives and escalation eligibility.
+        _swe2_model_scope=exclude_profile in SWE2_MODEL_SCOPE_PROFILES,
     )
     names: list[str] = []
     for line in out.splitlines():
@@ -3162,18 +3164,82 @@ def _probe_age_s(result: ProviderResult, now: dt.datetime) -> float | None:
     return now.timestamp() - float(result.fetched_at)
 
 
-def _swe2_probe_is_current(result: ProviderResult, now: dt.datetime) -> bool:
-    """True only for a clean probe inside the provider TTL.
+# Model-measurement warning classes (hk 1731): the models-list probe failed or
+# timed out, a SWE-2 model row was missing/unparseable, the model-scope parse
+# degraded, or the Free tag observation itself is in doubt. Account-axis,
+# banner, usage-line, and PTY warnings are unrelated — they say nothing about
+# the model rows, so a probe carrying only one of those stays current.
+_SWE2_MODEL_WARNING_MARKERS = (
+    "models list",
+    "models_list",
+    "model row",
+    "model-scope",
+    "swe-2",
+    "free tag",
+    "모델",
+    "free 태그",
+)
 
-    A warning, an error, or a stale snapshot is not current.
+
+def _swe2_model_warning(result: ProviderResult) -> bool:
+    """True when the result's warning is about the model-side measurement."""
+    warning = (result.warning or "").casefold()
+    if not warning:
+        return False
+    return any(marker in warning for marker in _SWE2_MODEL_WARNING_MARKERS)
+
+
+def _swe2_probe_is_current(result: ProviderResult, now: dt.datetime) -> bool:
+    """True only for a usable probe inside the provider TTL.
+
+    An error, a stale snapshot, a model-measurement warning, or an age past
+    the provider TTL is not current. An unrelated (account/banner/usage/PTY)
+    warning does not disqualify the model rows it says nothing about, and a
+    note alone never disqualifies.
     """
-    if result.error or result.warning or result.stale or result.status != "ok":
+    if result.error or result.stale or result.source == manual.SOURCE:
+        return False
+    if result.status != "ok" and not (result.status == "warning" and not _swe2_model_warning(result)):
         return False
     age = _probe_age_s(result, now)
     if age is None:
         return True
     ttl = cache.PROVIDER_TTL_S.get(result.id, cache.DEFAULT_TTL_S)
     return age <= ttl
+
+
+def _swe2_measurement_state(result: ProviderResult | None, now: dt.datetime) -> str:
+    """Short label for why the SWE-2 model measurement is not current."""
+    if result is None:
+        return "absent"
+    if result.error:
+        return "error"
+    if result.stale:
+        return "stale"
+    if result.source == manual.SOURCE:
+        return "manual-account-only"
+    if result.warning is not None and _swe2_model_warning(result):
+        return "warning:model"
+    age = _probe_age_s(result, now)
+    ttl = cache.PROVIDER_TTL_S.get(result.id, cache.DEFAULT_TTL_S)
+    if age is not None and age > ttl:
+        return f"aged:{age:.0f}s"
+    if result.status != "ok":
+        return f"status:{result.status}"
+    return "unknown"
+
+
+SWE2_MEASUREMENT_UNAVAILABLE = "swe2_measurement_unavailable"
+
+
+def _swe2_measurement_unavailable_reason(
+    profile_name: str, provider_id: str, result: ProviderResult | None, now: dt.datetime
+) -> str:
+    state = _swe2_measurement_state(result, now)
+    return (
+        f"{SWE2_MEASUREMENT_UNAVAILABLE}: {profile_name} pool={provider_id} "
+        f"basis=measurement-unavailable state={state}"
+    )
 
 
 def _swe2_model_bucket(result: ProviderResult, rung: str) -> Bucket | None:
@@ -3213,21 +3279,41 @@ def _maybe_swe2_model_scope_gate(
     """Judge an allowlisted SWE-2 name on its own rung's current Free model-scope bucket.
 
     None means this probe keeps today's account Daily/Weekly judgment: the
-    name is outside the allowlist, the probe is not current, the Free bucket
-    for its rung is missing or ambiguous (a sibling rung's bucket does not
+    name is outside the allowlist, a current probe is missing the Free bucket
+    for its rung or that bucket is ambiguous (a sibling rung's bucket does not
     count), or an active policy exclude must not be bypassed.
+    A noncurrent measurement — absent result, error, stale or past-TTL
+    snapshot, model-side warning — is a named unmeasurable refusal instead of
+    a silent account fallback: the account axes must not stand in for a model
+    judgment they cannot answer.
     Account Daily and Weekly never enter the cutoff comparison on this path.
     Static billing is not read.
     """
     rung = SWE2_PROFILE_RUNG.get(profile_name)
-    if result is None or rung is None:
+    if rung is None:
         return None
-    fallback: PoolClass = result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
+    fallback: PoolClass = (
+        result.pool_class if result is not None and result.pool_class in ("preserve", "spend") else "preserve"
+    )
     effective_class = get_policy(provider_id, fallback, today=today)[0]
     if effective_class == "exclude":
         return None
-    if not _swe2_probe_is_current(result, now):
-        return None
+    if result is None or not _swe2_probe_is_current(result, now):
+        reason = _swe2_measurement_unavailable_reason(profile_name, provider_id, result, now)
+        reason += _missing_windows_tag(missing)
+        reason += rung_suffix
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=reason,
+            unmeasurable=True,
+            alternatives=alternatives_fn() if alternatives_fn is not None else (),
+            missing_windows=missing,
+            e6_arm=e6_admitted,
+            **audit,
+        )
     bucket = _swe2_model_bucket(result, rung)
     if bucket is None:
         return None
@@ -3591,17 +3677,6 @@ def gate_check(
         result = by_id.get(provider_id)
         accepted = _stale_accepted(result, group_name, now)
         missing = _missing_required_windows(result, group_name)
-        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=None,
-                reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing),
-                unmeasurable=True,
-                missing_windows=missing,
-                **audit,
-            )
         swe2_decision = _maybe_swe2_model_scope_gate(
             profile_name=profile_name,
             provider_id=provider_id,
@@ -3620,6 +3695,17 @@ def gate_check(
         )
         if swe2_decision is not None:
             return swe2_decision
+        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing),
+                unmeasurable=True,
+                missing_windows=missing,
+                **audit,
+            )
         matches = _matching_buckets(result, group_name)
         if not matches:
             return GateResult(
@@ -3799,20 +3885,6 @@ def gate_check(
             )
 
     accepted = _stale_accepted(result, group_name, now)
-    if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
-        alts = alternatives()
-        return GateResult(
-            ok=False,
-            profile=profile_name,
-            provider_id=provider_id,
-            grade=grade,
-            reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing) + rung_suffix,
-            unmeasurable=True,
-            alternatives=alts,
-            missing_windows=missing,
-            **audit,
-        )
-
     swe2_decision = _maybe_swe2_model_scope_gate(
         profile_name=profile_name,
         provider_id=provider_id,
@@ -3831,6 +3903,20 @@ def gate_check(
     )
     if swe2_decision is not None:
         return swe2_decision
+
+    if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
+        alts = alternatives()
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=_unmeasurable_reason(provider_id, result) + _missing_windows_tag(missing) + rung_suffix,
+            unmeasurable=True,
+            alternatives=alts,
+            missing_windows=missing,
+            **audit,
+        )
 
     matches = _matching_buckets(result, group_name)
     if not matches:
@@ -4080,6 +4166,8 @@ def _evaluate(
     normalized_prices: Mapping[str, ModelPrice],
     table: dict[Grade, list[Profile]],
     free_rate_limit: str | None = None,
+    swe2_result: ProviderResult | None = None,
+    swe2_model_scope: bool = True,
 ) -> _Evaluation:
     # Filter the final table here, after CLI callers have merged a served canon
     # or catalog. This single candidate boundary also covers exclusion folds,
@@ -4138,34 +4226,74 @@ def _evaluate(
 
         provider_label = _provider_label(provider_id, group_name)
 
-        result = by_id.get(provider_id)
+        result = (
+            swe2_result
+            if profile.name in SWE2_MODEL_SCOPE_PROFILES and swe2_result is not None
+            else by_id.get(provider_id)
+        )
         accepted = _stale_accepted(result, group_name, now)
-        if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
-            excluded.append(
-                _Excluded(
-                    profile,
-                    _unmeasurable_reason(provider_id, result),
-                    provider_id=provider_id,
-                    kind="unmeasurable",
-                    placed_grade=placed_grade,
-                    one_up=one_up,
-                )
-            )
-            continue
 
-        matches = _matching_buckets(result, group_name)
-        if not matches:
-            excluded.append(
-                _Excluded(
-                    profile,
-                    "측정 불가",
-                    provider_id=provider_id,
-                    kind="unmeasurable",
-                    placed_grade=placed_grade,
-                    one_up=one_up,
+        # SWE-2 allowlist only (hk 1731): a current own-rung Free model-scope
+        # bucket is the whole measurement — the account axes never enter its
+        # states, cutoff, or scoring. A noncurrent measurement is a named
+        # unmeasurable exclusion; a current probe without a usable bucket
+        # keeps the account path. Pure reads only — no refresh here.
+        swe2_rung = SWE2_PROFILE_RUNG.get(profile.name) if swe2_model_scope else None
+        model_bucket: Bucket | None = None
+        fallback_class = result.pool_class if result is not None else "preserve"
+        swe2_excluded = (
+            swe2_rung is not None and get_policy(provider_id, fallback_class, today=today)[0] == "exclude"
+        )
+        if swe2_rung is not None and not swe2_excluded:
+            if result is None or not _swe2_probe_is_current(result, now):
+                excluded.append(
+                    _Excluded(
+                        profile,
+                        _swe2_measurement_unavailable_reason(profile.name, provider_id, result, now),
+                        provider_id=provider_id,
+                        kind="unmeasurable",
+                        placed_grade=placed_grade,
+                        one_up=one_up,
+                    )
                 )
-            )
-            continue
+                continue
+            model_bucket = _swe2_model_bucket(result, swe2_rung)
+
+        if model_bucket is None:
+            if (
+                result is None
+                or result.error
+                or result.warning
+                or (result.status != "ok" and accepted is None)
+            ):
+                excluded.append(
+                    _Excluded(
+                        profile,
+                        _unmeasurable_reason(provider_id, result),
+                        provider_id=provider_id,
+                        kind="unmeasurable",
+                        placed_grade=placed_grade,
+                        one_up=one_up,
+                    )
+                )
+                continue
+
+            matches = _matching_buckets(result, group_name)
+            if not matches:
+                excluded.append(
+                    _Excluded(
+                        profile,
+                        "측정 불가",
+                        provider_id=provider_id,
+                        kind="unmeasurable",
+                        placed_grade=placed_grade,
+                        one_up=one_up,
+                    )
+                )
+                continue
+        else:
+            assert isinstance(model_bucket.used_pct, (int, float))
+            matches = [(float(model_bucket.used_pct), model_bucket.window, model_bucket.resets_at)]
 
         states = _window_states(matches, now)
         constraint = _select_constraint(states)
@@ -4194,7 +4322,8 @@ def _evaluate(
 
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
-        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
+        observe_scope = f"model:{swe2_rung}" if model_bucket is not None else group_name
+        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=observe_scope)
         if over is not None:
             excluded.append(
                 _Excluded(
@@ -4272,7 +4401,9 @@ def _evaluate(
                 brake=brake,
                 brake_window=brake_window,
                 windows_display=(
-                    _format_windows_display(states, constraint)
+                    (f"basis={swe2_model_scope_basis(swe2_rung)} free_tag={SWE2_FREE_TAG_OBSERVED}")
+                    if model_bucket is not None
+                    else _format_windows_display(states, constraint)
                     + (f" [{_stale_tag(result, accepted)}]" if accepted is not None else "")
                 ),
                 used_pct=used_pct,
@@ -4391,6 +4522,8 @@ def recommend(
     hide_excluded: bool = False,
     grade_table: dict[Grade, list[Profile]] | None = None,
     free_rate_limit: str | None = None,
+    swe2_result: ProviderResult | None = None,
+    _swe2_model_scope: bool = True,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -4409,6 +4542,8 @@ def recommend(
         normalized_prices=normalized_prices,
         table=table,
         free_rate_limit=free_rate_limit,
+        swe2_result=swe2_result,
+        swe2_model_scope=_swe2_model_scope,
     )
     included = evaluation.included
     excluded = evaluation.excluded
@@ -4804,6 +4939,7 @@ def recommend_dict(
     model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
     free_rate_limit: str | None = None,
+    swe2_result: ProviderResult | None = None,
 ) -> dict[str, object]:
     """Structured ``--recommend`` rows — the same fold ``recommend()`` renders.
 
@@ -4831,6 +4967,7 @@ def recommend_dict(
         normalized_prices=normalized_prices,
         table=table,
         free_rate_limit=free_rate_limit,
+        swe2_result=swe2_result,
     )
 
     def _row(

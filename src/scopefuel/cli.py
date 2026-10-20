@@ -26,6 +26,7 @@ from . import (
     quota_share,
     quota_v2,
     recommend,
+    refresh,
     render,
     served,
     stale_build,
@@ -578,6 +579,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
     refresh_parser.add_argument("--background", action="store_true", help="즉시 반환하고 백그라운드 갱신")
     refresh_parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
+    refresh_parser.add_argument("--_swe2", action="store_true", help=argparse.SUPPRESS)
 
     subparsers.add_parser(
         "herdr-event",
@@ -902,10 +904,21 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     now = dt.datetime.now(dt.UTC)
     free_limit = free_window.active_record(now=now)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    automatic_devin = next((item for item in results if item.id == "devin"), None)
     results = manual.apply_for_display(results, now=now)
     bench_scores = bench.read_scores()
     model_prices = bench.read_prices()
     grade_table = bench.runtime_grade_table()
+    entries = [
+        *grade_table[args.recommend],
+        *(profile for profile, _grade in recommend._one_up_profiles(args.recommend, grade_table)),
+    ]
+    needs_swe2 = any(
+        profile.name in recommend.SWE2_MODEL_SCOPE_PROFILES
+        and recommend.profile_subscription(profile.name, "devin").subscribed
+        for profile in entries
+    )
+    swe2_result = _refresh_swe2_result(automatic_devin, needed=needs_swe2, now=now)
     catalog = bench.read_catalog()
     if getattr(args, "json", False):
         payload = recommend.recommend_dict(
@@ -917,6 +930,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             model_prices=model_prices,
             grade_table=grade_table,
             free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
+            swe2_result=swe2_result,
         )
         payload["catalog"] = catalog.label
         print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
@@ -935,6 +949,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
                 hide_excluded=bool(getattr(args, "hide_excluded", False)),
                 grade_table=grade_table,
                 free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
+                swe2_result=swe2_result,
             )
         )
         # Provenance line, always printed: a table that silently came from the
@@ -1137,6 +1152,23 @@ def _shadow_gate(
     )
 
 
+def _refresh_swe2_result(
+    result: ProviderResult | None, *, needed: bool, now: dt.datetime
+) -> ProviderResult | None:
+    """One bounded refresh for stale model observations; never retry during evaluation."""
+    if not needed or result is None:
+        return result
+    fallback = result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
+    if recommend.get_policy("devin", fallback, today=now.date())[0] == "exclude":
+        return result
+    age = recommend._probe_age_s(result, now)
+    ttl = refresh.cache.PROVIDER_TTL_S.get("devin", refresh.cache.DEFAULT_TTL_S)
+    if not result.stale and (age is None or age <= ttl):
+        return result
+    updated = refresh.refresh_swe2_result()
+    return updated if updated is not None else result
+
+
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     barred_model_id = recommend.barred_model_id_for_profile(args.profile)
     if barred_model_id:
@@ -1166,12 +1198,28 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         **_gate_args(args),
         **_gate_rung_args(args),
     )
+    if result.unmeasurable and result.reason.startswith(recommend.SWE2_MEASUREMENT_UNAVAILABLE):
+        target = next((item for item in automatic_results if item.id == "devin"), None)
+        updated = _refresh_swe2_result(target, needed=True, now=now)
+        if updated is not target:
+            automatic_results = [updated if item.id == "devin" else item for item in automatic_results]
+            result = recommend.gate_check(
+                automatic_results,
+                args.profile,
+                today=now.date(),
+                now=now,
+                bench_scores=bench_scores,
+                model_prices=model_prices,
+                grade_table=grade_table,
+                **_gate_args(args),
+                **_gate_rung_args(args),
+            )
 
     # Manual observations are considered only after the automatic path is
     # genuinely unmeasurable.  A cached automatic snapshot that already proves
     # cutoff/exclude remains authoritative and cannot be hidden by a lower
     # manual number.
-    if result.unmeasurable:
+    if result.unmeasurable and not result.reason.startswith(recommend.SWE2_MEASUREMENT_UNAVAILABLE):
         provider_id, group_name = recommend.profile_pool(args.profile)
         target = next((item for item in automatic_results if item.id == provider_id), None)
         if target is not None:
@@ -2104,6 +2152,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "refresh":
         if args._worker:
+            if args._swe2:
+                return run_worker(fetchers, args.pool, swe2=True)
             return run_worker(fetchers, args.pool)
         return spawn(args.pool, background=args.background)
 
