@@ -25,7 +25,7 @@ import urllib.parse
 
 import pytest
 
-from scopefuel import bench, cli, free_window, launch, policy, quota_share
+from scopefuel import bench, cache, cli, free_window, launch, policy, quota_share
 from scopefuel.free_window import FREE_PROFILES
 from scopefuel.http import HttpError
 from scopefuel.model import Bucket, ProviderResult, Scope
@@ -399,7 +399,8 @@ def test_recommend_rows_read_declared_account_on_nonmatching_host(monkeypatch):
     assert set(rows) == set(PROFILES)
     assert all(row["kind"] == "candidate" for row in rows.values())
     assert all(row["provider"] == "codex" for row in rows.values())
-    assert f"quota/codex/{DECLARED_FP}/latest" in hk.gets
+    # 두 형제 행이 한 문서 읽기를 공유한다 (memo 제거 뮤턴트는 이 assert 를 죽인다).
+    assert hk.gets.count(f"quota/codex/{DECLARED_FP}/latest") == 1
 
 
 def test_recommend_rows_are_named_unmeasurable_without_declared_account(monkeypatch):
@@ -574,3 +575,42 @@ def test_codex_result_does_not_open_generic_fp_gates(monkeypatch):
     hk = _enable(monkeypatch)
     assert quota_share.publish_result("codex", local, now=EPOCH)
     assert quota_share.key_for("codex", LOCAL_FP) in hk.docs
+
+
+def test_cache_roundtrip_preserves_publish_fp_for_matching_host():
+    """D7 회귀 — TTL 캐시 히트도 매칭 호스트 판정(publish_fp)을 잃지 않는다."""
+    restored = cache._from_entry(cache._to_entry(_codex_result(fp=DECLARED_FP), EPOCH), "codex", EPOCH)
+    assert restored.publish_fp == DECLARED_FP
+    assert restored.publish_fp_kind == "account"
+
+
+def test_matching_host_still_local_on_cache_hit_with_share_off(monkeypatch):
+    """D7 회귀(통합) — 캐시된 publish_fp 결과로 SCOPEFUEL_QUOTA_SHARE=off 도 로컬 판정."""
+    monkeypatch.setenv("SCOPEFUEL_QUOTA_SHARE", "off")
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    cached = cache._from_entry(
+        cache._to_entry(_codex_result(used_5h=42.0, used_7d=42.0, fp=DECLARED_FP), EPOCH),
+        "codex",
+        EPOCH,
+    )
+    cached.stale = False  # TTL-hit path (cache.py collect) marks fresh hits this way
+    _install_cli_stubs(monkeypatch, [cached])
+    _declare()
+
+    rc, out, err = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
+    assert rc == 0, (out, err)
+    assert "used_pct=42.0" in out
+
+
+def test_declared_doc_with_wrong_body_fp_is_refused(monkeypatch):
+    """N3 뮤턴트 — 키는 선언 지문이어도 본문 지문이 다르면 읽지 않는다."""
+    hk = _enable(monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    _install_cli_stubs(monkeypatch, [_codex_result()])
+    _declare()
+    _seed_codex_remote(hk, fp=LOCAL_FP)  # body fp = LOCAL; move under declared key
+    hk.docs[quota_share.key_for("codex", DECLARED_FP)] = hk.docs.pop(quota_share.key_for("codex", LOCAL_FP))
+
+    rc, out, err = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
+    assert rc == 4, (out, err)
+    assert FUSION_BILLING_UNMEASURED in err

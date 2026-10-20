@@ -31,14 +31,17 @@ AUTH = pathlib.Path.home() / ".codex" / "auth.json"
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 
-def _load_tokens() -> dict | None:
-    """auth.json 의 ``tokens`` 테이블 — 없거나 깨졌으면 None."""
+def _load_auth() -> dict | None:
+    """auth.json 본문 dict — 파일이 없거나 JSON 이 아니면 None.
+
+    dict 가 아닌 최상위 값은 빈 dict 로 취급한다 — 파일은 있는데 tokens 를
+    못 쓰는 상태는 '자격증명 파일 없음' 이 아니라 'access_token 없음' 이다.
+    """
     try:
         data = json.loads(_auth_path().read_text())
     except (OSError, ValueError):
         return None
-    tokens = data.get("tokens") if isinstance(data, dict) else None
-    return tokens if isinstance(tokens, dict) else None
+    return data if isinstance(data, dict) else {}
 
 
 def _account_identity(tokens: dict) -> tuple[str | None, str | None]:
@@ -71,15 +74,17 @@ def _session_fp(tokens: dict) -> str | None:
 
 def fetch() -> ProviderResult:
     auth = _auth_path()
-    tokens = _load_tokens()
-    if tokens is None:
+    data = _load_auth()
+    if data is None:
         return ProviderResult(
             id="codex", error="자격증명 파일 없음", hint=f"{auth} 없음 — `codex login` 후 재시도"
         )
+    tokens = data.get("tokens")
+    tokens = tokens if isinstance(tokens, dict) else {}
     fp, fp_kind = _account_identity(tokens)
     session_fp = _session_fp(tokens)
-    token = (tokens.get("access_token") or "").strip()
-    if not token:
+    token = tokens.get("access_token")
+    if not isinstance(token, str) or not token.strip():
         return ProviderResult(id="codex", error="access_token 없음", hint="`codex login` 필요")
 
     headers = {

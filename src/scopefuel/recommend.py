@@ -3446,6 +3446,7 @@ class _BillingGate:
     result: ProviderResult | None
     reason: str | None = None
     fields: dict[str, object] | None = None
+    declared: str | None = None
 
 
 def _resolve_fusion_billing(
@@ -3463,7 +3464,11 @@ def _resolve_fusion_billing(
     # billing account — judge on it exactly as before. codex carries its
     # account identity in publish_fp so the generic fp gates stay inert.
     if local is not None and (local.publish_fp or local.account_fp) == declared:
-        return _BillingGate(local, fields={"account": account_tag(declared, local.account_label, "account")})
+        return _BillingGate(
+            local,
+            fields={"account": account_tag(declared, local.account_label, "account")},
+            declared=declared,
+        )
     policy_class: PoolClass = (
         local.pool_class if local is not None and local.pool_class in ("preserve", "spend") else "preserve"
     )
@@ -3485,6 +3490,7 @@ def _resolve_fusion_billing(
                 ),
                 "observed_age_s": remote.age_s,
             },
+            declared=declared,
         )
     if snap is None:
         detail = f"account {tag} — quota/{provider_id}/{declared[:8]}/latest 문서 없음 또는 읽기 불가"
@@ -3497,7 +3503,7 @@ def _resolve_fusion_billing(
             detail = f"{label} — 측정 시각이 미래(클록 드리프트 한도 초과)"
         else:
             detail = f"{label} — 스냅샷에 유효 사용량 없음"
-    return _BillingGate(None, reason=detail, fields={"account": tag})
+    return _BillingGate(None, reason=detail, fields={"account": tag}, declared=declared)
 
 
 def _fusion_billing_gate(
@@ -3528,8 +3534,21 @@ def _fusion_billing_gate(
             None,
             reason=f"{FUSION_BILLING_UNMEASURED}: {profile_name} pool={provider_id} {gate.reason}",
             fields=gate.fields,
+            declared=gate.declared,
         )
     return gate
+
+
+def _billing_observe_scope(billing: _BillingGate | None, group_name: str | None) -> str | None:
+    """D8 — 선언 계정 판정의 소진 에피소드는 호스트 자체 풀 에피소드와 분리한다.
+
+    exhaust.observe 는 pool@scope 로 dedup 한다 — 비매칭 호스트에서 선언
+    계정의 소진이 이 호스트 자체 codex 로그인의 에피소드를 열고 닫으면
+    operator-switch 알림이 헛돈다. billing 판정만 전용 scope 로 보낸다.
+    """
+    if billing is not None and billing.declared:
+        return f"fusion-billing:{billing.declared[:8]}"
+    return group_name
 
 
 def gate_check(
@@ -3913,7 +3932,9 @@ def gate_check(
             )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
-        notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
+        notify_status = _observe_exhaustion(
+            provider_id, over, cutoff, now, scope=_billing_observe_scope(billing, group_name)
+        )
         if over is not None:
             return GateResult(
                 ok=False,
@@ -4156,7 +4177,9 @@ def gate_check(
 
     cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
-    notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=group_name)
+    notify_status = _observe_exhaustion(
+        provider_id, over, cutoff, now, scope=_billing_observe_scope(billing, group_name)
+    )
     if over is not None:
         alts = alternatives()
         return GateResult(
@@ -4518,6 +4541,7 @@ def _evaluate(
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
         observe_scope = f"model:{swe2_rung}" if model_bucket is not None else group_name
+        observe_scope = _billing_observe_scope(billing, observe_scope)
         notify_status = _observe_exhaustion(provider_id, over, cutoff, now, scope=observe_scope)
         if over is not None:
             excluded.append(

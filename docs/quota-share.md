@@ -232,11 +232,15 @@ substitution and no widened stale acceptance.
 **Publishing side.** mbp publishes `quota/codex/<fp>/latest` on every
 successful codex measurement — `collect`/`refresh` are the only writers, there
 is no scheduler — whenever scopefuel runs on mbp while the codex probe
-succeeds (the provider only emits an `account_fp` once this build is
-deployed; before it, codex results had no fingerprint and nothing was
-published). A document goes stale 15 minutes after `measured_at` — e.g. mbp
-asleep, codex probe failing, or scopefuel simply not running there. **A stale
-publish routinely refuses sol61 on other hosts** (`fusion_billing_unmeasured`,
-rc 4) whenever mbp has not published within the window — that fail-closed
-refusal is the intended semantics; if the lane needs higher availability the
+succeeds (the provider only emits a `publish_fp` once this build is deployed;
+before it, codex results had no fingerprint and nothing was published). A
+document goes stale 15 minutes after `measured_at` — e.g. mbp asleep, codex
+probe failing, or scopefuel simply not running there. **A stale publish
+routinely refuses sol61 on other hosts** (`fusion_billing_unmeasured`, rc 4)
+whenever mbp has not published within the window — that fail-closed refusal
+is the intended semantics; if the lane needs higher availability the
 operator/desk decides on a publisher schedule for mbp, not this repo.
+
+Note: `scopefuel policy clear codex` removes the whole `[pools.codex]` table
+including `fusion_billing_fp` — sol61 then closes to rc 4 (fail-closed) until
+the fingerprint is re-declared.
