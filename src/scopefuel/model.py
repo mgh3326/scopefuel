@@ -34,6 +34,11 @@ WASTE_WINDOW_S = 24 * 3600
 # 이번 회차만 생략됐다는 뜻이다. 캐시는 마지막 정상 스냅샷을 유지한다.
 PROBE_IN_PROGRESS = "probe_in_progress"
 
+# hk 1754 — refresh_swe2_result 의 한정 대기가 거절로 끝날 때 쓰는 error_kind
+# 계약값. 합성 결과는 캐시에 쓰이지 않고 게이트의 named rc 4 사유로만 소비된다.
+SWE2_IN_FLIGHT_TIMEOUT = "swe2_in_flight_timeout"
+SWE2_BACKOFF = "swe2_backoff"
+
 # 이 이하의 창은 "지금"으로 본다 (5h 창 = 21600초).
 NOW_HORIZON_MAX_S = 6 * 3600
 

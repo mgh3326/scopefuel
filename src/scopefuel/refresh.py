@@ -16,7 +16,7 @@ from contextlib import contextmanager
 
 from . import cache, proctrack, quota_share, quota_v2, recommend
 from .http import classify_error
-from .model import PROBE_IN_PROGRESS, ProviderResult
+from .model import PROBE_IN_PROGRESS, SWE2_BACKOFF, SWE2_IN_FLIGHT_TIMEOUT, ProviderResult
 from .providers import BUILTIN
 
 # Sorted so argparse choices stay stable in `scopefuel refresh --help`.
@@ -24,6 +24,26 @@ REFRESH_POOLS = tuple(sorted(BUILTIN))
 DEFAULT_TIMEOUT_S = 60.0
 LOCK_DIR_NAME = "refresh-locks"
 LOG_DIR_NAME = "refresh-logs"
+
+# hk 1754 — the --_swe2 worker reports why it skipped on these exit codes so
+# the parent can tell a skip apart from a run without parsing free text.
+# Plain `refresh` (swe2=False) keeps rc 0 for every skip.
+SWE2_RC_LOCK_HELD = 10
+SWE2_RC_PROBE_IN_PROGRESS = 11
+SWE2_RC_BACKOFF = 12
+SWE2_WAIT_SKIP_RCS = frozenset({SWE2_RC_LOCK_HELD, SWE2_RC_PROBE_IN_PROGRESS})
+
+# Bound for waiting on a probe another worker already holds in flight: the
+# in-flight worker's own hard cap is _timeout_seconds() (a devin fetch runs
+# two sequential probe phases under one lock, so the provider TIMEOUT_S alone
+# under-covers it), and the margin covers teardown plus the cache write after
+# the probe exits.
+SWE2_IN_FLIGHT_WAIT_MARGIN_S = 5.0
+SWE2_IN_FLIGHT_POLL_S = 0.25  # cache-file poll only — never a network call
+
+
+def _in_flight_wait_s() -> float:
+    return _timeout_seconds() + SWE2_IN_FLIGHT_WAIT_MARGIN_S
 
 
 def _refresh_dir(name: str) -> pathlib.Path:
@@ -112,7 +132,7 @@ def run_worker(fetchers: dict[str, object], pool: str, *, swe2: bool = False) ->
     with pool_lock(pool) as acquired:
         if not acquired:
             print(f"refresh: pool={pool} already in progress; skipped")
-            return 0
+            return SWE2_RC_LOCK_HELD if swe2 else 0
 
         signal.signal(signal.SIGALRM, _kill_process_group_on_timeout)
         signal.setitimer(signal.ITIMER_REAL, _timeout_seconds())
@@ -121,7 +141,7 @@ def run_worker(fetchers: dict[str, object], pool: str, *, swe2: bool = False) ->
             remaining = cache.backoff_remaining(pool, now)
             if remaining > 0:
                 print(f"refresh: pool={pool} backoff 중 — {remaining:.0f}s 뒤 허용, 네트워크 호출 생략")
-                return 0
+                return SWE2_RC_BACKOFF if swe2 else 0
             fetcher = fetchers[pool]
             v2_identities = _v2_capture(pool, now)
             started_at = now
@@ -131,7 +151,7 @@ def run_worker(fetchers: dict[str, object], pool: str, *, swe2: bool = False) ->
                 # provider 의 single-probe 잠금을 다른 프로브가 쥐고 있다 —
                 # 측정 실패가 아니므로 캐시·v2 감사도 남기지 않는다(#639).
                 print(f"refresh: pool={pool} probe in progress; skipped")
-                return 0
+                return SWE2_RC_PROBE_IN_PROGRESS if swe2 else 0
             usable_models = (
                 swe2
                 and pool == "devin"
@@ -208,10 +228,68 @@ def spawn(pool: str, *, background: bool) -> int:
     return subprocess.run(command, check=False).returncode
 
 
+def _admitted_landing(entry: dict, before_fetched: float | None, now: float) -> ProviderResult | None:
+    """An in-flight landing counts only when strictly newer than the pre-wait entry."""
+    fetched = entry.get("fetched_at")
+    if not isinstance(fetched, (int, float)) or fetched > now:
+        return None
+    # The entry the gate saw before waiting never admits; the landing must be
+    # a genuinely newer fetch.
+    if isinstance(before_fetched, (int, float)) and fetched <= before_fetched:
+        return None
+    failed = entry.get("last_error_at")
+    if isinstance(failed, (int, float)) and failed >= fetched:
+        return None
+    result = cache._from_entry(entry, "devin", now)
+    if result.error:
+        return None
+    ttl = cache.PROVIDER_TTL_S.get("devin", cache.DEFAULT_TTL_S)
+    if result.age_s is None or result.age_s > ttl:
+        return None
+    result.stale = False
+    return result
+
+
+def _wait_for_in_flight(before_fetched: float | None, now: float | None) -> ProviderResult:
+    """Poll the cache for the in-flight probe's landing; bounded, no network calls."""
+    wait_s = _in_flight_wait_s()
+    deadline = time.monotonic() + wait_s
+    while True:
+        at = time.time() if now is None else now
+        # Backoff wins over waiting — whether it was already on disk when the
+        # worker raced the lock, or the in-flight probe just recorded a 429.
+        if cache.backoff_remaining("devin", at) > 0:
+            return _backoff_refusal()
+        entry = cache._load().get("devin")
+        if isinstance(entry, dict):
+            result = _admitted_landing(entry, before_fetched, at)
+            if result is not None:
+                return result
+        if time.monotonic() >= deadline:
+            return ProviderResult(
+                id="devin",
+                error=(f"in-flight probe did not land in time (waited up to {wait_s:.0f}s)"),
+                error_kind=SWE2_IN_FLIGHT_TIMEOUT,
+            )
+        time.sleep(SWE2_IN_FLIGHT_POLL_S)
+
+
+def _backoff_refusal() -> ProviderResult:
+    """backoff 스킵은 기다리지 않는다 — named 사유에 남은 초를 싣는다."""
+    remaining = cache.backoff_remaining("devin", time.time())
+    return ProviderResult(
+        id="devin",
+        error=f"backoff 중, {remaining:.0f}s 뒤 재시도 가능",
+        error_kind=SWE2_BACKOFF,
+    )
+
+
 def refresh_swe2_result(now: float | None = None) -> ProviderResult | None:
-    """Run the existing bounded worker once, then read its fresh successful entry."""
+    """Run the bounded worker once, wait for an in-flight probe, then read the cache."""
     command = [sys.executable, "-m", "scopefuel.cli", "refresh", "devin", "--_worker", "--_swe2"]
     started = time.time()
+    before = cache._load().get("devin")
+    before_fetched = before.get("fetched_at") if isinstance(before, dict) else None
     try:
         process = subprocess.Popen(
             command,
@@ -231,14 +309,21 @@ def refresh_swe2_result(now: float | None = None) -> ProviderResult | None:
         with contextlib.suppress(subprocess.TimeoutExpired, OSError):
             process.wait(timeout=5)
         return None
+    if code == SWE2_RC_BACKOFF:
+        return _backoff_refusal()
+    if code in SWE2_WAIT_SKIP_RCS:
+        # A probe is already in flight and will write a fresh entry shortly —
+        # waiting for it is the bounded synchronous refresh, not a retry.
+        return _wait_for_in_flight(before_fetched, now)
     if code != 0:
         return None
     now = time.time() if now is None else now
     entry = cache._load().get("devin")
     if not isinstance(entry, dict):
         return None
-    # Lock/backoff/probe-in-progress skips also return zero. An older cache hit
-    # is not evidence that this refresh measured the models list.
+    # An older cache hit is not evidence that this refresh measured the models
+    # list — the swe2 worker's skip exit codes above are how a skip is told
+    # apart from a run.
     fetched = entry.get("fetched_at")
     if not isinstance(fetched, (int, float)) or not started <= fetched <= now:
         return None

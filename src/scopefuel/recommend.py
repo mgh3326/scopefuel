@@ -29,6 +29,8 @@ from . import cache, exhaust, free_window, manual, quota_share
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
+    SWE2_BACKOFF,
+    SWE2_IN_FLIGHT_TIMEOUT,
     Bucket,
     PoolClass,
     ProviderResult,
@@ -2450,6 +2452,13 @@ def _unmeasurable_reason(provider_id: str, result: ProviderResult | None) -> str
         if result.stale and result.age_s is not None:
             return f"{provider_id} 탐침 진행 중 — 직전 값 {cache.format_age(result.age_s)} 수용 불가"
         return f"{provider_id} 탐침 진행 중 — 직전 정상 값 없음"
+    # hk 1754 — the gate already waited its bound for the in-flight probe, or
+    # refused at once because the pool is in host backoff; the synthetic
+    # result's error text carries the detail (bound / remaining seconds).
+    if result is not None and result.error_kind == SWE2_IN_FLIGHT_TIMEOUT:
+        return f"{provider_id} {result.error or 'in-flight probe did not land in time'}"
+    if result is not None and result.error_kind == SWE2_BACKOFF:
+        return f"{provider_id} {result.error or 'backoff'}"
     # task #653 — 만료는 만료로 보고한다. 속도 제한도 아니고 '측정 불가' 도 아니다.
     if result is not None and result.error_kind == "token_expired":
         return f"{provider_id} {result.error or 'token expired — 자격 만료, 재로그인 필요'}"
@@ -3251,6 +3260,12 @@ def _swe2_measurement_state(result: ProviderResult | None, now: dt.datetime) -> 
     """Short label for why the SWE-2 model measurement is not current."""
     if result is None:
         return "absent"
+    # hk 1754 — refresh_swe2_result bounded-wait outcomes keep their own state
+    # names instead of collapsing into a generic "error".
+    if result.error_kind == SWE2_IN_FLIGHT_TIMEOUT:
+        return "in-flight-timeout"
+    if result.error_kind == SWE2_BACKOFF:
+        return "backoff"
     if result.error:
         return "error"
     if result.stale:
