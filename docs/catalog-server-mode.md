@@ -29,18 +29,46 @@ per `(profile, effort)`: `model_id`, the default effort rung, `pool`, `gate`.
 A local-backend host also reports `snapshot`, but is **not** stale: it has no
 canon to be behind, by configuration.
 
-### The validity floor (#954, the #667 class)
+### The validity floor (#954 + #1768, the #667 class)
 
 A fetched catalog is checked once, after the schema decode and before it may
 replace the last-good cache. It is **refused as a whole** when it is empty, or
-when any profile the bundled snapshot places is not mentioned in it at all —
-*mentioned* means present as a row, live or retired, so a legitimate
-server-side retirement still passes. A refused catalog is never written to the
-cache; the host degrades exactly as if the server were unreachable (cache if
-one exists, else the snapshot) with the reason on the label, e.g.
+when it fails to mention — as a live or retired row — a profile the
+**last-good committed cache** mentions. The last-good cache is the ratchet: a
+catalog that drops a profile the fleet already trusted is the #667 failure — a
+1-row catalog silently becoming the placements — no matter what the bundle
+says. Membership is not freshness: the ratchet still applies to a cache older
+than `catalog_stale_max_s`. A legitimate server-side retirement still passes,
+because a retired row *mentions* its profile.
+
+With **no last-good cache** — first run, unreadable rows, or a different
+endpoint (the stamp's `endpoint_id` check discards foreign caches before the
+floor ever sees them) — there is nothing to ratchet against, so the floor is
+the bundled snapshot itself and fails closed exactly as it did before: any
+snapshot profile the catalog never mentions rejects it, e.g.
 `catalog=stale (server catalog rejected: 1 row, missing 36 snapshot profiles)`.
-Per-profile gaps below this floor stay the launcher's problem — the
-`resolve_launch` snapshot fill-in remains the second line of defence.
+
+A snapshot profile that **neither** the fetched catalog **nor** the last-good
+cache mentions is *new to the bundle*: it does not reject the catalog. It is
+served from the bundled snapshot — exactly the snapshot placement, gate
+included, never wider — the same way `resolve_launch` fills any per-profile
+gap. When a catalog is accepted with new-to-bundle profiles, every
+gate/recommend/`bench catalog status` call prints one stderr line naming them:
+
+```
+warning: catalog canon does not cover bundled profiles devin-argon, ...;
+filling them from the bundled snapshot — bench push-catalog is needed to add
+them to the canon
+```
+
+`bench catalog status` lists them under their own heading —
+`new to the bundle (filled from the bundled snapshot; bench push-catalog
+needed)` — apart from `uncovered`, which keeps listing gaps the canon never
+attested (a pre-floor partial cache is the surviving example). The commit
+records only the server rows plus the attested set in the cache meta, so the
+warning and the heading persist on cache-served runs until `bench
+push-catalog` adds the rows; nothing snapshot-side ever lands in
+`bench_cache_catalog`.
 
 Tunables live in `~/.config/scopefuel/config.toml`:
 
@@ -202,13 +230,16 @@ flag does not make the hop safe — the bearer token crosses it in the clear, so
 use it only over a trusted private tunnel (WireGuard/Tailscale), never a
 public network path.
 
-Ordering matters on every later release too: the validity floor requires the
-server canon to mention every profile the bundled snapshot places. A scopefuel
-release that *adds* a snapshot profile therefore makes upgraded hosts reject
-the server canon until its row exists — push-catalog the new rows **before**
-installing such a release (or upgraded hosts degrade to `catalog=stale` with
-`server catalog rejected: N rows, missing 1 snapshot profile` until the push
-lands).
+Ordering still matters on every later release, but the failure mode changed
+(#1768): a release that *adds* a snapshot profile no longer makes upgraded
+hosts reject the canon — hosts with a last-good cache accept the catalog and
+fill the new profile from the bundled snapshot, printing the
+`catalog canon does not cover bundled profiles …` warning on every call. The
+warning is the release note that the canon is behind the bundle: run
+`bench push-catalog` to add the new rows and the warning stops. The one
+remaining fail-closed case is a host with no last-good cache at all (first
+run or a changed endpoint) — with nothing to ratchet against it still
+rejects the catalog until the push lands.
 
 ## Post-merge: record opus at S+ (absorbs #591 AC4)
 

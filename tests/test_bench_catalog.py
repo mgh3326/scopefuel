@@ -1123,3 +1123,329 @@ def test_catalog_status_check_exits_two_on_an_unreachable_served_cache(catalog_s
     assert rc == 2
     assert "catalog=cache (age 1.0h)" in captured.out
     assert "check failed: catalog=cache (age 1.0h)" in captured.err
+
+
+# --- #1768: the last-good ratchet — bundle-new profiles do not reject ------
+# The floor is no longer "every snapshot profile mentioned" but "every profile
+# the last-good committed cache mentions". A snapshot profile neither side
+# mentions is new to the bundle: it is served from the snapshot, warned about
+# on every call, and attested in the cache meta so the warning persists until
+# bench push-catalog lands the rows.
+
+NEW_TO_BUNDLE = (
+    "devin-argon",
+    "devin-argon-low",
+    "devin-argon-medium",
+    "devin-fusion-sol61",
+    "devin-fusion-sol61-xhigh",
+)
+
+
+def _canon_without(profiles):
+    """The 66-row / 39-profile canon the fleet ran before the bundle grew.
+
+    Measured on mbp 2026-10-20: the server catalog covered every profile the
+    last-good cache knew and none of the five bundle additions.
+    """
+
+    return [row for row in _seed_rows() if row["profile"] not in set(profiles)]
+
+
+def _commit_canon(rows, *, snapshot_fill=()):
+    """Write a last-good cache directly, the way a prior run's accept did."""
+
+    bench._commit_catalog_cache(
+        path=None,
+        entries=bench._catalog_from_payload({"catalog": rows}),
+        backend=bench.bench_backend(use="catalog"),
+        snapshot_fill=snapshot_fill,
+    )
+    bench.reset_catalog_memo()
+
+
+def _stored_fill() -> str:
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        row = conn.execute("SELECT snapshot_fill FROM bench_cache_meta WHERE scope = 'catalog'").fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else ""
+
+
+def test_a_bundle_new_profile_does_not_reject_the_canon(catalog_server, capsys):
+    """The measured case: canon covers the cache, not the 5 bundle additions.
+
+    Old floor rejected this catalog outright; the ratchet accepts it, warns
+    once naming all five, and admits builder-sonnet's pinned rung
+    (sonnet@xhigh, gate=escalation) by its normal gate.
+    """
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE)
+    assert {row["profile"] for row in canon} == bench.snapshot_profiles() - set(NEW_TO_BUNDLE)
+    _commit_canon(canon)  # the pre-bundle last-good cache
+    _age_catalog_cache(3601)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "server"
+    assert view.stale is False
+    assert view.snapshot_fill == tuple(sorted(NEW_TO_BUNDLE))
+
+    err = capsys.readouterr().err
+    for profile in NEW_TO_BUNDLE:
+        assert profile in err
+    assert "bundled snapshot" in err
+    assert "bench push-catalog" in err
+
+    decision = launch.resolve_launch("sonnet", effort="xhigh")
+    assert decision.gate == "escalation"
+    assert decision.catalog_source == "server"
+    assert decision.catalog_stale is False
+
+    # A bundle-new profile is served from the snapshot — exactly the snapshot
+    # placement, gate included, never a wider one.
+    decision = launch.resolve_launch("devin-argon")
+    assert decision.model_id == "gemini-4-argon-high"
+    assert decision.gate == "default"
+    assert decision.catalog_source == "snapshot"
+    assert decision.catalog_stale is True
+
+
+def test_the_cache_after_commit_holds_only_server_rows_and_keeps_warning(catalog_server, capsys):
+    """The committed last-good cache carries no snapshot-filled rows: the
+    attestation lives in the meta stamp, so the same profiles stay new to the
+    bundle on the next run and the warning persists until the push."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE)
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+    bench.read_catalog()
+    capsys.readouterr()
+
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        cached_profiles = {row[0] for row in conn.execute("SELECT profile FROM bench_cache_catalog")}
+    finally:
+        conn.close()
+    assert cached_profiles == {row["profile"] for row in canon}
+    assert not set(NEW_TO_BUNDLE) & cached_profiles
+    assert set(_stored_fill().split(",")) == set(NEW_TO_BUNDLE)
+
+    # Inside the TTL the cache serves and the warning still fires — the fill
+    # was never absorbed into the cache rows, so it stays new to the bundle.
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert view.snapshot_fill == tuple(sorted(NEW_TO_BUNDLE))
+    err = capsys.readouterr().err
+    assert "devin-argon" in err and "devin-fusion-sol61-xhigh" in err
+
+
+def test_a_catalog_dropping_a_cached_profile_is_rejected(catalog_server, capsys):
+    """The ratchet: a profile the last-good cache mentions can never be dropped.
+
+    Rejected exactly as today's floor rejected — refused whole, never
+    committed, the cache keeps serving with the reason on the label.
+    """
+
+    _, fake = catalog_server
+    bench.read_catalog()  # prime the last-good cache (the full seed)
+    _age_catalog_cache(3601)
+    fake.catalog = [row for row in _seed_rows() if row["profile"] != "kimi-k3"]
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert view.stale is False
+    assert "server catalog rejected" in view.detail
+    assert "missing 1 snapshot profile" in view.detail
+    assert "server catalog rejected" in capsys.readouterr().err
+    assert _cached_catalog_count() == len(bench.catalog_snapshot())
+
+
+def test_a_one_row_catalog_against_a_full_cache_is_still_rejected(catalog_server, capsys):
+    """#667: the 1-row canon is still the thing the floor exists to refuse."""
+
+    _, fake = catalog_server
+    _commit_canon(_canon_without(NEW_TO_BUNDLE))
+    _age_catalog_cache(3601)
+    fake.catalog = [_row("opus", "high", "claude-opus-5-5", "claude", "S+")]
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert view.detail == "server catalog rejected: 1 row, missing 38 snapshot profiles"
+    assert _cached_catalog_count() == 66
+
+
+def test_no_cache_keeps_the_bundle_floor(catalog_server):
+    """No last-good cache (first run): nothing to ratchet against, so the
+    bundle floor fails closed exactly as before."""
+
+    _, fake = catalog_server
+    fake.catalog = _canon_without({"devin-argon"})
+
+    view = bench.read_catalog()
+    assert view.source == "snapshot"
+    assert view.stale is True
+    assert "server catalog rejected" in view.detail
+    assert "missing 1 snapshot profile" in view.detail
+    assert _cached_catalog_count() == 0
+
+
+def test_a_foreign_endpoint_cache_is_not_the_ratchet(catalog_server):
+    """An endpoint change must not ratchet: the other endpoint's cache does
+    not count as last-good, so the bundle floor applies and fails closed."""
+
+    _, fake = catalog_server
+    _commit_canon(_canon_without(NEW_TO_BUNDLE))
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute("UPDATE bench_cache_meta SET endpoint_id = 'other-endpoint' WHERE scope = 'catalog'")
+        conn.commit()
+    finally:
+        conn.close()
+    fake.catalog = _canon_without(NEW_TO_BUNDLE)
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "snapshot"
+    assert "missing 5 snapshot profiles" in view.detail
+
+
+def test_a_stale_cache_still_ratchets(catalog_server):
+    """Membership is not freshness: a cache past catalog_stale_max_s still
+    supplies the profiles the canon may not drop."""
+
+    _, fake = catalog_server
+    _commit_canon(_canon_without(NEW_TO_BUNDLE))
+    _age_catalog_cache(90000)  # past catalog_stale_max_s
+    fake.catalog = [row for row in _canon_without(NEW_TO_BUNDLE) if row["profile"] != "kimi-k3"]
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "cache-stale"
+    assert "server catalog rejected" in view.detail
+    assert "missing 1 snapshot profile" in view.detail
+
+
+def test_a_server_retired_profile_stays_retired_under_the_ratchet(catalog_server):
+    """A profile the server marks retired is *mentioned*, so the catalog
+    stands — and the retirement still wins over the bundled placement."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE)
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    retired = "2026-10-20T00:00:00Z"
+    fake.catalog = [
+        ({**row, "retired_at": retired} if row["profile"] == "devin-ds41" else row) for row in canon
+    ]
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "server"
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch("devin-ds41")
+    table = bench.runtime_grade_table()
+    assert not any(p.name == "devin-ds41" for profiles in table.values() for p in profiles)
+
+
+def test_status_lists_new_to_bundle_under_their_own_heading(catalog_server, capsys):
+    """bench catalog status names the attested set apart from uncovered —
+    and the call itself prints the fill warning on stderr."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE)
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+
+    assert cli.main(["bench", "catalog", "status"]) == 0
+    captured = capsys.readouterr()
+    heading = next(line for line in captured.out.splitlines() if line.startswith("new to the bundle"))
+    for profile in NEW_TO_BUNDLE:
+        assert profile in heading
+    assert "uncovered" not in captured.out
+    for profile in NEW_TO_BUNDLE:
+        assert profile in captured.err
+
+    # A cache-served status call still splits attested from unattested gaps:
+    # trim one cached row and the profile it covered shows as uncovered while
+    # the attested five keep their own heading.
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute("DELETE FROM bench_cache_catalog WHERE profile = 'oc-solar4'")
+        conn.commit()
+    finally:
+        conn.close()
+    bench.reset_catalog_memo()
+    assert cli.main(["bench", "catalog", "status"]) == 0
+    out = capsys.readouterr().out
+    heading = next(line for line in out.splitlines() if line.startswith("new to the bundle"))
+    assert "devin-argon" in heading and "oc-solar4" not in heading
+    uncovered = next(line for line in out.splitlines() if line.startswith("uncovered"))
+    assert "oc-solar4" in uncovered and "devin-argon" not in uncovered
+
+
+def test_two_committers_leave_a_consistent_cache(catalog_server):
+    """A concurrent commit from a second process replaces rows+stamp+fill as
+    one triple — the last committer wins whole, never row-vs-fill torn."""
+
+    backend = bench.bench_backend(use="catalog")
+    first = _canon_without(NEW_TO_BUNDLE)
+    second = _canon_without(NEW_TO_BUNDLE + ("oc-solar4",))
+    bench._commit_catalog_cache(
+        path=None,
+        entries=bench._catalog_from_payload({"catalog": first}),
+        backend=backend,
+        snapshot_fill=tuple(sorted(NEW_TO_BUNDLE)),
+    )
+    bench._commit_catalog_cache(
+        path=None,
+        entries=bench._catalog_from_payload({"catalog": second}),
+        backend=backend,
+        snapshot_fill=tuple(sorted(NEW_TO_BUNDLE + ("oc-solar4",))),
+    )
+
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        profiles = {row[0] for row in conn.execute("SELECT profile FROM bench_cache_catalog")}
+        fill = conn.execute("SELECT snapshot_fill FROM bench_cache_meta WHERE scope = 'catalog'").fetchone()[
+            0
+        ]
+    finally:
+        conn.close()
+    assert profiles == {row["profile"] for row in second}
+    assert set(fill.split(",")) == set(NEW_TO_BUNDLE + ("oc-solar4",))
+
+
+def test_a_snapshot_filled_profile_keeps_the_snapshot_gate_not_a_wider_one(catalog_server):
+    """Mutant invariant: the fill is never placed wider than the snapshot.
+
+    oc-omni is escalation-gated in the bundle; while it is a bundle-new
+    profile the snapshot fill applies its own gate, so it still needs
+    --operator-request — the fill must not launder a wider placement.
+    """
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE + ("oc-omni",))
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+
+    view = bench.read_catalog()
+    assert view.source == "server"
+    assert "oc-omni" in view.snapshot_fill
+    with pytest.raises(launch.LaunchError, match="stale"):
+        launch.resolve_launch("oc-omni")
+    decision = launch.resolve_launch("oc-omni", operator_request=True)
+    assert decision.gate == "escalation"
+    assert decision.catalog_source == "snapshot"
