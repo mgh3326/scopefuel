@@ -656,3 +656,157 @@ def test_d10_matching_host_one_physical_exhaustion_is_one_alert(monkeypatch):
         )
     assert set(json.loads(exhaust._state_path().read_text())) == {"codex"}
     assert len(episodes) == 1, episodes
+
+
+# ------------------------------------------- non-matching host: billing episode (hk 1766)
+#
+# Mutant contract — on a non-matching host a billing-account exhaustion never
+# shares an episode with the host's own codex pool:
+#   m_d8_remote_ok_no_declared — the remote-ok _BillingGate loses `declared`,
+#     so _billing_observe_scope falls back to group_name → episode "codex".
+#   m_scope_always_group — _billing_observe_scope returns group_name always
+#     → same merge.  Both are killed by key equality below.
+
+BILLING_EPISODE_KEY = f"codex@fusion-billing:{DECLARED_FP[:8]}"
+EMPTY_TABLE = {grade: [] for grade in GRADE_TABLE}  # profile_pool knows sol61 → D3 path
+
+
+def _episodes(monkeypatch) -> list[str]:
+    """A succeeding emit sink — the episode records notified_at and dedups."""
+    emitted: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id: emitted.append(text) or True)
+    return emitted
+
+
+def _operator_switch() -> None:
+    path = policy.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[pools.codex]\non_exhaust = "operator-switch"\n')
+
+
+def _episode_keys() -> set[str]:
+    path = exhaust._state_path()
+    return set(json.loads(path.read_text())) if path.exists() else set()
+
+
+def _gate(providers, profile, table):
+    return gate_check(providers, profile, today=NOW.date(), now=NOW, grade_table=table)
+
+
+def test_billing_exhaustion_on_nonmatching_host_uses_dedicated_episode_scope(monkeypatch):
+    """hk 1766 — one billing-account exhaustion opens exactly
+    ``codex@fusion-billing:<fp8>`` and exactly one alert."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)  # declared billing account exhausted
+    local = _codex_result(used_5h=10, used_7d=10)  # host's own codex login healthy
+    for _ in range(3):
+        for profile in PROFILES:
+            assert not _gate([local], profile, _table_for_sol61()).ok
+        assert _gate([local], "codex-sol", GRADE_TABLE).ok
+    # Equality: only the dedicated billing episode — the host's own "codex"
+    # episode is never opened or touched.
+    assert _episode_keys() == {BILLING_EPISODE_KEY}
+    assert len(episodes) == 1, episodes
+    assert f"scope=fusion-billing:{DECLARED_FP[:8]}" in episodes[0]
+
+
+def test_healthy_billing_account_never_closes_the_host_codex_episode(monkeypatch):
+    """Reverse direction — the host's own exhaustion stays the plain "codex"
+    episode; healthy billing observations do not close it or alert again."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=5, used_7d=5)  # declared healthy
+    local = _codex_result(used_5h=100, used_7d=100)  # host's own login exhausted
+    for _ in range(3):
+        assert _gate([local], "devin-fusion-sol61", _table_for_sol61()).ok
+        assert not _gate([local], "codex-sol", GRADE_TABLE).ok
+    assert _episode_keys() == {"codex"}
+    assert len(episodes) == 1 and "scope=" not in episodes[0]
+
+
+def test_both_accounts_exhausted_keep_independent_episodes(monkeypatch):
+    """Two exhausted accounts → two episodes; each recovers on its own."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    local = _codex_result(used_5h=100, used_7d=100)
+    _gate([local], "devin-fusion-sol61", _table_for_sol61())
+    _gate([local], "codex-sol", GRADE_TABLE)
+    assert _episode_keys() == {"codex", BILLING_EPISODE_KEY}
+    assert len(episodes) == 2
+    # The declared account recovers → only the billing episode closes.
+    _seed_codex_remote(hk, used_5h=5, used_7d=5)
+    assert _gate([local], "devin-fusion-sol61", _table_for_sol61()).ok
+    assert _episode_keys() == {"codex"}
+    # The host login recovers → the last episode closes; no further alerts.
+    assert _gate([_codex_result(used_5h=5, used_7d=5)], "codex-sol", GRADE_TABLE).ok
+    assert _episode_keys() == set() and len(episodes) == 2
+
+
+def test_recommend_rows_use_the_same_dedicated_episode_scope(monkeypatch):
+    """The recommend/_evaluate path dedups on the same billing-scope key."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    local = _codex_result(used_5h=10, used_7d=10)
+    table = _table_for_sol61()
+    codex_sol = [p for rows in GRADE_TABLE.values() for p in rows if p.name == "codex-sol"]
+    table["B"] = list(table["B"]) + codex_sol[:1]
+    for _ in range(2):
+        recommend_dict([local], "B", today=NOW.date(), now=NOW, grade_table=table)
+    assert _episode_keys() == {BILLING_EPISODE_KEY}
+    assert len(episodes) == 1
+
+
+def test_billing_episode_scope_on_the_d3_quota_only_path(monkeypatch):
+    """A sol61 row absent from the grade table (D3 quota-only path) scopes the
+    same way — the host codex episode is still untouched."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    for profile in PROFILES:
+        assert not _gate([_codex_result(used_5h=10, used_7d=10)], profile, EMPTY_TABLE).ok
+    assert _episode_keys() == {BILLING_EPISODE_KEY}
+    assert len(episodes) == 1
+
+
+def test_unmeasured_billing_never_opens_or_closes_an_episode(monkeypatch):
+    """A stale/unmeasured declared doc refuses rc-early — it neither opens a
+    billing episode nor closes one already recorded."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    _gate([_codex_result()], "devin-fusion-sol61", _table_for_sol61())
+    assert _episode_keys() == {BILLING_EPISODE_KEY}
+    _seed_codex_remote(hk, used_5h=100, used_7d=100, measured_at=EPOCH - 3600)  # now stale
+    r = _gate([_codex_result(used_5h=1, used_7d=1)], "devin-fusion-sol61", _table_for_sol61())
+    assert r.reason.startswith(FUSION_BILLING_UNMEASURED)
+    assert _episode_keys() == {BILLING_EPISODE_KEY}
+    assert len(episodes) == 1
+
+
+def test_gate_alternatives_stay_inside_the_billing_scope(monkeypatch):
+    """A refused non-Fusion gate evaluates alternatives (incl. Fusion rows) —
+    the alternatives' observations still never touch the host "codex" episode."""
+    hk = _enable(monkeypatch)
+    _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    local = _codex_result(used_5h=10, used_7d=10)
+    for prof in ("cc-glm", "kiro-haiku", "devin-fusion-opus55"):
+        _gate([local], prof, None)
+    assert "codex" not in _episode_keys()
