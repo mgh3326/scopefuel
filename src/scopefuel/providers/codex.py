@@ -86,6 +86,7 @@ def fetch() -> ProviderResult:
     token = tokens.get("access_token")
     if not isinstance(token, str) or not token.strip():
         return ProviderResult(id="codex", error="access_token 없음", hint="`codex login` 필요")
+    token = token.strip()
 
     headers = {
         "Authorization": f"Bearer {token}",

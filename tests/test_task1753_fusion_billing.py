@@ -25,7 +25,7 @@ import urllib.parse
 
 import pytest
 
-from scopefuel import bench, cache, cli, free_window, launch, policy, quota_share
+from scopefuel import bench, cache, cli, exhaust, free_window, launch, policy, quota_share
 from scopefuel.free_window import FREE_PROFILES
 from scopefuel.http import HttpError
 from scopefuel.model import Bucket, ProviderResult, Scope
@@ -34,6 +34,7 @@ from scopefuel.recommend import (
     FUSION_BILLING_PROFILES,
     FUSION_BILLING_UNMEASURED,
     GRADE_TABLE,
+    gate_check,
     recommend_dict,
 )
 
@@ -614,3 +615,44 @@ def test_declared_doc_with_wrong_body_fp_is_refused(monkeypatch):
     rc, out, err = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
     assert rc == 4, (out, err)
     assert FUSION_BILLING_UNMEASURED in err
+
+
+def test_d9_padded_access_token_is_sent_stripped_like_baseline(tmp_path, monkeypatch, fixture_json):
+    """D9: baseline 6407c6a sends Bearer <token.strip()> for a newline-padded token."""
+    home = tmp_path / "ch"
+    home.mkdir()
+    (home / "auth.json").write_text(
+        json.dumps({"tokens": {"access_token": " tok-abc\n", "account_id": "acct-1"}})
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    seen = {}
+
+    def fake(url, headers=None, **kw):
+        seen.update(headers)
+        return fixture_json("codex_usage")
+
+    monkeypatch.setattr(codex, "request_json", fake)
+    result = codex.fetch()
+    assert result.error is None
+    assert seen["Authorization"] == "Bearer tok-abc", seen["Authorization"]
+
+
+def test_d10_matching_host_one_physical_exhaustion_is_one_alert(monkeypatch):
+    """D10: codex-sol and both Fusion rows share one matching-host codex episode."""
+    episodes: list[str] = []
+    monkeypatch.setattr(exhaust, "emit_lane_event", lambda text, event_id: episodes.append(text) or True)
+    path = policy.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[pools.codex]\non_exhaust = "operator-switch"\n')
+    _declare()
+    local = _codex_result(used_5h=100, used_7d=100, fp=DECLARED_FP)
+    for profile in ("codex-sol", *PROFILES):
+        gate_check(
+            [local],
+            profile,
+            today=NOW.date(),
+            now=NOW,
+            grade_table=GRADE_TABLE if profile == "codex-sol" else _table_for_sol61(),
+        )
+    assert set(json.loads(exhaust._state_path().read_text())) == {"codex"}
+    assert len(episodes) == 1, episodes

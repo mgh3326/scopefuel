@@ -3467,7 +3467,6 @@ def _resolve_fusion_billing(
         return _BillingGate(
             local,
             fields={"account": account_tag(declared, local.account_label, "account")},
-            declared=declared,
         )
     policy_class: PoolClass = (
         local.pool_class if local is not None and local.pool_class in ("preserve", "spend") else "preserve"
