@@ -129,10 +129,13 @@ def test_rows_resolve_to_unmeasured_codex_pool_rungs_with_no_invented_price(tmp_
         )
         assert decision.pool == "codex"
         assert decision.family == "openai"
-        assert decision.billing == launch.resolve_launch(
-            "codex-sol",
-            view=bench.CatalogView(entries=launch.snapshot_entries(), source="snapshot"),
-        ).billing
+        assert (
+            decision.billing
+            == launch.resolve_launch(
+                "codex-sol",
+                view=bench.CatalogView(entries=launch.snapshot_entries(), source="snapshot"),
+            ).billing
+        )
 
     prices = bench.read_prices(path=tmp_path / "missing.sqlite")
     assert not (set(MODEL_IDS.values()) & set(prices))
@@ -151,13 +154,16 @@ def test_codex_tester_family_and_exact_model_id_mapping():
     assert provider_family("devin-fusion-opus55") == "claude"
     assert provider_family("devin-fusion-sonnet55") == "claude"
     assert provider_family("devin-argon") == "google"
-    assert all(profile_pool(name) == ("devin", None) for name in (
-        name
-        for profiles in GRADE_TABLE.values()
-        for profile in profiles
-        for name in (profile.name,)
-        if name.startswith("devin-") and name not in PROFILES
-    ))
+    assert all(
+        profile_pool(name) == ("devin", None)
+        for name in (
+            name
+            for profiles in GRADE_TABLE.values()
+            for profile in profiles
+            for name in (profile.name,)
+            if name.startswith("devin-") and name not in PROFILES
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -193,18 +199,19 @@ def test_fusion_sol_reads_codex_quota_and_live_hold_only_blocks_six_free_rungs(m
 
     table = {grade: [] for grade in GRADE_TABLE}
     table["B"] = [profile for _, profile in _profile_rows().values()]
-    baseline_rows = recommend_dict(
-        providers, "B", today=NOW.date(), now=NOW, grade_table=table
-    )["rows"]
+    baseline_rows = recommend_dict(providers, "B", today=NOW.date(), now=NOW, grade_table=table)["rows"]
     baseline_target_rows = {row["profile"]: row for row in baseline_rows if row["profile"] in PROFILES}
     assert set(baseline_target_rows) == set(PROFILES)
     for row in baseline_target_rows.values():
         assert row["kind"] == "candidate"
         assert row["provider"] == "codex"
-        assert row["billing"] == launch.resolve_launch(
-            "codex-sol",
-            view=bench.CatalogView(entries=launch.snapshot_entries(), source="snapshot"),
-        ).billing
+        assert (
+            row["billing"]
+            == launch.resolve_launch(
+                "codex-sol",
+                view=bench.CatalogView(entries=launch.snapshot_entries(), source="snapshot"),
+            ).billing
+        )
 
     baseline_gate = {name: _capture_cli(["gate", "-m", name]) for name in PROFILES}
     assert all(result[0] == 0 and "pool=codex" in result[1] for result in baseline_gate.values())
@@ -251,4 +258,3 @@ def test_fusion_sol_reads_codex_quota_and_live_hold_only_blocks_six_free_rungs(m
         assert rc == 3, (free_profile, err)
         assert "free_rate_limited" in err, (free_profile, err)
         assert "rung devin-fusion-sol61" in err, (free_profile, err)
-
