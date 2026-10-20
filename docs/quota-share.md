@@ -188,3 +188,47 @@ Prerequisites per host (#659 AC7):
 - **Rollback:** `SCOPEFUEL_QUOTA_SHARE=off` disables publishing and reading on
   that host with no other change. Removing the env override restores it.
   Deleting the `quota/...` documents stops readers from finding snapshots.
+
+## Declared billing account — Fusion GPT rows (hk 1753 / b953)
+
+The Fusion GPT rows (`devin-fusion-sol61`, `devin-fusion-sol61-xhigh`) bill the
+ChatGPT account linked in Devin — the mbp codex account — not each host's own
+codex login. The account is declared as a fingerprint on the codex pool:
+
+```
+scopefuel policy set codex --fusion-billing-fp <fp>   # writes [pools.codex] fusion_billing_fp
+scopefuel policy set codex --fusion-billing-fp none   # removes the key
+```
+
+The config key is `[pools.codex] fusion_billing_fp`; it holds **only the
+account fingerprint** (`sha256("codex-account|<ChatGPT account_id>")[:16]`,
+kind `account` — the same `account_fp` the codex provider now emits), never a
+token or an email.
+
+- **Matching host** (local codex `account_fp` == declared — mbp today): the
+  rows judge on the local measurement exactly as before.
+- **Any other host**: gate and recommend read
+  `quota/codex/<declared fp>/latest` directly through this module
+  (`declared_result`), under the same `REMOTE_MAX_AGE_S` limit. The local
+  fingerprint-match rule in `remote_result` does not apply — the match is
+  against the declared fingerprint. The host's own codex pool is never used
+  for these rows.
+- **No declaration, or the document missing/stale/unreadable**: the gate
+  returns the measurement-unavailable exit (rc 4) with reason
+  `fusion_billing_unmeasured`, naming the account tag (fp8) and the measuring
+  host when a document exists.
+- Every other codex profile (`codex-sol`, `codex-luna`, astra spellings, …)
+  is unchanged: they still judge on their own host's codex pool and never
+  read the declared account's document.
+
+**Publishing side.** mbp publishes `quota/codex/<fp>/latest` on every
+successful codex measurement — `collect`/`refresh` are the only writers, there
+is no scheduler — whenever scopefuel runs on mbp while the codex probe
+succeeds (the provider only emits an `account_fp` once this build is
+deployed; before it, codex results had no fingerprint and nothing was
+published). A document goes stale 15 minutes after `measured_at` — e.g. mbp
+asleep, codex probe failing, or scopefuel simply not running there. **A stale
+publish routinely refuses sol61 on other hosts** (`fusion_billing_unmeasured`,
+rc 4) whenever mbp has not published within the window — that fail-closed
+refusal is the intended semantics; if the lane needs higher availability the
+operator/desk decides on a publisher schedule for mbp, not this repo.

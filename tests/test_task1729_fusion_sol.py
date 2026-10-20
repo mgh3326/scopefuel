@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from scopefuel import bench, cli, free_window, launch
+from scopefuel import bench, cli, free_window, launch, policy
 from scopefuel.free_window import FREE_PROFILES, OBSERVED_RUNG_IDS
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
@@ -28,6 +28,9 @@ MODEL_IDS = {
     "devin-fusion-sol61-xhigh": "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
 }
 NOW = dt.datetime(2026, 10, 20, 12, 0, tzinfo=dt.UTC)
+# hk 1753 (b953): the declared Devin-linked billing account fingerprint.
+# These tests run the matching host (local codex fp == declared).
+BILLING_FP = "c0605596eeff0011"
 RESET_1D = "2026-10-21T12:00:00Z"
 RESET_7D = "2026-10-27T12:00:00Z"
 
@@ -44,6 +47,11 @@ def _providers() -> list[ProviderResult]:
             id="codex",
             pool_class="spend",
             buckets=[Bucket("week", "7d", 30.0, RESET_7D, Scope("account"), "week")],
+            # hk 1753 (b953): declared billing account — this host is the
+            # matching host (mbp), so sol61 rows judge on the local
+            # measurement exactly as before.
+            account_fp=BILLING_FP,
+            account_fp_kind="account",
         ),
         ProviderResult(
             id="devin",
@@ -79,6 +87,7 @@ def _profile_rows():
 
 def _install_cli_stubs(monkeypatch):
     providers = _providers()
+    policy.set_policy("codex", None, fusion_billing_fp=BILLING_FP)
     monkeypatch.setattr(cli, "registry", lambda: {"codex": object(), "devin": object()})
     monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: providers)
     monkeypatch.setattr(cli.bench, "read_scores", lambda: [])

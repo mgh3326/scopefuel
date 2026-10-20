@@ -234,6 +234,7 @@ scopefuel policy set kiro --subscribed none         # 키만 제거
 scopefuel policy profile kiro-opus off              # [profiles.kiro-opus] subscribed=false
 scopefuel policy profile kiro-opus on               # 풀이 꺼져도 이 프로필만 복원
 scopefuel policy profile kiro-opus clear            # 프로필 키 제거 → 풀 수준 폴백
+scopefuel policy set codex --fusion-billing-fp <fp> # hk 1753: Fusion GPT 청구 계정 지문 선언
 scopefuel policy list                               # 풀 행의 [unsubscribed] + profiles: 절
 ```
 

@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from scopefuel import bench, cli
+from scopefuel import bench, cli, policy
 from scopefuel import recommend as recommend_mod
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
@@ -384,7 +384,19 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             )
             for group_name in group_names
         ]
-        providers.append(ProviderResult(id=provider_id, pool_class="preserve", buckets=buckets))
+        providers.append(
+            ProviderResult(
+                id=provider_id,
+                pool_class="preserve",
+                buckets=buckets,
+                # hk 1753 (b953): Fusion GPT rows judge on the declared billing
+                # account — this codex result is the matching host's own
+                # measurement so the oracle table is unchanged.
+                account_fp="billingfp00000000" if provider_id == "codex" else None,
+                account_fp_kind="account",
+            )
+        )
+    policy.set_policy("codex", None, fusion_billing_fp="billingfp00000000")
 
     def label(profile: Profile) -> str:
         """Literal expected label — the pinned string for this row, never a
