@@ -5,18 +5,16 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import io
-import json
 
 import pytest
 
 from scopefuel import bench, cli, free_window, launch
-from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.free_window import FREE_PROFILES, OBSERVED_RUNG_IDS
+from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     DEVIN_FUSION_SOL61_ANNOTATION,
     GRADE_TABLE,
     PROVIDER_FAMILY_OVERRIDES,
-    gate_check,
     is_rep_measured,
     profile_pool,
     provider_family,
