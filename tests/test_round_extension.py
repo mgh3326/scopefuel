@@ -443,11 +443,7 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
         # hk 1729 adds two unmeasured B rows. Their placement is asserted in
         # test_task1729_fusion_sol; removing just those rows preserves this
         # baseline check for every prior recommendation line.
-        actual = "\n".join(
-            line
-            for line in actual.splitlines()
-            if "devin-fusion-sol61" not in line
-        )
+        actual = "\n".join(line for line in actual.splitlines() if "devin-fusion-sol61" not in line)
         assert actual.encode() == expected.encode(), grade
         assert not any(name in actual for name in ("codex-astra", "fable", "builder-astra", "builder-fable"))
 
