@@ -226,9 +226,10 @@ def refresh_swe2_result(now: float | None = None) -> ProviderResult | None:
         code = process.wait(timeout=_timeout_seconds() + 5)
     except subprocess.TimeoutExpired:
         # Only signal the session we created; never a name/pattern-matched process.
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(OSError):
             os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=5)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            process.wait(timeout=5)
         return None
     if code != 0:
         return None

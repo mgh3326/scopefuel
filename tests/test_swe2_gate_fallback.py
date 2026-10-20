@@ -338,6 +338,31 @@ def test_refresh_timeout_cleans_only_tracked_session(monkeypatch):
     assert waits == [{"timeout": refresh._timeout_seconds() + 5}, {"timeout": 5}]
 
 
+@pytest.mark.parametrize("cleanup_error", [subprocess.TimeoutExpired, OSError])
+def test_cli_unreapable_refresh_still_returns_named_rc4(monkeypatch, capsys, cleanup_error):
+    waits = []
+    kills = []
+
+    def wait(**kw):
+        waits.append(kw)
+        if len(waits) == 1 or cleanup_error is subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired("fixture", kw["timeout"])
+        raise OSError("fixture reap failed")
+
+    cli_probe(monkeypatch, probe(stale=True))
+    monkeypatch.setattr(refresh, "refresh_swe2_result", REFRESH_SWE2)
+    monkeypatch.setattr(
+        refresh.subprocess,
+        "Popen",
+        lambda *a, **kw: SimpleNamespace(pid=12345, wait=wait),
+    )
+    monkeypatch.setattr(refresh.os, "killpg", lambda pid, sig: kills.append((pid, sig)))
+    assert cli.main(["gate", "-m", "builder-devin", "--no-cache"]) == 4
+    assert "swe2_measurement_unavailable" in capsys.readouterr().err
+    assert kills == [(12345, signal.SIGKILL)]
+    assert waits == [{"timeout": refresh._timeout_seconds() + 5}, {"timeout": 5}]
+
+
 @pytest.mark.parametrize(
     "swe2,warning,expected",
     [

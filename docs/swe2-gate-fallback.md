@@ -58,6 +58,10 @@ account display results, so paid/manual rows are not changed by this fix.
 Unavailability is `swe2_measurement_unavailable`, rc 4, with
 `basis=measurement-unavailable` in the reason, never paid-axis rc 3.
 The CLI must not launder it through manual/trusted-snapshot fallback.
+In particular, the hk 1381 escape hatch (a banner/PTY error plus a complete
+manual weekly account observation) no longer opens any of the six SWE-2
+names. It returns named rc 4 because manual weekly usage cannot prove a Free
+model tag. Paid Devin, including ds41, retains that manual path unchanged.
 Read-only inspection of `agent-skills/bin/wrk`, `quota_gate`, found that
 `3|4) exit "$rc"` propagates both as hard refusals. CLI-provided alternatives
 remain advisory; rc 4 is not admission.
