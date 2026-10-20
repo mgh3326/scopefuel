@@ -3238,7 +3238,7 @@ def _swe2_measurement_unavailable_reason(
     state = _swe2_measurement_state(result, now)
     return (
         f"{SWE2_MEASUREMENT_UNAVAILABLE}: {profile_name} pool={provider_id} "
-        f"basis=measurement-unavailable state={state}"
+        f"basis=measurement-unavailable state={state}; {_unmeasurable_reason(provider_id, result)}"
     )
 
 
@@ -4244,8 +4244,8 @@ def _evaluate(
         swe2_excluded = (
             swe2_rung is not None and get_policy(provider_id, fallback_class, today=today)[0] == "exclude"
         )
-        if swe2_rung is not None and not swe2_excluded:
-            if result is None or not _swe2_probe_is_current(result, now):
+        if swe2_rung is not None and not swe2_excluded and result is not None:
+            if not _swe2_probe_is_current(result, now):
                 excluded.append(
                     _Excluded(
                         profile,

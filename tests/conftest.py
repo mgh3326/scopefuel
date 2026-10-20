@@ -9,6 +9,14 @@ import pytest
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _block_real_swe2_refresh(monkeypatch):
+    """CLI tests opt into synchronous refresh with fixtures, never a live worker."""
+    from scopefuel import refresh
+
+    monkeypatch.setattr(refresh, "refresh_swe2_result", lambda: None)
+
+
 @pytest.fixture
 def fixture_json():
     def _load(name: str) -> dict:

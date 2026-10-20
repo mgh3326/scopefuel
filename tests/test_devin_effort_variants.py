@@ -182,7 +182,8 @@ def test_existing_devin_gate_output_matches_pre_635_golden(monkeypatch, capsys, 
     # (account windows unmeasured). hk 1614 re-captured the basis as
     # model-scope:swe-2-high: devin-swe2 is judged on its own rung's bucket
     # only. devin-ds41 on the same input stays fail-closed, and swe2_not_free
-    # is a parse error for both.
+    # is a parse error for both. hk 1731 names the SWE-2 measurement failure
+    # without passing through account/manual fallback; paid records stay exact.
     expected = json.loads(GATE_GOLDEN.read_text())
     actual = gate_outputs(monkeypatch, capsys, tmp_path, fixture_text)
     assert json.dumps(actual, ensure_ascii=False, sort_keys=True) == json.dumps(

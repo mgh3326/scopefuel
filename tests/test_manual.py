@@ -580,7 +580,7 @@ def test_known_timeout_and_transport_failures_are_manual_eligible(error):
     assert kind == "transport"
 
 
-def test_devin_banner_timeout_can_use_a_complete_weekly_manual_observation(capsys, monkeypatch):
+def test_paid_devin_banner_timeout_can_use_a_complete_weekly_manual_observation(capsys, monkeypatch):
     """#1381: devin 필수 창은 weekly(7d) 하나 — 수동 관측 7d 하나면 게이트가 열린다."""
     monkeypatch.setattr(
         cli,
@@ -595,7 +595,7 @@ def test_devin_banner_timeout_can_use_a_complete_weekly_manual_observation(capsy
     )
     _set_manual(capsys, pool="devin", window="weekly", used="10")
 
-    rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+    rc = cli.main(["gate", "-m", "devin-ds41", "--no-cache"])
 
     captured = capsys.readouterr()
     assert rc == 0

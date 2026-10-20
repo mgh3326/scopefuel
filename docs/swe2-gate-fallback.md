@@ -68,7 +68,7 @@ or override other refusals.
 
 ## Verification
 
-Only the two changed/added test files run locally, individually capped at
+Only changed/added test files run locally, individually capped at
 600 seconds and 2 GiB, with temporary HOME and every XDG directory. No real
 provider or cache is used. Fixture GateResult JSON for all non-SWE2 catalog
 names plus Argon trial names is byte-identical to the frozen base across
@@ -78,3 +78,12 @@ fold to avoid changing their refusal or escalation eligibility.
 
 The full suite belongs to CI. Final-head independent testing must also attack
 all inherited hunks, including any not required by an acceptance criterion.
+
+The initial CI exposed legacy tests expecting stale/manual account admission
+for SWE-2. Generic account-cache and manual contracts now explicitly use paid
+Devin, while new SWE-2 tests assert unavailability instead. The actual provider
+warning fixture now asserts Free admission. Only the SWE-2 failure row of the
+old gate golden changed; paid rows are untouched. The global test guard stubs
+the new refresh helper unless a test explicitly supplies fixture behavior.
+Absent-provider recommendation folds retain their original generic unavailable
+diagnostic; no refresh was attempted and no model/account admission is possible.

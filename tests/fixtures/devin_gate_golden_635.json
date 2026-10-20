@@ -143,7 +143,7 @@
       "profile": "devin-swe2",
       "provider_id": "devin",
       "purpose": null,
-      "reason": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]",
+      "reason": "swe2_measurement_unavailable: devin-swe2 pool=devin basis=measurement-unavailable state=stale; devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d]",
       "ref_resolution": null,
       "remaining_effect_s": null,
       "requested_by": null,
@@ -156,7 +156,7 @@
       "unmeasurable": true,
       "used_pct": null
     },
-    "stderr": "devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d] [manual fallback 불가: manual observation 없음]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
+    "stderr": "swe2_measurement_unavailable: devin-swe2 pool=devin basis=measurement-unavailable state=stale; devin 측정 불가 (provider error/degraded) [필수 창 미측정: 7d]\n대안(A+) 없음 — 동일 grade 정상 후보 전부 소진/측정불가\n",
     "stdout": ""
   }
 }

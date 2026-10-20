@@ -29,7 +29,8 @@ EPOCH = NOW.timestamp()
 
 # pool → (profile, required account-scope windows) — manual.REQUIRED_WINDOWS 와 동기.
 POOL_PROFILE = {
-    "devin": "devin-swe2",
+    # SWE-2 now requires current model evidence; account-cache contracts use paid Devin.
+    "devin": "devin-ds41",
     "kimi": "kimi-k3",
     "grok": "grok-hi",
     "kiro": "kiro-opus",
@@ -169,7 +170,7 @@ def test_refresh_worker_treats_probe_lock_skip_as_deferred(capsys):
 def test_gate_passes_with_lock_held_and_fresh_cache():
     _seed("devin", at=EPOCH - 30.0)
     results = [_collect_skip("devin", use_cache=False)]
-    res = gate_check(results, "devin-swe2", today=TODAY, now=NOW)
+    res = gate_check(results, "devin-ds41", today=TODAY, now=NOW)
     assert res.ok is True
     assert res.unmeasurable is False
 
@@ -178,7 +179,7 @@ def test_gate_passes_with_lock_held_and_stale_cache():
     """81초짜리 캐시(인시던트 재현)도 건너뜀이면 stale_accepted 로 통과한다."""
     _seed("devin", at=EPOCH - 80.0)
     results = [_collect_skip("devin", use_cache=True)]
-    res = gate_check(results, "devin-swe2", today=TODAY, now=NOW)
+    res = gate_check(results, "devin-ds41", today=TODAY, now=NOW)
     assert res.ok is True
     assert res.stale_accepted is True
     assert "탐침 진행 중" in res.reason
@@ -187,7 +188,7 @@ def test_gate_passes_with_lock_held_and_stale_cache():
 def test_gate_blocked_with_lock_held_and_no_cache():
     """정상 캐시가 없으면 오늘과 같이 막는다 — 단 사유는 '탐침 진행 중'."""
     results = [_collect_skip("devin", use_cache=True)]
-    res = gate_check(results, "devin-swe2", today=TODAY, now=NOW)
+    res = gate_check(results, "devin-ds41", today=TODAY, now=NOW)
     assert res.ok is False
     assert res.unmeasurable is True
     assert "탐침 진행 중" in res.reason
@@ -197,7 +198,7 @@ def test_gate_blocked_with_lock_held_and_cache_older_than_6h():
     _seed("devin", at=EPOCH - cache.STALE_MAX_S - 10.0)
     results = [_collect_skip("devin", use_cache=True)]
     assert results[0].error is not None
-    res = gate_check(results, "devin-swe2", today=TODAY, now=NOW)
+    res = gate_check(results, "devin-ds41", today=TODAY, now=NOW)
     assert res.ok is False
     assert res.unmeasurable is True
     assert res.stale_accepted is False
@@ -221,7 +222,7 @@ def test_gate_blocked_with_lock_held_and_elapsed_reset():
     )
     cache.update_entry("devin", stale, EPOCH - 80.0)
     results = [_collect_skip("devin", use_cache=True)]
-    res = gate_check(results, "devin-swe2", today=TODAY, now=NOW)
+    res = gate_check(results, "devin-ds41", today=TODAY, now=NOW)
     assert res.ok is False
     assert res.unmeasurable is True
 
@@ -241,7 +242,7 @@ def test_gate_blocks_real_provider_error_even_with_stale_cache():
     assert results[0].stale is True
     assert results[0].verdict.mark == "degraded"
     assert "조회 실패" in (results[0].note or "")
-    res = gate_check(results, "devin-swe2", today=TODAY, now=NOW)
+    res = gate_check(results, "devin-ds41", today=TODAY, now=NOW)
     assert res.ok is False
     assert res.unmeasurable is True
     assert "측정 불가" in res.reason
@@ -291,7 +292,7 @@ def test_gate_cli_passes_while_probe_in_progress(monkeypatch, capsys):
     )
     cache.update_entry("devin", fresh, now.timestamp() - 80.0)
     monkeypatch.setattr(cli, "registry", lambda: {"devin": _skip_fetcher("devin")})
-    rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
+    rc = cli.main(["gate", "-m", "devin-ds41", "--no-cache"])
     out = capsys.readouterr()
     assert rc == 0
     assert "stale_accepted=true" in out.out

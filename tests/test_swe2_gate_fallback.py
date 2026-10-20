@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from scopefuel import cache, cli, free_window, manual, recommend, refresh
-from scopefuel.model import Bucket, ProviderResult, Scope
+from scopefuel.model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 from scopefuel.policy import set_policy
 
 NOW = dt.datetime(2026, 10, 20, 2, 35, tzinfo=dt.UTC)
@@ -235,6 +235,25 @@ def test_unknown_status_is_named_unavailable():
     result = NonOK(id="devin", buckets=probe().buckets, pool_class="spend")
     assert gate(result).unmeasurable
     assert "status:degraded" in gate(result).reason
+
+
+def test_probe_lock_skip_cannot_turn_stale_free_rows_into_account_admission():
+    result = probe(
+        daily=10,
+        stale=True,
+        age_s=80,
+        error_kind=PROBE_IN_PROGRESS,
+        account_fp_match=True,
+    )
+    result.buckets = [
+        replace(b, resets_at=(NOW + dt.timedelta(days=7)).isoformat()) if b.scope.kind == "account" else b
+        for b in result.buckets
+    ]
+    free = gate(result)
+    paid = gate(result, "devin-ds41")
+    assert free.unmeasurable and not free.ok
+    assert free.reason.startswith("swe2_measurement_unavailable")
+    assert paid.ok and paid.stale_accepted and paid.gate_basis is None
 
 
 def test_policy_exclude_unchanged_without_refresh(monkeypatch, capsys):
