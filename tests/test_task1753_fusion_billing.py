@@ -666,6 +666,12 @@ def test_d10_matching_host_one_physical_exhaustion_is_one_alert(monkeypatch):
 #     so _billing_observe_scope falls back to group_name → episode "codex".
 #   m_scope_always_group — _billing_observe_scope returns group_name always
 #     → same merge.  Both are killed by key equality below.
+# hk 1772 (b953 S2) — the same separation on recovery, per call site: the
+# "billing scope applied only while exhausted" mutant sends a healthy
+# observation to group_name, wrongly closing the host codex episode while the
+# billing episode keeps a stale notified_at that suppresses its next alert.
+# The recovery tests below kill that mutant at recommend.py:3950 (D3) and
+# recommend.py:4558 (recommend) — each at its own site only.
 
 BILLING_EPISODE_KEY = f"codex@fusion-billing:{DECLARED_FP[:8]}"
 EMPTY_TABLE = {grade: [] for grade in GRADE_TABLE}  # profile_pool knows sol61 → D3 path
@@ -710,7 +716,12 @@ def test_billing_exhaustion_on_nonmatching_host_uses_dedicated_episode_scope(mon
     # episode is never opened or touched.
     assert _episode_keys() == {BILLING_EPISODE_KEY}
     assert len(episodes) == 1, episodes
-    assert f"scope=fusion-billing:{DECLARED_FP[:8]}" in episodes[0]
+    # N2 — the scope field by equality on the parsed head, not a substring
+    # that a full-fingerprint scope would also satisfy.
+    head = episodes[0].split(" — ", 1)[0]
+    fields = dict(field.split("=", 1) for field in head.split()[1:])
+    assert fields["pool"] == "codex"
+    assert fields["scope"] == f"fusion-billing:{DECLARED_FP[:8]}"
 
 
 def test_healthy_billing_account_never_closes_the_host_codex_episode(monkeypatch):
@@ -810,3 +821,68 @@ def test_gate_alternatives_stay_inside_the_billing_scope(monkeypatch):
     for prof in ("cc-glm", "kiro-haiku", "devin-fusion-opus55"):
         _gate([local], prof, None)
     assert "codex" not in _episode_keys()
+
+
+def test_d3_recovery_closes_only_the_billing_episode(monkeypatch):
+    """hk 1772 (b953 S2) — recovery independence on the D3 quota-only path
+    (recommend.py:3950): a healthy billing observation closes the billing
+    episode and must never touch the host's own codex episode. Kills the
+    'billing scope applied only while exhausted' mutant at this site."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    local = _codex_result(used_5h=100, used_7d=100)  # both accounts exhausted
+    # Open the billing episode on the D3 path and the host episode on codex-sol.
+    for profile in PROFILES:
+        assert not _gate([local], profile, EMPTY_TABLE).ok
+    assert not _gate([local], "codex-sol", GRADE_TABLE).ok
+    assert _episode_keys() == {"codex", BILLING_EPISODE_KEY}
+    assert len(episodes) == 2
+    # The declared account recovers while the host login stays exhausted —
+    # only the billing episode may close.
+    _seed_codex_remote(hk, used_5h=5, used_7d=5)
+    for profile in PROFILES:
+        assert _gate([local], profile, EMPTY_TABLE).ok
+    assert _episode_keys() == {"codex"}
+    # The host episode was never closed: re-observing its exhaustion dedups
+    # instead of opening a fresh episode (still two alerts, not three).
+    assert not _gate([local], "codex-sol", GRADE_TABLE).ok
+    assert len(episodes) == 2
+    # The host login recovers → the last episode closes.
+    assert _gate([_codex_result(used_5h=5, used_7d=5)], "codex-sol", GRADE_TABLE).ok
+    assert _episode_keys() == set()
+    assert len(episodes) == 2
+
+
+def test_recommend_recovery_closes_only_the_billing_episode(monkeypatch):
+    """hk 1772 (b953 S2) — recovery independence on the recommend/_evaluate
+    path (recommend.py:4558): the same mutant at this site routes a healthy
+    billing observation to group_name, wrongly closing the host episode."""
+    hk = _enable(monkeypatch)
+    episodes = _episodes(monkeypatch)
+    _operator_switch()
+    _declare()
+    _seed_codex_remote(hk, used_5h=100, used_7d=100)
+    local = _codex_result(used_5h=100, used_7d=100)
+    table = _table_for_sol61()
+    # Open the billing episode on the recommend path and the host episode on
+    # codex-sol through the gate path — only the recommend site's observation
+    # is exercised by the recovery step.
+    recommend_dict([local], "B", today=NOW.date(), now=NOW, grade_table=table)
+    assert not _gate([local], "codex-sol", GRADE_TABLE).ok
+    assert _episode_keys() == {"codex", BILLING_EPISODE_KEY}
+    assert len(episodes) == 2
+    # The declared account recovers while the host login stays exhausted —
+    # only the billing episode may close.
+    _seed_codex_remote(hk, used_5h=5, used_7d=5)
+    recommend_dict([local], "B", today=NOW.date(), now=NOW, grade_table=table)
+    assert _episode_keys() == {"codex"}
+    # The host episode was never closed: re-observing its exhaustion dedups.
+    assert not _gate([local], "codex-sol", GRADE_TABLE).ok
+    assert len(episodes) == 2
+    # The host login recovers → the last episode closes.
+    assert _gate([_codex_result(used_5h=5, used_7d=5)], "codex-sol", GRADE_TABLE).ok
+    assert _episode_keys() == set()
+    assert len(episodes) == 2
