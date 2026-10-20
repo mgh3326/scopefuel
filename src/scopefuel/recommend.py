@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from . import cache, exhaust, manual
+from . import cache, exhaust, free_window, manual
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
@@ -4169,18 +4169,6 @@ def _recommend_rank_key(
     )
 
 
-DEVIN_SWE2_FREE_PROFILES = frozenset(
-    {
-        "devin-swe2",
-        "devin-swe2-medium",
-        "devin-swe2-max",
-        "builder-devin",
-        "builder-devin-medium",
-        "builder-devin-max",
-    }
-)
-
-
 def _evaluate(
     providers: list[ProviderResult],
     grade: Grade,
@@ -4402,12 +4390,12 @@ def _evaluate(
         # Apply the independent free-window hold only after the ordinary
         # subscription, measurement, policy, and quota decisions admitted this
         # row. Existing exclusion reasons therefore remain authoritative.
-        if free_rate_limit and profile.name in DEVIN_SWE2_FREE_PROFILES:
+        if free_rate_limit and profile.name in free_window.FREE_PROFILES:
             excluded.append(
                 _Excluded(
                     profile,
                     free_rate_limit,
-                    provider_id="devin",
+                    provider_id=provider_id,
                     kind="free_rate_limited",
                     placed_grade=placed_grade,
                     one_up=one_up,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import io
+import json
 
 import pytest
 
@@ -90,6 +91,53 @@ def _install_cli_stubs(monkeypatch):
     )
     monkeypatch.setattr(cli, "_shadow_gate", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "_emit_stale_build_warning", lambda: None)
+
+
+def _isolate_free_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(free_window, "state_path", lambda: tmp_path / "free-limit.json")
+    monkeypatch.setattr(free_window, "lock_path", lambda: tmp_path / "free-limit.lock")
+    monkeypatch.setattr(free_window.cache, "_load", lambda: {})
+
+
+def _table_for_profiles(names):
+    profiles = {
+        profile.name: profile for rows in GRADE_TABLE.values() for profile in rows if profile.name in names
+    }
+    assert set(profiles) == set(names)
+    return {grade: (list(profiles.values()) if grade == "B" else []) for grade in GRADE_TABLE}
+
+
+def _recommend_output(providers, names, free_limit=None):
+    payload = recommend_dict(
+        providers,
+        "B",
+        today=NOW.date(),
+        now=NOW,
+        grade_table=_table_for_profiles(names),
+        free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
+    )
+    return payload, json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _observe_sol61_hold():
+    rc, out, err = _capture_cli(
+        [
+            "observe",
+            "devin-free-limit",
+            "--reset",
+            (NOW + dt.timedelta(minutes=45)).isoformat(),
+            "--observed",
+            (NOW - dt.timedelta(minutes=5)).isoformat(),
+            "--rung",
+            "devin-fusion-sol61",
+            "--source",
+            "job:hk1729-sol61",
+        ]
+    )
+    assert rc == 0, (out, err)
+    record = free_window.active_record(now=NOW)
+    assert record is not None
+    return record
 
 
 def _capture_cli(argv):
@@ -186,75 +234,136 @@ def test_fast_model_ids_do_not_resolve_to_supported_profiles(fast_id):
         )
 
 
-def test_fusion_sol_reads_codex_quota_and_live_hold_only_blocks_six_free_rungs(monkeypatch):
+def test_sol61_observation_holds_all_free_rungs_without_entering_swe2_scope(monkeypatch, tmp_path):
+    _isolate_free_window(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
     _install_cli_stubs(monkeypatch)
 
-    # Codex has usable headroom while Devin is intentionally exhausted. This
-    # makes a wrong pool route fail at the gate instead of looking plausible.
-    providers = _providers()
-    providers[1].buckets[0] = Bucket("daily", "1d", 99.0, RESET_1D, Scope("account"), "now")
-    providers[1].buckets[1] = Bucket("weekly", "7d", 99.0, RESET_7D, Scope("account"), "week")
-    monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: providers)
-
-    table = {grade: [] for grade in GRADE_TABLE}
-    table["B"] = [profile for _, profile in _profile_rows().values()]
-    baseline_rows = recommend_dict(providers, "B", today=NOW.date(), now=NOW, grade_table=table)["rows"]
-    baseline_target_rows = {row["profile"]: row for row in baseline_rows if row["profile"] in PROFILES}
-    assert set(baseline_target_rows) == set(PROFILES)
-    for row in baseline_target_rows.values():
-        assert row["kind"] == "candidate"
-        assert row["provider"] == "codex"
-        assert (
-            row["billing"]
-            == launch.resolve_launch(
-                "codex-sol",
-                view=bench.CatalogView(entries=launch.snapshot_entries(), source="snapshot"),
-            ).billing
-        )
-
-    baseline_gate = {name: _capture_cli(["gate", "-m", name]) for name in PROFILES}
-    assert all(result[0] == 0 and "pool=codex" in result[1] for result in baseline_gate.values())
-
-    rc, out, err = _capture_cli(
-        [
-            "observe",
-            "devin-free-limit",
-            "--reset",
-            (NOW + dt.timedelta(minutes=45)).isoformat(),
-            "--observed",
-            (NOW - dt.timedelta(minutes=5)).isoformat(),
-            "--rung",
-            "devin-fusion-sol61",
-            "--source",
-            "job:hk1729-sol61",
-        ]
-    )
-    assert rc == 0, (out, err)
-    record = free_window.active_record(now=NOW)
-    assert record is not None
+    record = _observe_sol61_hold()
     assert record.rung == "devin-fusion-sol61"
     assert record.source == "job:hk1729-sol61"
     assert "devin-fusion-sol61" in OBSERVED_RUNG_IDS
     assert "devin-fusion-sol61-xhigh" in OBSERVED_RUNG_IDS
-    assert not (set(PROFILES) & FREE_PROFILES)
+    assert set(PROFILES) <= FREE_PROFILES
+
+    from scopefuel.recommend import SWE2_MODEL_SCOPE_PROFILES, SWE2_PROFILE_RUNG
+
+    assert not (set(PROFILES) & SWE2_PROFILE_RUNG.keys())
+    assert not (set(PROFILES) & SWE2_MODEL_SCOPE_PROFILES)
 
     for name in PROFILES:
-        assert _capture_cli(["gate", "-m", name]) == baseline_gate[name]
-
-    held_rows = recommend_dict(
-        providers,
-        "B",
-        today=NOW.date(),
-        now=NOW,
-        grade_table=table,
-        free_rate_limit=free_window.reason(record),
-    )["rows"]
-    held_target_rows = {row["profile"]: row for row in held_rows if row["profile"] in PROFILES}
-    assert held_target_rows == baseline_target_rows
+        rc, _out, err = _capture_cli(["gate", "-m", name])
+        assert rc == 3, (name, err)
+        assert "free_rate_limited" in err, (name, err)
 
     for free_profile in sorted(FREE_PROFILES):
         rc, _out, err = _capture_cli(["gate", "-m", free_profile])
         assert rc == 3, (free_profile, err)
         assert "free_rate_limited" in err, (free_profile, err)
         assert "rung devin-fusion-sol61" in err, (free_profile, err)
+
+
+def test_live_hold_refuses_sol61_in_gate_and_excludes_recommend_rows_with_codex_pool(monkeypatch, tmp_path):
+    _isolate_free_window(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    _install_cli_stubs(monkeypatch)
+    providers = _providers()
+    _observe_sol61_hold()
+
+    for name in PROFILES:
+        rc, _out, err = _capture_cli(["gate", "-m", name])
+        assert rc == 3, (name, err)
+        assert "free_rate_limited" in err, (name, err)
+
+    record = free_window.active_record(now=NOW)
+    assert record is not None
+    payload, _encoded = _recommend_output(providers, PROFILES, record)
+    rows = {row["profile"]: row for row in payload["rows"]}
+    assert set(rows) == set(PROFILES)
+    for row in rows.values():
+        assert row["kind"] == "free_rate_limited"
+        assert row["provider"] == "codex"
+        assert row["reason"] == free_window.reason(record)
+
+
+def test_no_or_expired_hold_keeps_sol61_gate_and_recommend_output_unchanged(monkeypatch, tmp_path):
+    _isolate_free_window(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    _install_cli_stubs(monkeypatch)
+    providers = _providers()
+
+    baseline_gates = {name: _capture_cli(["gate", "-m", name]) for name in PROFILES}
+    _base_payload, baseline_recommend = _recommend_output(providers, PROFILES)
+    assert free_window.active_record(now=NOW) is None
+
+    expired = free_window.FreeLimitRecord(
+        NOW - dt.timedelta(minutes=1),
+        NOW - dt.timedelta(minutes=10),
+        "devin-fusion-sol61",
+        "job:hk1729-sol61-expired",
+    )
+    free_window._save_records({free_window._identity_key(): expired})
+    assert free_window.active_record(now=NOW) is None
+    assert {name: _capture_cli(["gate", "-m", name]) for name in PROFILES} == baseline_gates
+    _, expired_recommend = _recommend_output(providers, PROFILES, free_window.active_record(now=NOW))
+    assert expired_recommend == baseline_recommend
+
+
+def test_base_codex_refusal_keeps_its_reason_and_rc_during_live_hold(monkeypatch, tmp_path):
+    _isolate_free_window(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    _install_cli_stubs(monkeypatch)
+    providers = _providers()
+    providers[0].buckets[0] = Bucket("week", "7d", 100.0, RESET_7D, Scope("account"), "week")
+    monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: providers)
+
+    baseline_gate = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
+    _baseline_payload, baseline_recommend = _recommend_output(providers, PROFILES)
+    _observe_sol61_hold()
+
+    held_gate = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
+    assert held_gate == baseline_gate
+    assert held_gate[0] == 3
+    assert "free_rate_limited" not in held_gate[2]
+
+    record = free_window.active_record(now=NOW)
+    assert record is not None
+    held_payload, held_recommend = _recommend_output(providers, PROFILES, record)
+    assert held_recommend == baseline_recommend
+    rows = {row["profile"]: row for row in held_payload["rows"]}
+    assert all(row["kind"] != "free_rate_limited" for row in rows.values())
+    assert all(row["provider"] == "codex" for row in rows.values())
+
+
+def test_live_hold_leaves_paid_devin_and_codex_only_profiles_byte_identical(monkeypatch, tmp_path):
+    _isolate_free_window(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
+    _install_cli_stubs(monkeypatch)
+    providers = _providers()
+    protected = (
+        "devin-ds41",
+        "devin-glm52",
+        "devin-swe17",
+        "devin-fusion-opus55",
+        "devin-fusion-sonnet55",
+        "codex-sol",
+        "codex-luna",
+    )
+    # Argon is an ungraded trial row, so it has a gate path but no recommend row.
+    protected_gate_profiles = (*protected, "devin-argon", "gpt-6-astra")
+
+    baseline_gates = {name: _capture_cli(["gate", "-m", name]) for name in protected_gate_profiles}
+    _baseline_payload, baseline_recommend = _recommend_output(providers, protected)
+    _observe_sol61_hold()
+
+    assert {name: _capture_cli(["gate", "-m", name]) for name in protected_gate_profiles} == baseline_gates
+    record = free_window.active_record(now=NOW)
+    assert record is not None
+    held_payload, held_recommend = _recommend_output(providers, protected, record)
+    assert held_recommend == baseline_recommend
+    rows = {row["profile"]: row for row in held_payload["rows"]}
+    assert {name: rows[name]["provider"] for name in ("codex-sol", "codex-luna")} == {
+        "codex-sol": "codex",
+        "codex-luna": "codex",
+    }
+    assert profile_pool("gpt-6-astra") == ("codex", None)
