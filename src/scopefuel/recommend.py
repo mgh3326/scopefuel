@@ -435,6 +435,10 @@ DEVIN_SWE2_MAX_GRADE_ANNOTATION = (
 DEVIN_FUSION_ANNOTATION = (
     "미측정(유료 Devin fusion 레인 · Claude 패밀리 · pool devin · hk 1382 첫 reps 대기 · #1380)"
 )
+# hk 1729: these Fusion-Sol rows use the Codex pool. No vendor price for the
+# fusion-gpt-6-1-sol ids is present in this repository, so neither row claims
+# one. The annotation records the unmeasured state without a grade prefix.
+DEVIN_FUSION_SOL61_ANNOTATION = "미측정(Fusion-Sol · pool codex · openai 패밀리 · hk 1729 · reps 대기)"
 # #1620 (operator decision hk:doc owner/fleet/decision/2026-10-18/devin-argon-trial,
 # phase 1, approved by operator-desk 10-18 r1018b953go): the Devin PAID Argon
 # trial lane — spawn plumbing only. The Argon rows serve Gemini models under
@@ -523,6 +527,17 @@ def _devin_fusion_sonnet55_profile() -> Profile:
         None,
         benchmark_annotation=DEVIN_FUSION_ANNOTATION,
         billing="paid",
+    )
+
+
+def _devin_fusion_sol61_profile(name: str, effort: str) -> Profile:
+    """Unmeasured Fusion-Sol rung billed to Codex (hk 1729)."""
+
+    return Profile(
+        name,
+        f"GPT-6.1 Sol Fusion ({effort} + SWE-2 medium)",
+        None,
+        benchmark_annotation=DEVIN_FUSION_SOL61_ANNOTATION,
     )
 
 
@@ -1271,6 +1286,11 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # (#1340) keeps them below the Free-tag SWE-2 rows.
         _devin_fusion_opus55_profile(),
         _devin_fusion_sonnet55_profile(),
+        # hk 1729: unmeasured and listed at B like the hk 1380 rows. The pool
+        # routing branch sends their quota checks to Codex; no price seed or
+        # measured-grade provenance exists for either rung.
+        _devin_fusion_sol61_profile("devin-fusion-sol61", "high"),
+        _devin_fusion_sol61_profile("devin-fusion-sol61-xhigh", "xhigh"),
         # #1297 — operator 2026-10-08 via operator-desk, hk:task/1297:
         # sonnet@high promoted C -> B on the served canon (evidence reps
         # srv:1224·1228·1230·1238·1248·1288·1291·1298·1343·1357); this row
@@ -2112,6 +2132,10 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
     # bill against ClinePass), different harness (claude-code, not opencode).
     if profile in ("cc-qwen38", "cc-glm"):
         return "clinepass", None
+    if profile in {"devin-fusion-sol61", "devin-fusion-sol61-xhigh"}:
+        # hk 1729: these Devin launcher spellings use the Codex quota pool.
+        # Keep this branch ahead of generic devin-* routing.
+        return "codex", None
     if profile == "devin-swe2" or profile.startswith("devin-"):
         return "devin", None
     return "", None
@@ -2129,6 +2153,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
 PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
     "devin-fusion-opus55": "claude",
     "devin-fusion-sonnet55": "claude",
+    "devin-fusion-sol61": "openai",
+    "devin-fusion-sol61-xhigh": "openai",
     "devin-argon": "google",
     "devin-argon-medium": "google",
     "devin-argon-low": "google",

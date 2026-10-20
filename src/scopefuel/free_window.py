@@ -57,6 +57,8 @@ OBSERVED_RUNG_IDS = frozenset(
         "builder-ds41-max",
         "devin-fusion-opus55",
         "devin-fusion-sonnet55",
+        "devin-fusion-sol61",
+        "devin-fusion-sol61-xhigh",
         "devin-argon",
         "devin-argon-medium",
         "devin-argon-low",

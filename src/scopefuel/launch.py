@@ -101,6 +101,10 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     # pool; the rung is baked into the model id like every devin spelling.
     "devin-fusion-opus55": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
     "devin-fusion-sonnet55": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+    # hk 1729: Fusion GPT-6.1 Sol lead on the Codex pool; effort is baked into
+    # each model id and the SWE-2 medium sidekick is the same on both rows.
+    "devin-fusion-sol61": "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+    "devin-fusion-sol61-xhigh": "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
     # #1620: the paid Argon trial lane (phase 1) — Gemini 4 Argon rungs served
     # on the devin pool; the rung is baked into the model id. devin-argon is
     # the high default, the same shape devin-swe2 -> swe-2 (high) follows.
