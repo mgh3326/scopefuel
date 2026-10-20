@@ -18,7 +18,6 @@ from . import cache, proctrack, quota_share, quota_v2, recommend
 from .http import classify_error
 from .model import PROBE_IN_PROGRESS, SWE2_BACKOFF, SWE2_IN_FLIGHT_TIMEOUT, ProviderResult
 from .providers import BUILTIN
-from .providers.devin import TIMEOUT_S as DEVIN_PROBE_TIMEOUT_S
 
 # Sorted so argparse choices stay stable in `scopefuel refresh --help`.
 REFRESH_POOLS = tuple(sorted(BUILTIN))
@@ -35,10 +34,16 @@ SWE2_RC_BACKOFF = 12
 SWE2_WAIT_SKIP_RCS = frozenset({SWE2_RC_LOCK_HELD, SWE2_RC_PROBE_IN_PROGRESS})
 
 # Bound for waiting on a probe another worker already holds in flight: the
-# devin probe is itself capped at DEVIN_PROBE_TIMEOUT_S, and the margin covers
-# worker teardown plus the cache write landing after the probe child exits.
-SWE2_IN_FLIGHT_WAIT_S = DEVIN_PROBE_TIMEOUT_S + 5.0
+# in-flight worker's own hard cap is _timeout_seconds() (a devin fetch runs
+# two sequential probe phases under one lock, so the provider TIMEOUT_S alone
+# under-covers it), and the margin covers teardown plus the cache write after
+# the probe exits.
+SWE2_IN_FLIGHT_WAIT_MARGIN_S = 5.0
 SWE2_IN_FLIGHT_POLL_S = 0.25  # cache-file poll only — never a network call
+
+
+def _in_flight_wait_s() -> float:
+    return _timeout_seconds() + SWE2_IN_FLIGHT_WAIT_MARGIN_S
 
 
 def _refresh_dir(name: str) -> pathlib.Path:
@@ -247,9 +252,14 @@ def _admitted_landing(entry: dict, before_fetched: float | None, now: float) -> 
 
 def _wait_for_in_flight(before_fetched: float | None, now: float | None) -> ProviderResult:
     """Poll the cache for the in-flight probe's landing; bounded, no network calls."""
-    deadline = time.monotonic() + SWE2_IN_FLIGHT_WAIT_S
+    wait_s = _in_flight_wait_s()
+    deadline = time.monotonic() + wait_s
     while True:
         at = time.time() if now is None else now
+        # Backoff wins over waiting — whether it was already on disk when the
+        # worker raced the lock, or the in-flight probe just recorded a 429.
+        if cache.backoff_remaining("devin", at) > 0:
+            return _backoff_refusal()
         entry = cache._load().get("devin")
         if isinstance(entry, dict):
             result = _admitted_landing(entry, before_fetched, at)
@@ -258,7 +268,7 @@ def _wait_for_in_flight(before_fetched: float | None, now: float | None) -> Prov
         if time.monotonic() >= deadline:
             return ProviderResult(
                 id="devin",
-                error=(f"in-flight probe did not land in time (waited up to {SWE2_IN_FLIGHT_WAIT_S:.0f}s)"),
+                error=(f"in-flight probe did not land in time (waited up to {wait_s:.0f}s)"),
                 error_kind=SWE2_IN_FLIGHT_TIMEOUT,
             )
         time.sleep(SWE2_IN_FLIGHT_POLL_S)
