@@ -214,6 +214,47 @@ def test_codex_tester_family_and_exact_model_id_mapping():
     )
 
 
+# agent-skills director/gate_policy.json family values at PR 214 (hk 1729).
+# That file, not scopefuel, decides tester separation; agent-skills
+# tests/test_tester_eligible.py asserts the same four values on the real file.
+GATE_POLICY_FAMILY = {
+    "codex-sol": "openai",
+    "codex-luna": "openai",
+    "devin-fusion-sol61": "openai",
+    "devin-fusion-sol61-xhigh": "openai",
+}
+
+
+def test_scopefuel_family_is_codex_for_codex_rows_but_gate_policy_is_openai_for_all_four():
+    """Brief A3 in the terms scopefuel actually uses (hk 1729 r2 B5).
+
+    provider_family returns the quota pool id unless overridden, so codex-sol
+    and codex-luna report "codex" while both Fusion-Sol rows carry the vendor
+    override "openai". The two values differ on purpose and are not forced
+    equal here. scopefuel only prints this value (launch "family"); tester
+    separation reads agent-skills gate_policy.json, where all four are
+    "openai", so a codex-sol or codex-luna tester is same-family with a
+    Fusion-Sol contributor there.
+    """
+    assert {name: provider_family(name) for name in GATE_POLICY_FAMILY} == {
+        "codex-sol": "codex",
+        "codex-luna": "codex",
+        "devin-fusion-sol61": "openai",
+        "devin-fusion-sol61-xhigh": "openai",
+    }
+    assert {name: profile_pool(name) for name in GATE_POLICY_FAMILY} == {
+        name: ("codex", None) for name in GATE_POLICY_FAMILY
+    }
+    view = bench.CatalogView(entries=launch.snapshot_entries(), source="snapshot")
+    assert {name: launch.resolve_launch(name, view=view).family for name in GATE_POLICY_FAMILY} == {
+        "codex-sol": "codex",
+        "codex-luna": "codex",
+        "devin-fusion-sol61": "openai",
+        "devin-fusion-sol61-xhigh": "openai",
+    }
+    assert set(GATE_POLICY_FAMILY.values()) == {"openai"}
+
+
 @pytest.mark.parametrize(
     "fast_id",
     (
