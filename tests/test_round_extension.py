@@ -410,7 +410,7 @@ def test_builder_model_id_spellings_never_unlock(profile, ref):
         launch.resolve_launch(profile, role="builder", purpose="round-extension", operator_request=ref)
 
 
-def test_ordinary_defaults_and_recommendations_byte_identical_to_base():
+def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows():
     baseline = json.loads((Path(__file__).parent / "fixtures/round_extension_ordinary.json").read_text())
     view = CatalogView(entries=launch.snapshot_entries(), source=CATALOG_SOURCE_SNAPSHOT)
     for profile, expected in baseline["launch"].items():
@@ -440,6 +440,10 @@ def test_ordinary_defaults_and_recommendations_byte_identical_to_base():
         actual = recommend.recommend(
             _healthy_s_plus_providers(), grade, today=TODAY, now=NOW, bench_scores=[]
         )
+        # hk 1729 adds two unmeasured B rows. Their placement is asserted in
+        # test_task1729_fusion_sol; removing just those rows preserves this
+        # baseline check for every prior recommendation line.
+        actual = "\n".join(line for line in actual.splitlines() if "devin-fusion-sol61" not in line)
         assert actual.encode() == expected.encode(), grade
         assert not any(name in actual for name in ("codex-astra", "fable", "builder-astra", "builder-fable"))
 

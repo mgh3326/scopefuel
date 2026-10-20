@@ -177,6 +177,10 @@ MODEL_EQUIVALENCE: dict[str, frozenset[str]] = {
     # model id in the profile argv, same equivalence shape as ds41 above.
     "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": frozenset({"devin-fusion-opus55"}),
     "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": frozenset({"devin-fusion-sonnet55"}),
+    # hk 1729: only supported high and xhigh ids resolve; fast variants have
+    # no model equivalence entry.
+    "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium": frozenset({"devin-fusion-sol61"}),
+    "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium": frozenset({"devin-fusion-sol61-xhigh"}),
     # #1620: the paid Argon trial lane — the devin-* launchers embed exactly
     # this model id in the profile argv, same equivalence shape as above.
     "gemini-4-argon-high": frozenset({"devin-argon"}),

@@ -1,4 +1,4 @@
-"""Host-local observations of Devin's SWE-2 free short-window limit.
+"""Host-local observations of Devin's free short-window limit.
 
 The observer never probes Devin. It stores only the limit reported in an
 already-read worker pane. The ordinary quota-share channel carries provider
@@ -32,6 +32,8 @@ SCHEMA = "scopefuel.devin-free-limit.v1"
 STATE_NAME = "devin-free-limit.json"
 LOCK_NAME = "devin-free-limit.lock"
 MAX_WINDOW = dt.timedelta(hours=24)
+# Membership means a live exhausted free SWE-2 window stalls this profile.
+# The Fusion-Sol rows joined after the confirmed stall recorded in hk 1729 r2.
 FREE_PROFILES = frozenset(
     {
         "devin-swe2",
@@ -40,12 +42,14 @@ FREE_PROFILES = frozenset(
         "builder-devin",
         "builder-devin-medium",
         "builder-devin-max",
+        "devin-fusion-sol61",
+        "devin-fusion-sol61-xhigh",
     }
 )
 # Observation is selected by provider kind, so paid Devin workers can report
 # the same free-pool refusal text without being refused by this signal. Keep
-# this input allowlist separate from FREE_PROFILES, which alone controls gate
-# and recommendation denial membership.
+# this input allowlist separate from FREE_PROFILES, which controls gate and
+# recommendation denial membership.
 OBSERVED_RUNG_IDS = frozenset(
     FREE_PROFILES
     | {

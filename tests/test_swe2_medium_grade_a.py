@@ -82,7 +82,8 @@ def test_no_other_grade_table_row_changed():
     devin-swe2@high and devin-swe2-max@max E6-graduated to A+; grok-hi@xhigh
     E6-graduated to A; oc-solar4 B -> A) plus #1380's two paid fusion rows
     (devin-fusion-opus55/sonnet55 listed unmeasured at B only — verdict
-    1380a-verify-20261010-1449 option b)."""
+    1380a-verify-20261010-1449 option b) plus #1729's two Fusion-Sol rows
+    (devin-fusion-sol61/sol61-xhigh unmeasured at B only)."""
     pre = json.loads(PRE_787_ROWS.read_text())
     pre_counts = Counter(json.dumps(row, sort_keys=True) for row in pre)
     post_counts = Counter(json.dumps(row, sort_keys=True) for row in _rows(GRADE_TABLE))
@@ -121,6 +122,9 @@ def test_no_other_grade_table_row_changed():
         # option b — a whole-model-unmeasured row claims no A placement).
         ("B", "devin-fusion-opus55", None),
         ("B", "devin-fusion-sonnet55", None),
+        # #1729: both ChatGPT-billed Fusion-Sol profiles are unmeasured at B.
+        ("B", "devin-fusion-sol61", None),
+        ("B", "devin-fusion-sol61-xhigh", None),
     }
     assert {key(row) for row in removed} == {
         ("C", "devin-swe2-medium", None),
