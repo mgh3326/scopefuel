@@ -145,6 +145,16 @@ scopefuel gate -m oc-omni --operator-request hk:task/461 --requested-by operator
 소진 판정이 완화되지 않습니다. (3) stale 폴백 수용은 계속 fail-closed입니다 — 필수 창 커버리지가
 갖춰지지 않은 stale 스냅샷은 수용되지 않으며, 거부 사유가 부족한 창을 지목합니다.
 
+codex는 이 규칙의 유일한 plan 분기입니다 (hk 1769). `manual.CODEX_PLAN_REQUIRED_WINDOWS`가
+provider가 저장한 plan_type 별 필수 창을 정합니다 — 2026-10-20 wham usage API 증거(hk 1767
+리포트)로 plus는 `{5h, 7d}`, prolite는 `{7d}`만, free는 30일 창 하나(model.window_label의
+`30d` 밴드, ~2592000초)입니다. 표에 있는 plan이 필수 창 하나라도 유효 bucket으로 커버하지
+못하면 측정된 나머지 창으로 통과하지 않고 `codex_required_window_missing:<창> plan=<plan>`
+사유로 측정 불가(gate rc 4, recommend 제외)입니다 — plus 계정의 5h 부재를 7d 사용률로 흘리지
+않기 위해서입니다. 표에 없는 plan(None·pro·team 등)은 기존과 바이트 동일하게 `{5h, 7d}` +
+미측정 태그로 판정하고, 표를 확장하도록 한 번 경고합니다. 다른 provider는 모두 기존 집합
+그대로입니다.
+
 ### E6 측정 런그와 arm 표식 (task #692, grok·sol-medium 런그 #737)
 
 E6(#594, `hk:doc plan/2026-09-25/e6-effort-ladder`)는 한 모델을 여러 effort로 실과제에서

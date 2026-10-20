@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import uuid
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -61,6 +62,19 @@ REQUIRED_WINDOWS = {
     "clinepass": frozenset({"5h", "7d", "30d"}),
     "upstage": frozenset({"30d"}),
 }
+# hk 1769 (b953) — codex required windows follow plan_type, which
+# providers/codex.py already stores as ``plan``. 2026-10-20 wham usage API
+# fleet evidence (hk 1767 report): plus (fp 18b9acc4) returns {5h, 7d},
+# prolite (fc823b1d) returns {7d} only, and free (af2c560b) returns a single
+# 30-day window (~2592000 s, the "30d" band in model.window_label). A plan
+# absent from this table keeps the REQUIRED_WINDOWS {5h, 7d} floor and the
+# caller warns so the table gets extended.
+CODEX_PLAN_REQUIRED_WINDOWS = {
+    "plus": frozenset({"5h", "7d"}),
+    "prolite": frozenset({"7d"}),
+    "free": frozenset({"30d"}),
+}
+_CODEX_UNKNOWN_PLAN_WARNED: set[str] = set()
 
 _DURATION_PART = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([smhdw])", re.IGNORECASE)
 _AUTH_FAILURE = re.compile(
@@ -753,8 +767,52 @@ def _summary_for_pool(
     }
 
 
-def _required_windows(pool: str) -> frozenset[str]:
-    return REQUIRED_WINDOWS.get(pool, frozenset())
+def normalize_codex_plan(plan: object) -> str | None:
+    """plan_type as the wham API spells it — equality after normalising
+    (strip + casefold), never substring."""
+    if not isinstance(plan, str):
+        return None
+    normalized = plan.strip().casefold()
+    return normalized or None
+
+
+def _warn_unknown_codex_plan(plan: str | None) -> None:
+    """One warning per process per distinct plan — the table needs a row."""
+    key = plan if plan is not None else "<absent>"
+    if key in _CODEX_UNKNOWN_PLAN_WARNED:
+        return
+    _CODEX_UNKNOWN_PLAN_WARNED.add(key)
+    if plan is None:
+        warnings.warn(
+            "codex plan_type is absent — required windows fall back to {5h, 7d} "
+            "(hk 1769, CODEX_PLAN_REQUIRED_WINDOWS)",
+            stacklevel=4,
+        )
+    else:
+        warnings.warn(
+            f"codex plan_type {plan!r} is not in CODEX_PLAN_REQUIRED_WINDOWS — "
+            "required windows fall back to {5h, 7d}; extend the table (hk 1769)",
+            stacklevel=4,
+        )
+
+
+def required_windows_for(result: ProviderResult | None) -> frozenset[str]:
+    """Admission-coverage floor for one result (hk 1769).
+
+    codex follows the stored plan_type: a plan in
+    ``CODEX_PLAN_REQUIRED_WINDOWS`` uses its own row — a plan can never be
+    asked for a window the API does not return for it, and a missing window
+    that the plan does return is not waved through. Any absent or unlisted
+    plan keeps the ``REQUIRED_WINDOWS`` {5h, 7d} floor byte-identically.
+    """
+    if result is None:
+        return frozenset()
+    if result.id == "codex":
+        plan = normalize_codex_plan(result.plan)
+        if plan in CODEX_PLAN_REQUIRED_WINDOWS:
+            return CODEX_PLAN_REQUIRED_WINDOWS[plan]
+        _warn_unknown_codex_plan(plan)
+    return REQUIRED_WINDOWS.get(result.id, frozenset())
 
 
 def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> tuple[float, float] | None:
@@ -849,7 +907,7 @@ def resolve_result(
         )
 
     active = {entry["window"]: entry for entry in summary["latest_valid"]}
-    required = _required_windows(result.id)
+    required = required_windows_for(result)
     missing = sorted(required - active.keys())
     summary["required_windows"] = sorted(required)
     summary["covered_windows"] = sorted(active)

@@ -467,7 +467,11 @@ def horizon_for(window_seconds: float | None) -> Horizon:
 def window_label(seconds: float | None) -> str:
     if not seconds:
         return "?"
-    for secs, label in ((604800, "7d"), (86400, "1d"), (18000, "5h")):
+    # hk 1769 — the 30d band is what the wham usage API returns for the codex
+    # free plan (~2592000 s, observed 2026-10-20); only providers/codex.py calls
+    # this, so no other provider's labels move. Without the band a free reading
+    # labelled "720h" could not satisfy a named required window.
+    for secs, label in ((2592000, "30d"), (604800, "7d"), (86400, "1d"), (18000, "5h")):
         if abs(seconds - secs) < 60:
             return label
     return f"{seconds / 3600:g}h"
