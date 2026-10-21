@@ -768,6 +768,7 @@ def test_d3_headroom_deny_with_reserve(monkeypatch):
 def test_d3_allow_tag_and_publish(monkeypatch):
     result, hk = _claudex_gate(monkeypatch, [_row("a")], used=10.0)
     assert result.ok and result.inflight == "inflight=1"
+    assert result.reason.endswith(" inflight=1")
     assert [c for c in hk.calls if c[0] == "PUT" and "/inflight/" in c[1]]
 
 
@@ -797,7 +798,7 @@ def test_two_distinct_window_reserves(monkeypatch):
     # 7d reserve 5 * n=2 -> 80+10=90 == cutoff on 7d; 5h reserve 12 * 2 -> 10+24=34 < 90
     policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0, "7d": 5.0})
     result = gate_check([_codex(("5h", 10.0), ("7d", 80.0))], "codex-max", today=TODAY, now=NOW)
-    assert result.ok is False and result.reason.startswith("codex inflight_headroom window=7d")
+    assert result.reason == "codex inflight_headroom window=7d used=80 n=2 reserve=5 cutoff=90"
 
 
 def test_reserve_on_unrequired_window_ignored(monkeypatch):
@@ -806,7 +807,10 @@ def test_reserve_on_unrequired_window_ignored(monkeypatch):
     _spy_arbiter(monkeypatch, rows=[_row("a"), _row("b")])
     _enable_hk(monkeypatch)
     policy.set_policy("codex", None, inflight_reserve_pct={"30d": 50.0})
-    result = gate_check([_codex(("5h", 10.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    result = gate_check(
+        [_codex(("5h", 10.0), ("7d", 10.0), ("30d", 80.0))], "codex-max", today=TODAY, now=NOW
+    )
+    # 30d is not a required window for codex: mutant judging it would deny (80+100)
     assert result.ok and result.inflight == "inflight=2"
 
 
@@ -842,8 +846,10 @@ def test_7h_old_job_counts(monkeypatch):
 
 def test_drop_unparseable_started_at_and_published_at(monkeypatch):
     job = {"job_id": "j1", "started_at": "not-a-date"}
-    bad_pub = _doc("oci", [_remote_job("j1")])
+    bad_pub = _doc("pi", [_remote_job("j1")])
     bad_pub["body"] = json.dumps({**json.loads(bad_pub["body"]), "published_at": "nope"})
+    # two docs under distinct keys: bad started_at drops its job, bad
+    # published_at drops its doc — either mutant surviving would count j1
     result, _, _ = _gate_with(monkeypatch, [], [_doc("oci", [job]), bad_pub])
     assert result.inflight == "inflight=0"
 
@@ -853,7 +859,12 @@ def test_self_exclusion_key_suffix_leg(monkeypatch):
     _host(monkeypatch, "gatehost")
     _spy_arbiter(monkeypatch, rows=[])
     hk = _enable_hk(monkeypatch)
-    hk.docs[inflight.doc_key("codex", FP, "gatehost")] = _doc("gatehost", [_remote_job("mine")])
+    # doc key ends in this host but its body names a different host — only the
+    # key-suffix leg can drop it (kills the body-leg-only mutant too)
+    key = inflight.doc_key("codex", FP, "gatehost")
+    doc = _doc("othername", [_remote_job("mine")])
+    doc["key"] = key
+    hk.docs[key] = doc
 
     original = hk.__call__
 
@@ -993,3 +1004,158 @@ def test_token_kind_fp_never_publishes_or_queries(monkeypatch):
     assert gate.inflight == "inflight=unknown(remote)"
     assert [c for c in hk.calls if c[0] == "PUT"] == []
     assert [c for c in hk.calls if "inflight" in c[1] and c[0] == "GET"] == []
+
+
+# ------------------------------------------------- round-3 survivor killers
+
+
+def _sentinel_stale(monkeypatch):
+    """Replace the stale-build emitter with a fixed sentinel line."""
+    monkeypatch.setattr(
+        cli, "_emit_stale_build_warning", lambda: print("warning: stale-sentinel", file=sys.stderr)
+    )
+
+
+def test_allow_path_warning_order_with_stale(monkeypatch, capsys):
+    """inflight warning sits between unknown-plan and stale-build on allow."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, fail=True)
+    _enable_hk(monkeypatch)
+    _sentinel_stale(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    providers_result = _codex(("5h", 10.0), ("7d", 10.0), plan="pro")
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: providers_result})
+    rc = cli.main(["gate", "-m", "codex-max", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 0
+    warnings = [
+        w
+        for w in out.err.splitlines()
+        if w.startswith("warning:") and ("plan_type" in w or "in-flight" in w or "stale-sentinel" in w)
+    ]
+    kinds = ["plan" if "plan_type" in w else ("inflight" if "in-flight" in w else "stale") for w in warnings]
+    assert kinds == ["plan", "inflight", "stale"]
+
+
+def test_deny_path_warning_order_with_stale(monkeypatch, capsys):
+    """Deny: reason is stderr line 1, then plan, inflight, stale sentinel."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, fail=True)
+    _enable_hk(monkeypatch)
+    _sentinel_stale(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    providers_result = _codex(("5h", 95.0), ("7d", 10.0), plan="pro")
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: providers_result})
+    rc = cli.main(["gate", "-m", "codex-max", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 3
+    # deny reason line precedes the trailing warning block (bench warnings
+    # from the hk fake may precede the reason itself — they are unrelated)
+    assert "소진" in out.err
+    warnings = [
+        w
+        for w in out.err.splitlines()
+        if w.startswith("warning:") and ("plan_type" in w or "in-flight" in w or "stale-sentinel" in w)
+    ]
+    kinds = ["plan" if "plan_type" in w else ("inflight" if "in-flight" in w else "stale") for w in warnings]
+    assert kinds == ["plan", "inflight", "stale"]
+    deny_idx = out.err.index("소진")
+    first_warn_idx = min(out.err.index(w) for w in warnings)
+    assert deny_idx < first_warn_idx
+
+
+def test_show_per_account_n_with_working_local(monkeypatch, capsys):
+    """Two account_fps with a live arbiter: n is per-fp, not accumulated."""
+    _host(monkeypatch, "mbp")
+    _spy_arbiter(monkeypatch, rows=[_row("a")])
+    hk = _enable_hk(monkeypatch)
+    live = dt.datetime.now(dt.UTC)
+    for fp, host, jobs in (
+        (FP, "oci", [{"job_id": "j1", "started_at": live.isoformat()}]),
+        ("fp-other-2222", "pi", [{"job_id": "j2", "started_at": live.isoformat()}]),
+    ):
+        body = {
+            "schema": inflight.SCHEMA,
+            "pool": "codex",
+            "account_fp": fp,
+            "host": host,
+            "published_at": live.isoformat(),
+            "jobs": jobs,
+        }
+        key = inflight.doc_key("codex", fp, host)
+        hk.docs[key] = {
+            "key": key,
+            "kind": "note",
+            "session": inflight.DOC_SESSION,
+            "job": "",
+            "body": json.dumps(body, sort_keys=True),
+        }
+    rc = cli.main(["inflight", "show", "--pool", "codex"])
+    out = capsys.readouterr()
+    assert rc == 0
+    # local 1 + remote 1 each — a mutant summing across fps would print 3
+    assert f"account_fp={FP} n=2" in out.out
+    assert "account_fp=fp-other-2222 n=2" in out.out
+    assert [c for c in hk.calls if c[0] == "PUT"] == []
+
+
+def test_invalid_job_fields_not_counted(monkeypatch):
+    """Jobs with missing or non-str job_id are dropped, not counted."""
+    doc = _doc(
+        "oci",
+        [{"started_at": NOW.isoformat()}, {"job_id": 42, "started_at": NOW.isoformat()}],
+    )
+    result, _, _ = _gate_with(monkeypatch, [], [doc])
+    assert result.inflight == "inflight=0"
+
+
+def test_policy_replace_keeps_sibling_keys(monkeypatch):
+    """Replacing the reserve table must not drop sibling keys under pools.<p>."""
+    policy.set_policy("codex", None, subscribed=True, inflight_reserve_pct={"5h": 12.0})
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 20.0})
+    reserves, _ = policy.get_inflight_reserve("codex")
+    assert reserves == {"5h": 20.0}
+    assert "subscribed = true" in policy.config_path().read_text()
+
+
+def test_gate_output_record_carries_inflight(monkeypatch, tmp_path):
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=[_row("a")])
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    out_file = tmp_path / "gate.json"
+    providers_result = _codex(("5h", 10.0), ("7d", 10.0))
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: providers_result})
+    rc = cli.main(["gate", "-m", "codex-max", "--no-cache", "--gate-output", str(out_file)])
+    assert rc == 0
+    record = json.loads(out_file.read_text())
+    assert record.get("inflight") == "inflight=1"
+
+
+def test_reserve_bool_and_over_100_fall_back(monkeypatch):
+    path = policy.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[pools.codex.inflight_reserve_pct]\n5h = true\n7d = 150.0\n30d = 4.0\n")
+    reserves, status = policy.get_inflight_reserve("codex")
+    assert reserves == {"30d": 4.0} and status is not None
+    # a table whose every value is invalid behaves as unset
+    path.write_text("[pools.codex.inflight_reserve_pct]\n5h = true\n7d = 150.0\n")
+    assert policy.get_inflight_reserve("codex") == ({}, policy.get_inflight_reserve("codex")[1])
+
+
+def test_wrong_window_reserve_would_overcharge(monkeypatch):
+    """Wrong-window reserve mutants (max/first/swap for all windows) must be
+    visible: judge codex-sol, whose required window is only 7d. Its own
+    reserve (2*3=6) leaves 64+6=70 < 90; any mutant pulling the 5h reserve
+    (50) for 7d judges 64+150 >= 90 and wrongly denies."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=[_row("a"), _row("b"), _row("c")])
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 50.0, "7d": 2.0})
+    result = gate_check(
+        [_codex(("5h", 10.0), ("7d", 64.0), plan="prolite")],
+        "codex-sol",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok and result.inflight == "inflight=3"
