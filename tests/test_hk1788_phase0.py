@@ -15,6 +15,7 @@ carrier (e6_arm_carrier_grade), never the bare E6_ARM_GRADE constant.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import pathlib
@@ -28,6 +29,7 @@ from scopefuel.recommend import (
     E6_ARM_KEYS,
     E6_ARM_RUNGS,
     GRADE_TABLE,
+    Profile,
     e6_arm_carrier_grade,
     e6_arm_tag,
     gate_check,
@@ -229,26 +231,83 @@ def test_the_c1_merge_is_monotonic_over_the_bundled_seed():
 
 
 def test_a_c_carrier_sonnet_max_would_have_been_a_violation():
-    """The mutant pin: sonnet@max at C sits below sonnet@xhigh's A+."""
+    """The mutant pin: sonnet@max at C sits below sonnet@xhigh's A+.
+
+    The merged state is built from the real bundled snapshot — forcing
+    e6_arm_carrier_grade back to the global C turns the baseline
+    zero-violations assertion red."""
     merged = {entry.key: entry for entry in bench.catalog_snapshot()}
+    # The seed's own sonnet@max row rides at its carrier — forcing the carrier
+    # back to global C makes this assert (and the zero-violations baseline on
+    # the write below) fail, which is what pins the mutant.
+    assert merged[("sonnet", "max")].grade == "A+" == e6_arm_carrier_grade("sonnet", "max")
     rows = _c1_rows()
     for entry in rows:
         merged[entry.key] = entry
     write = {entry.key: entry.grade for entry in rows}
-    write[("sonnet", "max")] = "C"  # the global-carrier mutation
-    merged[("sonnet", "max")] = bench.CatalogEntry(
-        profile="sonnet",
-        effort="max",
-        model_id="claude-sonnet-5-5",
-        pool="claude",
-        grade="C",
-    )
+    assert grades.catalog_monotonicity_violations(list(merged.values()), write) == []
+    # The pre-#1788 global-carrier mutant: sonnet@max pushed at C.
+    merged[("sonnet", "max")] = dataclasses.replace(merged[("sonnet", "max")], grade="C")
+    write[("sonnet", "max")] = "C"
     violations = grades.catalog_monotonicity_violations(list(merged.values()), write)
     assert violations
     assert violations[0].profile == "sonnet"
     assert violations[0].effort == "max"
     assert violations[0].grade == "C"
     assert violations[0].lower_grade == "A+"
+
+
+def test_gate_check_refuses_a_carrier_grade_rung_without_marker():
+    """Mutant pin for the gate's arm check: a grade table that carries
+    sonnet@max at exactly its A+ carrier (the post-push canon) must still
+    gate it — the row is the unmeasured arm, not a measured placement.
+    Comparing the row to the global C instead of its carrier opens it
+    unmarked."""
+    table = {
+        "A+": [
+            Profile(
+                "sonnet",
+                "Sonnet 5.5 (max)",
+                70.6,
+                launcher_effort="max",
+                benchmark_effort="max",
+                aa_model_id="claude-sonnet-5-5",
+            )
+        ],
+        "A": [
+            Profile(
+                "sonnet",
+                "Sonnet 5.5 (high)",
+                43.0,
+                launcher_effort="high",
+                benchmark_effort="high",
+                aa_model_id="claude-sonnet-5-5",
+            )
+        ],
+    }
+    result = gate_check(
+        [_provider("claude")],
+        "sonnet",
+        effort="max",
+        grade_table=table,
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "e6_arm_required" in result.reason
+    assert result.grade == "A+"
+    result = gate_check(
+        [_provider("claude")],
+        "sonnet",
+        effort="max",
+        grade_table=table,
+        e6_arm="sonnet@max",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True
+    assert result.grade == "A+"
+    assert result.e6_arm == "sonnet@max"
 
 
 # --- AC4: byte-identical elsewhere ---------------------------------------------
