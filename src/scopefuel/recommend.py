@@ -1774,6 +1774,29 @@ _REP_DECISION_REF = re.compile(
     r"(?=\s*(?:;|$))"
 )
 
+# ── d1786ap (operator directive, hk:task/1786 / hk 1795): borrowed rungs ─────
+# One profile@effort may sit in two grades (d1786dup): the canon keys its rows
+# on (profile, effort) with a single grade column, so a second placement cannot
+# be expressed as a row. The directive is therefore a cross-grade *listing*:
+# each entry names a rung and the grade ``--recommend`` lists it at while the
+# live table still places it exactly one grade above. The row keeps its own
+# gate — codex-sol@xhigh stays escalation-gated (it still needs
+# --operator-request to launch).
+#
+# The ``_SOL_PROFILES``-outside-S+ rule is about placements. A borrowed listing
+# places nothing — ``validate_grade_table`` is never called for it — and the
+# one-up listing's exclusion of Sol profiles stays exactly as it is.
+# ``BORROWED_RUNGS`` is the explicit operator exception to both: it is what
+# lets codex-sol@xhigh list at S without placing a Sol row outside S+, and
+# what lets opus@low list at A+ without rep evidence.
+#
+# Shape: (profile, launcher_effort, listed_grade, decision_ref).
+BORROWED_RUNGS: tuple[tuple[str, str, Grade, str], ...] = (
+    ("opus", "low", "A+", "operator d1786ap hk:task/1786"),
+    ("codex-sol", "xhigh", "S", "operator d1786ap hk:task/1786"),
+)
+BORROWED_TAG_PREFIX = "[borrowed "
+
 
 def is_rep_measured(profile: Profile) -> bool:
     """Whether this row's *grade* is rep-measured evidence.
@@ -1835,15 +1858,46 @@ def _one_up_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tu
     ]
 
 
-def _one_up_suffix(item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
-    """The ``[one-up <placed grade>]`` tag, or ``""`` for an exact-grade row."""
+def _borrowed_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tuple[Profile, Grade]]:
+    """``BORROWED_RUNGS`` entries the live table places exactly one grade above ``grade``.
+
+    An entry lists only while the table carries its rung at exactly the grade
+    above ``listed_grade``: placed anywhere else, or not carried at all (moved,
+    retired, or dropped — an E6 row at its carrier never reaches the table),
+    the entry is inert and lists nothing, so a stale directive cannot invent a
+    candidate after a later canon move.
+    """
+    out: list[tuple[Profile, Grade]] = []
+    for profile_name, effort, listed_grade, _decision_ref in BORROWED_RUNGS:
+        if listed_grade != grade:
+            continue
+        upper_index = _GRADE_ORDER.index(listed_grade) - 1
+        if upper_index < 0:
+            continue
+        upper = _GRADE_ORDER[upper_index]
+        out.extend(
+            (profile, upper)
+            for profile in table.get(upper, [])
+            if profile.name == profile_name and normalize_effort(profile.launcher_effort) == effort
+        )
+    return out
+
+
+def _placed_tag_suffix(
+    item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed | _EscalationEntry,
+) -> str:
+    """The ``[borrowed <placed>]``/``[one-up <placed>]`` tag, or ``""`` for an exact-grade row."""
+    if item.borrowed and item.placed_grade is not None:
+        return f"  {BORROWED_TAG_PREFIX}{item.placed_grade}]"
     if item.one_up and item.placed_grade is not None:
         return f"  {ONE_UP_TAG_PREFIX}{item.placed_grade}]"
     return ""
 
 
 def _fold_name(item: _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
-    """Profile name inside a folded exclusion line, tagged when one-up."""
+    """Profile name inside a folded exclusion line, tagged when non-exact."""
+    if item.borrowed and item.placed_grade is not None:
+        return f"{item.profile.name}{BORROWED_TAG_PREFIX}{item.placed_grade}]"
     if item.one_up and item.placed_grade is not None:
         return f"{item.profile.name}{ONE_UP_TAG_PREFIX}{item.placed_grade}]"
     return item.profile.name
@@ -2330,8 +2384,11 @@ class _Candidate:
     value_sort_skipped: bool = False
     # #1318-2 (operator A, hk 1321): the grade the row is placed at. ``one_up``
     # marks a rep-measured row listed one grade below that placement.
+    # d1786ap: ``borrowed`` marks a BORROWED_RUNGS listing — the two flags are
+    # mutually exclusive (a row qualifying as both lists once, as borrowed).
     placed_grade: Grade | None = None
     one_up: bool = False
+    borrowed: bool = False
 
 
 @dataclass
@@ -2342,6 +2399,7 @@ class _Excluded:
     kind: str = "other"  # "exhausted" | "unmeasurable" | "other"
     placed_grade: Grade | None = None
     one_up: bool = False
+    borrowed: bool = False
 
 
 @dataclass
@@ -2353,6 +2411,7 @@ class _PolicyExcluded:
     note: str | None
     placed_grade: Grade | None = None
     one_up: bool = False
+    borrowed: bool = False
 
 
 @dataclass
@@ -2369,6 +2428,7 @@ class _Unsubscribed:
     source: str  # "pool" | "profile" — which level's flag decided
     placed_grade: Grade | None = None
     one_up: bool = False
+    borrowed: bool = False
 
 
 @dataclass
@@ -2380,6 +2440,7 @@ class _EscalationEntry:
     status_note: str | None
     placed_grade: Grade | None = None
     one_up: bool = False
+    borrowed: bool = False
 
 
 def _matching_buckets(result: ProviderResult, group_name: str | None) -> list[tuple[float, str, str | None]]:
@@ -3178,6 +3239,8 @@ def _alt_candidates(
 
     #1318-2: ``[one-up G]`` 태그가 붙은 행은 한 급 위 배치 행이라 같은 급의
     대체 후보가 아니다 — gate 의 대안 나열 의미를 좁히지 않기 위해 건너뛴다.
+    d1786ap: ``[borrowed G]`` 행도 같은 이유로 건너뛴다 — 한 급 위 배치 행의
+    표시 나열이지 같은 급 후보가 아니다.
     """
     out = recommend(
         providers,
@@ -3195,7 +3258,7 @@ def _alt_candidates(
     for line in out.splitlines():
         if not line[:1].isdigit():
             continue
-        if ONE_UP_TAG_PREFIX in line:
+        if ONE_UP_TAG_PREFIX in line or BORROWED_TAG_PREFIX in line:
             continue
         # "N. [🔥] name  label ..." 또는 "N. name  label ..."
         rest = line.split(".", 1)[1].strip()
@@ -4642,7 +4705,9 @@ def _recommend_rank_key(
     then exact before one-up as the last tie-break, then the caller's stable
     slot. Because ``one_up`` sits after the quota dims, a *measured* one-up
     row may outrank an *unmeasured* exact row (amended AC6); exact rows win
-    only a full quota/boost/score/slot tie.
+    only a full quota/boost/score/slot tie. d1786ap: borrowed rows order like
+    one-up rows — the same element keeps exact-grade rows ahead of them on
+    the final tie-break.
 
     The billing dimension is a per-row datum (``Profile.billing``), not a
     pool-scoped comparison: a "paid" row carries 1, "free" and "unknown" both
@@ -4663,7 +4728,7 @@ def _recommend_rank_key(
         1 if candidate.profile.billing == "paid" else 0,
         value_order[id(candidate.profile)],
         intra_pool_rank[id(candidate.profile)],
-        1 if candidate.one_up else 0,
+        1 if (candidate.one_up or candidate.borrowed) else 0,
         slot,
     )
 
@@ -4711,11 +4776,30 @@ def _evaluate(
     # rep-measured rows placed one grade up. A one-up row flows through the
     # identical candidacy checks — the unsubscribed/policy/exhausted folds keep
     # it in the same exclusion lines as an exact-grade row.
+    # d1786ap: borrowed rungs ride the same path after the one-up rows. A row
+    # qualifying as both one-up and borrowed lists once, as borrowed.
     entries: list[tuple[Profile, Grade]] = [(profile, grade) for profile in table[grade]]
-    entries += _one_up_profiles(grade, table)
+    borrowed = _borrowed_profiles(grade, table)
+    borrowed_rungs = {
+        (profile.name, normalize_effort(profile.launcher_effort)) for profile, _placed in borrowed
+    }
+    entries += [
+        (profile, placed)
+        for profile, placed in _one_up_profiles(grade, table)
+        if (profile.name, normalize_effort(profile.launcher_effort)) not in borrowed_rungs
+    ]
+    entries += borrowed
 
     for profile, placed_grade in entries:
-        one_up = placed_grade != grade
+        borrowed_row = (
+            placed_grade != grade
+            and (
+                profile.name,
+                normalize_effort(profile.launcher_effort),
+            )
+            in borrowed_rungs
+        )
+        one_up = placed_grade != grade and not borrowed_row
         provider_id, group_name = resolved_pool(profile)
         # task #742 — 구독 해지(풀 또는 프로필 플래그)는 후보·승급·비상 후보 어떤
         # 경로로도 추천되지 않는다. 행은 지우지 않고 후보 평가만 건너뛴다 —
@@ -4729,14 +4813,18 @@ def _evaluate(
                     source=subscription.source,
                     placed_grade=placed_grade,
                     one_up=one_up,
+                    borrowed=borrowed_row,
                 )
             )
             continue
 
         # Escalation profiles → separate section, not in normal ranked candidates.
+        # The row keeps its own gate: a borrowed escalation rung (d1786ap)
+        # lists here too, tagged, and still needs --operator-request to launch.
         if profile.gate == "escalation":
             entry = _build_escalation_entry(profile, by_id, today, now=now)
             entry.placed_grade = placed_grade
+            entry.borrowed = borrowed_row
             escalation.append(entry)
             continue
 
@@ -4758,6 +4846,7 @@ def _evaluate(
                         kind="unmeasurable",
                         placed_grade=placed_grade,
                         one_up=one_up,
+                        borrowed=borrowed_row,
                     )
                 )
                 continue
@@ -4785,6 +4874,7 @@ def _evaluate(
                         kind="unmeasurable",
                         placed_grade=placed_grade,
                         one_up=one_up,
+                        borrowed=borrowed_row,
                     )
                 )
                 continue
@@ -4805,6 +4895,7 @@ def _evaluate(
                         kind="unmeasurable",
                         placed_grade=placed_grade,
                         one_up=one_up,
+                        borrowed=borrowed_row,
                     )
                 )
                 continue
@@ -4821,6 +4912,7 @@ def _evaluate(
                         kind="unmeasurable",
                         placed_grade=placed_grade,
                         one_up=one_up,
+                        borrowed=borrowed_row,
                     )
                 )
                 continue
@@ -4835,6 +4927,7 @@ def _evaluate(
                         kind="unmeasurable",
                         placed_grade=placed_grade,
                         one_up=one_up,
+                        borrowed=borrowed_row,
                     )
                 )
                 continue
@@ -4863,6 +4956,7 @@ def _evaluate(
                     note=override.note if override is not None else None,
                     placed_grade=placed_grade,
                     one_up=one_up,
+                    borrowed=borrowed_row,
                 )
             )
             continue
@@ -4882,6 +4976,7 @@ def _evaluate(
                     kind="exhausted",
                     placed_grade=placed_grade,
                     one_up=one_up,
+                    borrowed=borrowed_row,
                 )
             )
             continue
@@ -4933,6 +5028,7 @@ def _evaluate(
                     kind="free_rate_limited",
                     placed_grade=placed_grade,
                     one_up=one_up,
+                    borrowed=borrowed_row,
                 )
             )
             continue
@@ -4970,6 +5066,7 @@ def _evaluate(
                 imminent_exhaustion=imminent_exhaustion,
                 placed_grade=placed_grade,
                 one_up=one_up,
+                borrowed=borrowed_row,
             )
         )
 
@@ -5365,7 +5462,7 @@ def recommend(
         lines_out: list[str] = []
         for (kind, provider_id, reason), group in groups.items():
             if len(group) == 1 and not group[0].provider_id:
-                lines_out.append(f"✗ {group[0].profile.name:<12} {reason}{_one_up_suffix(group[0])}")
+                lines_out.append(f"✗ {group[0].profile.name:<12} {reason}{_placed_tag_suffix(group[0])}")
                 continue
             names = "·".join(_fold_name(i) for i in group)
             if kind == "exhausted":
@@ -5395,13 +5492,13 @@ def recommend(
             note_s = f"  {item.note}" if item.note else ""
             lines.append(
                 f"  {item.profile.name:<12} {item.provider_label}  pool={item.provider_id}"
-                f"  until={until_s}{note_s}{_one_up_suffix(item)}"
+                f"  until={until_s}{note_s}{_placed_tag_suffix(item)}"
             )
     else:
         for rank, cand in enumerate(included, start=1):
             benchmark, live_measured = benchmark_cell(cand.profile)
             bench = f"  벤치 {benchmark}" if benchmark else ""
-            one_up_tag = _one_up_suffix(cand)
+            placed_tag = _placed_tag_suffix(cand)
             profile_label = _text_label(cand.profile)
             usage = cand.windows_display
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
@@ -5409,19 +5506,19 @@ def recommend(
                     f"{rank}. 🔥🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"  소멸 임박 우선 (boost 역전){bench}{one_up_tag}"
+                    f"  소멸 임박 우선 (boost 역전){bench}{placed_tag}"
                 )
             elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"{bench}{one_up_tag}"
+                    f"{bench}{placed_tag}"
                 )
             else:
                 lines.append(
                     f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}"
-                    f"{bench}{one_up_tag}"
+                    f"{bench}{placed_tag}"
                 )
             if explain:
                 brake_explain = ""
@@ -5466,6 +5563,7 @@ def recommend(
         for entry in escalation:
             lines.append(
                 f"  {_text_label(entry.profile):<24} {entry.provider_label}  pool={entry.provider_id}"
+                f"{_placed_tag_suffix(entry)}"
             )
             lines.append(f"    근거: {entry.gate_reason}")
             if entry.status_note:
@@ -5495,7 +5593,9 @@ def recommend_dict(
     at) and ``one_up`` (True when the row is a rep-measured placement listed one
     grade below it, the text surface's ``[one-up <grade>]`` tag). Exact-grade
     rows have ``one_up`` false and ``placed_grade == grade``; escalation entries
-    report their own placement.
+    report their own placement. d1786ap: a ``BORROWED_RUNGS`` listing adds
+    ``borrowed: true`` to its row only (every other row is byte-identical) —
+    the text surface's ``[borrowed <grade>]`` tag.
     """
 
     today = today or dt.datetime.now(dt.UTC).date()
@@ -5521,7 +5621,7 @@ def recommend_dict(
     def _row(
         item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed | _EscalationEntry,
     ) -> dict[str, object]:
-        return {
+        row: dict[str, object] = {
             "profile": item.profile.name,
             "display": _profile_label(item.profile),
             "launch": _launch_spelling(item.profile),
@@ -5532,6 +5632,11 @@ def recommend_dict(
             # dimension. Text rows stay unchanged; JSON gains this marker.
             "billing": item.profile.billing,
         }
+        # d1786ap: the additive marker rides borrowed rows only — emitting it
+        # everywhere would move every other row off the base bytes.
+        if item.borrowed:
+            row["borrowed"] = True
+        return row
 
     rows: list[dict[str, object]] = []
     for cand in evaluation.included:

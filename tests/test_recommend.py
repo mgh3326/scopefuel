@@ -770,8 +770,10 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     # moved to C, max is the S escalation rung. No ranked sonnet row in A+.
     assert not any(line[:1].isdigit() and line.split()[1] == "sonnet" for line in aplus_output.splitlines())
     assert "sonnet --effort xhigh" in aplus_output
-    # ROB-591: opus --effort low no longer lives in A+ at all (moved to S).
-    assert "opus --effort low" not in aplus_output
+    # ROB-591 + d1786ap: opus --effort low has no A+ placement — at A+ it lists
+    # only as the borrowed S rung, tagged, never as an exact-grade row.
+    opus_low_lines = [line for line in aplus_output.splitlines() if "opus --effort low" in line]
+    assert len(opus_low_lines) == 1 and "[borrowed S]" in opus_low_lines[0]
     # ROB-1202: Grok medium relocated here — estimated + unmeasured, not the raw high score.
     assert any(line[:1].isdigit() and "grok --effort medium" in line for line in aplus_output.splitlines())
     assert "벤치 59.4(추정(외삽))" in aplus_output
