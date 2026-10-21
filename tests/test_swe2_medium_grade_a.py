@@ -96,7 +96,6 @@ def test_no_other_grade_table_row_changed():
 
     assert {key(row) for row in added} == {
         ("A", "devin-swe2-medium", None),
-        ("S", "sonnet", "max"),
         ("A+", "sonnet", "xhigh"),
         ("C", "sonnet", "medium"),
         # #1026 (09-30 operator decision): the codex-sol rows relabelled
@@ -108,10 +107,9 @@ def test_no_other_grade_table_row_changed():
         ("C", "haiku", "low"),
         ("C", "haiku", "medium"),
         ("C", "haiku", "high"),
-        ("C", "haiku", "xhigh"),
-        ("C", "haiku", "max"),
         # #1297 (10-08 operator applies, hk:task/1296 + hk:task/1297).
-        ("B", "sonnet", "high"),
+        # hk 1788: b953-hk1786 promote lands the row at A (was B via #1297).
+        ("A", "sonnet", "high"),
         ("A+", "devin-swe2", "high"),
         ("A+", "devin-swe2-max", "max"),
         ("A", "grok-hi", "xhigh"),
@@ -140,6 +138,8 @@ def test_no_other_grade_table_row_changed():
         ("C", "haiku", "low"),
         # #1297: oc-solar4's B row is replaced by the promoted A row.
         ("B", "oc-solar4", None),
+        # hk 1788: the #920/#1269 estimate placements de-graduate to E6 arm
+        # rungs — they leave GRADE_TABLE entirely.
     }
 
 

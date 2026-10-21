@@ -287,9 +287,11 @@ SONNET_5_5_MEDIUM_PLACEMENT_NOTE = "raw 29.0 은 이미 최하위 급(C) — 낮
 # not SONNET_5_5_ESTIMATE_REASON, whose conservative-placement sentence only
 # applies to the still-estimated rungs.
 SONNET_5_5_HIGH_GRADE_ANNOTATION = (
-    "급 실측(B; evidence reps srv:1224, srv:1228, srv:1230, srv:1238, srv:1248, "
-    "srv:1288, srv:1291, srv:1298, srv:1343, srv:1357 · operator 2026-10-08 "
-    "via operator-desk · hk:task/1297) · 표기 점수는 벤더 TB4 추정 43.0"
+    "급 실측(A; evidence reps 8 clean A passes · 0 FAIL — b953-hk1786 · "
+    "hk:doc/reports/b953/hk1786-propose-sonnet-high; 이전 B 결정 evidence reps "
+    "srv:1224, srv:1228, srv:1230, srv:1238, srv:1248, srv:1288, srv:1291, "
+    "srv:1298, srv:1343, srv:1357 · operator 2026-10-08 via operator-desk · "
+    "hk:task/1297) · 표기 점수는 벤더 TB4 추정 43.0"
 )
 SONNET_5_5_XHIGH_PLACEMENT_NOTE = "보수 배치(A+; raw 61.0 은 S 구간 — 실측 reps 전 1단계 보수)"
 SONNET_5_5_MAX_PLACEMENT_NOTE = "보수 배치(S; raw 70.6 은 S+ 구간 — 실측 reps 전 1단계 보수)"
@@ -940,21 +942,10 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             aa_agent_model_id="claude-opus-5-5",
             aa_model_id="claude-opus-5-5",
         ),
-        # #920: Sonnet 5.5 (max) — 벤더 TB4 70.6 은 S+ 구간이지만 실측 reps 전까지
-        # 한 단계 보수(S). 최상위 effort 런그라 운영자 명시 요청으로만 연다.
-        Profile(
-            "sonnet",
-            "Sonnet 5.5 (max)",
-            70.6,
-            gate="escalation",
-            gate_reason=SONNET_5_5_MAX_ESCALATION_REASON,
-            launcher_effort="max",
-            benchmark_effort="max",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=SONNET_5_5_ESTIMATE_REASON,
-            placement_note=SONNET_5_5_MAX_PLACEMENT_NOTE,
-            aa_model_id="claude-sonnet-5-5",
-        ),
+        # hk 1788 (hk 1786 phase 0): sonnet@max left GRADE_TABLE again — it is an
+        # E6 measurement rung once more (E6_ARM_RUNGS), carrier grade A+ so the
+        # canon push keeps the sonnet ladder monotonic. Phase 2 places it at the
+        # measured grade.
     ],
     "A+": [
         Profile(
@@ -1219,6 +1210,27 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             estimate_reason=UPSTAGE_SOLAR4_ESTIMATE_REASON,
             placement_note=UPSTAGE_SOLAR4_PLACEMENT_NOTE,
         ),
+        # hk 1788 (hk 1786 phase 0, b953-hk1786): sonnet@high promoted B -> A —
+        # the propose report grades it rule 1.2 on 8 clean A passes and 0 FAIL
+        # (hk:doc/reports/b953/hk1786-propose-sonnet-high, action promote,
+        # target A). Score stays the vendor TB4 estimate 43.0; the
+        # launch.ARM_GRADE_OVERRIDES entry stamps the new decision provenance
+        # so a full seed push cannot revert it. The B placement it replaces
+        # was the #1297 apply (hk:task/1297, evidence kept inside the
+        # annotation).
+        Profile(
+            "sonnet",
+            "Sonnet 5.5 (high)",
+            43.0,
+            launcher_effort="high",
+            benchmark_effort="high",
+            benchmark_annotation=SONNET_5_5_HIGH_GRADE_ANNOTATION,
+            # #1305: measured row — the displayed reason is the decision
+            # evidence, not the estimated-rung sentence (that sentence still
+            # covers the xhigh/medium rungs above/below).
+            estimate_reason=SONNET_5_5_HIGH_GRADE_ANNOTATION,
+            aa_model_id="claude-sonnet-5-5",
+        ),
     ],
     "B": [
         # ROB-1201: measured Luna medium (42) belongs to B (40–47).
@@ -1303,28 +1315,8 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
         # measured-grade provenance exists for either rung.
         _devin_fusion_sol61_profile("devin-fusion-sol61", "high"),
         _devin_fusion_sol61_profile("devin-fusion-sol61-xhigh", "xhigh"),
-        # #1297 — operator 2026-10-08 via operator-desk, hk:task/1297:
-        # sonnet@high promoted C -> B on the served canon (evidence reps
-        # srv:1224·1228·1230·1238·1248·1288·1291·1298·1343·1357); this row
-        # makes the placement canon agree so a full seed push cannot revert
-        # the decision. Score stays the vendor TB4 estimate 43.0 — the
-        # launch.ARM_GRADE_OVERRIDES entry stamps the decision provenance on
-        # the bundled catalog row exactly as #781/#787 did for swe2-medium.
-        # oc-solar4 left this bucket for A on the same-day hk:task/1296
-        # decision (see the A bucket).
-        Profile(
-            "sonnet",
-            "Sonnet 5.5 (high)",
-            43.0,
-            launcher_effort="high",
-            benchmark_effort="high",
-            benchmark_annotation=SONNET_5_5_HIGH_GRADE_ANNOTATION,
-            # #1305: measured B row — the displayed reason is the decision
-            # evidence, not the estimated-rung sentence (that sentence still
-            # covers the max/xhigh/medium rungs above/below).
-            estimate_reason=SONNET_5_5_HIGH_GRADE_ANNOTATION,
-            aa_model_id="claude-sonnet-5-5",
-        ),
+        # hk 1788: sonnet@high left this bucket for A — the b953-hk1786
+        # promote (8 clean A passes, 0 FAIL). See the A bucket.
     ],
     "C": [
         # ROB-591: codex-luna low stays on the pre-refresh gpt-5.6-luna baseline —
@@ -1400,30 +1392,9 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             placement_note=HAIKU_5_5_PLACEMENT_NOTE,
             aa_model_id="claude-haiku-5-5",
         ),
-        Profile(
-            "haiku",
-            "Claude Haiku 5.5 (xhigh)",
-            31.5,
-            launcher_effort="xhigh",
-            benchmark_effort="xhigh",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
-            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
-            aa_model_id="claude-haiku-5-5",
-        ),
-        # #1269 (10-08 operator decision, option A): haiku@max 도 다른 네 런그와
-        # 같은 평범한 C 행 — 게이트를 두지 않는다.
-        Profile(
-            "haiku",
-            "Claude Haiku 5.5 (max)",
-            39.2,
-            launcher_effort="max",
-            benchmark_effort="max",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_ANNOTATION,
-            estimate_reason=HAIKU_5_5_ESTIMATE_REASON,
-            placement_note=HAIKU_5_5_PLACEMENT_NOTE,
-            aa_model_id="claude-haiku-5-5",
-        ),
+        # hk 1788 (hk 1786 phase 0): haiku@xhigh and haiku@max left GRADE_TABLE
+        # for E6_ARM_RUNGS — C-carrier measurement rows (haiku@low is C, so the
+        # ladder stays monotonic). Phase 2 places them at the measured grade.
         Profile(
             "oc-qwen37-max",
             "qwen3.7-max",
@@ -1524,6 +1495,17 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
 # inert. ``launch.e6_arm_entries()`` turns this table into catalog rows;
 # ``bench.catalog_snapshot()`` merges them into the catalog view.
 E6_ARM_GRADE: Grade = "C"
+# hk 1788 (hk 1786 phase 0): the per-row carrier grade. An E6 row is pushed at
+# the weakest grade that keeps that profile's effort ladder monotonic —
+# handoffkeep checkBenchCatalogMonotonicity refuses a higher effort below any
+# lower one, with no E6 exemption — so the carrier is the strongest grade
+# among the profile's lower-effort rows. sonnet@max must carry A+ (sonnet@xhigh
+# is A+); the other rungs' ladders all sit at C below them. Everywhere a check
+# asks "is this row an unmeasured arm" the answer is the row's OWN carrier —
+# a canon row at its carrier is never a candidate; moved off it, ordinary.
+E6_ARM_CARRIER_GRADES: dict[tuple[str, str], Grade] = {
+    ("sonnet", "max"): "A+",
+}
 E6_ARM_ANNOTATION = "미측정(#594 E6 측정 런그 · 급 비상속 · SCOPEFUEL_E6_ARM 표식 필요)"
 # The rung the spawner declares: ``SCOPEFUEL_E6_ARM=<profile>@<effort>``.
 E6_ARM_MARKER_ENV = "SCOPEFUEL_E6_ARM"
@@ -1599,11 +1581,59 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
     # the E6 table — the served canon places them at A / A+ / A+, and measured
     # rungs are ordinary GRADE_TABLE placements now (the #920 sonnet@max
     # graduation shape).
+    # hk 1788 (hk 1786 phase 0, hk:doc/briefs/b953/tier-coverage): four new
+    # measurement rungs. sonnet@max carries A+ (E6_ARM_CARRIER_GRADES —
+    # sonnet@xhigh sits A+, so a C carrier would be refused non-monotonic);
+    # the other three carry C. sonnet@max was the #920 S placement; the
+    # estimate is unmeasured, so phase 0 takes it back to an arm rung pending
+    # real reps.
+    _e6_arm_profile(
+        "codex-sol",
+        "GPT-6.1 Sol (low)",
+        "low",
+        "gpt-6.1-sol AA-model intelligence high 42.8(low 미저장)",
+        aa_agent_model_id="gpt-6.1-sol",
+        aa_model_id="gpt-6-1-sol",
+    ),
+    _e6_arm_profile(
+        "haiku",
+        "Claude Haiku 5.5 (xhigh)",
+        "xhigh",
+        "claude-haiku-5-5 AA-agent 미발표 — 벤더 TB4 xhigh 31.5",
+        aa_model_id="claude-haiku-5-5",
+    ),
+    _e6_arm_profile(
+        "haiku",
+        "Claude Haiku 5.5 (max)",
+        "max",
+        "claude-haiku-5-5 AA-agent 미발표 — 벤더 TB4 max 39.2",
+        aa_model_id="claude-haiku-5-5",
+    ),
+    _e6_arm_profile(
+        "sonnet",
+        "Sonnet 5.5 (max)",
+        "max",
+        "claude-sonnet-5-5 AA-agent 미발표 — 벤더 TB4 max 70.6",
+        aa_model_id="claude-sonnet-5-5",
+    ),
 )
 
 E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
     (row.name, row.launcher_effort or "") for row in E6_ARM_RUNGS
 )
+
+
+def e6_arm_carrier_grade(profile: str, effort: str | None) -> Grade:
+    """The carrier grade one E6 rung is pushed at (#1788).
+
+    C unless the profile's lower-effort ladder already sits higher — the
+    canon refuses a rung below a lower effort with no E6 exemption
+    (sonnet@xhigh is A+, so sonnet@max must carry A+). Every check that asks
+    "is this row an unmeasured arm" compares the row's grade against THIS
+    value, never the bare E6_ARM_GRADE constant.
+    """
+
+    return E6_ARM_CARRIER_GRADES.get((profile, effort or ""), E6_ARM_GRADE)
 
 
 def normalize_effort(effort: str | None) -> str | None:
@@ -1686,9 +1716,14 @@ def e6_arm_matches(marker: E6ArmRequest | None, profile: str, effort: str | None
 
 
 def e6_arm_tag(rung: str) -> str:
-    """The visible admission marker the gate prints on its allow line."""
+    """The visible admission marker the gate prints on its allow line.
 
-    return f"[E6 arm, unmeasured C: {rung}]"
+    The tag names the rung's carrier grade — "unmeasured C" for every rung
+    whose ladder sits at C, "unmeasured A+" for sonnet@max (#1788 carrier)."""
+
+    profile, _, effort = rung.partition("@")
+    carrier = e6_arm_carrier_grade(profile, effort)
+    return f"[E6 arm, unmeasured {carrier}: {rung}]"
 
 
 def _e6_arm_suffix(e6_arm: str | None) -> str:
@@ -3872,11 +3907,12 @@ def gate_check(
     # 그 런그를 배치로 판정한다(escalation 대안 거부 생략). 표식으로만 골라진
     # 런그는 해당하지 않는다 — ambient env 는 새어 나간 문맥을 넓히지 못한다.
     explicit_rung = normalize_effort(effort) is not None and rung_row is not None
-    # 캐논이 그 런그를 C 밖으로 배치했으면 E6 제한은 없다 — 제한은 "미측정 C" 동안만
-    # 유효하다(측정이 끝난 런그는 평범한 런그다).
+    # 캐논이 그 런그를 그 런그의 carrier 급 밖으로 배치했으면 E6 제한은 없다 —
+    # 제한은 "미측정" 동안만 유효하다(측정이 끝난 런그는 평범한 런그다). 비교는
+    # 런그 자체의 carrier 에 대해 한다 — sonnet@max 는 A+ 가 carrier 다(#1788).
     e6_row = (
         None
-        if rung_row is not None and rung_row[0] != E6_ARM_GRADE
+        if rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung)
         else e6_arm_rung_for(canonical_profile, rung)
     )
     e6_admitted: str | None = None
@@ -3888,11 +3924,11 @@ def gate_check(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
-                grade=E6_ARM_GRADE,
+                grade=e6_arm_carrier_grade(canonical_profile, rung),
                 reason=f"profile '{profile_name}' rung '{rung}' is retired in the catalog",
                 e6_arm=f"{canonical_profile}@{rung}",
             )
-        # C 급 E6 측정 런그는 배치가 아니다 — 표식이 정확히 이 런그를 가리킬 때만
+        # 미측정 E6 측정 런그는 배치가 아니다 — 표식이 정확히 이 런그를 가리킬 때만
         # 열린다. 없으면 런그 이름을 댄 사유로 거부한다(쿼타 판정 이전 — 배치 자체가
         # 없는 런그를 쿼타로 판정하면 "쿼타 소진"으로 오독된다).
         if not e6_arm_matches(e6_marker, canonical_profile, rung):
@@ -3900,7 +3936,7 @@ def gate_check(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
-                grade=E6_ARM_GRADE,
+                grade=e6_arm_carrier_grade(canonical_profile, rung),
                 reason=(
                     f"e6_arm_required: {canonical_profile}@{rung} 은 미측정 E6 측정 런그다 "
                     f"(#594) — SCOPEFUEL_E6_ARM={canonical_profile}@{rung} 표식이 있어야 연다"
@@ -3911,10 +3947,10 @@ def gate_check(
 
     found = _find_profile(profile_name, grade_table=table)
     if e6_admitted is not None:
-        # 열린 런그의 급은 C 다 — 프로필 기본 배치(A+ 등)를 보고하면 감사 기록이
-        # 실제 측정 런그보다 높은 급을 주장하게 된다.
+        # 열린 런그의 급은 그 런그의 carrier 다 — 프로필 기본 배치(A+ 등)를
+        # 보고하면 감사 기록이 실제 측정 런그와 다른 급을 주장하게 된다.
         assert e6_row is not None
-        found = (E6_ARM_GRADE, e6_row)
+        found = (e6_arm_carrier_grade(canonical_profile, rung), e6_row)
     elif rung_row is not None:
         # #692: 판정 대상은 요청한 런그의 행이다. 프로필의 최선 배치가 아니다 —
         # `gate -m opus --effort low` 는 low 런그의 판정이다. 표가 모르는 런그는

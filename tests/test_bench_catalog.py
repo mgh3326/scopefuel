@@ -425,7 +425,8 @@ def test_sol61_switch_snapshot_and_seed_carry_gpt61(capsys):
     carries gpt-6.1-sol — grades, scores, gates and efforts unchanged.
     kiro-sol stays on gpt-5.6-sol."""
     snapshot = {entry.effort: entry for entry in bench.catalog_snapshot() if entry.profile == "codex-sol"}
-    assert set(snapshot) == {"max", "xhigh", "high", "medium"}
+    # hk 1788: codex-sol@low joins as an E6 arm row (carrier C, no score).
+    assert set(snapshot) == {"max", "xhigh", "high", "medium", "low"}
     for entry in snapshot.values():
         assert entry.model_id == "gpt-6.1-sol"
     placements = {effort: (row.grade, row.score, row.gate) for effort, row in snapshot.items()}
@@ -434,11 +435,12 @@ def test_sol61_switch_snapshot_and_seed_carry_gpt61(capsys):
         "xhigh": ("S+", 65.0, "escalation"),
         "high": ("C", None, "default"),
         "medium": ("C", None, "default"),
+        "low": ("C", None, "default"),
     }, "the switch changes no grade"
 
     assert cli.main(["bench", "push-catalog", "--emit-seed", "--decided-by", "operator-desk"]) == 0
     seed = {(row["profile"], row["effort"]): row for row in json.loads(capsys.readouterr().out)["catalog"]}
-    for effort in ("max", "xhigh", "high", "medium"):
+    for effort in ("max", "xhigh", "high", "medium", "low"):
         assert seed[("codex-sol", effort)]["model_id"] == "gpt-6.1-sol"
     assert seed[("kiro-sol", "")]["model_id"] == "gpt-5.6-sol"
 
@@ -1280,7 +1282,7 @@ def test_a_one_row_catalog_against_a_full_cache_is_still_rejected(catalog_server
     view = bench.read_catalog()
     assert view.source == "cache"
     assert view.detail == "server catalog rejected: 1 row, missing 38 snapshot profiles"
-    assert _cached_catalog_count() == 66
+    assert _cached_catalog_count() == 67
 
 
 def test_no_cache_keeps_the_bundle_floor(catalog_server):
