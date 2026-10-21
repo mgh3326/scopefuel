@@ -287,8 +287,10 @@ arbiter의 `quota_pool` 행은 예약이 아니라 **기록**입니다. hk 1767�
 - **비활성 계약**: 키가 없거나 모든 값이 0이면 arbiter 호출·hk 요청·게시가 전부 0이고 출력은
   base와 바이트 단위로 동일합니다.
 - **로컬 집합**: `arbiter status --json`(`ARBITER_BIN` → PATH 순서, 5초 상한)의
-  `quota_pool_records`에서 판정 풀의 행만 셉니다. release된 행은 테이블에 없으므로 세지
-  않고, 지금 판정 중인 잡은 아직 레코드가 없어 자기 자신을 세지 않습니다.
+  `quota_pool_records`에서 판정 풀의 행만 셉니다. 로컬 행도 원격 문서와 같은 8시간
+  (`INFLIGHT_MAX_AGE_S`) 나이 규칙을 따릅니다 — release되지 않은 채 남는 arbiter 행이
+  합계를 영구히 부풀리지 않도록(hk 1797). 지금 판정 중인 잡은 아직 레코드가 없어
+  자기 자신을 세지 않습니다.
 - **타 호스트 집계**: 로컬 집합을 읽은 게이트는 `quota/<pool>/<account_fp>/inflight/<host>`에
   자기 live 목록을 게시합니다(비어 있어도 게시 — release가 다음 게이트에서 지워지게).
   읽을 때는 자기 호스트 문서를 빼고, 고정 스키마·pool/account_fp 일치·`published_at`이

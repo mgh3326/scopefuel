@@ -10,7 +10,11 @@ missing sum: local live records plus cross-host published sets, keyed by
 
 - Local set: ``arbiter status --json`` (the binary resolves from
   ``ARBITER_BIN`` — the name wrk uses — then ``arbiter`` on PATH). The arbiter
-  opens its own DB read-only; this module never opens ``state.db``.
+  opens its own DB read-only; this module never opens ``state.db``. Rows keep
+  the same age rule as remote docs — ``started_at`` must parse
+  (``_parse_ts``) and sit within ``INFLIGHT_MAX_AGE_S`` of now — because
+  unreleased arbiter rows otherwise count forever (hk 1797: ~100 stale rows
+  per pool on measured hosts).
 - Publish: after a gate read a local set for a pool with a known account_fp,
   the host's live list goes up under its own key — even when empty, so a
   release clears the entry at the host's next gate run. Same transport,
@@ -73,13 +77,17 @@ def _run_arbiter(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, timeout=ARBITER_TIMEOUT_S)
 
 
-def local_jobs(pool: str) -> list[dict] | None:
+def local_jobs(pool: str, *, now: float | None = None) -> LocalRead | None:
     """Live ``quota_pool_records`` rows for ``pool``, or None when unreadable.
 
-    A released row is gone from the table, so every surviving row counts. The
-    job being gated has no record yet, so it never counts itself. Any failure
-    — missing binary, timeout, non-zero rc, unreadable JSON — folds to None:
-    the caller degrades to the base decision and tags the count unknown.
+    A surviving row counts only when its ``started_at`` parses (``_parse_ts``)
+    and is within ``INFLIGHT_MAX_AGE_S`` of now — the same comparison as the
+    remote filter, since unreleased arbiter rows stay in the table. Filtered
+    rows are not counted and not published; ``show`` reports them with their
+    reason. The job being gated has no record yet, so it never counts itself.
+    Any failure — missing binary, timeout, non-zero rc, unreadable JSON —
+    folds to None: the caller degrades to the base decision and tags the
+    count unknown.
     """
     binary = _arbiter_bin()
     if binary is None:
@@ -99,7 +107,11 @@ def local_jobs(pool: str) -> list[dict] | None:
     rows = doc.get("quota_pool_records")
     if not isinstance(rows, list):
         return None
+    epoch = (
+        now if isinstance(now, (int, float)) and math.isfinite(now) else dt.datetime.now(dt.UTC).timestamp()
+    )
     jobs: list[dict] = []
+    dropped: list[JobView] = []
     for row in rows:
         if not isinstance(row, dict) or row.get("pool") != pool:
             continue
@@ -107,8 +119,14 @@ def local_jobs(pool: str) -> list[dict] | None:
         if not isinstance(job_id, str) or not job_id:
             continue
         started_at = row.get("started_at")
-        jobs.append({"job_id": job_id, "started_at": started_at if isinstance(started_at, str) else None})
-    return jobs
+        started = _parse_ts(started_at)
+        if started is None:
+            dropped.append(JobView(job_id, False, "invalid_started_at"))
+        elif abs(epoch - started.timestamp()) > INFLIGHT_MAX_AGE_S:
+            dropped.append(JobView(job_id, False, "aged"))
+        else:
+            jobs.append({"job_id": job_id, "started_at": started_at})
+    return LocalRead(jobs=jobs, dropped=dropped)
 
 
 def doc_key(pool: str, account_fp: str, host: str) -> str:
@@ -201,6 +219,18 @@ class JobView:
     job_id: str
     counted: bool
     reason: str = ""
+
+
+@dataclass
+class LocalRead:
+    """One local arbiter read — kept rows plus the filtered rows with reasons."""
+
+    jobs: list[dict]
+    dropped: list[JobView] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.jobs)
 
 
 @dataclass
@@ -346,14 +376,15 @@ def show(pool: str, *, now: float | None = None) -> dict:
     """Read-only observation for ``scopefuel inflight show``. Never publishes.
 
     Lists every inflight doc under ``quota/<pool>/`` and reports the local
-    set plus, per account_fp, each doc's counted and dropped jobs and the
-    resulting n = local live + counted remote jobs.
+    set — kept rows plus the age-filtered rows with their reasons — and, per
+    account_fp, each doc's counted and dropped jobs and the resulting
+    n = local live + counted remote jobs.
     """
     host = _local_host()
     epoch = (
         now if isinstance(now, (int, float)) and math.isfinite(now) else dt.datetime.now(dt.UTC).timestamp()
     )
-    local = local_jobs(pool)
+    local = local_jobs(pool, now=epoch)
     prefix = f"quota/{pool}/"
     payload = _request("GET", f"?{urllib.parse.urlencode({'prefix': prefix, 'limit': LIST_LIMIT})}")
     documents = payload.get("documents") if isinstance(payload, dict) else None
@@ -385,7 +416,7 @@ def show(pool: str, *, now: float | None = None) -> dict:
                     elif job.counted:
                         counted_ids.add(job.job_id)
             views.append(view)
-        local_n = len(local) if local is not None else 0
+        local_n = local.count if local is not None else 0
         report_accounts.append(
             {
                 "account_fp": fp,
@@ -397,7 +428,8 @@ def show(pool: str, *, now: float | None = None) -> dict:
     return {
         "pool": pool,
         "host": host,
-        "local": local,
+        "local": local.jobs if local is not None else None,
+        "local_dropped": local.dropped if local is not None else None,
         "accounts": report_accounts,
         "listed": isinstance(documents, list),
     }

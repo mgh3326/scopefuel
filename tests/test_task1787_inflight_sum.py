@@ -140,6 +140,11 @@ def _row(job_id: str, pool: str = "codex", hours_ago: float = 1.0, profile: str 
     }
 
 
+def _live_row(job_id: str, pool: str = "codex") -> dict:
+    """A row stamped on the real clock — for CLI paths that take no ``now``."""
+    return {**_row(job_id, pool=pool), "started_at": dt.datetime.now(dt.UTC).isoformat()}
+
+
 def _doc(host: str, jobs: list[dict], *, pool: str = "codex", fp: str = FP, skew_s: float = 0.0) -> dict:
     payload = {
         "schema": inflight.SCHEMA,
@@ -583,7 +588,7 @@ def test_warning_order_after_unknown_plan(monkeypatch, capsys):
 
 def test_inflight_show_is_read_only(monkeypatch, capsys):
     _host(monkeypatch, "mbp")
-    _spy_arbiter(monkeypatch, rows=[_row("a")])
+    _spy_arbiter(monkeypatch, rows=[_live_row("a")])
     hk = _enable_hk(monkeypatch)
     live = dt.datetime.now(dt.UTC)
     fresh = {"job_id": "j1", "started_at": (live - dt.timedelta(hours=1)).isoformat()}
@@ -648,7 +653,9 @@ def test_inflight_show_json(monkeypatch, capsys):
 
 def test_local_jobs_parses_rows(monkeypatch):
     _spy_arbiter(monkeypatch, rows=[_row("a"), _row("b", pool="devin")])
-    assert inflight.local_jobs("codex") == [{"job_id": "a", "started_at": _row("a")["started_at"]}]
+    read = inflight.local_jobs("codex", now=EPOCH)
+    assert read is not None and read.dropped == []
+    assert read.jobs == [{"job_id": "a", "started_at": _row("a")["started_at"]}]
 
 
 def test_local_jobs_failures(monkeypatch):
@@ -1067,7 +1074,7 @@ def test_deny_path_warning_order_with_stale(monkeypatch, capsys):
 def test_show_per_account_n_with_working_local(monkeypatch, capsys):
     """Two account_fps with a live arbiter: n is per-fp, not accumulated."""
     _host(monkeypatch, "mbp")
-    _spy_arbiter(monkeypatch, rows=[_row("a")])
+    _spy_arbiter(monkeypatch, rows=[_live_row("a")])
     hk = _enable_hk(monkeypatch)
     live = dt.datetime.now(dt.UTC)
     for fp, host, jobs in (
@@ -1120,7 +1127,7 @@ def test_policy_replace_keeps_sibling_keys(monkeypatch):
 
 def test_gate_output_record_carries_inflight(monkeypatch, tmp_path):
     _host(monkeypatch)
-    _spy_arbiter(monkeypatch, rows=[_row("a")])
+    _spy_arbiter(monkeypatch, rows=[_live_row("a")])
     _enable_hk(monkeypatch)
     policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
     out_file = tmp_path / "gate.json"
