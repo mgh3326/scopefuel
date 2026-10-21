@@ -1039,6 +1039,7 @@ def _inflight_command(args: argparse.Namespace) -> int:
             for account in report["accounts"]
         ]
         local = report["local"]
+        local_dropped = report["local_dropped"]
         print(
             json.dumps(
                 {
@@ -1047,6 +1048,14 @@ def _inflight_command(args: argparse.Namespace) -> int:
                     "host": report["host"],
                     "local": local,
                     "local_count": len(local) if local is not None else None,
+                    "local_dropped": (
+                        [
+                            {"job_id": job.job_id, "counted": job.counted, "reason": job.reason}
+                            for job in local_dropped
+                        ]
+                        if local_dropped is not None
+                        else None
+                    ),
                     "listed": report["listed"],
                     "accounts": accounts,
                 },
@@ -1061,9 +1070,13 @@ def _inflight_command(args: argparse.Namespace) -> int:
     if local is None:
         print("local: unavailable (arbiter status failed)")
     else:
-        print(f"local: {len(local)} live job(s)")
+        dropped = report["local_dropped"]
+        suffix = f" ({len(dropped)} dropped)" if dropped else ""
+        print(f"local: {len(local)} live job(s){suffix}")
         for job in local:
             print(f"  {job['job_id']} started_at={job.get('started_at')}")
+        for job in dropped:
+            print(f"  {job.job_id} dropped: {job.reason}")
     if not report["listed"]:
         print("remote: unavailable (hk list failed)")
     elif not report["accounts"]:

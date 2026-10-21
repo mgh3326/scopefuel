@@ -3673,7 +3673,7 @@ def _inflight_gate(
     reserves, status = get_inflight_reserve(provider_id)
     if not reserves:
         return None
-    local = inflight.local_jobs(provider_id)
+    local = inflight.local_jobs(provider_id, now=now.timestamp())
     if local is None:
         return _InflightGate(
             reserves,
@@ -3689,7 +3689,7 @@ def _inflight_gate(
         account_fp = inflight.account_fingerprint(result)
     host = inflight._local_host()
     if account_fp is not None:
-        inflight.publish_jobs(provider_id, account_fp, local, host=host, now=now.timestamp())
+        inflight.publish_jobs(provider_id, account_fp, local.jobs, host=host, now=now.timestamp())
     if account_fp is None:
         detail = "account fingerprint unknown"
         remote = None
@@ -3699,13 +3699,13 @@ def _inflight_gate(
     if remote is None:
         return _InflightGate(
             reserves,
-            len(local),
+            len(local.jobs),
             "inflight=unknown(remote)",
             f"{provider_id} in-flight remote count unavailable ({detail}); "
-            f"local n={len(local)} still applied (hk 1787)",
+            f"local n={len(local.jobs)} still applied (hk 1787)",
             status,
         )
-    n = len(local) + remote.count
+    n = len(local.jobs) + remote.count
     return _InflightGate(reserves, n, f"inflight={n}", None, status)
 
 
