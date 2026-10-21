@@ -265,7 +265,60 @@ scopefuel policy list                               # 풀 행의 [unsubscribed] 
   (제안·보류·런그 상세 줄에 `[unsubscribed]` 태그만 추가). 플래그는 이력을 지우거나
   평가를 건너뛰지 않습니다 — 되돌리면 끊기지 않은 기록으로 이어집니다.
 
-### one-up 행 — reps 실측 배치가 한 급 위일 때 (task #1318 part 2)
+### in-flight 예약 — 공유 쿼타 풀의 진행 중 잡 합산 (hk 1787)
+
+arbiter의 `quota_pool` 행은 예약이 아니라 **기록**입니다. hk 1767에서 게이트가 스냅샷 한
+장과 프로필 하나만 보고 codex 잡 3개를 연달아 통과시켰고, 그 셋이 약 42분 동안 겹쳐 돌았습니다.
+같은 계정을 쓰는 호스트는 각자 자기 arbiter `state.db`를 갖기 때문에, 로컬 카운트만으로는 다른
+호스트에서 도는 잡을 볼 수 없습니다. 합산은 **account_fp 단위, 호스트 횡단**입니다.
+
+```toml
+[pools.codex.inflight_reserve_pct]
+5h = 12    # in-flight 잡 1개당 5h 창에 12%p 예약
+7d = 2
+```
+
+- **판정 규칙**: `[pools.<pool>] inflight_reserve_pct`가 설정돼 있으면 게이트는
+  n = (로컬 arbiter live 레코드 수) + (같은 account_fp 아래 타 호스트의 집계 잡 수)를 구하고,
+  예약이 걸린 필수 창 w마다 `used_pct(w)` 대신 `used_pct(w) + reserve(w) * n`으로 cutoff를
+  비교합니다. 보정값이 cutoff를 넘고 원값이 넘지 않으면 rc 3으로 거부합니다:
+  `codex inflight_headroom window=5h used=41 n=3 reserve=12 cutoff=90`. 예약이 없는 창은
+  기존 비교 그대로입니다. 값을 잘못 쓰면(비수치·음수·범위 밖) 그 창만 미설정으로 폴백합니다.
+- **비활성 계약**: 키가 없거나 모든 값이 0이면 arbiter 호출·hk 요청·게시가 전부 0이고 출력은
+  base와 바이트 단위로 동일합니다.
+- **로컬 집합**: `arbiter status --json`(`ARBITER_BIN` → PATH 순서, 5초 상한)의
+  `quota_pool_records`에서 판정 풀의 행만 셉니다. 로컬 행도 원격 문서와 같은 8시간
+  (`INFLIGHT_MAX_AGE_S`) 나이 규칙을 따릅니다 — release되지 않은 채 남는 arbiter 행이
+  합계를 영구히 부풀리지 않도록(hk 1797). 지금 판정 중인 잡은 아직 레코드가 없어
+  자기 자신을 세지 않습니다.
+- **타 호스트 집계**: 로컬 집합을 읽은 게이트는 `quota/<pool>/<account_fp>/inflight/<host>`에
+  자기 live 목록을 게시합니다(비어 있어도 게시 — release가 다음 게이트에서 지워지게).
+  읽을 때는 자기 호스트 문서를 빼고, 고정 스키마·pool/account_fp 일치·`published_at`이
+  `MAX_FUTURE_SKEW_S`(60s) 이내 미래·각 잡의 `started_at`이 `INFLIGHT_MAX_AGE_S`(8h) 이내인
+  잡만 세며, 잡 id는 문서 간 중복 제거합니다. 문서 자체의 나이로는 버리지 않습니다 —
+  release 후 게이트를 안 돌린 호스트는 그 잡을 계속 세게 두는 쪽(과대계산)이 안전하기 때문입니다.
+- **fail-open 태그**: 로컬 읽기나 원격 목록이 실패하면(arbiter 없음·타임아웃·JSON
+  깨짐·hk 불통) 판정은 측정된 값 그대로입니다. 사유에 `inflight=unknown(local)` 또는
+  `inflight=unknown(remote)`을 붙이고, 결정 줄 뒤 hk 1769 unknown-plan 경고 다음 위치에
+  경고 한 줄을 인쇄합니다. 카운트가 미확정이라는 이유만으로 거부하지 않으며, 부분 결과
+  (로컬 성공·원격 실패)는 로컬 n을 그대로 적용합니다. 통과 사유에는 `inflight=N`만 붙습니다.
+- **관측 명령**: `scopefuel inflight show --pool P`가 로컬 집합과 각 원격 문서
+  (호스트·published_at·counted/dropped 잡과 사유), account_fp별 n을 보여줍니다.
+  읽기 전용 — 절대 게시하지 않습니다.
+- **활성화**: 설정은 unset으로 배포됩니다. 켜는 명령은
+  `scopefuel policy set codex --inflight-reserve 5h=12 --inflight-reserve 7d=2`
+  (`none`으로 테이블 전체 제거)입니다.
+
+알려진 한계(수정하지 않음):
+
+- 두 호스트가 같은 순간 게이트를 돌리면 둘 다 통과할 수 있습니다 — 예약이 아니라 합산이므로.
+- `quota_pool` 레코드가 release됐는데 pane이 살아 있는 잡은 세지 않습니다. hk 1767이 본
+  sentinel lost-grace 경로의 release가 그 경우이며, hk 1770이 그 경로를 좁혔지만 없애지는
+  않았습니다.
+- m1의 prolite는 account_fp가 다르므로 자기만의 합계를 갖습니다 — 한계가 아니라 의도된
+  분리입니다.
+
+
 
 `--recommend G`는 G 행만이 아니라, **reps 실측으로 정확히 한 급 위(G 바로 위)에 배치된
 행**도 함께 나열합니다. 급의 근거가 측정된 reps(또는 reps 근거의 운영자 급 결정)인
