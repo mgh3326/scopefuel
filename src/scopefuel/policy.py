@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import datetime as dt
+import math
 import os
 import pathlib
 import re
@@ -450,6 +451,10 @@ def _toml_value(value: object) -> str:
         return _toml_string(value)
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ConfigEditError(f"cannot serialize non-finite {value!r} as TOML")
+        return repr(value)
     if isinstance(value, dt.date):
         return value.isoformat()
     raise ConfigEditError(f"cannot serialize {value!r} as TOML")
@@ -904,6 +909,7 @@ def set_policy(
     boost: int | None | Literal["__unset__"] = "__unset__",
     subscribed: bool | None | Literal["__unset__"] = "__unset__",
     fusion_billing_fp: str | None | Literal["__unset__"] = "__unset__",
+    inflight_reserve_pct: dict[str, float] | None | Literal["__unset__"] = "__unset__",
 ) -> None:
     """Set pool class and/or numeric boost and/or the subscribed flag.
 
@@ -917,9 +923,12 @@ def set_policy(
     merged into the same locked edit so a combined ``policy set`` applies as
     one atomic transaction (#751 B3). ``fusion_billing_fp`` (hk 1753, b953)
     follows it too: ``str`` writes the declared Fusion GPT billing-account
-    fingerprint, ``None`` removes just that key. ``plan``/``price_usd``/
-    ``capacity_weight`` are read-only from this module's perspective — they
-    are config.toml-only fields with no CLI setter (operator-edited).
+    fingerprint, ``None`` removes just that key. ``inflight_reserve_pct``
+    (hk 1787) follows it as well: a ``{window: pct}`` dict replaces the whole
+    sub-table (set to all ``0`` to keep it configured-but-inactive), ``None``
+    removes just that key. ``plan``/``price_usd``/``capacity_weight`` are
+    read-only from this module's perspective — they are config.toml-only
+    fields with no CLI setter (operator-edited).
     """
     if pool_class is not None and until is None:
         raise ValueError("until(만료일)은 필수입니다")
@@ -947,6 +956,18 @@ def set_policy(
             if not _FUSION_BILLING_FP_RE.fullmatch(fusion_billing_fp):
                 raise ValueError(f"fusion_billing_fp 는 지문 문자열만 받습니다: {fusion_billing_fp!r}")
             ops["fusion_billing_fp"] = fusion_billing_fp
+    if inflight_reserve_pct != "__unset__":
+        if inflight_reserve_pct is None:
+            ops["inflight_reserve_pct"] = _DELETE
+        else:
+            for window, pct in inflight_reserve_pct.items():
+                if not isinstance(window, str) or not window or not _BARE_KEY_RE.fullmatch(window):
+                    raise ValueError(f"inflight_reserve_pct 의 창 라벨이 잘못됐습니다: {window!r}")
+                if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+                    raise ValueError(f"inflight_reserve_pct 는 0~100 사이 수치만 받습니다: {window}={pct!r}")
+                if not _finite(float(pct)) or not 0.0 <= float(pct) <= 100.0:
+                    raise ValueError(f"inflight_reserve_pct 는 0~100 사이 수치만 받습니다: {window}={pct!r}")
+            ops["inflight_reserve_pct"] = {w: float(p) for w, p in inflight_reserve_pct.items()}
     if not ops:
         return
     base = ("pools", pool)
@@ -954,7 +975,16 @@ def set_policy(
     def edit(doc: _Doc):
         for key, value in ops.items():
             if value is _DELETE:
+                # a sub-table (inflight_reserve_pct) needs region deletion —
+                # remove_key only covers the inline ``key = {...}`` form.
                 doc.remove_key(base + (key,))
+                doc.delete_table(base + (key,))
+            elif isinstance(value, dict):
+                # replace semantics for the window→pct sub-table: drop the old
+                # region so a removed window cannot survive under new values.
+                doc.delete_table(base + (key,))
+                for window, pct in sorted(value.items()):
+                    doc.set_value(base + (key, window), pct)
             else:
                 doc.set_value(base + (key,), value)
         # semantic expectation: same result the old dict-level write produced
@@ -1143,6 +1173,42 @@ def get_cutoff(pool: str, default: float) -> tuple[float, str | None]:
     if not _finite(value) or not 0.0 <= value <= 100.0:
         return default, f"invalid cutoff {raw!r} (기본값 {default:g}%로 폴백)"
     return value, None
+
+
+def get_inflight_reserve(pool: str) -> tuple[dict[str, float], str | None]:
+    """``[pools.<p>] inflight_reserve_pct`` — 창 라벨 → 잡당 예약 %(hk 1787).
+
+    게이트가 판정할 때 ``used_pct(w) + reserve(w) * n`` 을 cutoff 와 비교하는
+    창별 예약 테이블이다. ``get_cutoff`` 와 같은 검증 관례다 — 비수치·bool·
+    범위(0~100) 밖·음수·NaN/inf 값은 그 창만 폴백(unset)하고 status 로
+    노출한다. 테이블 자체가 dict 가 아니면 전체를 unset 으로 본다. 결과에
+    양수가 하나도 없으면(미설정·전부 0·전부 무효) 빈 dict — 게이트는 이를
+    "기능 꺼짐"으로 읽어 arbiter/hk 호출을 일절 하지 않는다.
+    """
+    entry = _pools_table(load_config()).get(pool)
+    if not isinstance(entry, dict):
+        return {}, None
+    raw = entry.get("inflight_reserve_pct")
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, f"invalid inflight_reserve_pct {raw!r} — 테이블이 아니라 미설정으로 폴백"
+    reserves: dict[str, float] = {}
+    status: str | None = None
+    for window, value in raw.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not _finite(float(value))
+            or not 0.0 <= float(value) <= 100.0
+        ):
+            if status is None:
+                status = f"invalid inflight_reserve_pct {window}={value!r} — 해당 창은 미설정으로 폴백"
+            continue
+        reserves[str(window)] = float(value)
+    if not any(pct > 0.0 for pct in reserves.values()):
+        return {}, status
+    return reserves, status
 
 
 def get_on_exhaust(pool: str) -> tuple[str, str | None]:

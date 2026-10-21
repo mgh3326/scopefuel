@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from . import cache, exhaust, free_window, manual, quota_share
+from . import cache, exhaust, free_window, inflight, manual, quota_share
 from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
@@ -47,6 +47,7 @@ from .policy import (
     get_fusion_billing_fp,
     get_imminent_remaining_pct,
     get_imminent_reset_hours,
+    get_inflight_reserve,
     get_policy,
     get_profile_subscribed,
     get_reset_urgency_hours,
@@ -3071,6 +3072,12 @@ class GateResult:
     # 살아 있는 판정 경로에서만 채운다 — provider error·버킷 없음 경로의 출력은
     # base 와 동일하게 유지된다. CLI 가 결정 출력 뒤에 warning 한 줄로 인쇄한다.
     unknown_plan: str | None = None
+    # hk 1787 — in-flight 예약 감사 필드(additive). ``inflight`` 는 reason 에
+    # 붙은 태그("inflight=N" 또는 "inflight=unknown(local|remote)")이고,
+    # ``inflight_warning`` 은 카운트 미확정 시 CLI 가 unknown-plan 경고 뒤에
+    # 한 줄로 인쇄할 사유다. 설정 미활성이면 둘 다 None — 출력은 base 와 동일.
+    inflight: str | None = None
+    inflight_warning: str | None = None
 
 
 def _find_profile(
@@ -3589,6 +3596,110 @@ def _billing_observe_scope(billing: _BillingGate | None, group_name: str | None)
     return group_name
 
 
+# ── hk 1787 (b953): in-flight reserve for shared quota pools ───────────────
+# The arbiter quota_pool row is a record, not a reservation: hk 1767 saw three
+# codex jobs admitted back-to-back that then overlapped ~42m because each gate
+# run judged one snapshot and never saw the others in flight. With
+# ``[pools.<p>] inflight_reserve_pct`` set, the gate sums live records across
+# hosts (local arbiter + published per-account sets) and judges each reserved
+# window at ``used_pct(w) + reserve(w) * n``. Unset/all-zero: no arbiter call,
+# no hk traffic, byte-identical output.
+
+
+@dataclass(frozen=True)
+class _InflightGate:
+    """One gate run's in-flight probe outcome (None = feature inactive)."""
+
+    reserves: dict[str, float]
+    n: int | None  # counted in-flight jobs; None = count unknown (local read failed)
+    tag: str  # "inflight=N" | "inflight=unknown(local)" | "inflight=unknown(remote)"
+    warning: str | None  # detail for the CLI's one trailing warning line
+    status: str | None  # invalid entries dropped from the config table
+
+    @property
+    def unknown(self) -> bool:
+        return self.tag.startswith("inflight=unknown")
+
+
+def _inflight_gate(
+    provider_id: str,
+    result: ProviderResult | None,
+    billing: _BillingGate | None,
+    now: dt.datetime,
+) -> _InflightGate | None:
+    """Sum live quota_pool records for the judged pool's account, per the config.
+
+    Steps (brief order): read the local arbiter set; publish it when an
+    account_fp is known; list sibling hosts' sets under the same account_fp.
+    Every leg fails open — a failed local read yields ``unknown(local)`` and
+    no count; a failed remote read yields ``unknown(remote)`` and still
+    applies the local n. The count is never a reason to deny by itself.
+    """
+    reserves, status = get_inflight_reserve(provider_id)
+    if not reserves:
+        return None
+    local = inflight.local_jobs(provider_id)
+    if local is None:
+        return _InflightGate(
+            reserves,
+            None,
+            "inflight=unknown(local)",
+            f"{provider_id} in-flight local count unavailable — arbiter status failed; "
+            "judged on measured windows alone (hk 1787)",
+            status,
+        )
+    if billing is not None and billing.declared:
+        account_fp = billing.declared
+    else:
+        account_fp = inflight.account_fingerprint(result)
+    host = inflight._local_host()
+    if account_fp is not None:
+        inflight.publish_jobs(provider_id, account_fp, local, host=host, now=now.timestamp())
+    if account_fp is None:
+        detail = "account fingerprint unknown"
+        remote = None
+    else:
+        remote = inflight.remote_jobs(provider_id, account_fp, host=host, now=now.timestamp())
+        detail = "hk unreachable"
+    if remote is None:
+        return _InflightGate(
+            reserves,
+            len(local),
+            "inflight=unknown(remote)",
+            f"{provider_id} in-flight remote count unavailable ({detail}); "
+            f"local n={len(local)} still applied (hk 1787)",
+            status,
+        )
+    n = len(local) + remote.count
+    return _InflightGate(reserves, n, f"inflight={n}", None, status)
+
+
+def _inflight_headroom(
+    states: list[_WindowState],
+    required: frozenset[str],
+    reserves: dict[str, float],
+    n: int,
+    cutoff: float,
+) -> tuple[str, float, float] | None:
+    """First required window whose reserved sum crosses the cutoff, or None.
+
+    Only windows that carry a reserve are judged at ``used + reserve*n``; a
+    required window without a reserve keeps its plain comparison. Deterministic
+    pick: lowest window label of the crossings.
+    """
+    by_window = {state.window: state for state in states}
+    for window in sorted(required):
+        reserve = reserves.get(window)
+        if reserve is None:
+            continue
+        state = by_window.get(window)
+        if state is None:
+            continue
+        if state.used_pct < cutoff <= state.used_pct + reserve * n:
+            return window, state.used_pct, reserve
+    return None
+
+
 def gate_check(
     providers: list[ProviderResult],
     profile_name: str,
@@ -3989,23 +4100,56 @@ def gate_check(
         notify_status = _observe_exhaustion(
             provider_id, over, cutoff, now, scope=_billing_observe_scope(billing, group_name)
         )
+        in_flight = _inflight_gate(provider_id, result, billing, now)
         if over is not None:
+            deny_reason = (
+                f"{_exhaust_display(over, cutoff)} (class={effective_class})"
+                f"{_exhaust_suffix(cutoff_status, notify_status)}"
+            )
+            if in_flight is not None and in_flight.unknown:
+                deny_reason += f" {in_flight.tag}"
             return GateResult(
                 ok=False,
                 profile=profile_name,
                 provider_id=provider_id,
                 grade=None,
-                reason=(
-                    f"{_exhaust_display(over, cutoff)} (class={effective_class})"
-                    f"{_exhaust_suffix(cutoff_status, notify_status)}"
-                ),
+                reason=deny_reason,
                 used_pct=over.used_pct,
                 pool_class=effective_class,
                 exhaust_notice=notify_status,
                 missing_windows=missing,
                 unknown_plan=unknown_plan,
+                inflight=in_flight.tag if in_flight is not None else None,
+                inflight_warning=in_flight.warning if in_flight is not None else None,
                 **audit,
             )
+        if in_flight is not None and in_flight.n is not None:
+            headroom = _inflight_headroom(
+                states, manual.required_windows_for(result), in_flight.reserves, in_flight.n, cutoff
+            )
+            if headroom is not None:
+                window, plain, reserve = headroom
+                headroom_reason = (
+                    f"{provider_id} inflight_headroom window={window} used={plain:g} "
+                    f"n={in_flight.n} reserve={reserve:g} cutoff={cutoff:g}"
+                )
+                headroom_reason += _missing_windows_tag(missing)
+                if in_flight.status:
+                    headroom_reason += f" ({in_flight.status})"
+                return GateResult(
+                    ok=False,
+                    profile=profile_name,
+                    provider_id=provider_id,
+                    grade=None,
+                    reason=headroom_reason,
+                    used_pct=plain,
+                    pool_class=effective_class,
+                    missing_windows=missing,
+                    unknown_plan=unknown_plan,
+                    inflight=in_flight.tag,
+                    inflight_warning=in_flight.warning,
+                    **audit,
+                )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
         reason += _exhaust_suffix(cutoff_status, notify_status)
         reason += _missing_windows_tag(missing, "측정된 창으로 판정")
@@ -4018,6 +4162,10 @@ def gate_check(
                 f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
             )
         reason += _e6_arm_suffix(e6_admitted)
+        if in_flight is not None:
+            if in_flight.status:
+                reason += f" ({in_flight.status})"
+            reason += f" {in_flight.tag}"
         return GateResult(
             ok=True,
             profile=profile_name,
@@ -4030,6 +4178,8 @@ def gate_check(
             missing_windows=missing,
             e6_arm=e6_admitted,
             unknown_plan=unknown_plan,
+            inflight=in_flight.tag if in_flight is not None else None,
+            inflight_warning=in_flight.warning if in_flight is not None else None,
             **audit,
         )
 
@@ -4255,25 +4405,68 @@ def gate_check(
     notify_status = _observe_exhaustion(
         provider_id, over, cutoff, now, scope=_billing_observe_scope(billing, group_name)
     )
+    in_flight = _inflight_gate(provider_id, result, billing, now)
     if over is not None:
         alts = alternatives()
+        deny_reason = (
+            f"{_exhaust_display(over, cutoff)} (class={effective_class})"
+            f"{_exhaust_suffix(cutoff_status, notify_status)}{rung_suffix}"
+        )
+        if in_flight is not None and in_flight.unknown:
+            deny_reason += f" {in_flight.tag}"
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
             grade=grade,
-            reason=(
-                f"{_exhaust_display(over, cutoff)} (class={effective_class})"
-                f"{_exhaust_suffix(cutoff_status, notify_status)}{rung_suffix}"
-            ),
+            reason=deny_reason,
             used_pct=over.used_pct,
             pool_class=effective_class,
             alternatives=alts,
             exhaust_notice=notify_status,
             missing_windows=missing,
             unknown_plan=unknown_plan,
+            inflight=in_flight.tag if in_flight is not None else None,
+            inflight_warning=in_flight.warning if in_flight is not None else None,
             **audit,
         )
+
+    if in_flight is not None and in_flight.n is not None:
+        headroom = _inflight_headroom(
+            states, manual.required_windows_for(result), in_flight.reserves, in_flight.n, cutoff
+        )
+        if headroom is not None:
+            alts = alternatives()
+            window, plain, reserve = headroom
+            headroom_reason = (
+                f"{provider_id} inflight_headroom window={window} used={plain:g} "
+                f"n={in_flight.n} reserve={reserve:g} cutoff={cutoff:g}"
+            )
+            headroom_reason += _missing_windows_tag(missing)
+            headroom_reason += rung_suffix
+            if in_flight.status:
+                headroom_reason += f" ({in_flight.status})"
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=grade,
+                reason=headroom_reason,
+                used_pct=plain,
+                pool_class=effective_class,
+                alternatives=alts,
+                missing_windows=missing,
+                unknown_plan=unknown_plan,
+                inflight=in_flight.tag,
+                inflight_warning=in_flight.warning,
+                **audit,
+            )
+
+    inflight_allow_suffix = ""
+    if in_flight is not None:
+        if in_flight.status:
+            inflight_allow_suffix = f" ({in_flight.status})"
+        inflight_allow_suffix += f" {in_flight.tag}"
 
     if profile.gate == "escalation" and not explicit_rung:
         reason = (
@@ -4291,6 +4484,7 @@ def gate_check(
             reason += f" [{tag}]"
         reason += _e6_arm_suffix(e6_admitted)
         reason += rung_suffix
+        reason += inflight_allow_suffix
         return GateResult(
             ok=True,
             profile=profile_name,
@@ -4303,6 +4497,8 @@ def gate_check(
             missing_windows=missing,
             e6_arm=e6_admitted,
             unknown_plan=unknown_plan,
+            inflight=in_flight.tag if in_flight is not None else None,
+            inflight_warning=in_flight.warning if in_flight is not None else None,
             **audit,
         )
 
@@ -4315,6 +4511,7 @@ def gate_check(
         reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     reason += _e6_arm_suffix(e6_admitted)
     reason += rung_suffix
+    reason += inflight_allow_suffix
     return GateResult(
         ok=True,
         profile=profile_name,
@@ -4327,6 +4524,8 @@ def gate_check(
         missing_windows=missing,
         e6_arm=e6_admitted,
         unknown_plan=unknown_plan,
+        inflight=in_flight.tag if in_flight is not None else None,
+        inflight_warning=in_flight.warning if in_flight is not None else None,
         **audit,
     )
 

@@ -21,6 +21,7 @@ from . import (
     free_window,
     grades,
     herdr,
+    inflight,
     launch,
     manual,
     quota_share,
@@ -188,6 +189,16 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help=(
             "hk 1753 Fusion GPT 청구 계정 지문 ([pools.<pool>] fusion_billing_fp) — "
             "지문만, 토큰·이메일 금지. 'none' 은 키만 제거"
+        ),
+    )
+    set_parser.add_argument(
+        "--inflight-reserve",
+        action="append",
+        metavar="WINDOW=PCT|none",
+        help=(
+            "hk 1787 [pools.<pool>.inflight_reserve_pct] — 반복 지정으로 창별 잡당 "
+            "예약 %를 설정(예: --inflight-reserve 5h=12 --inflight-reserve 7d=2). "
+            "'none' 은 테이블 전체 제거"
         ),
     )
 
@@ -624,6 +635,16 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     v2_eval.add_argument("-m", "--profile", required=True, choices=all_profiles)
     v2_eval.add_argument("--purpose", metavar="PURPOSE")
 
+    inflight_parser = subparsers.add_parser(
+        "inflight", help="in-flight 잡 합계 관측 (hk 1787 — 읽기 전용, 게시 없음)"
+    )
+    inflight_sub = inflight_parser.add_subparsers(dest="inflight_command", required=True)
+    inflight_show = inflight_sub.add_parser(
+        "show", help="로컬 arbiter live 레코드와 hk 에 게시된 타 호스트 목록을 표시"
+    )
+    inflight_show.add_argument("--pool", required=True, help="provider pool 이름")
+    inflight_show.add_argument("--json", action="store_true", help="JSON 으로 출력")
+
     models_parser = subparsers.add_parser("models", help="업스트림 서빙 모델 기록/drift 검증")
     models_sub = models_parser.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser(
@@ -695,6 +716,17 @@ def _emit_unknown_plan_warning(result: recommend.GateResult) -> None:
             "required windows fall back to {5h, 7d}; extend the table (hk 1769)"
         )
     print(f"warning: {detail}", file=sys.stderr)
+
+
+def _emit_inflight_warning(result: recommend.GateResult) -> None:
+    """Trailing ``warning:`` line for an in-flight count that stayed unknown (hk 1787).
+
+    Printed after the hk 1769 unknown-plan warning and before the stale-build
+    warning on both allow and deny paths — the count being unknown never
+    changes the decision itself.
+    """
+    if result.inflight_warning is not None:
+        print(f"warning: {result.inflight_warning}", file=sys.stderr)
 
 
 def _emit_stale_build_warning() -> None:
@@ -809,13 +841,35 @@ def _policy_command(
         if args.fusion_billing_fp is not None:
             stripped = args.fusion_billing_fp.strip()
             billing_fp_arg = None if stripped.lower() == "none" else stripped
+        # hk 1787 — 반복된 WINDOW=PCT 를 하나의 예약 테이블로 모은다.
+        # 'none' 단독이면 테이블 전체 제거(나머지 필드 보존).
+        reserve_arg = "__unset__"
+        if args.inflight_reserve:
+            reserve_arg = {}
+            for item in args.inflight_reserve:
+                if item.strip().lower() == "none":
+                    if len(args.inflight_reserve) != 1:
+                        parser.error("--inflight-reserve none 은 단독으로만 지정합니다")
+                    reserve_arg = None
+                    break
+                window, sep, raw_pct = item.partition("=")
+                if not sep:
+                    parser.error("--inflight-reserve 는 WINDOW=PCT 형식입니다")
+                try:
+                    reserve_arg[window.strip()] = float(raw_pct.strip())
+                except ValueError:
+                    parser.error(f"--inflight-reserve 값이 수치가 아닙니다: {item!r}")
         if (
             args.pool_class is None
             and boost_arg == "__unset__"
             and args.subscribed is None
             and billing_fp_arg == "__unset__"
+            and reserve_arg == "__unset__"
         ):
-            parser.error("class, --boost, --subscribed, --fusion-billing-fp 중 하나는 지정해야 합니다")
+            parser.error(
+                "class, --boost, --subscribed, --fusion-billing-fp, "
+                "--inflight-reserve 중 하나는 지정해야 합니다"
+            )
 
         # #751 — class/boost/subscribed go through one locked edit so the
         # combined command commits atomically instead of leaving a partial
@@ -833,6 +887,7 @@ def _policy_command(
                 boost=boost_arg,
                 subscribed=subscribed_arg,
                 fusion_billing_fp=billing_fp_arg,
+                inflight_reserve_pct=reserve_arg,
             )
         except ConfigEditError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -857,6 +912,14 @@ def _policy_command(
                 "fusion_billing_fp removed"
                 if billing_fp_arg is None
                 else f"fusion_billing_fp={billing_fp_arg[:8]}"
+            )
+        if reserve_arg != "__unset__":
+            parts.append(
+                "inflight_reserve_pct removed"
+                if reserve_arg is None
+                else "inflight_reserve_pct={"
+                + ", ".join(f"{w}:{p:g}" for w, p in sorted(reserve_arg.items()))
+                + "}"
             )
         print(f"{args.pool} -> {', '.join(parts)}")
         return 0
@@ -946,6 +1009,79 @@ def _manual_command(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 2
+
+
+def _inflight_command(args: argparse.Namespace) -> int:
+    """``scopefuel inflight show --pool P`` — 읽기 전용, 절대 게시하지 않는다 (hk 1787)."""
+    if args.inflight_command != "show":
+        return 2
+    report = inflight.show(args.pool)
+    if args.json:
+        accounts = [
+            {
+                "account_fp": account["account_fp"],
+                "remote_count": account["remote_count"],
+                "n": account["n"],
+                "docs": [
+                    {
+                        "key": view.key,
+                        "host": view.host,
+                        "published_at": view.published_at,
+                        "dropped_reason": view.dropped_reason,
+                        "jobs": [
+                            {"job_id": job.job_id, "counted": job.counted, "reason": job.reason}
+                            for job in view.jobs
+                        ],
+                    }
+                    for view in account["docs"]
+                ],
+            }
+            for account in report["accounts"]
+        ]
+        local = report["local"]
+        print(
+            json.dumps(
+                {
+                    "schema": "scopefuel.inflight-show.v1",
+                    "pool": report["pool"],
+                    "host": report["host"],
+                    "local": local,
+                    "local_count": len(local) if local is not None else None,
+                    "listed": report["listed"],
+                    "accounts": accounts,
+                },
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        )
+        return 0
+    print(f"pool={report['pool']} host={report['host']}")
+    local = report["local"]
+    if local is None:
+        print("local: unavailable (arbiter status failed)")
+    else:
+        print(f"local: {len(local)} live job(s)")
+        for job in local:
+            print(f"  {job['job_id']} started_at={job.get('started_at')}")
+    if not report["listed"]:
+        print("remote: unavailable (hk list failed)")
+    elif not report["accounts"]:
+        print("remote: no inflight documents")
+    for account in report["accounts"]:
+        n = account["n"]
+        n_s = str(n) if n is not None else "unknown"
+        print(f"account_fp={account['account_fp']} n={n_s} (remote={account['remote_count']})")
+        for view in account["docs"]:
+            if view.dropped_reason is not None:
+                host_s = view.host or view.key.rsplit("/", 1)[-1]
+                print(f"  doc host={host_s} dropped: {view.dropped_reason}")
+                continue
+            print(f"  doc host={view.host} published_at={view.published_at} counted={view.counted}")
+            for job in view.jobs:
+                marker = "counted" if job.counted else f"dropped: {job.reason}"
+                print(f"    job {job.job_id} {marker}")
+    return 0
 
 
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
@@ -1050,6 +1186,7 @@ def _gate_record(
             "exhaust_notice": result.exhaust_notice,
             "missing_windows": list(result.missing_windows),
         }
+        | ({"inflight": result.inflight} if result.inflight else {})
         | ({"account": account} if account else {})
         | (
             # #692: only an opened E6 measurement rung carries this — every other
@@ -1467,6 +1604,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         print(first_line)
         print(result.reason)
         _emit_unknown_plan_warning(result)
+        _emit_inflight_warning(result)
         _emit_stale_build_warning()
         return 0
 
@@ -1517,6 +1655,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         # This independent hold does not establish exhaustion of other pools.
         print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)
     _emit_unknown_plan_warning(result)
+    _emit_inflight_warning(result)
     _emit_stale_build_warning()
     return exit_code
 
@@ -2223,6 +2362,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "quota-v2":
         return _quota_v2_command(args, fetchers)
+
+    if args.command == "inflight":
+        return _inflight_command(args)
 
     if args.list_providers:
         for name in default_order(list(fetchers)):
