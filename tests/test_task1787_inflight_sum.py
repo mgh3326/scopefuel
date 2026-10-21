@@ -213,8 +213,19 @@ def _matrix() -> list[tuple[list[ProviderResult], str]]:
 
 def _load_base(tmp_path):
     """scopefuel @ 5be221b from a git archive, as package ``scopefuel_base``."""
+    base_sha = "5be221b4375681aca084fabe162aaabd77cbb996"
+    if subprocess.run(
+        ["git", "cat-file", "-e", base_sha], cwd=REPO, capture_output=True
+    ).returncode != 0:
+        # Shallow CI checkouts lack the base commit — fetch just that object.
+        subprocess.run(
+            ["git", "fetch", "--depth=1", "origin", base_sha],
+            cwd=REPO,
+            capture_output=True,
+            check=True,
+        )
     archive = subprocess.run(
-        ["git", "archive", "5be221b", "src"],
+        ["git", "archive", base_sha, "src"],
         capture_output=True,
         cwd=REPO,
         check=True,
