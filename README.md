@@ -158,20 +158,26 @@ provider가 저장한 plan_type 별 필수 창을 정합니다 — 2026-10-20 wh
 ### E6 측정 런그와 arm 표식 (task #692, grok·sol-medium 런그 #737)
 
 E6(#594, `hk:doc plan/2026-09-25/e6-effort-ladder`)는 한 모델을 여러 effort로 실과제에서
-비교합니다. 그 런그 중 표가 몰랐던 것은 이제 **카탈로그 행**으로 존재합니다 — 급 C·점수 없음
+비교합니다. 그 런그 중 표가 몰랐던 것은 이제 **카탈로그 행**으로 존재합니다 — carrier 급(sonnet@max 는 A+, 나머지는 C)·점수 없음
 (`미측정`), `--recommend` 후보가 아니고 런처 기본값도 아닙니다. 배치가 아니라 측정 행이므로
 `launch.snapshot_entries()`(배치 스냅샷)에는 들어가지 않고 `bench catalog list`/정본 시드에는
 들어갑니다.
 
-| profile | model | effort | pool | 급 |
+| profile | model | effort | pool | carrier 급 |
 |---|---|---|---|---|
 | `codex-sol` | gpt-6.1-sol | high | codex | C |
 | `codex-sol` | gpt-6.1-sol | medium | codex | C |
+| `codex-sol` | gpt-6.1-sol | low | codex | C |
 | `kimi-k3` | kimi-k3 | high | kimi | C |
 | `kimi-k3` | kimi-k3 | max | kimi | C |
 | `grok-hi` | grok-4.7 | low | grok | C |
 | `grok-hi` | grok-4.7 | medium | grok | C |
-| `grok-hi` | grok-4.7 | xhigh | grok | C |
+| `haiku` | claude-haiku-5-5 | xhigh | claude | C |
+| `haiku` | claude-haiku-5-5 | max | claude | C |
+| `sonnet` | claude-sonnet-5-5 | max | claude | A+ |
+
+carrier 급은 그 프로필의 effort 사다리를 handoffkeep 카탈로그 단조성 검사에 맞게 유지하는 가장
+약한 급입니다. 그래서 `sonnet@xhigh`가 A+이므로 `sonnet@max`는 A+를 싣고, 나머지 런그는 C를 싣습니다.
 
 이 런그는 **명시적 arm 표식** 하나로만 열립니다 — 스포너가 스폰 명령에 붙이는 환경변수입니다.
 wrk는 자신의 환경을 자식 `scopefuel` 호출에 그대로 넘기므로 카탈로그 조회와 쿼타 게이트가
@@ -181,23 +187,24 @@ wrk는 자신의 환경을 자식 `scopefuel` 호출에 그대로 넘기므로 �
 SCOPEFUEL_E6_ARM=codex-sol@high wrk spawn -m codex-sol --effort high ...   # E6 arm 스폰
 scopefuel gate -m codex-sol --effort high                              # 표식 없음 → exit 3, 런그 이름을 댄 사유
 SCOPEFUEL_E6_ARM=codex-sol@high scopefuel gate -m codex-sol --effort high  # → exit 0, allow 라인에 [E6 arm, unmeasured C: codex-sol@high]
+# sonnet@max 런그의 태그는 carrier 급을 댑니다                          → [E6 arm, unmeasured A+: sonnet@max]
 ```
 
 - 표식 값은 `<profile>@<effort>`이며 effort 어휘는 소문자 폐쇄 집합입니다(`--effort`와 같은
   정규화). 별칭도 받습니다(`codex-max@high` = `codex-sol@high`).
 - 표식이 그 런그를 가리키지 않으면 **아무것도 넓히지 못합니다** — 다른 프로필·다른 런그·
-  형식 오류는 무시되고, C 급 E6 런그는 계속 거부됩니다(exit 3).
-- 표식은 C 급 런그의 admission key이면서 **게이트가 판정할 런그를 지명하는 스포너 경로**입니다
+  형식 오류는 무시되고, carrier 급 E6 런그는 계속 거부됩니다(exit 3).
+- 표식은 carrier 급 런그의 admission key이면서 **게이트가 판정할 런그를 지명하는 스포너 경로**입니다
   (wrk 는 `gate` 에 `--effort` 를 넘기지 않습니다). 그래서 `sonnet@xhigh` 같은 escalation
   런그는 표식으로 런그를 지명한 뒤 기존 `--operator-request` 경로로 엽니다 — 표식 자체가
   escalation 을 우회하지는 않습니다. 배치된 런그를 지명하면 판정이 그 런그로 **좁아질 뿐**
   넓어지지는 않습니다(예: `SCOPEFUEL_E6_ARM=sonnet@xhigh gate -m sonnet` 는 xhigh 런그의
   escalation 판정).
-- 캐논이 런그를 retire 하면 표식으로도 열리지 않습니다 — 닫는 수단은 retire 또는 C 밖 배치입니다.
+- 캐논이 런그를 retire 하면 표식으로도 열리지 않습니다 — 닫는 수단은 retire 또는 carrier 밖 배치입니다.
 - 표식 없이 `policy launch`는 기존 폴백을 그대로 씁니다(`wrk -m codex`는 codex-sol@high를,
   `-m builder-grok`은 grok-hi@xhigh를 pin하므로 이 스펠링들은 변하지 않습니다). 캐논이 E6
   행을 싣고 있어도 표식 없는 기본값 계산은 C 행을 고르지 않습니다.
-- `--recommend`는 어느 급에서도 E6 런그를 나열하지 않습니다. 캐논이 그 런그를 C 밖으로
+- `--recommend`는 어느 급에서도 E6 런그를 나열하지 않습니다. 캐논이 그 런그를 carrier 밖으로
   측정하면 제한은 자동으로 풀립니다(그때는 평범한 런그).
 - 게이트의 `--effort`는 판정 대상을 런그로 좁힙니다 — `gate -m opus --effort low`는 low 런그
   (S)의 판정입니다. #716: **배치 행을 가리키는 `--effort`는 그 런그를 배치로 판정합니다**
@@ -499,6 +506,10 @@ $ scopefuel bench catalog list
 $ scopefuel bench push-catalog --emit-seed --decided-by operator-desk > seed.json
 $ scopefuel bench push-catalog seed.json   # 운영자 토큰 전용
 ```
+
+호스트가 푸시된 정본을 검증하지 못하면 오류 없이 번들 스냅샷 표로 폴백합니다. 그래서 구버전 빌드가
+검증하지 못하는 행을 더하는 카탈로그 파일(예: `docs/catalog/hk1788.json`)은 모든 호스트가 새 빌드를
+돌린 뒤에만 푸시합니다.
 
 서버 불가·stale은 "마지막으로 확인된 정본의 재현"까지만 허용합니다: `consult_only`는 절대 완화되지
 않고, stale 상태의 비-`default` gate는 `--operator-request`를 요구합니다("서버 다운 ≠ 자유 배정") —
