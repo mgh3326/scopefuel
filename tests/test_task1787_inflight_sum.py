@@ -125,6 +125,8 @@ class ArbiterSpy:
 
 def _spy_arbiter(monkeypatch, rows=None, fail=False) -> ArbiterSpy:
     spy = ArbiterSpy(rows, fail)
+    # CI has no arbiter on PATH — stub resolution so the spy is always reached.
+    monkeypatch.setattr(inflight, "_arbiter_bin", lambda: "/fake/arbiter")
     monkeypatch.setattr(inflight, "_run_arbiter", spy)
     return spy
 
