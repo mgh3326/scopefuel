@@ -92,7 +92,7 @@ def local_jobs(pool: str) -> list[dict] | None:
         return None
     try:
         doc = json.loads(proc.stdout)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(doc, dict):
         return None
@@ -241,7 +241,7 @@ def _doc_view(key: str, document: dict, pool: str, account_fp: str, host: str, n
     body = document.get("body")
     try:
         snap = json.loads(body) if isinstance(body, str) else None
-    except ValueError:
+    except (ValueError, RecursionError):
         snap = None
     if not isinstance(snap, dict) or set(snap) != _PAYLOAD_KEYS or snap.get("schema") != SCHEMA:
         view.dropped_reason = "schema"

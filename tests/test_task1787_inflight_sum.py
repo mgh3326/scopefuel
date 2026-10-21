@@ -676,3 +676,320 @@ def test_arbiter_bin_env_resolution(monkeypatch, tmp_path):
         inflight.shutil, "which", lambda name: "/usr/bin/arbiter" if name == "arbiter" else None
     )
     assert inflight._arbiter_bin() == "/usr/bin/arbiter"
+
+
+# ---------------------------------------------------------- hk 1787 r1 fixes
+
+
+def _deep_json(n: int) -> str:
+    return "[" * n + "]" * n
+
+
+def test_local_jobs_deeply_nested_json_fails_open(monkeypatch):
+    """D1 fix: pathological arbiter output folds to None, not RecursionError."""
+    _spy_arbiter(monkeypatch)
+    monkeypatch.setattr(
+        inflight,
+        "_run_arbiter",
+        lambda argv: subprocess.CompletedProcess(argv, 0, stdout=_deep_json(200000), stderr=""),
+    )
+    assert inflight.local_jobs("codex") is None
+
+
+def test_gate_deeply_nested_arbiter_json_unknown_not_crash(monkeypatch):
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch)
+    monkeypatch.setattr(
+        inflight,
+        "_run_arbiter",
+        lambda argv: subprocess.CompletedProcess(argv, 0, stdout=_deep_json(200000), stderr=""),
+    )
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = gate_check([_codex(("5h", 10.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.ok and result.inflight == "inflight=unknown(local)"
+
+
+def test_doc_view_deeply_nested_body_drops(monkeypatch):
+    """D1 fix: pathological remote doc body drops by schema, not RecursionError."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=[])
+    hk = _enable_hk(monkeypatch)
+    key = inflight.doc_key("codex", FP, "oci")
+    hk.docs[key] = {
+        "key": key,
+        "kind": "note",
+        "session": inflight.DOC_SESSION,
+        "job": "",
+        "body": _deep_json(100000),
+    }
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = gate_check([_codex(("5h", 10.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.ok and result.inflight == "inflight=0"
+
+
+def test_policy_set_replaces_existing_table(monkeypatch):
+    """D2 fix: set -> replace -> get, with an existing [pools.<p>] header."""
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 20.0})
+    reserves, status = policy.get_inflight_reserve("codex")
+    assert reserves == {"5h": 20.0} and status is None
+
+
+def test_policy_set_replaces_without_pool_header():
+    """D2 fix: only the implicit [pools.<p>.inflight_reserve_pct] exists."""
+    path = policy.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[pools.codex.inflight_reserve_pct]\n5h = 12.0\n")
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 20.0})
+    reserves, _ = policy.get_inflight_reserve("codex")
+    assert reserves == {"5h": 20.0}
+
+
+# ------------------------------------------------- round-2 survivor killers
+
+
+def _claudex_gate(monkeypatch, local_rows, remote_docs=None, reserve=None, used=10.0):
+    """Drive the D3 not-in-table site: 'claudex' judges a pool not in its table."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=local_rows)
+    hk = _enable_hk(monkeypatch)
+    for doc in remote_docs or []:
+        hk.docs[doc["key"]] = doc
+    policy.set_policy("codex", None, inflight_reserve_pct=reserve or {"5h": 12.0})
+    return gate_check([_codex(("5h", used), ("7d", 10.0), plan="pro")], "claudex", today=TODAY, now=NOW), hk
+
+
+def test_d3_headroom_deny_with_reserve(monkeypatch):
+    result, _ = _claudex_gate(monkeypatch, [_row("a"), _row("b"), _row("c")], used=54.0)
+    assert result.ok is False and "inflight_headroom" in result.reason
+
+
+def test_d3_allow_tag_and_publish(monkeypatch):
+    result, hk = _claudex_gate(monkeypatch, [_row("a")], used=10.0)
+    assert result.ok and result.inflight == "inflight=1"
+    assert [c for c in hk.calls if c[0] == "PUT" and "/inflight/" in c[1]]
+
+
+def test_d3_unknown_tag_on_plain_deny(monkeypatch):
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, fail=True)
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = gate_check([_codex(("5h", 95.0), ("7d", 10.0), plan="pro")], "claudex", today=TODAY, now=NOW)
+    assert result.ok is False and "inflight=unknown(local)" in result.reason
+
+
+def test_normal_site_unknown_tag_on_deny(monkeypatch):
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, fail=True)
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = gate_check([_codex(("5h", 95.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.ok is False and "inflight=unknown(local)" in result.reason
+
+
+def test_two_distinct_window_reserves(monkeypatch):
+    """Each reserve applies to its own window only (kills max/first mutants)."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=[_row("a"), _row("b")])
+    _enable_hk(monkeypatch)
+    # 7d reserve 5 * n=2 -> 80+10=90 == cutoff on 7d; 5h reserve 12 * 2 -> 10+24=34 < 90
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0, "7d": 5.0})
+    result = gate_check([_codex(("5h", 10.0), ("7d", 80.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.ok is False and result.reason.startswith("codex inflight_headroom window=7d")
+
+
+def test_reserve_on_unrequired_window_ignored(monkeypatch):
+    """A reserve on a window the profile does not require never fires."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=[_row("a"), _row("b")])
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"30d": 50.0})
+    result = gate_check([_codex(("5h", 10.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.ok and result.inflight == "inflight=2"
+
+
+def test_drop_wrong_schema_value(monkeypatch):
+    doc = _doc("oci", [_remote_job("j1")])
+    doc["body"] = json.dumps({**json.loads(doc["body"]), "schema": "scopefuel.other.v1"})
+    result, _, _ = _gate_with(monkeypatch, [], [doc])
+    assert result.inflight == "inflight=0"
+
+
+def test_drop_wrong_pool_under_matching_key(monkeypatch):
+    """Doc sits under the codex prefix but its body says another pool."""
+    key = inflight.doc_key("codex", FP, "oci")
+    doc = _doc("oci", [_remote_job("j1")])
+    doc["key"] = key
+    doc["body"] = json.dumps({**json.loads(doc["body"]), "pool": "claude"})
+    result, _, _ = _gate_with(monkeypatch, [], [doc])
+    assert result.inflight == "inflight=0"
+
+
+def test_drop_future_started_at(monkeypatch):
+    """started_at beyond the 8h window in the future drops; +1h still counts."""
+    job = {"job_id": "fut", "started_at": (NOW + dt.timedelta(hours=9)).isoformat()}
+    near = {"job_id": "near", "started_at": (NOW + dt.timedelta(hours=1)).isoformat()}
+    result, _, _ = _gate_with(monkeypatch, [], [_doc("oci", [job, near])])
+    assert result.inflight == "inflight=1"
+
+
+def test_7h_old_job_counts(monkeypatch):
+    result, _, _ = _gate_with(monkeypatch, [], [_doc("oci", [_remote_job("j1", hours_ago=7.0)])])
+    assert result.inflight == "inflight=1"
+
+
+def test_drop_unparseable_started_at_and_published_at(monkeypatch):
+    job = {"job_id": "j1", "started_at": "not-a-date"}
+    bad_pub = _doc("oci", [_remote_job("j1")])
+    bad_pub["body"] = json.dumps({**json.loads(bad_pub["body"]), "published_at": "nope"})
+    result, _, _ = _gate_with(monkeypatch, [], [_doc("oci", [job]), bad_pub])
+    assert result.inflight == "inflight=0"
+
+
+def test_self_exclusion_key_suffix_leg(monkeypatch):
+    """Key-suffix self leg: seed a self doc and make the publish PUT fail."""
+    _host(monkeypatch, "gatehost")
+    _spy_arbiter(monkeypatch, rows=[])
+    hk = _enable_hk(monkeypatch)
+    hk.docs[inflight.doc_key("codex", FP, "gatehost")] = _doc("gatehost", [_remote_job("mine")])
+
+    original = hk.__call__
+
+    def flaky(url, *, method="GET", **kw):
+        if method == "PUT":
+            raise HttpError(503, "unavailable")
+        return original(url, method=method, **kw)
+
+    monkeypatch.setattr(quota_share, "request_json", flaky)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = gate_check([_codex(("5h", 10.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.inflight == "inflight=0"
+
+
+def test_self_exclusion_body_host_leg(monkeypatch):
+    """Body-host self leg: doc under another key claims host == this host."""
+    key = inflight.doc_key("codex", FP, "otherkey")
+    doc = _doc("gatehost", [_remote_job("mine")])
+    doc["key"] = key
+    result, _, _ = _gate_with(monkeypatch, [], [doc])
+    assert result.inflight == "inflight=0"
+
+
+def test_local_failed_remote_present_not_applied(monkeypatch):
+    """Local read failed: remote n must NOT apply, tag unknown(local), no PUT."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, fail=True)
+    hk = _enable_hk(monkeypatch)
+    hk.docs[inflight.doc_key("codex", FP, "oci")] = _doc(
+        "oci", [_remote_job("j1"), _remote_job("j2"), _remote_job("j3")]
+    )
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = gate_check([_codex(("5h", 54.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    assert result.ok and "inflight=unknown(local)" in result.reason
+    assert [c for c in hk.calls if c[0] == "PUT"] == []
+
+
+def test_deny_path_warning_order(monkeypatch, capsys):
+    """Deny path: reason line first, then unknown-plan, then inflight warning."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, fail=True)
+    _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    providers_result = _codex(("5h", 95.0), ("7d", 10.0), plan="pro")
+    monkeypatch.setattr(cli, "registry", lambda: {"codex": lambda: providers_result})
+    rc = cli.main(["gate", "-m", "codex-max", "--no-cache"])
+    out = capsys.readouterr()
+    assert rc == 3
+    warnings = [
+        w
+        for w in out.err.splitlines()
+        if w.startswith("warning:") and ("plan_type" in w or "in-flight" in w or "build stale" in w)
+    ]
+    kinds = ["plan" if "plan_type" in w else ("inflight" if "in-flight" in w else "stale") for w in warnings]
+    # unknown-plan -> inflight -> stale-build order on the deny path too
+    assert kinds == ["plan", "inflight", "stale"] or kinds == ["plan", "inflight"]
+    assert "inflight=unknown(local)" in out.err
+
+
+def test_publish_key_uses_sanitised_host(monkeypatch):
+    # patch gethostname only — _local_host must run _safe_host on it
+    monkeypatch.setattr(inflight.socket, "gethostname", lambda: "we ird/host!")
+    _spy_arbiter(monkeypatch, rows=[])
+    hk = _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    gate_check([_codex(("5h", 10.0), ("7d", 10.0))], "codex-max", today=TODAY, now=NOW)
+    puts = [c[1] for c in hk.calls if c[0] == "PUT" and "/inflight/" in c[1]]
+    assert puts == ["quota/codex/fp-account-aaaa1111/inflight/unknown"]
+
+
+def test_show_two_account_fps_and_failed_local(monkeypatch, capsys):
+    _host(monkeypatch, "mbp")
+    _spy_arbiter(monkeypatch, fail=True)
+    hk = _enable_hk(monkeypatch)
+    live = dt.datetime.now(dt.UTC)
+    for fp, host, jobs in (
+        (FP, "oci", [{"job_id": "j1", "started_at": live.isoformat()}]),
+        ("fp-other-2222", "pi", [{"job_id": "j2", "started_at": live.isoformat()}]),
+    ):
+        body = {
+            "schema": inflight.SCHEMA,
+            "pool": "codex",
+            "account_fp": fp,
+            "host": host,
+            "published_at": live.isoformat(),
+            "jobs": jobs,
+        }
+        key = inflight.doc_key("codex", fp, host)
+        hk.docs[key] = {
+            "key": key,
+            "kind": "note",
+            "session": inflight.DOC_SESSION,
+            "job": "",
+            "body": json.dumps(body, sort_keys=True),
+        }
+    rc = cli.main(["inflight", "show", "--pool", "codex"])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "local: unavailable" in out.out
+    assert f"account_fp={FP} n=unknown" in out.out
+    assert "account_fp=fp-other-2222 n=unknown" in out.out
+    assert [c for c in hk.calls if c[0] == "PUT"] == []
+
+
+def test_token_kind_fp_never_publishes_or_queries(monkeypatch):
+    """A token-kind publish fp must not be treated as an account fingerprint."""
+    _host(monkeypatch)
+    _spy_arbiter(monkeypatch, rows=[_row("a")])
+    hk = _enable_hk(monkeypatch)
+    policy.set_policy("codex", None, inflight_reserve_pct={"5h": 12.0})
+    result = ProviderResult(
+        id="codex",
+        plan="plus",
+        pool_class="preserve",
+        publish_fp="fp-token-bbbb",
+        publish_fp_kind="token",
+        buckets=[
+            Bucket(
+                label="5h",
+                window="5h",
+                used_pct=10.0,
+                resets_at=_reset("5h"),
+                scope=Scope("account"),
+                horizon="now",
+            ),
+            Bucket(
+                label="7d",
+                window="7d",
+                used_pct=10.0,
+                resets_at=_reset("7d"),
+                scope=Scope("account"),
+                horizon="week",
+            ),
+        ],
+    )
+    gate = gate_check([result], "codex-max", today=TODAY, now=NOW)
+    assert gate.inflight == "inflight=unknown(remote)"
+    assert [c for c in hk.calls if c[0] == "PUT"] == []
+    assert [c for c in hk.calls if "inflight" in c[1] and c[0] == "GET"] == []

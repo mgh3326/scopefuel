@@ -661,6 +661,16 @@ class _Doc:
             self._delete_lines(victim.start, victim.end)
             self._rescan()
             found = True
+        if found:
+            # keep the parsed snapshot in step — set_value refuses to build a
+            # table under a path the snapshot still says exists (hk 1787 r1).
+            parent = self.config
+            for seg in path[:-1]:
+                parent = parent.get(seg) if isinstance(parent, dict) else None
+                if parent is None:
+                    break
+            if isinstance(parent, dict):
+                parent.pop(path[-1], None)
         return found
 
 
