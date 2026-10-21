@@ -35,7 +35,7 @@ NOW = dt.datetime(2026, 10, 8, 12, 0, 0, tzinfo=dt.UTC)
 
 # (profile, effort) -> (decided grade, task ref, one evidence rep)
 SERVED: dict[tuple[str, str], tuple[str, str, str]] = {
-    ("sonnet", "high"): ("B", "hk:task/1297", "srv:1224"),
+    ("sonnet", "high"): ("A", "hk1786-propose-sonnet-high", "b953-hk1786"),
     ("devin-swe2", "high"): ("A+", "hk:task/1296", "srv:686"),
     ("devin-swe2-max", "max"): ("A+", "hk:task/1296", "srv:1225"),
     ("grok-hi", "xhigh"): ("A", "hk:task/1296", "srv:1396"),
@@ -43,8 +43,10 @@ SERVED: dict[tuple[str, str], tuple[str, str, str]] = {
 }
 
 DECIDED_BY = "operator:2026-10-08 via operator-desk"
+# hk 1788 (b953-hk1786): sonnet@high promoted B -> A on the propose report.
+DECIDED_BY_HK1788 = "b953-hk1786"
 DECIDED_AT = {
-    ("sonnet", "high"): "2026-10-08T11:52:05.815922Z",
+    ("sonnet", "high"): "2026-10-21",
     ("devin-swe2", "high"): "2026-10-08T13:03:23.617077Z",
     ("devin-swe2-max", "max"): "2026-10-08T13:03:23.617077Z",
     ("grok-hi", "xhigh"): "2026-10-08T13:03:23.617077Z",
@@ -76,10 +78,13 @@ def test_each_bundled_row_matches_the_served_decision():
     for key, (grade, task_ref, evidence) in SERVED.items():
         entry = rows[key]
         assert entry.grade == grade, (key, entry.grade)
-        assert entry.decided_by == DECIDED_BY
+        if key == ("sonnet", "high"):
+            assert entry.decided_by == DECIDED_BY_HK1788
+        else:
+            assert entry.decided_by == DECIDED_BY
+            assert evidence in entry.deviation_ref
         assert entry.decided_at == DECIDED_AT[key]
         assert task_ref in entry.deviation_ref
-        assert evidence in entry.deviation_ref
         assert entry.gate == "default"
 
 
@@ -99,8 +104,13 @@ def test_the_seed_emits_the_served_rows(capsys):
     for key, (grade, task_ref, _) in SERVED.items():
         row = rows[key]
         assert row["grade"] == grade
-        assert row["decided_by"] == DECIDED_BY
-        assert row["decided_at"] == DECIDED_AT[key]  # already RFC3339 on the wire
+        if key == ("sonnet", "high"):
+            assert row["decided_by"] == DECIDED_BY_HK1788
+        else:
+            assert row["decided_by"] == DECIDED_BY
+        # the bare decision date goes out normalized to day-start UTC
+        expected_at = "2026-10-21T00:00:00Z" if key == ("sonnet", "high") else DECIDED_AT[key]
+        assert row["decided_at"] == expected_at  # already RFC3339 on the wire
         assert task_ref in row["deviation_ref"]
 
 
@@ -126,13 +136,13 @@ def test_recommend_lists_each_rung_at_its_decided_grade_and_one_up():
         out = recommend(providers, grade, today=TODAY, now=NOW)
         lines_at[grade] = [line for line in out.splitlines() if line[:1].isdigit()]
 
-    one_below = {"A+": "A", "A": "B", "B": "C"}
+    one_below = {"A+": "A", "A": "B"}
     expected_lines = {
         # #1331: devin launchers take no --effort flag — the rung is a
         # parenthetical annotation, the launch spelling is the bare profile.
         "A+": ["devin-swe2 (effort high)", "devin-swe2-max (effort max)"],
-        "A": ["grok-hi --effort xhigh", "oc-solar4"],
-        "B": ["sonnet --effort high"],
+        # hk 1788: sonnet@high joins A (b953-hk1786 promote).
+        "A": ["grok-hi --effort xhigh", "oc-solar4", "sonnet --effort high"],
     }
     for grade, names in expected_lines.items():
         for name in names:
@@ -160,7 +170,7 @@ def test_launch_answers_for_each_promoted_row():
         launch.resolve_launch("sonnet", effort="high"),
     ):
         assert decision.effort == "high"
-        assert decision.grade == "B"
+        assert decision.grade == "A"
         assert decision.model_id == "claude-sonnet-5-5"
         assert decision.gate == "default"
 
@@ -184,12 +194,12 @@ def test_launch_answers_for_each_promoted_row():
     assert (decision.effort, decision.grade) == ("xhigh", "A")
 
 
-def test_policy_launch_sonnet_high_json_reports_b(capsys):
+def test_policy_launch_sonnet_high_json_reports_a(capsys):
     """AC1: the bundled snapshot answers the promoted grade."""
 
     assert cli.main(["policy", "launch", "sonnet", "--effort", "high", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["grade"] == "B"
+    assert payload["grade"] == "A"
     assert payload["model_id"] == "claude-sonnet-5-5"
     assert payload["gate"] == "default"
     assert payload["catalog"]["source"] == "snapshot"

@@ -507,8 +507,9 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     for pre-refresh claude-haiku-4.5 reps.
     """
     sonnet_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "sonnet"]
-    assert len(sonnet_rows) == 4  # S max, A+ xhigh, B high, C medium — low has no vendor point
-    assert {p.launcher_effort for p in sonnet_rows} == {"max", "xhigh", "high", "medium"}
+    # hk 1788: max left for the E6 table — A+ xhigh, A high (b953 promote), C medium.
+    assert len(sonnet_rows) == 3
+    assert {p.launcher_effort for p in sonnet_rows} == {"xhigh", "high", "medium"}
     for profile in sonnet_rows:
         assert profile.aa_model_id == "claude-sonnet-5-5"
 
@@ -517,12 +518,12 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     # decision, option A). The rung -> score mapping is pinned by equality:
     # swapping two scores fails.
     haiku_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "haiku"]
+    # hk 1788: xhigh/max left for the E6 table — the vendor curve moves into
+    # the arm rows' reference text.
     assert {p.launcher_effort: p.benchmark for p in haiku_rows} == {
         "low": 12.8,
         "medium": 20.3,
         "high": 25.0,
-        "xhigh": 31.5,
-        "max": 39.2,
     }
     assert all(p.aa_model_id == "claude-haiku-5-5" for p in haiku_rows)
     assert all(p in GRADE_TABLE["C"] for p in haiku_rows)
@@ -549,7 +550,7 @@ def test_task1305_sonnet_high_reason_is_its_measured_evidence():
     assert high.estimate_reason == SONNET_5_5_HIGH_GRADE_ANNOTATION
     assert high.estimate_reason != SONNET_5_5_ESTIMATE_REASON
     assert "한 단계 아래에 배치" not in high.estimate_reason
-    for effort in ("max", "xhigh", "medium"):
+    for effort in ("xhigh", "medium"):
         assert rows[("sonnet", effort)].estimate_reason == SONNET_5_5_ESTIMATE_REASON
     # The narrowed wording itself is the pinned requirement: the
     # one-grade-below sentence must name the estimated rungs, and the old
@@ -785,11 +786,12 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     # high-B (44.0) row was an over-estimate (vendor TB4 puts 4.5 at 0.0).
     assert "haiku --effort" not in b_output
     assert any(line[:1].isdigit() and "grok --effort low" in line for line in b_output.splitlines())
-    # #1297: the 10-08 operator apply placed the estimated high rung at B —
-    # the row shows the decided grade annotation (score stays the vendor TB4
-    # estimate, cited inside it).
-    assert any(line[:1].isdigit() and "sonnet --effort high" in line for line in b_output.splitlines())
-    assert "벤치 43.0(급 실측(B;" in b_output
+    # hk 1788: b953 promote moved sonnet@high to A — at B it lists only
+    # tagged [one-up A].
+    assert any(
+        line[:1].isdigit() and "sonnet --effort high" in line and "[one-up A]" in line
+        for line in b_output.splitlines()
+    )
 
     c_output = recommend(providers, "C", today=TODAY, now=NOW)
     assert "codex-luna --effort low" in c_output
@@ -797,24 +799,18 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     assert "codex-luna --effort medium" not in c_output
     # #920+#1297: Sonnet 5.5 vendor-TB4 estimates — high promoted to B on the
     # operator apply; medium raw 29.0 stays at the floor, marked estimate.
-    # #1318-2: sonnet@high's B placement is rep-measured (급 실측(B; evidence
-    # reps …)) so the row lists one grade down at C — but only tagged one-up.
-    sonnet_high_c = [
-        line for line in c_output.splitlines() if line[:1].isdigit() and "sonnet --effort high" in line
-    ]
-    assert sonnet_high_c and all("[one-up B]" in line for line in sonnet_high_c)
+    # hk 1788: sonnet@high is A now — it takes no C slot at all (its one-up
+    # lives at B).
+    assert not any(line[:1].isdigit() and "sonnet --effort high" in line for line in c_output.splitlines())
     assert any(line[:1].isdigit() and "sonnet --effort medium" in line for line in c_output.splitlines())
     assert "벤치 29.0(추정(외삽))" in c_output
     assert "보수 배치(C; raw 43.0 은 B 구간" not in c_output
-    # #1269: Haiku 5.5 vendor-TB4 estimates — the whole launchable curve lands
-    # at C (raws already at the floor); max is an ordinary ranked row too
-    # (10-08 operator decision, option A).
+    # #1269: Haiku 5.5 vendor-TB4 estimates — the launchable curve landed at
+    # C; hk 1788 moved xhigh/max into the E6 arm table.
     for rung, score in (
         ("low", 12.8),
         ("medium", 20.3),
         ("high", 25.0),
-        ("xhigh", 31.5),
-        ("max", 39.2),
     ):
         assert any(
             line[:1].isdigit() and f"haiku --effort {rung}" in line for line in c_output.splitlines()

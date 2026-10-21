@@ -43,8 +43,8 @@ GRADES = _GRADE_ORDER
 # devin-swe2 sits at three grades as a non-rep row.
 EXPECTED_REP_MEASURED = {
     "A+": {"devin-ds41", "devin-swe2 (effort high)", "devin-swe2-max (effort max)"},
-    "A": {"devin-swe2-medium", "grok-hi --effort xhigh", "oc-solar4"},
-    "B": {"sonnet --effort high"},
+    # hk 1788: sonnet@high promoted to A (b953-hk1786) — B holds no rep row.
+    "A": {"devin-swe2-medium", "grok-hi --effort xhigh", "oc-solar4", "sonnet --effort high"},
 }
 
 
@@ -229,10 +229,13 @@ def test_recommend_b_lists_the_a_rep_rows_tagged_one_up():
         assert len(lines) == 1 and "[one-up A]" in lines[0], (label, out)
 
 
-def test_recommend_c_lists_the_b_rep_row_tagged_one_up():
-    out = recommend(_pool_providers(), "C", today=TODAY, now=NOW)
+def test_recommend_b_lists_the_a_sonnet_row_tagged_one_up():
+    """hk 1788: sonnet@high is A now — it takes its one-up slot at B."""
+    out = recommend(_pool_providers(), "B", today=TODAY, now=NOW)
     lines = [line for line in out.splitlines() if line[:1].isdigit() and "sonnet --effort high" in line]
-    assert len(lines) == 1 and "[one-up B]" in lines[0], out
+    assert len(lines) == 1 and "[one-up A]" in lines[0], out
+    out = recommend(_pool_providers(), "C", today=TODAY, now=NOW)
+    assert not any(line[:1].isdigit() and "sonnet --effort high" in line for line in out.splitlines())
 
 
 def test_s_and_splus_have_no_one_up_rows():
@@ -541,7 +544,7 @@ def test_server_unmeasured_revocation_is_honored():
             )
     table = bench._catalog_grade_table(_server_view(rows))
     assert table is not None
-    profile = next(p for p in table["B"] if p.name == "sonnet" and p.launcher_effort == "high")
+    profile = next(p for p in table["A"] if p.name == "sonnet" and p.launcher_effort == "high")
     assert not is_rep_measured(profile), (
         "server estimate-only row falsely lowered",
         profile.benchmark_annotation,

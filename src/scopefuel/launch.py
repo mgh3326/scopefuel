@@ -36,7 +36,6 @@ from .recommend import (
     ASTRA_FORBIDDEN_SEATS,
     ASTRA_ROLE_PROFILES,
     BARRED_MODEL_DECISION_REF,
-    E6_ARM_GRADE,
     E6_ARM_KEYS,
     E6_ARM_RUNGS,
     GRADE_TABLE,
@@ -46,6 +45,7 @@ from .recommend import (
     Grade,
     astra_purpose_allowed,
     barred_model_id_for_profile,
+    e6_arm_carrier_grade,
     e6_arm_matches,
     e6_arm_rung_for,
     is_barred_model_id,
@@ -336,14 +336,15 @@ ARM_GRADE_OVERRIDES: dict[tuple[str, str], ArmGradeOverride] = {
         decided_at="2026-09-27",
         deviation_ref="hk:doc 5177 item 2 (evidence srv:973, srv:976, srv:988)",
     ),
+    # hk 1788 (b953-hk1786): sonnet@high B -> A — the propose report grades it
+    # rule 1.2 on 8 clean A passes and 0 FAIL (action promote, target A). The
+    # bundled catalog row carries the new decision provenance so a full seed
+    # push cannot revert it; the superseded #1297 stamp is superseded here too.
     ("sonnet", "high"): ArmGradeOverride(
-        grade="B",
-        decided_by="operator:2026-10-08 via operator-desk",
-        decided_at="2026-10-08T11:52:05.815922Z",
-        deviation_ref=(
-            "hk:task/1297 (evidence srv:1224, srv:1228, srv:1230, srv:1238, srv:1248, "
-            "srv:1288, srv:1291, srv:1298, srv:1343, srv:1357)"
-        ),
+        grade="A",
+        decided_by="b953-hk1786",
+        decided_at="2026-10-21",
+        deviation_ref="hk:doc/reports/b953/hk1786-propose-sonnet-high",
     ),
     ("devin-swe2", "high"): ArmGradeOverride(
         grade="A+",
@@ -371,6 +372,35 @@ ARM_GRADE_OVERRIDES: dict[tuple[str, str], ArmGradeOverride] = {
         decided_by="operator:2026-10-08 via operator-desk",
         decided_at="2026-10-08T13:03:23.617077Z",
         deviation_ref="hk:task/1296 (evidence srv:705, srv:707)",
+    ),
+    # hk 1788 (hk 1786 phase 0, hk:doc/briefs/b953/tier-coverage): the four new
+    # E6 measurement rungs. The grade restatement is each rung's own carrier
+    # (A+ for sonnet@max — a C carrier would be refused non-monotonic under
+    # sonnet@xhigh's A+; C for the other three) — the stamp exists to carry
+    # the decision provenance on the bundled catalog rows, the #787 shape.
+    ("codex-sol", "low"): ArmGradeOverride(
+        grade="C",
+        decided_by="b953-hk1786",
+        decided_at="2026-10-21",
+        deviation_ref="hk:doc/briefs/b953/tier-coverage",
+    ),
+    ("haiku", "xhigh"): ArmGradeOverride(
+        grade="C",
+        decided_by="b953-hk1786",
+        decided_at="2026-10-21",
+        deviation_ref="hk:doc/briefs/b953/tier-coverage",
+    ),
+    ("haiku", "max"): ArmGradeOverride(
+        grade="C",
+        decided_by="b953-hk1786",
+        decided_at="2026-10-21",
+        deviation_ref="hk:doc/briefs/b953/tier-coverage",
+    ),
+    ("sonnet", "max"): ArmGradeOverride(
+        grade="A+",
+        decided_by="b953-hk1786",
+        decided_at="2026-10-21",
+        deviation_ref="hk:doc/briefs/b953/tier-coverage",
     ),
 }
 
@@ -408,7 +438,7 @@ def e6_arm_entries() -> tuple[CatalogEntry, ...]:
                 effort=row.launcher_effort or "",
                 model_id=_snapshot_model_id(row.name, row),
                 pool=profile_pool(row.name)[0],
-                grade=E6_ARM_GRADE,
+                grade=e6_arm_carrier_grade(row.name, row.launcher_effort),
                 score=None,
                 gate=GATE_DEFAULT,
                 benchmark_source=row.benchmark_source,
@@ -500,7 +530,9 @@ def _unmeasured_e6_row(row: CatalogEntry) -> bool:
     again.
     """
 
-    return (row.profile, row.effort) in E6_ARM_KEYS and row.grade == E6_ARM_GRADE
+    return (row.profile, row.effort) in E6_ARM_KEYS and row.grade == e6_arm_carrier_grade(
+        row.profile, row.effort
+    )
 
 
 def _default_effort(profile: str, rows: list[CatalogEntry]) -> tuple[str, str]:
@@ -761,7 +793,9 @@ def resolve_launch(
     # must not claim it as an E6 admission.
     opened_arm = (
         f"{canonical}@{resolved_effort}"
-        if e6_open and row.grade == E6_ARM_GRADE and (row.profile, row.effort) == (canonical, resolved_effort)
+        if e6_open
+        and row.grade == e6_arm_carrier_grade(row.profile, row.effort)
+        and (row.profile, row.effort) == (canonical, resolved_effort)
         else None
     )
 
