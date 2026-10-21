@@ -2419,7 +2419,7 @@ def _stale_accepted(result: ProviderResult | None, group_name: str | None, now: 
     if not matches:
         return None
     covered = {window for _used, window, _reset in matches}
-    if not manual.REQUIRED_WINDOWS.get(result.id, frozenset()) <= covered:
+    if not manual.required_windows_for(result) <= covered:
         return None
     now_utc = now.replace(tzinfo=dt.UTC) if now.tzinfo is None else now.astimezone(dt.UTC)
     for _used, _window, reset_at in matches:
@@ -2476,11 +2476,26 @@ def _missing_required_windows(result: ProviderResult | None, group_name: str | N
     """
     if result is None:
         return ()
-    required = manual.REQUIRED_WINDOWS.get(result.id, frozenset())
+    required = manual.required_windows_for(result)
     if not required:
         return ()
     covered = {window for _used, window, _reset in _matching_buckets(result, group_name)}
     return tuple(sorted(required - covered))
+
+
+def _codex_plan_window_refusal(result: ProviderResult, missing: tuple[str, ...]) -> str | None:
+    """hk 1769 (b953) — a codex plan in ``manual.CODEX_PLAN_REQUIRED_WINDOWS``
+    is strict: when one of its required windows has no valid bucket the
+    verdict is unmeasurable with a named reason, never admit-on-measured.
+    Absent/unlisted plans return None and keep the {5h, 7d} floor plus the
+    미측정 tag; every other provider returns None too.
+    """
+    if result.id != "codex" or not missing:
+        return None
+    plan = manual.normalize_codex_plan(result.plan)
+    if plan not in manual.CODEX_PLAN_REQUIRED_WINDOWS:
+        return None
+    return f"codex_required_window_missing:{','.join(missing)} plan={plan}"
 
 
 def _missing_windows_tag(missing: tuple[str, ...], note: str = "") -> str:
@@ -2888,8 +2903,13 @@ def _build_escalation_entry(
     if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
         status_notes.append(_unmeasurable_reason(provider_id, result))
     else:
+        strict_refusal = _codex_plan_window_refusal(result, _missing_required_windows(result, group_name))
         matches = _matching_buckets(result, group_name)
-        if not matches:
+        if strict_refusal is not None:
+            # hk 1769 — a listed codex plan missing a required window is
+            # unmeasurable here too, not a row measured on partial windows.
+            status_notes.append(strict_refusal)
+        elif not matches:
             status_notes.append("측정 불가")
         else:
             states = _window_states(matches, now)
@@ -3047,6 +3067,10 @@ class GateResult:
     # 안전 라벨). Fusion GPT 행이 선언된 청구 계정으로 판정될 때만 설정한다 —
     # 다른 프로필은 None 이라 기존 출력과 바이트 동일하다.
     account: str | None = None
+    # hk 1769 — 성공한 codex 판독의 미등재 plan_type (없으면 "<absent>"). 측정이
+    # 살아 있는 판정 경로에서만 채운다 — provider error·버킷 없음 경로의 출력은
+    # base 와 동일하게 유지된다. CLI 가 결정 출력 뒤에 warning 한 줄로 인쇄한다.
+    unknown_plan: str | None = None
 
 
 def _find_profile(
@@ -3900,6 +3924,20 @@ def gate_check(
                 missing_windows=missing,
                 **audit,
             )
+        strict_refusal = _codex_plan_window_refusal(result, missing)
+        if strict_refusal is not None:
+            # hk 1769 — a listed codex plan never admits on the remaining
+            # windows when one it requires has no valid bucket.
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=None,
+                reason=strict_refusal + _missing_windows_tag(missing),
+                unmeasurable=True,
+                missing_windows=missing,
+                **audit,
+            )
         matches = _matching_buckets(result, group_name)
         if not matches:
             return GateResult(
@@ -3915,6 +3953,7 @@ def gate_check(
                 missing_windows=missing,
                 **audit,
             )
+        unknown_plan = manual.unknown_codex_plan(result)
         states = _window_states(matches, now)
         constraint = _select_constraint(states)
         used_pct = constraint.used_pct
@@ -3942,6 +3981,7 @@ def gate_check(
                 used_pct=used_pct,
                 pool_class=effective_class,
                 missing_windows=missing,
+                unknown_plan=unknown_plan,
                 **audit,
             )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
@@ -3963,6 +4003,7 @@ def gate_check(
                 pool_class=effective_class,
                 exhaust_notice=notify_status,
                 missing_windows=missing,
+                unknown_plan=unknown_plan,
                 **audit,
             )
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
@@ -3988,6 +4029,7 @@ def gate_check(
             stale_accepted=accepted is not None,
             missing_windows=missing,
             e6_arm=e6_admitted,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4142,6 +4184,23 @@ def gate_check(
             **audit,
         )
 
+    strict_refusal = _codex_plan_window_refusal(result, missing)
+    if strict_refusal is not None:
+        # hk 1769 — a listed codex plan never admits on the remaining
+        # windows when one it requires has no valid bucket.
+        alts = alternatives()
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=grade,
+            reason=strict_refusal + _missing_windows_tag(missing) + rung_suffix,
+            unmeasurable=True,
+            alternatives=alts,
+            missing_windows=missing,
+            **audit,
+        )
+
     matches = _matching_buckets(result, group_name)
     if not matches:
         alts = alternatives()
@@ -4160,6 +4219,7 @@ def gate_check(
             **audit,
         )
 
+    unknown_plan = manual.unknown_codex_plan(result)
     states = _window_states(matches, now)
     constraint = _select_constraint(states)
     used_pct = constraint.used_pct
@@ -4186,6 +4246,7 @@ def gate_check(
             pool_class=effective_class,
             alternatives=alts,
             missing_windows=missing,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4210,6 +4271,7 @@ def gate_check(
             alternatives=alts,
             exhaust_notice=notify_status,
             missing_windows=missing,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4240,6 +4302,7 @@ def gate_check(
             stale_accepted=accepted is not None,
             missing_windows=missing,
             e6_arm=e6_admitted,
+            unknown_plan=unknown_plan,
             **audit,
         )
 
@@ -4263,6 +4326,7 @@ def gate_check(
         stale_accepted=accepted is not None,
         missing_windows=missing,
         e6_arm=e6_admitted,
+        unknown_plan=unknown_plan,
         **audit,
     )
 
@@ -4502,6 +4566,22 @@ def _evaluate(
                     _Excluded(
                         profile,
                         _unmeasurable_reason(provider_id, result),
+                        provider_id=provider_id,
+                        kind="unmeasurable",
+                        placed_grade=placed_grade,
+                        one_up=one_up,
+                    )
+                )
+                continue
+
+            strict_refusal = _codex_plan_window_refusal(result, _missing_required_windows(result, group_name))
+            if strict_refusal is not None:
+                # hk 1769 — a listed codex plan missing a required window is
+                # unmeasurable on this path too, never a measured candidate.
+                excluded.append(
+                    _Excluded(
+                        profile,
+                        strict_refusal,
                         provider_id=provider_id,
                         kind="unmeasurable",
                         placed_grade=placed_grade,

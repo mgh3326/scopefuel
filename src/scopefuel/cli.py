@@ -677,6 +677,26 @@ def _stale_build_verdict() -> stale_build.Verdict | None:
         return verdict
 
 
+def _emit_unknown_plan_warning(result: recommend.GateResult) -> None:
+    """Trailing ``warning:`` line naming a plan the table does not know (hk 1769).
+
+    Printed after the decision line on both allow and deny paths, so the deny
+    reason keeps stderr line 1 byte-identical to base. Set only when a
+    successful codex reading carried an absent or unlisted plan_type — error
+    and no-bucket paths emit nothing.
+    """
+    if result.unknown_plan is None:
+        return
+    if result.unknown_plan == "<absent>":
+        detail = "codex plan_type is absent — required windows fall back to {5h, 7d} (hk 1769)"
+    else:
+        detail = (
+            f"codex plan_type {result.unknown_plan!r} is not in CODEX_PLAN_REQUIRED_WINDOWS — "
+            "required windows fall back to {5h, 7d}; extend the table (hk 1769)"
+        )
+    print(f"warning: {detail}", file=sys.stderr)
+
+
 def _emit_stale_build_warning() -> None:
     """Print the one-line stale-build warning to stderr (the ``warning: catalog=stale`` convention).
 
@@ -1280,8 +1300,11 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 and (target.fetched_at is not None or confirmed_cutoff is not None)
                 else result
             )
+            # hk 1769 r2 — the re-gates only run after a live provider error,
+            # so no fresh plan was observed: the unknown-plan warning must not
+            # fire on these paths (the r1 F1 noise class).
             if not snapshot_gate.ok and not snapshot_gate.unmeasurable:
-                result = snapshot_gate
+                result = replace(snapshot_gate, unknown_plan=None)
             else:
                 try:
                     resolution = manual.resolve_result(target, now=now, group_name=group_name)
@@ -1303,7 +1326,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         **_gate_args(args),
                         **_gate_rung_args(args),
                     )
-                    result = _manual_gate_audit(result, resolution)
+                    result = _manual_gate_audit(replace(result, unknown_plan=None), resolution)
                 elif resolution is not None:
                     result = replace(
                         result,
@@ -1443,6 +1466,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             )
         print(first_line)
         print(result.reason)
+        _emit_unknown_plan_warning(result)
         _emit_stale_build_warning()
         return 0
 
@@ -1492,6 +1516,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     elif not result.reason.startswith("free_rate_limited until "):
         # This independent hold does not establish exhaustion of other pools.
         print(f"대안({result.grade}) 없음 — 동일 grade 정상 후보 전부 소진/측정불가", file=sys.stderr)
+    _emit_unknown_plan_warning(result)
     _emit_stale_build_warning()
     return exit_code
 

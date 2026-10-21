@@ -336,6 +336,9 @@ def test_disabled_env_skips_without_probing(stale_on, monkeypatch):
 HEALTHY_CODEX = ProviderResult(
     id="codex",
     pool_class="preserve",
+    # hk 1769 — a healthy reading carries its plan_type; prolite requires only
+    # the 7d window this fixture has, so it admits without a plan warning.
+    plan="prolite",
     buckets=[Bucket(label="7d", window="7d", used_pct=10.0)],
 )
 
