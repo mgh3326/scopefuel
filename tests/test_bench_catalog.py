@@ -1491,3 +1491,719 @@ def test_push_catalog_refetch_clears_the_same_floor(catalog_server, tmp_path, ca
     view = bench.read_catalog()
     assert "server catalog rejected" in view.detail
     assert "kimi-k3" not in {entry.profile for entry in view.entries} or view.source != "server"
+
+
+# --- #1774: ratchet invariants the PR-164 suite left to the tester ----------
+# Each test names the mutant it kills: a single-edit change that survived the
+# shipped suite and only the hk 1768 tester's probes caught (hk:doc
+# reports/b953/hk1768-verdict-r2; probes adapted from
+# reports/b953/hk1768-tester-probes).
+
+FILL_WARNING = "warning: catalog canon does not cover bundled"
+
+
+def _fill_lines(err: str) -> list[str]:
+    return [line for line in err.splitlines() if line.startswith(FILL_WARNING)]
+
+
+def _setup_pre_bundle(fake, *, age=3601, fill=()):
+    """A pre-bundle last-good cache: the 66-row canon, aged past the TTL."""
+
+    canon = _canon_without(NEW_TO_BUNDLE)
+    _commit_canon(canon, snapshot_fill=fill)
+    if age is not None:
+        _age_catalog_cache(age)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+    return canon
+
+
+def _dump_cache():
+    """Rows and meta, verbatim — a byte-level before/after for commit tests."""
+
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        rows = conn.execute("SELECT * FROM bench_cache_catalog ORDER BY profile, effort").fetchall()
+        meta = conn.execute("SELECT * FROM bench_cache_meta WHERE scope = 'catalog'").fetchall()
+    finally:
+        conn.close()
+    return rows, meta
+
+
+def _set_meta(**fields):
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        for key, value in fields.items():
+            conn.execute(f"UPDATE bench_cache_meta SET {key} = ? WHERE scope = 'catalog'", (value,))
+        conn.commit()
+    finally:
+        conn.close()
+    bench.reset_catalog_memo()
+
+
+def _push_rows(profiles):
+    return [
+        {**row, "decided_by": "test", "decided_at": "2026-10-21T00:00:00Z"}
+        for row in _seed_rows()
+        if row["profile"] in set(profiles)
+    ]
+
+
+def _write_push(tmp_path, rows):
+    src = tmp_path / "push.json"
+    src.write_text(json.dumps({"catalog": rows}), encoding="utf-8")
+    return src
+
+
+def _cache_profiles() -> set:
+    if not bench.db_path().exists():
+        return set()
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        return {row[0] for row in conn.execute("SELECT profile FROM bench_cache_catalog")}
+    finally:
+        conn.close()
+
+
+def _db_sha() -> str:
+    import hashlib
+
+    return hashlib.sha256(bench.db_path().read_bytes()).hexdigest()
+
+
+def test_the_rejection_floor_keeps_its_empty_and_floor_semantics(catalog_server):
+    """Unit matrix: empty always rejects; no last-good means the bundle floor."""
+
+    snap = list(bench.catalog_snapshot())
+    assert bench._server_catalog_rejection([]) == "empty catalog"
+    assert bench._server_catalog_rejection([], snap) == "empty catalog"
+    assert bench._server_catalog_rejection([], None) == "empty catalog"
+    part = [entry for entry in snap if entry.profile != "devin-argon"]
+    assert "missing 1 snapshot profile" in bench._server_catalog_rejection(part, None)
+    assert "missing 1 snapshot profile" in bench._server_catalog_rejection(part, [])
+    assert bench._server_catalog_rejection(part, part) is None
+    assert "missing 1 snapshot profile" in bench._server_catalog_rejection(part, snap)
+
+
+def test_a_retired_only_cached_profile_still_counts_for_the_ratchet(catalog_server):
+    """M01: cached rows that are all retired still *mention* their profile.
+
+    Dropping a profile whose only cached rows are retired is the same #667
+    regression as dropping a live one — retirement is coverage, so the
+    ratchet still rejects. Keeping it (retired) is a mention and stands.
+    """
+
+    _, fake = catalog_server
+    retired = "2026-10-20T00:00:00Z"
+    canon = _canon_without(NEW_TO_BUNDLE)
+    canon = [({**row, "retired_at": retired} if row["profile"] == "devin-ds41" else row) for row in canon]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+
+    fake.catalog = [row for row in canon if row["profile"] != "devin-ds41"]
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert "missing 1 snapshot profile" in view.detail
+
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "server"
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch("devin-ds41")
+
+
+def test_a_dropped_profile_the_bundle_never_carried_is_named_cached(catalog_server):
+    """M08: the rejection noun is "cached" for a non-bundled dropped profile.
+
+    A server-only profile the bundle never carried is not a "snapshot"
+    profile — and a mixed drop (bundled + server-only) keeps the noun too.
+    """
+
+    _, fake = catalog_server
+    canon = _seed_rows() + [_row("brand-new", "high", "brand-new-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+
+    fake.catalog = _seed_rows()
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert "missing 1 cached profile" in view.detail
+
+    fake.catalog = [row for row in _seed_rows() if row["profile"] != "kimi-k3"]
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert "missing 2 cached profiles" in view.detail
+
+
+def test_the_fill_warning_fires_on_every_degraded_serve(catalog_server, capsys):
+    """M10: rejected-to-cache, offline-to-cache and cache-stale serves all
+    print exactly one fill warning, like the TTL serve does."""
+
+    _, fake = catalog_server
+    canon = _setup_pre_bundle(fake)
+    bench.read_catalog()  # accept: attests the fill on the commit
+    _age_catalog_cache(3601)
+
+    # The server rejects its own catalog -> the cache serves.
+    fake.catalog = [row for row in canon if row["profile"] != "kimi-k3"]
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+    view = bench.read_catalog()
+    assert view.source == "cache" and view.detail
+    assert len(_fill_lines(capsys.readouterr().err)) == 1
+
+    # The server is unreachable -> the cache serves.
+    fake.offline = True
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert len(_fill_lines(capsys.readouterr().err)) == 1
+
+    # ... and past catalog_stale_max_s -> the cache-stale serve warns too.
+    _age_catalog_cache(90000)
+    view = bench.read_catalog()
+    assert view.source == "cache-stale"
+    assert len(_fill_lines(capsys.readouterr().err)) == 1
+
+
+class _FailOnFillUpdate:
+    """Connection proxy that fails the snapshot_fill UPDATE (fault injection)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args):
+        if str(sql).lstrip().startswith("UPDATE bench_cache_meta SET snapshot_fill"):
+            raise sqlite3.OperationalError("injected")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_the_fill_update_commits_with_the_rows_and_the_stamp(catalog_server, monkeypatch):
+    """M11: rows, stamp and fill are one transaction.
+
+    A fault in the fill UPDATE must roll the rows and the stamp back with it —
+    committing them first would leave a cache whose fill attests nothing.
+    """
+
+    _commit_canon(_canon_without(NEW_TO_BUNDLE), snapshot_fill=NEW_TO_BUNDLE)
+    before = _dump_cache()
+    real = bench._cache_connect
+    monkeypatch.setattr(bench, "_cache_connect", lambda path=None: _FailOnFillUpdate(real(path)))
+    backend = bench.bench_backend(use="catalog")
+    with pytest.raises(sqlite3.OperationalError):
+        bench._commit_catalog_cache(
+            path=None,
+            entries=bench._catalog_from_payload({"catalog": _canon_without(NEW_TO_BUNDLE + ("oc-solar4",))}),
+            backend=backend,
+            snapshot_fill=tuple(sorted(NEW_TO_BUNDLE + ("oc-solar4",))),
+        )
+    assert _dump_cache() == before
+
+
+def test_commit_cache_false_without_a_db_creates_nothing(catalog_server):
+    """M14: the read-only path never creates the database."""
+
+    _, fake = catalog_server
+    fake.catalog = _seed_rows()
+    path = bench.db_path()
+    assert not path.exists()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == "server"
+    assert not path.exists()
+
+
+def test_commit_cache_false_ratchets_and_never_writes(catalog_server, capsys):
+    """M14: the read-only path honours the ratchet without touching the DB."""
+
+    _, fake = catalog_server
+    canon = _setup_pre_bundle(fake)
+    before = _db_sha()
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == "server"
+    assert view.snapshot_fill == tuple(sorted(NEW_TO_BUNDLE))
+    assert len(_fill_lines(capsys.readouterr().err)) == 1
+    assert _db_sha() == before
+    # Dropping a cached profile is still rejected on the read-only path.
+    fake.catalog = [row for row in canon if row["profile"] != "kimi-k3"]
+    bench.reset_catalog_memo()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == "cache" and "server catalog rejected" in view.detail
+    assert _db_sha() == before
+
+
+def test_commit_cache_false_survives_a_db_lacking_snapshot_fill(catalog_server):
+    """M14+M15: a pre-fill DB is a usable cache, and the read-only path
+    must not migrate it."""
+
+    _, fake = catalog_server
+    _setup_pre_bundle(fake)
+    conn = sqlite3.connect(bench.db_path())
+    conn.execute("ALTER TABLE bench_cache_meta DROP COLUMN snapshot_fill")
+    conn.commit()
+    conn.close()
+    before = _db_sha()
+
+    bench.reset_catalog_memo()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == "server"  # fetched; the ratchet read the rows anyway
+    assert _db_sha() == before
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bench_cache_meta)")]
+    finally:
+        conn.close()
+    assert "snapshot_fill" not in cols
+
+    # The TTL serve on the same legacy DB attests no fill.
+    _age_catalog_cache(60)
+    before = _db_sha()
+    bench.reset_catalog_memo()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == "cache" and view.snapshot_fill == ()
+    assert _db_sha() == before
+
+
+def test_commit_cache_false_survives_a_db_lacking_the_meta_table(catalog_server):
+    """M14: no meta table at all means no stamp, so the bundle floor decides —
+    and the read-only path still writes nothing."""
+
+    _, fake = catalog_server
+    canon = _setup_pre_bundle(fake)
+    conn = sqlite3.connect(bench.db_path())
+    conn.execute("DROP TABLE bench_cache_meta")
+    conn.commit()
+    conn.close()
+    before = _db_sha()
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+    view = bench.read_catalog(commit_cache=False)
+    assert view.source == "snapshot"
+    assert _db_sha() == before
+
+
+def test_a_pre_fill_cache_reads_as_usable_with_no_attested_fill(catalog_server, capsys):
+    """M15: a cache committed before snapshot_fill existed still serves; the
+    gaps it cannot attest are listed under uncovered, never warned about."""
+
+    path = bench.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE bench_cache_meta (scope TEXT PRIMARY KEY CHECK (scope IN "
+        "('scores','reps','grades','catalog')), fetched_at TEXT NOT NULL, "
+        "endpoint_id TEXT NOT NULL DEFAULT '')"
+    )
+    conn.commit()
+    conn.close()
+    canon = _canon_without(NEW_TO_BUNDLE)
+    backend = bench.bench_backend(use="catalog")
+    # The head build opens the DB (which adds the column); stamping without a
+    # fill value emulates a pre-floor commit.
+    conn = bench._cache_connect(None)
+    try:
+        for entry in bench._catalog_from_payload({"catalog": canon}):
+            bench._put_cached_catalog(conn, entry)
+        bench._stamp_cache(conn, "catalog", backend, bench._cache_now())
+        conn.commit()
+    finally:
+        conn.close()
+    assert _stored_fill() == ""
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+
+    assert cli.main(["bench", "catalog", "status"]) == 0
+    cap = capsys.readouterr()
+    assert not any(line.startswith("new to the bundle") for line in cap.out.splitlines())
+    uncovered = next(line for line in cap.out.splitlines() if line.startswith("uncovered"))
+    for profile in NEW_TO_BUNDLE:
+        assert profile in uncovered
+    assert not _fill_lines(cap.err)
+
+
+def test_the_old_meta_table_migrates_with_the_fill_column(catalog_server):
+    """A pre-#593-shape meta table gains snapshot_fill on first open, and a
+    commit then records the attested fill end to end."""
+
+    path = bench.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE bench_cache_meta (scope TEXT PRIMARY KEY CHECK (scope IN "
+        "('scores','reps','grades')), fetched_at TEXT NOT NULL, "
+        "endpoint_id TEXT NOT NULL DEFAULT '')"
+    )
+    conn.execute("INSERT INTO bench_cache_meta VALUES ('scores','2026-01-01T00:00:00+00:00','e')")
+    conn.commit()
+    conn.close()
+
+    conn = bench._cache_connect(None)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bench_cache_meta)")]
+    finally:
+        conn.close()
+    assert "snapshot_fill" in cols
+
+    _commit_canon(_canon_without(NEW_TO_BUNDLE), snapshot_fill=NEW_TO_BUNDLE)
+    assert set(_stored_fill().split(",")) == set(NEW_TO_BUNDLE)
+
+
+def test_the_stored_fill_is_intersected_with_this_builds_bundle(catalog_server, capsys, monkeypatch):
+    """M07: a profile the bundle dropped since the commit is not attested.
+
+    The stored fill names profiles *new to this build's bundle*; a later build
+    that drops one must not echo it on the warning or the view.
+    """
+
+    _setup_pre_bundle(catalog_server[1])
+    bench.read_catalog()  # commits fill = NEW_TO_BUNDLE
+    real = bench.snapshot_profiles
+    monkeypatch.setattr(bench, "snapshot_profiles", lambda: real() - {"devin-argon"})
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+
+    view = bench.read_catalog()
+    assert view.source == "cache"
+    assert "devin-argon" not in view.snapshot_fill
+    line = "".join(_fill_lines(capsys.readouterr().err))
+    named = line.split("bundled profiles ")[1].split(";")[0].split(", ")
+    assert "devin-argon" not in named
+    assert "devin-argon-low" in named
+
+
+def test_push_refetch_ratchet_is_the_cache_not_the_bundle(catalog_server, tmp_path, capsys):
+    """N3/N7: the push-path floor is the last-good cache, not the bundle.
+
+    The dropped profile is server-only — the bundle never carried it — so the
+    bundle floor alone cannot reject the refetch (nor can an always-empty
+    baseline). Only the cache ratchet does.
+    """
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [_row("srv-only", "high", "srv-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = [row for row in canon if row["profile"] != "srv-only"]
+    before = _dump_cache()
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    err = capsys.readouterr().err
+    assert "refetched catalog was rejected" in err
+    assert "missing 1 cached profile" in err
+    assert _dump_cache() == before
+    assert "srv-only" in _cache_profiles()
+
+
+def test_push_refetch_foreign_endpoint_cache_is_no_baseline(catalog_server, tmp_path, capsys):
+    """N1: another endpoint's cache never ratchets the push path — the
+    refetch is judged by the bundle floor and refreshes the cache."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [_row("srv-only", "high", "srv-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _set_meta(endpoint_id="some-other-endpoint")
+    fake.catalog = _seed_rows()  # the full bundle; lacks srv-only
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    assert "was rejected" not in capsys.readouterr().err
+    assert "srv-only" not in _cache_profiles()  # refreshed to the new endpoint's canon
+    assert _stored_fill() == ""
+
+
+def test_push_refetch_stale_cache_still_ratchets(catalog_server, tmp_path, capsys):
+    """N4: membership is not freshness — a cache far past catalog_stale_max_s
+    is still the push-path baseline. The server serves the complete bundle, so
+    only the cache ratchet can reject the refetch."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [_row("srv-only", "high", "srv-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _age_catalog_cache(100 * 86400)
+    fake.catalog = _seed_rows()  # complete bundle coverage; drops srv-only
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    err = capsys.readouterr().err
+    assert "refetched catalog was rejected" in err
+    assert "missing 1 cached profile" in err
+    assert "srv-only" in _cache_profiles()
+
+
+def test_push_refetch_bundle_only_gap_refreshes_and_records_the_fill(catalog_server, tmp_path, capsys):
+    """M16: a gap that is bundle-new only does not reject — the refresh lands
+    and the commit records the still-missing attested fill."""
+
+    _, fake = catalog_server
+    _setup_pre_bundle(fake)  # cache and server both lack the five additions
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    assert "was rejected" not in capsys.readouterr().err
+    assert "devin-argon" in _cache_profiles()
+    assert set(_stored_fill().split(",")) == set(NEW_TO_BUNDLE) - {"devin-argon"}
+
+
+def test_push_refetch_repair_push_restores_the_dropped_profile(catalog_server, tmp_path, capsys):
+    """A push that restores the dropped profile refetches clean and the cache
+    is complete again — the ratchet is a floor, not a wedge."""
+
+    _, fake = catalog_server
+    canon = _setup_pre_bundle(fake)
+    fake.catalog = [row for row in canon if row["profile"] != "kimi-k3"]
+    capsys.readouterr()
+
+    repair = [
+        {**row, "decided_by": "test", "decided_at": "2026-10-21T00:00:00Z"}
+        for row in canon
+        if row["profile"] == "kimi-k3"
+    ]
+    assert repair
+    bench.push_catalog(_write_push(tmp_path, repair))
+    assert "was rejected" not in capsys.readouterr().err
+    assert {row["profile"] for row in canon} <= _cache_profiles()
+
+
+def test_push_refetch_without_a_cache_uses_the_bundle_floor(catalog_server, tmp_path, capsys):
+    """First run, no DB: a partial seed push is refused by the bundle floor
+    and creates no cache; a complete seed is accepted and fills it."""
+
+    _, fake = catalog_server
+    fake.catalog = []
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    err = capsys.readouterr().err
+    assert "refetched catalog was rejected" in err and "snapshot" in err
+    assert _cache_profiles() == set()
+
+    full = [{**row, "decided_by": "test", "decided_at": "2026-10-21T00:00:00Z"} for row in _seed_rows()]
+    capsys.readouterr()
+    bench.push_catalog(_write_push(tmp_path, full))
+    assert "was rejected" not in capsys.readouterr().err
+    assert len(_cache_profiles()) == len(bench.snapshot_profiles())
+
+
+def test_push_refetch_cli_output_unchanged_on_a_rejected_refresh(catalog_server, tmp_path, capsys):
+    """The write still reports what it wrote; a rejected refresh is a
+    warning, not a failure."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [_row("srv-only", "high", "srv-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = [row for row in canon if row["profile"] != "srv-only"]
+    src = _write_push(tmp_path, _push_rows(["devin-argon"]))
+    capsys.readouterr()
+
+    rc = cli.main(["bench", "push-catalog", str(src)])
+    cap = capsys.readouterr()
+    assert rc == 0
+    assert f"catalog rows written: {len(_push_rows(['devin-argon']))}" in cap.out
+    assert "refetched catalog was rejected" in cap.err
+
+
+def test_the_last_good_gate_unit_matrix(catalog_server):
+    """N1/N4/N5/N8: the stamp gate on the push-path baseline — no DB, no
+    stamp, foreign endpoint, and garbage/empty/future stamps are no baseline;
+    age is irrelevant."""
+
+    import datetime as dt
+
+    backend = bench.bench_backend(use="catalog")
+    assert bench._last_good_catalog(path=None, backend=backend) == []  # no DB
+    canon = _canon_without(NEW_TO_BUNDLE)
+    _commit_canon(canon)
+    got = bench._last_good_catalog(path=None, backend=backend)
+    assert {e.profile for e in got} == {row["profile"] for row in canon}
+    _age_catalog_cache(100 * 86400)
+    assert bench._last_good_catalog(path=None, backend=backend)  # age is irrelevant
+    for bad in (
+        (dt.datetime.now(dt.UTC) + dt.timedelta(days=30)).isoformat(),
+        "garbage",
+        "",
+    ):
+        _set_meta(fetched_at=bad)
+        assert bench._last_good_catalog(path=None, backend=backend) == [], bad
+    _set_meta(fetched_at=dt.datetime.now(dt.UTC).isoformat(), endpoint_id="other")
+    assert bench._last_good_catalog(path=None, backend=backend) == []
+    conn = sqlite3.connect(bench.db_path())
+    conn.execute("DELETE FROM bench_cache_meta WHERE scope = 'catalog'")
+    conn.commit()
+    conn.close()
+    assert bench._last_good_catalog(path=None, backend=backend) == []
+
+
+@pytest.mark.parametrize("serve", ["ttl", "rejected", "offline", "stale"])
+def test_a_tampered_fill_never_names_a_covered_profile(catalog_server, capsys, serve):
+    """R2: hand-edited meta naming a covered profile is not echoed — on any
+    of the serve paths that use the stored fill (TTL, rejected-to-cache,
+    offline-to-cache, cache-stale)."""
+
+    _, fake = catalog_server
+    canon = _setup_pre_bundle(fake)  # aged 3601 by default
+    _set_meta(snapshot_fill="opus,devin-argon")
+    if serve == "ttl":
+        _age_catalog_cache(60)
+    elif serve == "rejected":
+        fake.catalog = [row for row in canon if row["profile"] != "kimi-k3"]
+    elif serve == "offline":
+        fake.offline = True
+    else:  # stale
+        _age_catalog_cache(90000)
+        fake.offline = True
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+
+    view = bench.read_catalog()
+    assert view.source == ("cache-stale" if serve == "stale" else "cache")
+    assert view.snapshot_fill == ("devin-argon",)
+    warned = "".join(_fill_lines(capsys.readouterr().err))
+    assert "devin-argon" in warned
+    assert "opus" not in warned
+
+    out = bench.catalog_status_report()
+    heading = next(line for line in out.splitlines() if line.startswith("new to the bundle"))
+    assert "devin-argon" in heading and "opus" not in heading
+    uncovered = next(line for line in out.splitlines() if line.startswith("uncovered"))
+    assert "devin-argon-low" in uncovered
+
+
+@pytest.mark.parametrize("serve", ["ttl", "rejected", "offline", "stale"])
+def test_a_commit_landing_mid_read_never_names_a_covered_profile(catalog_server, capsys, monkeypatch, serve):
+    """R1: the torn read cannot echo a covered profile — on any serve path.
+
+    The rows SELECT and the meta SELECT are separate statements; a commit
+    landing between them yields rows from one commit and the stamp+fill from
+    another. The served profiles are subtracted from the stored fill, so the
+    warning and the view still cannot name a profile the served entries cover.
+    The racing commit's stamp is backdated so each case really takes its own
+    serve path rather than always the TTL serve.
+    """
+
+    _, fake = catalog_server
+    backend = bench.bench_backend(use="catalog")
+    canon_a = _canon_without(NEW_TO_BUNDLE)  # covers oc-solar4
+    canon_b = _canon_without(NEW_TO_BUNDLE + ("oc-solar4",))
+    _commit_canon(canon_a, snapshot_fill=NEW_TO_BUNDLE)
+    real = bench._catalog_meta_row
+    state = {"done": False}
+    age_s = {"ttl": 60, "rejected": 3601, "offline": 3601, "stale": 90000}[serve]
+
+    def racing(conn):
+        if not state["done"]:
+            state["done"] = True
+            bench._commit_catalog_cache(
+                path=None,
+                entries=bench._catalog_from_payload({"catalog": canon_b}),
+                backend=backend,
+                snapshot_fill=tuple(sorted(NEW_TO_BUNDLE + ("oc-solar4",))),
+            )
+            import datetime as dt
+
+            stamp = (dt.datetime.now(dt.UTC) - dt.timedelta(seconds=age_s)).isoformat()
+            conn.execute("UPDATE bench_cache_meta SET fetched_at = ? WHERE scope = 'catalog'", (stamp,))
+        return real(conn)
+
+    monkeypatch.setattr(bench, "_catalog_meta_row", racing)
+    if serve == "rejected":
+        fake.catalog = canon_b  # drops canon_a's oc-solar4 -> the fetch is refused
+    if serve in ("offline", "stale"):
+        fake.offline = True
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+
+    view = bench.read_catalog()
+    assert state["done"] is True
+    assert view.source == ("cache-stale" if serve == "stale" else "cache")
+    served = {entry.profile for entry in view.entries}
+    assert "oc-solar4" in served
+    assert "oc-solar4" not in view.snapshot_fill
+    assert set(view.snapshot_fill) == set(NEW_TO_BUNDLE)
+    warned = "".join(_fill_lines(capsys.readouterr().err))
+    assert "oc-solar4" not in warned
+    assert "devin-argon" in warned
+
+
+@pytest.mark.parametrize("bad_stamp", ["not-a-timestamp", "", "2026-13-45T00:00:00Z"])
+def test_the_read_path_distrusts_an_unparseable_stamp(catalog_server, bad_stamp):
+    """N8, read path: an unparseable stamp is no baseline and no cache.
+
+    The cache holds a server-only profile; the fetched catalog covers the
+    whole bundle but lacks it — only a trusted baseline could reject that
+    catalog. With the stamp unparseable the bundle floor accepts it, and an
+    unreachable server means the snapshot, not the unreadable cache.
+    """
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [_row("srv-only", "high", "srv-1", "codex", "S", score=63.0)]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    _set_meta(fetched_at=bad_stamp)
+
+    fake.offline = True
+    view = bench.read_catalog()
+    assert view.source == "snapshot"
+    fake.offline = False
+    fake.catalog = _seed_rows()
+    bench.reset_catalog_memo()
+    view = bench.read_catalog()
+    assert view.source == "server"
+
+
+def test_the_fill_warning_is_grammatical_in_the_singular(catalog_server, capsys):
+    """The singular reads "filling it ... to add it"; the plural keeps
+    "filling them ... to add them"."""
+
+    _, fake = catalog_server
+    canon = _canon_without(("devin-argon",))
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = canon
+    bench.reset_catalog_memo()
+    capsys.readouterr()
+
+    view = bench.read_catalog()
+    assert view.snapshot_fill == ("devin-argon",)
+    (line,) = _fill_lines(capsys.readouterr().err)
+    assert "bundled profile devin-argon;" in line
+    assert "filling it from the bundled snapshot" in line
+    assert "to add it to the canon" in line
+
+    _setup_pre_bundle(fake)
+    capsys.readouterr()
+    view = bench.read_catalog()
+    assert len(view.snapshot_fill) == len(NEW_TO_BUNDLE)
+    (line,) = _fill_lines(capsys.readouterr().err)
+    assert "bundled profiles" in line
+    assert "filling them from the bundled snapshot" in line
+    assert "to add them to the canon" in line
+
+
+def test_push_refetch_ratchet_counts_a_retired_only_cached_profile(catalog_server, tmp_path, capsys):
+    """M01 on the push path: a cached profile whose rows are all retired
+    still counts toward the baseline — the server serves the complete
+    bundle, so only the cache ratchet can reject the refetch."""
+
+    _, fake = catalog_server
+    canon = _canon_without(NEW_TO_BUNDLE) + [
+        _row("srv-only", "high", "srv-1", "codex", "S", score=63.0, retired_at="2026-10-20T00:00:00Z")
+    ]
+    _commit_canon(canon)
+    _age_catalog_cache(3601)
+    fake.catalog = _seed_rows()  # full bundle; srv-only hard-deleted
+    capsys.readouterr()
+
+    bench.push_catalog(_write_push(tmp_path, _push_rows(["devin-argon"])))
+    err = capsys.readouterr().err
+    assert "refetched catalog was rejected" in err
+    assert "missing 1 cached profile" in err
+    assert "srv-only" in _cache_profiles()

@@ -3040,10 +3040,11 @@ def _warn_snapshot_fill(fill: tuple[str, ...] | list[str]) -> None:
     """
 
     word = "profile" if len(fill) == 1 else "profiles"
+    pronoun = "it" if len(fill) == 1 else "them"
     print(
         f"warning: catalog canon does not cover bundled {word} {', '.join(fill)}; "
-        "filling them from the bundled snapshot — bench push-catalog is needed "
-        "to add them to the canon",
+        f"filling {pronoun} from the bundled snapshot — bench push-catalog is needed "
+        f"to add {pronoun} to the canon",
         file=sys.stderr,
     )
 
@@ -3131,13 +3132,36 @@ def _stored_snapshot_fill(row: sqlite3.Row | None) -> tuple[str, ...]:
     return tuple(profile for profile in text.split(",") if profile)
 
 
+def _catalog_stamp_age_s(row: sqlite3.Row | None, backend: BenchBackend, now: dt.datetime) -> float | None:
+    """The committed cache stamp's age in seconds, or ``None`` when it attests nothing.
+
+    The one trust gate the cache serve and the push-path ratchet share: no
+    meta row, another endpoint's stamp, an unparseable stamp, or a stamp from
+    the future beyond the clock skew all mean the rows are not last-good. A
+    stamp from the future is not a very fresh cache, it is a broken one — a
+    clock skew or a corrupted row; clamping it to age 0 pinned the host to
+    that cache forever and no server change ever arrived.
+    """
+
+    if row is None or row["endpoint_id"] != backend.endpoint_id:
+        return None
+    fetched_at = _cached_at(row["fetched_at"])
+    if fetched_at is None:
+        return None
+    age = (now - fetched_at).total_seconds()
+    if age < -_CACHE_CLOCK_SKEW_S:
+        return None
+    return max(0.0, age)
+
+
 def _last_good_catalog(*, path: pathlib.Path | str | None, backend: BenchBackend) -> list[CatalogEntry]:
     """The last-good committed cache rows, gated exactly like a cache serve.
 
     Empty when the cache is unusable as a ratchet baseline: no meta stamp,
     another endpoint's rows, or an unparseable/future stamp — the same
-    conditions that empty ``cached`` in ``_read_catalog_uncached`` (freshness
-    itself is irrelevant: membership is not freshness).
+    ``_catalog_stamp_age_s`` gate that empties ``cached`` in
+    ``_read_catalog_uncached`` (freshness itself is irrelevant: membership is
+    not freshness).
     """
 
     try:
@@ -3149,12 +3173,7 @@ def _last_good_catalog(*, path: pathlib.Path | str | None, backend: BenchBackend
             conn.close()
     except sqlite3.Error:
         return []
-    if row is None or row["endpoint_id"] != backend.endpoint_id:
-        return []
-    fetched_at = _cached_at(row["fetched_at"])
-    if fetched_at is None:
-        return []
-    if (_cache_now() - fetched_at).total_seconds() < -_CACHE_CLOCK_SKEW_S:
+    if _catalog_stamp_age_s(row, backend, _cache_now()) is None:
         return []
     return cached
 
@@ -3241,27 +3260,21 @@ def _read_catalog_uncached(
             except sqlite3.Error:
                 cached, row = [], None
 
-    age_s: float | None = None
-    if row is not None and row["endpoint_id"] == backend.endpoint_id:
-        fetched_at = _cached_at(row["fetched_at"])
-        if fetched_at is not None:
-            age = (now - fetched_at).total_seconds()
-            # A stamp from the future is not a very fresh cache, it is a broken
-            # one — a clock skew or a corrupted row. Clamping it to age 0 pinned
-            # the host to that cache forever and no server change ever arrived.
-            age_s = age if age >= -_CACHE_CLOCK_SKEW_S else None
-            if age_s is not None:
-                age_s = max(0.0, age_s)
+    age_s = _catalog_stamp_age_s(row, backend, now)
     if age_s is None:
         cached = []
     # The last-good attestation: which bundled profiles the canon legitimately
     # lacked at the last commit. It shares the cache's trust gate — a stamp
     # that failed the endpoint/age checks attests nothing — and only profiles
-    # still in this build's bundle can still be new to it.
+    # still in this build's bundle can still be new to it. Profiles the served
+    # rows cover are subtracted too: a stored fill naming one is torn (a commit
+    # landed between the two SELECTs) or hand-edited meta, and a warning must
+    # never name a profile the served entries already cover.
     stored_fill: tuple[str, ...] = ()
     if age_s is not None:
         bundled = snapshot_profiles()
-        stored_fill = tuple(p for p in _stored_snapshot_fill(row) if p in bundled)
+        covered = {entry.profile for entry in cached}
+        stored_fill = tuple(p for p in _stored_snapshot_fill(row) if p in bundled and p not in covered)
 
     # ``catalog_stale_max_s`` is a ceiling on trusting the cache at all, so a TTL
     # configured above it must not be able to keep serving a cache the ceiling
