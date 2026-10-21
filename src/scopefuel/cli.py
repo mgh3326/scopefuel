@@ -197,7 +197,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         metavar="WINDOW=PCT|none",
         help=(
             "hk 1787 [pools.<pool>.inflight_reserve_pct] — 반복 지정으로 창별 잡당 "
-            "예약 %를 설정(예: --inflight-reserve 5h=12 --inflight-reserve 7d=2). "
+            "예약 비율을 설정(예: --inflight-reserve 5h=12 --inflight-reserve 7d=2). "
             "'none' 은 테이블 전체 제거"
         ),
     )
