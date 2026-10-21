@@ -22,12 +22,12 @@ from scopefuel import bench, cli, launch
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
     E6_ARM_ANNOTATION,
-    E6_ARM_GRADE,
     E6_ARM_KEYS,
     E6_ARM_MARKER_ENV,
     E6_ARM_RUNGS,
     GRADE_TABLE,
     Profile,
+    e6_arm_carrier_grade,
     e6_arm_rung_for,
     gate_check,
     parse_e6_arm_marker,
@@ -40,18 +40,27 @@ NOW = dt.datetime(2026, 9, 25, 12, 0, 0, tzinfo=dt.UTC)
 
 # (profile, effort) -> (pool, catalog model id, the AA number scopefuel stores)
 # #920: sonnet@max left this table — the Sonnet 5.5 refresh placed the rung at
-# S (estimated vendor TB4 70.6, one step below its raw S+ read).
+# S (estimated vendor TB4 70.6, one step below its raw S+ read). hk 1788 took
+# it back to an arm rung (hk 1786 phase 0): the S placement was an estimate.
 # #1296: grok-hi@xhigh, devin-swe2@high and devin-swe2-max@max left too — the
 # 10-08 operator decision promoted them to ordinary placements (A / A+ / A+).
-NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str]] = {
-    ("codex-sol", "high"): ("codex", "gpt-6.1-sol", "high 42.8"),
-    ("codex-sol", "medium"): ("codex", "gpt-6.1-sol", "medium 미저장"),
-    ("kimi-k3", "high"): ("kimi", "kimi-k3", "default 61.0"),
-    ("kimi-k3", "max"): ("kimi", "kimi-k3", "max 43.6"),
+# (profile, effort) -> (pool, catalog model id, the AA/vendor number scopefuel
+# stores, the rung's carrier grade — C except sonnet@max at A+, #1788)
+NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str, str]] = {
+    ("codex-sol", "high"): ("codex", "gpt-6.1-sol", "high 42.8", "C"),
+    ("codex-sol", "medium"): ("codex", "gpt-6.1-sol", "medium 미저장", "C"),
+    ("codex-sol", "low"): ("codex", "gpt-6.1-sol", "low 미저장", "C"),
+    ("kimi-k3", "high"): ("kimi", "kimi-k3", "default 61.0", "C"),
+    ("kimi-k3", "max"): ("kimi", "kimi-k3", "max 43.6", "C"),
     # #737 (decision 4088): the grok E6 arms — builder-grok-low/-medium/-xhigh.
-    ("grok-hi", "low"): ("grok", "grok-4.7", "high 46.3"),
-    ("grok-hi", "medium"): ("grok", "grok-4.7", "high 46.3"),
+    ("grok-hi", "low"): ("grok", "grok-4.7", "high 46.3", "C"),
+    ("grok-hi", "medium"): ("grok", "grok-4.7", "high 46.3", "C"),
+    # hk 1788 (hk 1786 phase 0, hk:doc/briefs/b953/tier-coverage).
+    ("haiku", "xhigh"): ("claude", "claude-haiku-5-5", "xhigh 31.5", "C"),
+    ("haiku", "max"): ("claude", "claude-haiku-5-5", "max 39.2", "C"),
+    ("sonnet", "max"): ("claude", "claude-sonnet-5-5", "max 70.6", "A+"),
 }
+CARRIER = {key: spec[3] for key, spec in NEW_RUNGS.items()}
 # #1284: rungs whose model has no AA measurement at all — the row must say so
 # rather than carry an AA mapping it does not have. Empty since #1296 (the two
 # no-AA devin rungs graduated to ordinary placements); kept for the next arm.
@@ -61,9 +70,8 @@ NO_AA_RUNGS: frozenset[tuple[str, str]] = frozenset()
 EXISTING_RUNGS: dict[tuple[str, str], str] = {
     ("opus", "low"): "S",
     ("opus", "medium"): "S+",
-    # #920: sonnet@max graduated from the E6 table to a placed S row
-    # (estimated); sonnet@xhigh stays A+ (raw 61.0 is S, one step down).
-    ("sonnet", "max"): "S",
+    # #920: sonnet@max graduated to a placed S row — hk 1788 took it back to
+    # an arm rung; sonnet@xhigh stays A+ (raw 61.0 is S, one step down).
     ("sonnet", "xhigh"): "A+",
     ("codex-sol", "xhigh"): "S+",
     ("codex-sol", "max"): "S+",
@@ -121,13 +129,12 @@ def test_no_new_row_appears_for_a_rung_that_already_existed():
 
 
 @pytest.mark.parametrize(("key", "expected"), sorted(NEW_RUNGS.items()))
-def test_each_new_rung_is_a_catalog_row_of_grade_c(key, expected):
-    pool, model_id, aa_reference = expected
+def test_each_new_rung_is_a_catalog_row_at_its_carrier(key, expected):
+    pool, model_id, aa_reference, carrier = expected
     rows = [entry for entry in bench.catalog_snapshot() if entry.key == key]
     assert len(rows) == 1, rows
     (row,) = rows
-    assert row.grade == E6_ARM_GRADE
-    assert row.grade == "C"
+    assert row.grade == e6_arm_carrier_grade(*key) == carrier
     assert row.score is None
     assert row.pool == pool
     assert row.model_id == model_id
@@ -181,20 +188,20 @@ def test_the_seed_emits_the_e6_rows_with_their_own_deviation_ref(capsys):
     rows = {(row["profile"], row["effort"]): row for row in json.loads(capsys.readouterr().out)["catalog"]}
     for key in NEW_RUNGS:
         row = rows[key]
-        assert row["grade"] == "C"
-        assert row["decided_by"] == "operator-desk"
-        assert "e6-effort-ladder" in row["deviation_ref"]
+        assert row["grade"] == CARRIER[key]
+        assert row["decided_by"] in {"operator-desk", "b953-hk1786"}
+        assert row["deviation_ref"]
 
 
 @pytest.mark.parametrize("key", sorted(NEW_RUNGS))
 def test_each_new_rung_resolves_to_the_right_pool_and_effort_with_the_marker(key):
     profile, effort = key
-    pool, model_id, _ = NEW_RUNGS[key]
+    pool, model_id, _, carrier = NEW_RUNGS[key]
     decision = launch.resolve_launch(profile, effort=effort, e6_arm=f"{profile}@{effort}")
     assert decision.pool == pool
     assert decision.effort == effort
     assert decision.model_id == model_id
-    assert decision.grade == "C"
+    assert decision.grade == carrier
     assert decision.e6_arm == f"{profile}@{effort}"
 
 
@@ -330,15 +337,14 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
         return bench.CatalogEntry(
             profile=profile,
             effort=effort,
-            model_id="claude-sonnet-5-5" if profile == "sonnet" else "gpt-6.1-sol",
-            pool="claude" if profile == "sonnet" else "codex",
+            model_id={"sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}.get(profile, "gpt-6.1-sol"),
+            pool="claude" if profile in ("sonnet", "haiku") else "codex",
             grade=grade,
             benchmark_annotation=E6_ARM_ANNOTATION,
         )
 
     view = bench.CatalogView(
-        entries=tuple(entry(profile, effort, "C") for profile, effort in NEW_RUNGS)
-        + (entry("sonnet", "high", "B"),),
+        entries=tuple(entry(p, e, CARRIER[(p, e)]) for p, e in NEW_RUNGS) + (entry("sonnet", "high", "A"),),
         source="server",
         backend="handoffkeep",
     )
@@ -347,6 +353,8 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
     placed = {(p.name, p.launcher_effort or "") for profiles in table.values() for p in profiles}
     assert not (set(E6_ARM_KEYS) & placed)
     assert ("sonnet", "high") in placed
+    # sonnet@max at its A+ carrier stays out; a canon move off carrier is ordinary.
+    assert ("sonnet", "max") not in placed
 
 
 # --- AC2: the gate admits only an explicit E6 arm ----------------------------
@@ -366,7 +374,7 @@ def test_gate_refuses_an_unmarked_rung_with_the_rung_in_the_reason(key):
     assert result.ok is False
     assert result.unmeasurable is False
     assert result.role_denied is False
-    assert result.grade == "C"
+    assert result.grade == CARRIER[key]
     assert "e6_arm_required" in result.reason
     assert f"{profile}@{effort}" in result.reason
     assert E6_ARM_MARKER_ENV in result.reason
@@ -385,9 +393,9 @@ def test_gate_admits_the_rung_with_the_marker_and_tags_the_allow_reason(key):
         now=NOW,
     )
     assert result.ok is True, result.reason
-    assert result.grade == "C"
+    assert result.grade == CARRIER[key]
     assert result.e6_arm == f"{profile}@{effort}"
-    assert f"[E6 arm, unmeasured C: {profile}@{effort}]" in result.reason
+    assert f"[E6 arm, unmeasured {CARRIER[key]}: {profile}@{effort}]" in result.reason
 
 
 def test_gate_cli_refuses_and_names_the_remedy(monkeypatch, capsys, tmp_path):
@@ -541,9 +549,8 @@ def test_a_retired_e6_rung_is_not_revived_by_the_marker():
 def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
     """sonnet@high is a placement: the marker neither opens nor closes anything.
 
-    #1297: sonnet@high is the Sonnet 5.5 B row (operator decision 2026-10-08;
-    the estimate's raw 43.0 reads B) — the marker still changes nothing about
-    the judgement."""
+    hk 1788: sonnet@high is the Sonnet 5.5 A row (b953-hk1786 promote — 8 clean
+    A passes, 0 FAIL) — the marker still changes nothing about the judgement."""
 
     result = gate_check(
         [_provider("claude", pool_class="spend")],
@@ -554,7 +561,7 @@ def test_a_marker_for_a_placed_rung_leaves_that_rung_ordinary():
         now=NOW,
     )
     assert result.ok is True
-    assert result.grade == "B"
+    assert result.grade == "A"
     assert result.e6_arm is None
     assert "E6 arm" not in result.reason
 
@@ -618,14 +625,20 @@ def test_builder_grok_pin_resolves_the_promoted_rung_without_a_marker():
     assert decision.e6_arm is None
 
 
-def test_an_unmarked_max_rung_resolves_its_own_placed_row():
-    """#920: sonnet@max is a placed S row now, not an E6 rung — no marker needed."""
+def test_an_unmarked_max_rung_falls_back_to_the_default_rung():
+    """hk 1788: sonnet@max is an arm rung again — unmarked, its E6 row is
+    dropped and the launch falls back to the profile default (high), exactly
+    the fallback a rung the catalog never placed takes."""
 
     decision = launch.resolve_launch("sonnet", effort="max")
     assert decision.effort == "max"
-    assert decision.grade == "S"
-    assert decision.gate == "escalation"
+    assert decision.grade == "A"
+    assert decision.gate == "default"
     assert decision.e6_arm is None
+    decision = launch.resolve_launch("sonnet", effort="max", e6_arm="sonnet@max")
+    assert decision.effort == "max"
+    assert decision.grade == "A+"
+    assert decision.e6_arm == "sonnet@max"
 
 
 def test_the_marker_does_not_change_a_request_that_names_no_rung(monkeypatch, capsys):
@@ -635,7 +648,7 @@ def test_the_marker_does_not_change_a_request_that_names_no_rung(monkeypatch, ca
     assert cli.main(["policy", "launch", "sonnet", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["effort"] == "high"
-    assert payload["grade"] == "B"  # #1297: the promoted sonnet@high row
+    assert payload["grade"] == "A"  # hk 1788: the b953 promoted sonnet@high row
     assert payload["e6_arm"] is None
 
 
@@ -654,7 +667,7 @@ def test_the_plain_gate_output_carries_no_e6_field(monkeypatch, capsys, tmp_path
     assert "e6_arm" not in record
 
 
-def test_every_e6_row_is_unmeasured_and_grade_c():
+def test_every_e6_row_is_unmeasured_at_its_carrier():
     for row in E6_ARM_RUNGS:
         assert row.benchmark is None
         assert row.benchmark_source is None

@@ -3775,10 +3775,10 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
     """
 
     from .recommend import (
-        E6_ARM_GRADE,
         E6_ARM_KEYS,
         GRADE_TABLE,
         UNGRADED_TRIAL_PROFILE_NAMES,
+        e6_arm_carrier_grade,
         validate_grade_table,
     )
 
@@ -3818,10 +3818,12 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
             continue
         # #692: an unmeasured E6 measurement rung is a catalog row, not a
         # candidate. A canon that carries the row (the seed emits them) must not
-        # turn it into a recommendation at C — `--recommend` never lists one, and
-        # only the E6 arm marker opens the rung at the gate. Once the canon
-        # measures it (grade above C) it is an ordinary row again.
-        if entry.key in E6_ARM_KEYS and entry.grade == E6_ARM_GRADE:
+        # turn it into a recommendation at its carrier — `--recommend` never
+        # lists one, and only the E6 arm marker opens the rung at the gate. The
+        # carrier is per-row (#1788): sonnet@max carries A+ so the canon ladder
+        # stays monotonic. Once the canon moves the rung off its carrier grade
+        # (a real measurement) it is an ordinary row again.
+        if entry.key in E6_ARM_KEYS and entry.grade == e6_arm_carrier_grade(entry.profile, entry.effort):
             continue
         if not entry.effort and entry.profile in enumerated:
             continue
