@@ -220,6 +220,59 @@ def test_no_warning_on_no_bucket_path(monkeypatch, capsys):
     assert "plan_type" not in err
 
 
+def test_no_warning_through_manual_re_gate(monkeypatch, capsys):
+    """r2 F1: the manual re-gate runs only after a live fetch error — the
+    absent plan on the rebuilt result is an artifact of the failure, not an
+    observed plan_type, so no warning may print."""
+    live_now = dt.datetime.now(dt.UTC)
+    manual.record_observation(
+        pool="codex",
+        used_pct=10.0,
+        window="5h",
+        measured_at=live_now - dt.timedelta(minutes=2),
+        reason="hk1769 r2 M1",
+    )
+    manual.record_observation(
+        pool="codex",
+        used_pct=10.0,
+        window="7d",
+        measured_at=live_now - dt.timedelta(minutes=2),
+        reason="hk1769 r2 M1",
+    )
+    rc, out, err = _gate_cli(
+        monkeypatch,
+        capsys,
+        ProviderResult(id="codex", plan=None, error="network unreachable"),
+    )
+    assert rc == 0
+    assert "plan_type" not in err
+
+
+def test_no_warning_through_snapshot_re_gate(monkeypatch, capsys):
+    """r2 F1: the trusted-snapshot re-gate also runs only after a live fetch
+    error — a cached reading's plan must not warn during the outage."""
+    live_now = dt.datetime.now(dt.UTC)
+    stale_snapshot = ProviderResult(
+        id="codex",
+        plan="pro",
+        error="network unreachable",
+        stale=True,
+        fetched_at=(live_now - dt.timedelta(hours=2)).timestamp(),
+        buckets=[
+            Bucket(
+                label="5h",
+                window="5h",
+                scope=Scope("account"),
+                used_pct=100.0,
+                resets_at=(live_now + dt.timedelta(hours=1)).isoformat(),
+            )
+        ],
+    )
+    rc, out, err = _gate_cli(monkeypatch, capsys, stale_snapshot)
+    assert rc == 3
+    assert "plan_type" not in err
+
+
 def test_deny_stderr_line1_is_base_reason(monkeypatch, capsys):
     """On deny paths the reason keeps stderr line 1; the warning trails."""
     rc, out, err = _gate_cli(monkeypatch, capsys, _codex("pro", ("5h", 100.0)))

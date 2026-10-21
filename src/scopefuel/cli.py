@@ -1300,8 +1300,11 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 and (target.fetched_at is not None or confirmed_cutoff is not None)
                 else result
             )
+            # hk 1769 r2 — the re-gates only run after a live provider error,
+            # so no fresh plan was observed: the unknown-plan warning must not
+            # fire on these paths (the r1 F1 noise class).
             if not snapshot_gate.ok and not snapshot_gate.unmeasurable:
-                result = snapshot_gate
+                result = replace(snapshot_gate, unknown_plan=None)
             else:
                 try:
                     resolution = manual.resolve_result(target, now=now, group_name=group_name)
@@ -1323,7 +1326,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         **_gate_args(args),
                         **_gate_rung_args(args),
                     )
-                    result = _manual_gate_audit(result, resolution)
+                    result = _manual_gate_audit(replace(result, unknown_plan=None), resolution)
                 elif resolution is not None:
                     result = replace(
                         result,
