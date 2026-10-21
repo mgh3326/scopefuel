@@ -323,8 +323,11 @@ def test_ac4_s_has_luna_max_first_and_no_sol_in_candidates_or_alternatives():
     )
     assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in output.splitlines())
     assert not any(line.startswith("1.") and "codex-sol" in line for line in output.splitlines())
-    assert "codex-sol" not in output
-    assert "Sol" not in output
+    # d1786ap: codex-sol@xhigh lists at S once — tagged [borrowed S+] in the
+    # escalation section, still never a ranked candidate or a placement here.
+    sol_lines = [line for line in output.splitlines() if "codex-sol" in line]
+    assert len(sol_lines) == 1 and "[borrowed S+]" in sol_lines[0]
+    assert "승급 후보" in output
 
 
 def test_ac5_value_sort_preserves_pool_slot_sequence_exactly():
@@ -426,6 +429,16 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             (profile, True)
             for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)
             if not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
+        ]
+        # d1786ap: borrowed rows take the appended non-exact slots, after the
+        # one-up rows — the same order _evaluate builds entries. The
+        # escalation-gated codex-sol rung lists in its own section, so it is
+        # filtered like the exact rows above.
+        ordered += [
+            (profile, True)
+            for profile, _placed in recommend_mod._borrowed_profiles(grade, GRADE_TABLE)
+            if profile.gate != "escalation"
+            and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
         ]
         expected[grade] = [
             label(profile)

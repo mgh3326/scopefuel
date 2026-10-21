@@ -960,6 +960,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     entries = [
         *grade_table[args.recommend],
         *(profile for profile, _grade in recommend._one_up_profiles(args.recommend, grade_table)),
+        *(profile for profile, _grade in recommend._borrowed_profiles(args.recommend, grade_table)),
     ]
     needs_swe2 = any(
         profile.name in recommend.SWE2_MODEL_SCOPE_PROFILES

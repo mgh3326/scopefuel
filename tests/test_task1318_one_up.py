@@ -24,6 +24,7 @@ from scopefuel.recommend import (
     Profile,
     Subscription,
     _alt_candidates,
+    _borrowed_profiles,
     _one_up_profiles,
     _profile_has_benchmark_score,
     _recommend_rank_key,
@@ -250,7 +251,8 @@ def test_s_and_splus_have_no_one_up_rows():
 
 def test_every_bundled_row_lists_only_at_its_placement_or_one_below():
     """AC3/AC7a/AC7b: a row's ranked listings stay within its placed grade —
-    plus exactly one grade below, tagged, iff the placement is rep-measured.
+    plus exactly one grade below, tagged, iff the placement is rep-measured
+    or the rung is a d1786ap borrowed listing there.
 
     The rep-measured set is pinned by name (EXPECTED_REP_MEASURED), not
     re-derived from the predicate, so a predicate mutant widens or narrows
@@ -280,6 +282,14 @@ def test_every_bundled_row_lists_only_at_its_placement_or_one_below():
                 if below is not None:
                     allowed.add(below)
                 rep_measured_labels.add((label, below))
+    # d1786ap: a borrowed rung also lists at its entry's listed_grade while the
+    # table keeps it exactly one grade above — the ranked-line oracle must
+    # allow that one extra grade for the named rungs.
+    for profile, _placed in _borrowed_profiles("A+", GRADE_TABLE) + _borrowed_profiles("S", GRADE_TABLE):
+        label = _label(profile)
+        if label is not None and profile.gate == "default":
+            listed = GRADES[_grade_index(_placed) + 1]
+            allowed_at.setdefault(label, set()).add(listed)
     for label, allowed in allowed_at.items():
         seen = {grade for grade in GRADES if label in ranked_at[grade]}
         assert seen <= allowed, (label, allowed, seen)

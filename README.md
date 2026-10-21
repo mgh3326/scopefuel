@@ -294,6 +294,28 @@ AA-agent 점수만 있는 행, 미측정 행(E6 측정 런그 포함)은 아래�
   추천 출력을 읽는 유일한 소비자는 gate의 동일-급 대안 나열이며, one-up 행은
   그 목록에서도 걸러집니다.
 
+### borrowed 행 — 운영자 지정 런그의 한 급 아래 표시 (d1786ap, hk 1795)
+
+`recommend.BORROWED_RUNGS`는 운영자 지시(d1786ap, hk:task/1786)로 지정된 두
+런그 — `opus@low`(A+에 표시)와 `codex-sol@xhigh`(S에 표시) — 를 배치 급의
+정확히 한 급 아래에도 나열합니다. 한 행이 두 급에 앉는 것(d1786dup)은 카탈로그가
+(profile, effort) 당 급 하나만 담을 수 있어서 표기 불가하므로, 배치가 아니라
+**표시 나열**로 표현합니다. 표 형식·순서 규칙은 one-up 행과 같습니다(순위 줄
+끝 `[borrowed <배치 급>]` 태그, JSON은 `borrowed: true` + `placed_grade`) —
+정급 행이 borrowed 행보다 앞서는 것도 마지막 완전 동률 타이브레이크뿐입니다.
+
+- 활성 조건(규칙 2): 런타임 표(canon 또는 스냅샷)가 그 런그를 나열 급의 정확히
+  한 급 위에 둘 때만 표시합니다. 다른 곳에 두거나 아예 싣지 않으면(이동·은퇴·
+  carrier 의 E6 행처럼 표에서 빠진 경우) 그 항목은 inert — 아무것도 나열하지
+  않습니다. 이는 나중의 canon 이동 뒤에도 stale 지시가 후보를 지어내지 못하게
+  합니다.
+- 게이트 유지(규칙 4): borrowed 행은 자기 게이트를 그대로 가져갑니다.
+  `codex-sol@xhigh`는 escalation 태그를 달고 승급 후보 섹션에 표시되며, 실행은
+  계속 `--operator-request` 가 필요합니다(desk 가 그 행의 게이트를 바꾸기
+  전까지). one-up 의 Sol 배제·`validate_grade_table` 은 *배치* 규칙이라 표시
+  나열에는 적용되지 않습니다 — BORROWED_RUNGS 는 그 둘의 명시적 운영자 예외이며,
+  같은 행이 one-up 과 borrowed 양쪽 자격이면 borrowed 로 한 번만 나열합니다.
+
 ## Benchmark backend
 
 벤치 점수와 대표 실행 기록의 backend는 `auto`(기본)·`handoffkeep`·`local` 중 하나입니다.
