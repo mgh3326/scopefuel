@@ -308,6 +308,21 @@ def test_gate_check_refuses_a_carrier_grade_rung_without_marker():
     assert result.ok is True
     assert result.grade == "A+"
     assert result.e6_arm == "sonnet@max"
+    # A retired carrier rung reports its own carrier grade on the refusal —
+    # a global-C mutant here reports the wrong grade to the audit log.
+    retired = gate_check(
+        [_provider("claude")],
+        "sonnet",
+        effort="max",
+        grade_table=table,
+        e6_arm="sonnet@max",
+        retired_rungs=frozenset({("sonnet", "max")}),
+        today=TODAY,
+        now=NOW,
+    )
+    assert retired.ok is False
+    assert retired.grade == "A+"
+    assert "retired" in retired.reason
 
 
 # --- AC4: byte-identical elsewhere ---------------------------------------------
