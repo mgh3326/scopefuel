@@ -1317,6 +1317,7 @@ def test_multi_account_publish_and_read_isolation(monkeypatch, tmp_path):
     }
 
     # B 에 로그인된 읽는 호스트(토큰 만료)는 B 의 문서만 조회한다.
+    publish_gets = list(hk.gets)
     _claude_creds(
         monkeypatch,
         tmp_path,
@@ -1334,7 +1335,7 @@ def test_multi_account_publish_and_read_isolation(monkeypatch, tmp_path):
     assert hk.gets[-1] == f"quota/claude/{fp_b}/latest"
     assert results[0].source == quota_share.REMOTE_SOURCE
     assert results[0].account_fp == fp_b
-    assert hk.gets[-1] != f"quota/claude/{fp_a}/latest"
+    assert hk.gets[len(publish_gets) :] == [f"quota/claude/{fp_b}/latest"]
 
     # 계정 C 로그인 호스트 — 자기 키에 신선 문서가 없으면 로컬(만료)로 폴백.
     _claude_creds(
