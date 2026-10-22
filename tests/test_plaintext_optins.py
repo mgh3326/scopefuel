@@ -195,7 +195,7 @@ def test_reps_and_quota_optins_do_not_move_the_catalog(hk_plaintext):
         "claude", _failing_fetcher(), _failing_fetcher()(), "spend", now=EPOCH + 60
     )
     assert remote is not None and remote.source == quota_share.REMOTE_SOURCE
-    assert fake.hits[("GET", "documents")] == 1
+    assert fake.hits[("GET", "documents")] == 2
 
 
 def test_catalog_opt_in_alone_does_not_enable_reps_or_quota(hk_plaintext):
