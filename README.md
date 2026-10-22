@@ -203,7 +203,7 @@ SCOPEFUEL_E6_ARM=codex-sol@high scopefuel gate -m codex-sol --effort high  # →
 - 캐논이 런그를 retire 하면 표식으로도 열리지 않습니다 — 닫는 수단은 retire 또는 carrier 밖 배치입니다.
 - 표식 없이 `policy launch`는 기존 폴백을 그대로 씁니다(`wrk -m codex`는 codex-sol@high를,
   `-m builder-grok`은 grok-hi@xhigh를 pin하므로 이 스펠링들은 변하지 않습니다). 캐논이 E6
-  행을 싣고 있어도 표식 없는 기본값 계산은 C 행을 고르지 않습니다.
+  행을 싣고 있어도 표식 없는 기본값 계산은 carrier 행을 고르지 않습니다.
 - `--recommend`는 어느 급에서도 E6 런그를 나열하지 않습니다. 캐논이 그 런그를 carrier 밖으로
   측정하면 제한은 자동으로 풀립니다(그때는 평범한 런그).
 - 게이트의 `--effort`는 판정 대상을 런그로 좁힙니다 — `gate -m opus --effort low`는 low 런그
@@ -509,7 +509,7 @@ $ scopefuel bench push-catalog seed.json   # 운영자 토큰 전용
 
 호스트가 푸시된 정본을 검증하지 못하면 오류 없이 번들 스냅샷 표로 폴백합니다. 그래서 구버전 빌드가
 검증하지 못하는 행을 더하는 카탈로그 파일(예: `docs/catalog/hk1788.json`)은 모든 호스트가 새 빌드를
-돌린 뒤에만 푸시합니다.
+돌린 뒤에만 푸시합니다. 푸시한 뒤 각 호스트에서는 `catalog_ttl_s`(기본 3600초)가 지난 뒤에 `scopefuel bench catalog status --check`를 실행해, 출력이 `catalog=server`이거나 푸시 이후에 가져온 cache일 때만 푸시가 반영됐다고 봅니다. 그 전에는 호스트가 푸시 이전 cache를 그대로 답할 수 있습니다.
 
 서버 불가·stale은 "마지막으로 확인된 정본의 재현"까지만 허용합니다: `consult_only`는 절대 완화되지
 않고, stale 상태의 비-`default` gate는 `--operator-request`를 요구합니다("서버 다운 ≠ 자유 배정") —
