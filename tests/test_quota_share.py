@@ -452,7 +452,7 @@ def test_remote_not_read_when_local_fresh(monkeypatch):
     results = cache.collect({"claude": lambda: _ok()}, ["claude"], now=EPOCH)
     assert results[0].source == "oauth-usage-api"
     assert results[0].note != "remote measured (mbp-server)"
-    assert hk.gets == []
+    assert hk.gets == [f"quota/claude/{FP_A}/latest"]
     assert len(hk.puts) == 1  # 로컬 성공은 게시만 한다
 
 
@@ -534,7 +534,7 @@ def test_usage_call_count_unchanged_by_sharing(monkeypatch):
     cache.collect({"claude": fetch}, ["claude"], now=EPOCH + 60)  # TTL 안 → 캐시 히트
     assert calls["n"] == 1  # usage API 는 1회 — 게시는 hk PUT 만 더한다
     assert len(hk.puts) == 1
-    assert hk.gets == []  # 성공·캐시 히트는 원격을 읽지 않는다
+    assert hk.gets == [f"quota/claude/{FP_A}/latest"]  # 게시 전 최신성 확인만 한다
 
 
 # ------------------------------------------------------------------ AC3: 지문
@@ -1334,7 +1334,7 @@ def test_multi_account_publish_and_read_isolation(monkeypatch, tmp_path):
     assert hk.gets[-1] == f"quota/claude/{fp_b}/latest"
     assert results[0].source == quota_share.REMOTE_SOURCE
     assert results[0].account_fp == fp_b
-    assert f"quota/claude/{fp_a}/latest" not in hk.gets
+    assert hk.gets[-1] != f"quota/claude/{fp_a}/latest"
 
     # 계정 C 로그인 호스트 — 자기 키에 신선 문서가 없으면 로컬(만료)로 폴백.
     _claude_creds(
@@ -1417,6 +1417,37 @@ def test_snapshot_host_sanitized_on_read_and_write(monkeypatch):
     assert quota_share.publish_result("claude", _ok(), now=EPOCH + 1) is True
     payload = json.loads(hk.puts[-1][1]["body"])
     assert payload["measured_by"]["host"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected_put", "expected_result"),
+    [(EPOCH + 60, False, False), (EPOCH, False, False), (EPOCH - 60, True, True)],
+)
+def test_publish_newest_snapshot_wins(monkeypatch, stored, expected_put, expected_result):
+    hk = _enable(monkeypatch)
+    _seed_remote(hk, measured_at=stored)
+    assert quota_share.publish_result("claude", _ok(), now=EPOCH) is expected_result
+    assert bool(hk.puts) is expected_put
+
+
+def test_publish_puts_when_stored_document_missing_or_malformed(monkeypatch):
+    hk = _enable(monkeypatch)
+    assert quota_share.publish_result("claude", _ok(), now=EPOCH) is True
+    hk.puts.clear()
+    key = f"quota/claude/{FP_A}/latest"
+    hk.docs[key]["body"] = "not json"
+    assert quota_share.publish_result("claude", _ok(), now=EPOCH) is True
+    assert len(hk.puts) == 1
+
+
+def test_publish_get_exception_is_fail_closed_without_raise(monkeypatch):
+    _enable(monkeypatch)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(quota_share, "_request", boom)
+    assert quota_share.publish_result("claude", _ok(), now=EPOCH) is False
 
 
 def test_long_hostname_truncates_with_hash_suffix(monkeypatch):

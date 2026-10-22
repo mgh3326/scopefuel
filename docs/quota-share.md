@@ -122,6 +122,8 @@ unchanged). Publish failures are fail-open: the measuring host behaves exactly
 as before. Results without an **account-bound** fingerprint are not published
 (token-hash fallback is refused — see N-1 above).
 
+When publishing, the newest snapshot wins by `measured_at_epoch`; a GET-then-PUT race between two hosts is still possible and is accepted.
+
 ## Deployment
 
 Prerequisites per host (#659 AC7):

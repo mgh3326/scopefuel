@@ -247,6 +247,9 @@ def publish_result(pool: str, result: ProviderResult, *, now: float | None = Non
                 sort_keys=True,
             ),
         }
+        stored = _snapshot(_request("GET", key))
+        if stored is not None and stored["measured_at_epoch"] >= float(epoch):
+            return False
         response = _request("PUT", key, document)
         return isinstance(response, dict) and isinstance(response.get("document"), dict)
     except Exception:
