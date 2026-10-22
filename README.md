@@ -509,7 +509,7 @@ $ scopefuel bench push-catalog seed.json   # 운영자 토큰 전용
 
 호스트가 푸시된 정본을 검증하지 못하면 오류 없이 번들 스냅샷 표로 폴백합니다. 그래서 구버전 빌드가
 검증하지 못하는 행을 더하는 카탈로그 파일(예: `docs/catalog/hk1788.json`)은 모든 호스트가 새 빌드를
-돌린 뒤에만 푸시합니다. 푸시한 뒤에는 각 호스트에서 `scopefuel bench catalog status`를 실행해 정본을 읽고 있는지 확인하세요. 폴백은 소리 없이 일어나므로 이 명령의 출력이 유일한 판정 수단입니다.
+돌린 뒤에만 푸시합니다. 푸시한 뒤 각 호스트에서는 `catalog_ttl_s`(기본 3600초)가 지난 뒤에 `scopefuel bench catalog status --check`를 실행해, 출력이 `catalog=server`이거나 푸시 이후에 가져온 cache일 때만 푸시가 반영됐다고 봅니다. 그 전에는 호스트가 푸시 이전 cache를 그대로 답할 수 있습니다.
 
 서버 불가·stale은 "마지막으로 확인된 정본의 재현"까지만 허용합니다: `consult_only`는 절대 완화되지
 않고, stale 상태의 비-`default` gate는 `--operator-request`를 요구합니다("서버 다운 ≠ 자유 배정") —
