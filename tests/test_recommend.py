@@ -520,11 +520,16 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     haiku_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "haiku"]
     # hk 1788: xhigh/max left for the E6 table — the vendor curve moves into
     # the arm rows' reference text.
-    assert {p.launcher_effort: p.benchmark for p in haiku_rows} == {
+    haiku_scores = {p.launcher_effort: p.benchmark for p in haiku_rows}
+    assert haiku_scores == {
         "low": 12.8,
         "medium": 20.3,
         "high": 25.0,
     }
+    # hk 1279: the dict keeps only the last value per key, so a duplicated
+    # rung row would still pass the pin above — the row count must equal
+    # the number of distinct launcher efforts it maps onto.
+    assert len(haiku_rows) == len(haiku_scores) == len({p.launcher_effort for p in haiku_rows})
     assert all(p.aa_model_id == "claude-haiku-5-5" for p in haiku_rows)
     assert all(p in GRADE_TABLE["C"] for p in haiku_rows)
     assert all(p.gate == "default" and p.gate_reason is None for p in haiku_rows)
