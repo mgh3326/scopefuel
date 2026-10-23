@@ -4611,7 +4611,12 @@ def _rep_conflict_error(exc: BenchHttpStatusError, *, offset: int) -> BenchBacke
                 entry.get("origin_id"),
                 entry.get("conflict_server_id"),
             )
-            if all(isinstance(v, int) and not isinstance(v, bool) for v in (index, origin_id, server_id)):
+            if (
+                all(isinstance(v, int) and not isinstance(v, bool) for v in (index, origin_id, server_id))
+                and index >= 0
+                and 0 < origin_id < (1 << 63)
+                and 0 < server_id < (1 << 63)
+            ):
                 conflicts.append(
                     RepWriteConflict(
                         index=offset + index,

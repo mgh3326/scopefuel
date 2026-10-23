@@ -7,6 +7,7 @@ the actual a2ad282 client before implementing this change.
 from __future__ import annotations
 
 import dataclasses
+import json
 import pathlib
 import shutil
 import socket
@@ -321,9 +322,13 @@ def test_pending_failure_transitions_retry_identical_payload(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("mode", ["old", "new"])
-def test_refused_without_conflicting_id_is_terminal(tmp_path, monkeypatch, capsys, mode):
+@pytest.mark.parametrize("body", ["unparseable", "out-of-range-id"])
+def test_refused_without_conflicting_id_is_terminal(tmp_path, monkeypatch, capsys, mode, body):
     fake = _remote(monkeypatch, tmp_path, mode)
-    fake.fail_next_put = bench.HttpError(409, "unparseable")
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: 100)
+    if body == "out-of-range-id":
+        body = json.dumps({"conflicts": [{"index": 0, "origin_id": 100, "conflict_server_id": 1 << 63}]})
+    fake.fail_next_put = bench.HttpError(409, body)
     args = _add_args()
     assert cli.main(args) == 2
     capsys.readouterr()
