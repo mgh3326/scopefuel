@@ -362,6 +362,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_list.add_argument("--profile", help="프로필 필터")
     reps_list.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
 
+    reps_pending = reps_sub.add_parser("pending", help="로컬 pending/refused 기록 관리 (서버 전송 없음)")
+    pending_sub = reps_pending.add_subparsers(dest="pending_command", required=True)
+    pending_sub.add_parser("list", help="origin, 상태, profile, recorded_at, 충돌 서버 id 조회")
+    pending_drop = pending_sub.add_parser("drop", help="로컬 pending/refused 기록 한 건 삭제")
+    pending_drop.add_argument("origin", help="origin id (숫자 또는 origin:<숫자>)")
+
     reps_compare = reps_sub.add_parser("compare", help="같은 급 안 프로필별 대표 실행 비교")
     reps_compare.add_argument(
         "--grade",
@@ -1852,6 +1858,20 @@ def _bench_command(args: argparse.Namespace) -> int:
 
 
 def _reps_command(args: argparse.Namespace) -> int:
+    if args.reps_command == "pending":
+        try:
+            if args.pending_command == "list":
+                for rep in bench.list_pending_reps():
+                    print(bench.format_rep(rep))
+                return 0
+            if not bench.drop_pending_rep(args.origin):
+                print(f"error: no local pending/refused rep for {args.origin}", file=sys.stderr)
+                return 2
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"dropped local pending/refused rep {args.origin}")
+        return 0
     if args.reps_command == "add":
         try:
             rep = bench.add_rep(
