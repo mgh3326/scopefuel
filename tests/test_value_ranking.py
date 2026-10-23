@@ -88,6 +88,7 @@ _EXPECTED_LABELS = {
     ("opus", "xhigh"): "opus --effort xhigh",
     ("sonnet", "high"): "sonnet --effort high",
     ("sonnet", "max"): "sonnet --effort max",
+    ("sonnet", "low"): "sonnet --effort low",
     ("sonnet", "medium"): "sonnet --effort medium",
     ("sonnet", "xhigh"): "sonnet --effort xhigh",
 }

@@ -98,6 +98,8 @@ def test_no_other_grade_table_row_changed():
         ("A", "devin-swe2-medium", None),
         ("A+", "sonnet", "xhigh"),
         ("C", "sonnet", "medium"),
+        # hk 1885 (director-1 2026-10-23): sonnet@low joins at C, unscored.
+        ("C", "sonnet", "low"),
         # #1026 (09-30 operator decision): the codex-sol rows relabelled
         # gpt-6-sol -> gpt-6.1-sol — same (grade, name, effort) keys.
         ("S+", "codex-sol", "max"),

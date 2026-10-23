@@ -51,6 +51,9 @@ WRK_BUILDER_SPELLINGS: dict[str, tuple[str, str]] = {
     "builder-opus-medium": ("opus", "medium"),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
+    # hk 1796 (agent-skills PR 220) / hk 1863 (agent-skills PR 231).
+    "builder-sonnet-medium": ("sonnet", "medium"),
+    "builder-sonnet-low": ("sonnet", "low"),
     # #921: bare builder-sonnet consults sonnet@xhigh (EFFORT:-xhigh) —
     # accepts high|xhigh|max; a recorded rep effort still wins over the pin.
     "builder-sonnet": ("sonnet", "xhigh"),
@@ -59,12 +62,19 @@ WRK_BUILDER_SPELLINGS: dict[str, tuple[str, str]] = {
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     "builder-sol-medium": ("codex-sol", "medium"),
+    "builder-sol-low": ("codex-sol", "low"),
     # #1026: the gpt-6-sol rollback builder seat — catalog-exempt on the wrk
     # side (literal gpt-6-sol argv) but it gates at codex-sol@high, so its
     # reps resolve there and read as model mismatches.
     "builder-sol6": ("codex-sol", "high"),
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
+    "builder-luna-low": ("codex-luna", "low"),
+    "builder-luna-medium": ("codex-luna", "medium"),
+    "builder-haiku-low": ("haiku", "low"),
+    "builder-haiku-high": ("haiku", "high"),
+    "builder-haiku-xhigh": ("haiku", "xhigh"),
+    "builder-haiku-max": ("haiku", "max"),
     "builder-grok": ("grok-hi", "xhigh"),
     "builder-grok-low": ("grok-hi", "low"),
     "builder-grok-medium": ("grok-hi", "medium"),

@@ -46,27 +46,46 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     "sonnet-med": ("sonnet", None),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
+    # hk 1796 (agent-skills PR 220): sonnet@medium builder rung.
+    "builder-sonnet-medium": ("sonnet", "medium"),
+    # hk 1863 (agent-skills PR 231): sonnet@low builder rung.
+    "builder-sonnet-low": ("sonnet", "low"),
     # #921 (wrk db8a58d): builder-only, accepts --effort high|xhigh|max and
     # defaults xhigh — resolve_catalog_profile pins "${EFFORT:-xhigh}", which
-    # for the bare spelling is the xhigh consult mirrored here.
+    # for the bare spelling is the xhigh consult mirrored here. The max rung
+    # is open to builder seats since hk 1863 (operator hk 1864); ultra stays
+    # refused under --role builder.
     "builder-sonnet": ("sonnet", "xhigh"),
     "haiku": ("haiku", None),
+    # hk 1796 (agent-skills PR 220): haiku@low builder rung.
+    "builder-haiku-low": ("haiku", "low"),
+    # hk 1863 (agent-skills PR 231): haiku@high, haiku@xhigh, haiku@max builder rungs.
+    "builder-haiku-high": ("haiku", "high"),
+    "builder-haiku-xhigh": ("haiku", "xhigh"),
+    "builder-haiku-max": ("haiku", "max"),
     "fable": ("fable", None),
     "codex": ("codex-sol", "high"),
     "codex-sol": ("codex-sol", None),
     "codex-max": ("codex-sol", None),
-    # decision 4088B: a builder seat never takes the max rung — wrk's
-    # resolve_catalog_profile pins high for both sol builder spellings.
+    # decision 4088B: builder-sol defaults to the high rung — wrk's
+    # resolve_catalog_profile pins high for the bare sol builder spellings.
+    # hk 1863 (operator decision on hk 1864) opened the max rung as a builder
+    # seat; ultra stays refused.
     "builder-sol": ("codex-sol", "high"),
     "captain-sol": ("codex-sol", "high"),
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     # #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.
     "builder-sol-medium": ("codex-sol", "medium"),
+    # hk 1863 (agent-skills PR 231): codex-sol@low builder rung.
+    "builder-sol-low": ("codex-sol", "low"),
     # #633: builder-luna is codex-luna under --role builder, pinned to the
     # #594 E3 rung (xhigh) — same catalog profile as the worker spellings.
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
+    # hk 1796 (agent-skills PR 220): codex-luna@low and codex-luna@medium builder rungs.
+    "builder-luna-low": ("codex-luna", "low"),
+    "builder-luna-medium": ("codex-luna", "medium"),
     "codex-luna": ("codex-luna", "medium"),
     "codex-luna-hi": ("codex-luna", "high"),
     "codex-luna-max": ("codex-luna-max", None),
@@ -216,6 +235,38 @@ def test_every_catalog_consuming_wrk_spelling_resolves(spelling):
     assert decision.profile
     if pinned:
         assert decision.effort == pinned
+
+
+# hk 1885: the nine builder spellings bin/wrk resolves at agent-skills 2756dae
+# (hk 1796 / PR 220: sonnet-medium, haiku-low, luna-low, luna-medium; hk 1863 /
+# PR 231: sol-low, haiku-high, haiku-xhigh, haiku-max, sonnet-low). Pinned as a
+# literal because agent-skills is not checked out with this repo; the source is
+# CATALOG_PROFILE / CATALOG_EFFORT_PIN in agent-skills bin/wrk at 2756dae
+# (about lines 3486-3527), mirrored by tests/test-model-contract-guard.sh there.
+WRK_BUILDER_SPELLINGS_2756DAE: dict[str, tuple[str, str]] = {
+    "builder-sonnet-medium": ("sonnet", "medium"),  # hk 1796
+    "builder-haiku-low": ("haiku", "low"),  # hk 1796
+    "builder-luna-low": ("codex-luna", "low"),  # hk 1796
+    "builder-luna-medium": ("codex-luna", "medium"),  # hk 1796
+    "builder-sol-low": ("codex-sol", "low"),  # hk 1863
+    "builder-haiku-high": ("haiku", "high"),  # hk 1863
+    "builder-haiku-xhigh": ("haiku", "xhigh"),  # hk 1863
+    "builder-haiku-max": ("haiku", "max"),  # hk 1863
+    "builder-sonnet-low": ("sonnet", "low"),  # hk 1863
+}
+
+
+def test_scopefuel_table_agrees_with_bin_wrk_on_the_hk_1796_and_1863_spellings():
+    for spelling, pair in WRK_BUILDER_SPELLINGS_2756DAE.items():
+        assert WRK_CATALOG_SPELLINGS.get(spelling) == (pair[0], pair[1]), spelling
+
+
+def test_sonnet_low_row_resolves_to_the_served_sonnet_model_at_low():
+    """hk 1885: the sonnet@low row (C, director-1 2026-10-23) backs builder-sonnet-low."""
+
+    decision = launch.resolve_launch("sonnet", effort="low")
+    assert decision.model_id == "claude-sonnet-5-5"
+    assert decision.effort == "low"
 
 
 @pytest.mark.parametrize("spelling", sorted(WRK_PRE_593_RESOLUTION))

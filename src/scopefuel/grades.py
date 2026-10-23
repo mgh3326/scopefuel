@@ -294,8 +294,9 @@ STATIC_SUPERSEDES: tuple[tuple[str, str], ...] = (
 # bin/wrk resolve_catalog_profile()'s CATALOG_PROFILE/CATALOG_EFFORT_PIN plus
 # the catalog-exempt builder spellings (devin-*/kimi-* take the same-named
 # catalog profile; their launchers pass no effort flag, so the pin is "").
-# decision 4088 B: builder-sol/captain-sol pin high — a builder seat never
-# takes the max rung.
+# decision 4088 B: builder-sol/captain-sol pin high — the bare sol builder
+# spellings default to the high rung. hk 1863 (operator decision on hk 1864)
+# opened the max rung as a builder seat for every model; ultra stays refused.
 _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-opus": ("opus", ""),
     "captain-opus": ("opus", ""),
@@ -303,6 +304,10 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-opus-medium": ("opus", "medium"),
     "builder-sonnet-xhigh": ("sonnet", "xhigh"),
     "builder-sonnet-max": ("sonnet", "max"),
+    # hk 1796 (agent-skills PR 220) / hk 1863 (agent-skills PR 231): the rung
+    # is the last name segment, pinned by wrk's CATALOG_EFFORT_PIN.
+    "builder-sonnet-medium": ("sonnet", "medium"),
+    "builder-sonnet-low": ("sonnet", "low"),
     # #921 (wrk db8a58d): the non-rung Sonnet builder seat accepts
     # --effort high|xhigh|max, default xhigh — a bare spawn consults the
     # canon at sonnet@xhigh (CATALOG_EFFORT_PIN="${EFFORT:-xhigh}"), so the
@@ -313,6 +318,7 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-sol-high": ("codex-sol", "high"),
     "builder-sol-max": ("codex-sol", "max"),
     "builder-sol-medium": ("codex-sol", "medium"),
+    "builder-sol-low": ("codex-sol", "low"),
     # #1026: builder-sol6 is the gpt-6-sol rollback builder seat — it consults
     # the same rung as builder-sol (codex-sol@high), but its literal gpt-6-sol
     # model id now reads as a model mismatch on the 6.1 rungs rather than
@@ -322,6 +328,14 @@ _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     # #594 E3 rung (xhigh).
     "builder-luna": ("codex-luna", "xhigh"),
     "builder-luna-max": ("codex-luna", "max"),
+    # hk 1796 (agent-skills PR 220): codex-luna@low and codex-luna@medium.
+    "builder-luna-low": ("codex-luna", "low"),
+    "builder-luna-medium": ("codex-luna", "medium"),
+    # hk 1796 (agent-skills PR 220) / hk 1863 (agent-skills PR 231): haiku rungs.
+    "builder-haiku-low": ("haiku", "low"),
+    "builder-haiku-high": ("haiku", "high"),
+    "builder-haiku-xhigh": ("haiku", "xhigh"),
+    "builder-haiku-max": ("haiku", "max"),
     # Task-240 pilot + #737 E6 rungs: grok-hi@<rung>.
     "builder-grok": ("grok-hi", "xhigh"),
     "builder-grok-low": ("grok-hi", "low"),
