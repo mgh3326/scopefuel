@@ -4928,9 +4928,13 @@ def _open_pending_rep(
         ]
         # A refusal is terminal until explicitly dropped. It never becomes a
         # resend and an identical add never silently mints a fresh origin.
+        # An old-dialect conflict is terminal for the same reason: a resend
+        # would overwrite the other holder's row, which already differs here.
         for item in matches:
             if item.record.pending_state == "refused":
                 raise _refused_rep_error(item.record)
+            if item.record.pending_state == "pending" and item.record.pending_reason == "conflict":
+                raise _conflict_rep_error(item.record)
         if matches:
             return matches[0]
         origin_id = _new_rep_origin_id()
@@ -4947,6 +4951,14 @@ def _refused_rep_error(record: RepRecord) -> BenchBackendError:
     return BenchBackendError(
         f"rep origin:{record.id} [refused]{holder}; nothing sent — inspect the refusal, then run "
         f"scopefuel reps pending drop {record.id} before adding it again"
+    )
+
+
+def _conflict_rep_error(record: RepRecord) -> BenchBackendError:
+    return BenchBackendError(
+        f"rep origin:{record.id} [pending] reason=conflict; nothing sent — the server held a different rep "
+        "under this key and a resend could overwrite it; run scopefuel reps pending drop "
+        f"{record.id} before adding it again"
     )
 
 
