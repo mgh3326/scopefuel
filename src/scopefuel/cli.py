@@ -372,6 +372,14 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     reps_compare.add_argument("--profile", help="프로필 필터")
     reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
 
+    reps_pending = reps_sub.add_parser("pending", help="로컬 write-ahead rep (pending 또는 refused)")
+    reps_pending_sub = reps_pending.add_subparsers(dest="pending_command", required=True)
+    reps_pending_sub.add_parser("list", help="pending 과 refused 행을 나열 (서버에 보내지 않음)")
+    reps_pending_drop = reps_pending_sub.add_parser(
+        "drop", help="로컬 pending 또는 refused 행 1건을 삭제 (서버에 보내지 않음)"
+    )
+    reps_pending_drop.add_argument("origin", help="origin id 또는 origin:<id>")
+
     reps_backfill = reps_sub.add_parser(
         "backfill",
         help="task->grade 매핑 파일로 기존 rep의 과제 급을 주석 행으로 보충 (원행 불변, 기본 dry-run)",
@@ -1851,6 +1859,50 @@ def _bench_command(args: argparse.Namespace) -> int:
     return 2
 
 
+def _pending_origin(text: str) -> int:
+    """A local write-ahead origin. srv:, lost:, and local: are never that."""
+
+    for prefix in ("srv:", "lost:", "local:"):
+        if text.startswith(prefix):
+            raise bench.BenchError(
+                f"{text} is not a local pending origin; a bound or confirmed rep is left untouched"
+            )
+    raw = text[len("origin:") :] if text.startswith("origin:") else text
+    if not raw.isdigit():
+        raise bench.BenchError(
+            f"{text} is not a local pending origin; a bound or confirmed rep is left untouched"
+        )
+    origin_id = int(raw)
+    if origin_id < 1:
+        raise bench.BenchError("origin must be a positive integer")
+    return origin_id
+
+
+def _reps_pending_command(args: argparse.Namespace) -> int:
+    if args.pending_command == "list":
+        try:
+            rows = bench.list_pending_reps()
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not rows:
+            print("reps pending: none")
+            return 0
+        for row in rows:
+            print(bench.format_pending_rep(row))
+        return 0
+    if args.pending_command == "drop":
+        try:
+            origin_id = _pending_origin(args.origin)
+            bench.drop_pending_rep(origin_id)
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"reps pending drop: removed origin:{origin_id}")
+        return 0
+    return 2
+
+
 def _reps_command(args: argparse.Namespace) -> int:
     if args.reps_command == "add":
         try:
@@ -1921,6 +1973,8 @@ def _reps_command(args: argparse.Namespace) -> int:
         for comparison in comparisons:
             print(bench.format_rep_comparison(comparison))
         return 0
+    if args.reps_command == "pending":
+        return _reps_pending_command(args)
     if args.reps_command == "backfill":
         try:
             raw = json.loads(pathlib.Path(args.mapping).read_text(encoding="utf-8"))
