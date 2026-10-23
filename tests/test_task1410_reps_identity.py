@@ -401,9 +401,12 @@ def test_s2_grades_gather_reps_ignores_lost_and_pending(tmp_path, monkeypatch):
 
 
 def test_s3_refused_readd_prints_state_and_drop_sends_nothing(tmp_path, monkeypatch, capsys):
-    """409, then three identical re-adds: no further PUT of that origin.
+    """409, then three identical re-adds fail locally: rc 2, no new origin.
 
-    pending list shows the row. pending drop removes only it and does not request.
+    Each prints state=refused, the conflict id, and the pending-drop hint.
+    Zero further PUTs. A fresh origin is not minted. pending list shows the
+    row. pending drop removes only it and sends nothing. Only after that drop
+    does an identical re-add start a new write.
     """
 
     fake = collision._remote(monkeypatch, tmp_path / "host")
@@ -413,16 +416,24 @@ def test_s3_refused_readd_prints_state_and_drop_sends_nothing(tmp_path, monkeypa
     assert cli.main(collision._add_args(task="attacker", notes="refused rep")) == 2
     capsys.readouterr()
     assert fake.hits["PUT"] == 1
-    puts = len(fake.put_payloads)
 
+    def _refuse_fresh_origin() -> int:
+        raise AssertionError("identical re-add of a refused row minted a fresh origin")
+
+    monkeypatch.setattr(bench, "_new_rep_origin_id", _refuse_fresh_origin)
     for _ in range(3):
         assert cli.main(collision._add_args(task="attacker", notes="refused rep")) == 2
         captured = capsys.readouterr()
         text = captured.out + captured.err
         assert "state=refused" in text
-        assert f"origin:{origin}" in text or f"origin={origin}" in text
-    resent = [batch for batch in fake.put_payloads[puts:] if batch and batch[0].get("origin_id") == origin]
-    assert resent == []
+        assert "conflict-id=4" in text
+        assert f"scopefuel reps pending drop {origin}" in text
+        assert f"origin:{origin}" in text
+        assert "srv:" not in text
+    assert fake.hits["PUT"] == 1
+    assert [(row["origin_id"], row["notes"]) for row in collision._pending_rows(tmp_path / "host")] == [
+        (origin, "refused rep")
+    ]
 
     assert cli.main(["reps", "pending", "list"]) == 0
     listed = capsys.readouterr().out
@@ -464,6 +475,21 @@ def test_s3_refused_readd_prints_state_and_drop_sends_nothing(tmp_path, monkeypa
     finally:
         conn.close()
     assert left == ["still pending"]
+
+    fresh = origin + 2
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: fresh)
+    puts = fake.hits["PUT"]
+    rows_before = len(fake.reps)
+    assert cli.main(collision._add_args(task="attacker", notes="refused rep")) == 0
+    recorded = capsys.readouterr().out
+    assert "recorded rep id=srv:" in recorded
+    assert fake.hits["PUT"] == puts + 1
+    assert len(fake.reps) == rows_before + 1
+    assert any(row["origin_id"] == fresh and row["notes"] == "refused rep" for row in fake.reps)
+    assert any(row["origin_id"] == origin and row["notes"] == "held" for row in fake.reps)
+    pending = collision._pending_rows(tmp_path / "host")
+    assert [row["notes"] for row in pending] == ["still pending"]
+    assert all(row["origin_id"] != origin for row in pending)
 
 
 @pytest.mark.parametrize(
