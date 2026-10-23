@@ -961,12 +961,13 @@ def test_probe_capture_replay_types_usage_once_after_status_line(
     assert elapsed < devin.TIMEOUT_S - 10.0  # 30 s 데드라인보다 한참 아래서 끝난다
 
 
+@pytest.mark.parametrize("capture", _CAPTURE_REPLAYS)
 def test_probe_capture_replay_reads_daily_and_weekly_from_real_usage_screen(
-    tmp_path, monkeypatch, fixture_text
+    tmp_path, monkeypatch, fixture_text, capture
 ):
     """캡처 재생이 실측 /usage 화면(devin_usage 픽스처)으로 이어지면 두 축을 읽는다."""
     log = _stub_tui_binary(tmp_path, monkeypatch, mode="cap_replay", models_payload=_fixture(fixture_text))
-    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path("devin_capture3")))
+    monkeypatch.setenv("STUB_CAPTURE", str(_capture_path(capture)))
     monkeypatch.setenv("STUB_STATUS_DELAY", "1.5")
     monkeypatch.setenv("STUB_USAGE", "file")
     monkeypatch.setenv("STUB_USAGE_FILE", str(_capture_path("devin_usage")))
@@ -1029,6 +1030,50 @@ def test_probe_sends_no_input_to_single_modal_line_over_status_line(
     assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축은 쓴다
     assert labels["daily"].used_pct is None
     assert _stub_reads(log) == []
+
+
+def test_probe_sends_no_input_to_chevron_only_modal_after_usage_typed(tmp_path, monkeypatch, fixture_text):
+    """hk 1422: /usage 를 친 뒤 chevron 옵션 목록만(``?`` 질문줄 없음) 그려지면 아무것도 치지 않는다.
+
+    이 화면은 ``_POST_INPUT_MODAL`` 의 chevron 브랜치만 잡는다. 질문 브랜치만 남긴
+    뮤턴트(P5)는 Enter 를 보내 ``Yes, update and restart`` 를 확정하고 MODAL-CONFIRMED 로
+    RED 가 된다.
+    """
+    log = _stub_tui_binary(
+        tmp_path, monkeypatch, mode="chevron_after_input", models_payload=_fixture(fixture_text)
+    )
+    monkeypatch.setattr(devin, "TIMEOUT_S", 2.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["weekly"].used_pct == 18.0  # 배너가 증명한 축은 쓴다
+    assert labels["daily"].used_pct is None
+    assert _stub_reads(log) == [b"/usage"]  # Enter 도 /exit 도 보내지 않는다
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
+
+
+def test_probe_submits_usage_and_exit_through_echoed_composer_lines(tmp_path, monkeypatch, fixture_text):
+    """hk 1422: 입력 에코 줄(``❭ /usage``, ``❭ /exit``)은 모달이 아니라 제외된다.
+
+    에코를 chevron composer 줄로 되그리는 스텁에서도 프로브는 /usage 와 /exit 를 각각
+    Enter 로 제출하고 두 축을 모두 읽는다. 에코 제외(lookahead)를 빼는 뮤턴트(P6)는
+    에코 줄을 모달로 보고 제출 전에 멈춰 RED 가 된다.
+    """
+    log = _stub_tui_binary(tmp_path, monkeypatch, mode="echo_composer", models_payload=_fixture(fixture_text))
+    monkeypatch.setattr(devin, "USAGE_WAIT_S", 1.0)
+
+    result = devin.fetch()
+
+    assert result.error is None
+    labels = {b.label: b for b in result.buckets}
+    assert labels["daily"].used_pct == 0.0
+    assert labels["weekly"].used_pct == 18.0
+    assert _stub_reads(log) == [b"/usage", b"\r", b"/exit", b"\r"]
+    assert _stub_lines(log, "KEYS-INTO-MODAL") == []
+    assert _stub_lines(log, "MODAL-CONFIRMED") == []
 
 
 @pytest.mark.parametrize("capture", _CAPTURE_REPLAYS)

@@ -61,6 +61,8 @@ UPDATE_MODAL = (
     "❯ Yes, update and restart\r\n  No, remind me later\r\n"
 )
 QUESTION_PROMPT = "\r\n? Devin wants to continue the previous session. Continue? (Y/n) "
+# ``?`` 질문줄 없이 chevron 옵션 목록만 — _POST_INPUT_MODAL 의 chevron 브랜치 전용.
+CHEVRON_OPTIONS = "\r\n❯ Yes, update and restart\r\n  No, remind me later\r\n"
 # 입력이 시작된 '뒤'에 모달이 그려지는 모드들 — cap_replay 와 같은 바이트
 # 재생을 하되 모달 트리거가 다르다(STUB_CAPTURE 필수).
 _POST_INPUT_MODES = (
@@ -155,7 +157,7 @@ sched = []  # (t0 기준 경과초, 모달 종류) — 입력 '뒤'에 그려질
 
 def show_modal(kind):
     global modal
-    emit({"update": UPDATE_MODAL, "question": QUESTION_PROMPT}[kind])
+    emit({"update": UPDATE_MODAL, "question": QUESTION_PROMPT, "chevron": CHEVRON_OPTIONS}[kind])
     modal = kind
     log("paint-modal-" + kind)
 
@@ -181,9 +183,13 @@ while time.monotonic() < deadline:
         continue
     if data == b"\r":
         if modal is not None:
-            option = {"update": "Yes, update and restart", "question": "Y (default)"}[modal]
+            option = {
+                "update": "Yes, update and restart",
+                "question": "Y (default)",
+                "chevron": "Yes, update and restart",
+            }[modal]
             log("MODAL-CONFIRMED", option.encode())
-            if modal == "update":
+            if modal in ("update", "chevron"):
                 emit("\r\nUpdating Devin and restarting…\r\n")
                 log("restart-exit")
                 sys.exit(0)
@@ -235,6 +241,10 @@ while time.monotonic() < deadline:
         typed = b""
     else:
         typed += data
+        if mode == "echo_composer":
+            # 입력 에코를 chevron composer 줄로 되그린다 — 실측 캡처의 에코는 맨 /usage 줄이라
+            # 이 모드가 '❭ /usage' 에코 줄 제외(_POST_INPUT_MODAL 의 lookahead)를 핀한다.
+            emit("\r\n❭ " + data.decode("utf-8", errors="replace") + "\r\n")
         # 명령 텍스트가 다 치해지는 순간(Enter 전) 모달을 그리는 트리거들.
         if mode == "cr_modal_usage" and state == "wait_usage" and typed == b"/usage":
             show_modal("update")
@@ -242,5 +252,7 @@ while time.monotonic() < deadline:
             show_modal("question")
         elif mode == "cr_modal_exit" and typed == b"/exit":
             show_modal("update")
+        elif mode == "chevron_after_input" and typed in (b"/usage", b"/exit"):
+            show_modal("chevron")
 log("deadline")
 sys.exit(0)
