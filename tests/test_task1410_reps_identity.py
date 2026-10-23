@@ -124,25 +124,35 @@ def _insert_mark(
 
 @pytest.mark.parametrize("mode", ["old", "new"])
 def test_s1_same_hostname_two_installs_keep_both_rows(tmp_path, monkeypatch, capsys, mode):
-    """Two installs, one hostname, one rep each.
+    """Two installs, one hostname, identical rep content.
 
-    Mutant: put the hostname back into the origin. Old server ends at 1 row
-    (silent overwrite). New server raises 409. Both must end at 2 rows.
+    The notes and recorded_at match, so the content key does not separate
+    them. Mutant: put the hostname back in place of the install id. Both
+    installs then share an origin, each dialect ends at 1 server row, and
+    the length assertion goes RED.
     """
 
     _pin_host(monkeypatch)
     fake = collision.FakeRepStore(HK_URL, mode=mode)
-    for name, notes in (("host-a", "host A rep"), ("host-b", "host B rep")):
+    stamp = "2026-10-10T00:00:00+00:00"
+    for name in ("host-a", "host-b"):
         home = tmp_path / name
-        _seed_local(monkeypatch, home, notes=notes)
+        _seed_local(monkeypatch, home, notes="shared rep")
         capsys.readouterr()
+        conn = sqlite3.connect(bench.db_path())
+        try:
+            conn.execute("UPDATE reps SET recorded_at = ?", (stamp,))
+            conn.commit()
+        finally:
+            conn.close()
         _attach(monkeypatch, home, fake)
         try:
             bench.push_local()
         except bench.BenchRepConflictError as exc:
             pytest.fail(f"push-local raised 409 on the {mode} server: {exc}")
-    assert sorted(row["notes"] for row in fake.reps) == ["host A rep", "host B rep"]
+    assert len(fake.reps) == 2
     assert len({row["origin_id"] for row in fake.reps}) == 2
+    assert {row["notes"] for row in fake.reps} == {"shared rep"}
 
 
 @pytest.mark.parametrize("mode", ["old", "new"])
