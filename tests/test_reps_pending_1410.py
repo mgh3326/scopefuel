@@ -446,3 +446,70 @@ def test_drop_unbound_pending_removes_only_its_local_echo(tmp_path, monkeypatch,
     assert _pending() == []
     assert all(row.notes != "unbound" for row in bench.read_reps())
     assert len(fake.reps) == 1 and fake.reps[0]["notes"] == "holder"
+
+
+def _old_server_conflict(tmp_path, monkeypatch, capsys):
+    """Old dialect: our PUT lands, then another host's content holds origin 100."""
+    fake = _remote(monkeypatch, tmp_path, "old")
+    fake.after_put = lambda: fake.reps[0].update(notes="other host")
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: 100)
+    assert cli.main(_add_args(notes="mine")) == 0
+    capsys.readouterr()
+    assert [(row["origin_id"], row["state"], row["reason"]) for row in _pending()] == [
+        (100, "pending", "conflict")
+    ]
+    return fake
+
+
+def test_old_server_conflict_is_terminal_for_identical_readds(tmp_path, monkeypatch, capsys):
+    """Mutant guard: without the conflict check in _open_pending_rep, a re-add
+    resends origin 100 and the old server overwrites the other host's row, so
+    the PUT count and the holder row go RED. A conflict re-add must mint no origin."""
+    fake = _old_server_conflict(tmp_path, monkeypatch, capsys)
+    row, holder, puts = _pending(), dict(fake.reps[0]), fake.hits["PUT"]
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: pytest.fail("minted a new origin"))
+    for _ in range(3):
+        assert cli.main(_add_args(notes="mine")) == 2
+        err = capsys.readouterr().err
+        assert "origin:100" in err and "[pending] reason=conflict" in err
+        assert "scopefuel reps pending drop 100" in err
+        assert "refused" not in err
+        assert fake.hits["PUT"] == puts
+        assert fake.reps == [holder]
+        assert _pending() == row
+    assert cli.main(["reps", "pending", "list"]) == 0
+    listed = capsys.readouterr().out
+    assert "origin:100" in listed and "reason=conflict" in listed
+
+
+@pytest.mark.parametrize("reason", ["awaiting-confirmation", None])
+def test_safe_pending_reasons_still_resend_identical_payload(tmp_path, monkeypatch, capsys, reason):
+    fake = _remote(monkeypatch, tmp_path, "old")
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: 100)
+    fake.fail_next_put = OSError("timeout")
+    args = _add_args(notes="mine")
+    assert cli.main(args) == 2
+    capsys.readouterr()
+    conn = bench._cache_connect()
+    conn.execute("UPDATE bench_pending_reps SET reason = ?", (reason,))
+    conn.commit()
+    conn.close()
+    assert _pending()[0]["state"] == "pending" and _pending()[0]["reason"] == reason
+    assert cli.main(args) == 0
+    assert [batch[0]["origin_id"] for batch in fake.put_payloads] == [100, 100]
+    assert fake.put_payloads[0] == fake.put_payloads[1]
+    assert len(fake.reps) == 1 and _pending() == []
+
+
+def test_drop_conflict_then_identical_add_mints_fresh_origin(tmp_path, monkeypatch, capsys):
+    fake = _old_server_conflict(tmp_path, monkeypatch, capsys)
+    holder = dict(fake.reps[0])
+    assert cli.main(["reps", "pending", "drop", "100"]) == 0
+    capsys.readouterr()
+    assert _pending() == []
+    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: 200)
+    assert cli.main(_add_args(notes="mine")) == 0
+    assert fake.put_payloads[-1][0]["origin_id"] == 200
+    assert fake.reps[0] == holder
+    assert sorted(row["origin_id"] for row in fake.reps) == [100, 200]
+    assert _pending() == []
