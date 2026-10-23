@@ -294,8 +294,9 @@ STATIC_SUPERSEDES: tuple[tuple[str, str], ...] = (
 # bin/wrk resolve_catalog_profile()'s CATALOG_PROFILE/CATALOG_EFFORT_PIN plus
 # the catalog-exempt builder spellings (devin-*/kimi-* take the same-named
 # catalog profile; their launchers pass no effort flag, so the pin is "").
-# decision 4088 B: builder-sol/captain-sol pin high — a builder seat never
-# takes the max rung.
+# decision 4088 B: builder-sol/captain-sol pin high — the bare sol builder
+# spellings default to the high rung. hk 1863 (operator decision on hk 1864)
+# opened the max rung as a builder seat for every model; ultra stays refused.
 _BUILDER_RUNGS: dict[str, tuple[str, str]] = {
     "builder-opus": ("opus", ""),
     "captain-opus": ("opus", ""),

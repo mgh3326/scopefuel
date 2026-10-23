@@ -53,7 +53,8 @@ WRK_CATALOG_SPELLINGS: dict[str, tuple[str, str | None]] = {
     # #921 (wrk db8a58d): builder-only, accepts --effort high|xhigh|max and
     # defaults xhigh — resolve_catalog_profile pins "${EFFORT:-xhigh}", which
     # for the bare spelling is the xhigh consult mirrored here. The max rung
-    # is open to builder seats since hk 1863 (operator hk 1864).
+    # is open to builder seats since hk 1863 (operator hk 1864); ultra stays
+    # refused under --role builder.
     "builder-sonnet": ("sonnet", "xhigh"),
     "haiku": ("haiku", None),
     # hk 1796 (agent-skills PR 220): haiku@low builder rung.
