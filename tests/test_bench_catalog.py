@@ -1282,7 +1282,9 @@ def test_a_one_row_catalog_against_a_full_cache_is_still_rejected(catalog_server
     view = bench.read_catalog()
     assert view.source == "cache"
     assert view.detail == "server catalog rejected: 1 row, missing 38 snapshot profiles"
-    assert _cached_catalog_count() == 67
+    # hk 1885: 68 = the 67 pre-1885 rows + the sonnet@low C row (the profile
+    # count of "missing 38" is unchanged — sonnet was already a profile).
+    assert _cached_catalog_count() == 68
 
 
 def test_no_cache_keeps_the_bundle_floor(catalog_server):

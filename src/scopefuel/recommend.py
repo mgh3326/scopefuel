@@ -275,6 +275,13 @@ SONNET_5_5_ESTIMATE_REASON = (
     "실측 reps 전까지 추정 런그는 점수가 가리키는 급의 한 단계 아래에 배치"
 )
 SONNET_5_5_MEDIUM_PLACEMENT_NOTE = "raw 29.0 은 이미 최하위 급(C) — 낮출 급이 없어 C 유지"
+# hk 1885 (director-1 2026-10-23): sonnet@low at C. The TB4 curve has no low
+# point, so the row is unscored; C is the rung the monotone ladder allows
+# under sonnet@medium (C).
+SONNET_5_5_LOW_ESTIMATE_REASON = (
+    "claude-sonnet-5-5: 벤더 TB4 곡선에 low 점이 없어 점수 미표기 (외삽 안 함) — "
+    "director-1 2026-10-23 결정으로 C; sonnet@medium(C) 아래 단조 사다리 유지"
+)
 # #1297 — operator 2026-10-08 via operator-desk (hk:task/1297): sonnet@high
 # promoted C -> B on the served canon (desk grades apply --only sonnet@high,
 # decided_at 2026-10-08T11:52:05.815922Z; promote evidence reps srv:1224 ·
@@ -1338,6 +1345,19 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             **_aa_agent_benchmark(38.0, "claude-sonnet-4.6", "medium", harness="claude-code"),
             aa_agent_model_id="claude-sonnet-4.6",
             aa_model_id="claude-sonnet-4-6",
+        ),
+        # hk 1885 (director-1 2026-10-23): Sonnet 5.5 low at C. The vendor TB4
+        # curve has no low point, so the row carries no score (not extrapolated);
+        # C keeps the ladder monotonic under sonnet@medium (C) and sonnet@high (A).
+        Profile(
+            "sonnet",
+            "Sonnet 5.5 (low)",
+            None,
+            launcher_effort="low",
+            benchmark_effort="low",
+            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            estimate_reason=SONNET_5_5_LOW_ESTIMATE_REASON,
+            aa_model_id="claude-sonnet-5-5",
         ),
         # #920: Sonnet 5.5 medium — 벤더 TB4 곡선 추정 점수로 표기. high 런그는
         # #1297 운영자 승격(C -> B)으로 위 B 버킷으로 이동; medium 의 raw 29.0 은

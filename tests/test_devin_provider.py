@@ -1788,6 +1788,8 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
     # A row on the operator-approved reps measurement (hk:doc 5177 item 2).
     # devin-swe2-max's effort-less row stays C; its @max rung was #1296-promoted.
     expected |= {"devin-swe2-max", "devin-ds41-max"}
+    # hk 1885: sonnet@low is an unscored C row (director-1 2026-10-23).
+    expected |= {"sonnet"}
     actual = {p.name for p in GRADE_TABLE["C"] if p.benchmark is None}
     assert actual == expected
     medium = next(p for p in GRADE_TABLE["A"] if p.name == "devin-swe2-medium")
@@ -1796,7 +1798,7 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
         entry.profile: entry
         for entry in launch.snapshot_entries()
         if entry.profile in expected
-        and (entry.effort == "low" if entry.profile == "codex-luna" else entry.effort == "")
+        and (entry.effort == "low" if entry.profile in {"codex-luna", "sonnet"} else entry.effort == "")
     }
     assert set(snapshot) == expected
     assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())

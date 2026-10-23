@@ -508,8 +508,9 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     """
     sonnet_rows = [p for profiles in GRADE_TABLE.values() for p in profiles if p.name == "sonnet"]
     # hk 1788: max left for the E6 table — A+ xhigh, A high (b953 promote), C medium.
-    assert len(sonnet_rows) == 3
-    assert {p.launcher_effort for p in sonnet_rows} == {"xhigh", "high", "medium"}
+    # hk 1885 (director-1 2026-10-23): sonnet@low joins as C, unscored.
+    assert len(sonnet_rows) == 4
+    assert {p.launcher_effort for p in sonnet_rows} == {"xhigh", "high", "medium", "low"}
     for profile in sonnet_rows:
         assert profile.aa_model_id == "claude-sonnet-5-5"
 
@@ -592,12 +593,14 @@ def test_rob1194_c_tier_order_and_display_metadata_are_not_rank_inputs():
     assert "8.0분" not in without_measurement
 
     # #920: Sonnet 5.5 medium sits in C right after oc-sonnet46; #1297 moved
-    # the high rung to B (10-08 operator decision).
-    c_names = [profile.model for profile in GRADE_TABLE["C"][:5]]
+    # the high rung to B (10-08 operator decision). hk 1885: Sonnet 5.5 low
+    # sits in C just above medium.
+    c_names = [profile.model for profile in GRADE_TABLE["C"][:6]]
     assert c_names == [
         "Luna (low)",
         "Qwen3 Coder",
         "Sonnet 4.6",
+        "Sonnet 5.5 (low)",
         "Sonnet 5.5 (medium)",
         "Claude Haiku 5.5 (low)",
     ]
