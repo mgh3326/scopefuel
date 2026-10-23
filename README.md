@@ -468,9 +468,12 @@ migrate 밴드 `[2^40, 2^40+2^48)`와 겹치지 않음). `reps list`의 `id=`는
 쓰기는 write-ahead입니다: PUT 전에 대기 rep(origin_id + 전체 페이로드, 서버 id 없음)이 로컬
 `bench_pending_reps`에 남고, 실패·타임아웃 후 재시도는 **같은 origin_id와 같은 페이로드**를 다시
 보냅니다(새 id를 만들지 않음) — 서버의 identical-resend 규칙이 같은 서버 id를 돌려줍니다.
-`reps list`는 대기 rep을 `origin:<id>`로만 보여 주고 srv id는 붙이지 않습니다.
+`reps list`는 대기 rep을 `origin:<id> [pending]`과 reason으로 보여 주고 srv id는 붙이지 않습니다.
+서버가 확인하지 못한 쓰기는 새로고침 후에도 대기 행으로 남습니다. `reps compare`는 handoffkeep
+모드에서 서버가 확인한 행만 집계하고, pending/refused/lost 및 익명 캐시 행은 집계하지 않습니다.
 
-새 서버는 PUT 응답에 `ids`(입력 순서)를 실어 보내므로 그 id가 정본입니다. `ids`를 안 보내는
+새 서버는 PUT 응답에 `ids`(입력 순서)를 실어 보내므로 그 id로 확인합니다. 이후 GET이 그 id의
+내용을 부인하면 pending으로 남깁니다. `ids`를 안 보내는
 옛 서버에서만 쓰기 후 GET으로 바인딩하며, 그 바인딩은 fail-closed입니다 — `origin_id`를 유일하게,
 그리고 동일한 내용으로 쥔 서버 행이 증명될 때만 `srv:`를 붙이고, 아니면 `origin:`로 두고 경고합니다.
 남의 srv id는 절대 출력하지 않습니다.
@@ -478,13 +481,22 @@ migrate 밴드 `[2^40, 2^40+2^48)`와 겹치지 않음). `reps list`의 `id=`는
 충돌 — 새 서버가 같은 `(created_by, origin_id)` 슬롯에 다른 rep이 있음을 발견하면 PUT 전체가
 409 `bench_rep_conflict`로 거부되고, 클라이언트는 origin id와 `srv:<conflict_server_id>`를 함께
 출력하며(서버 행을 읽을 수 있으면 다른 필드명까지) 종료코드 2로 끝납니다. 새 id로의 자동 재시도는
-없습니다. 옛 서버는 충돌 시 조용히 덮어쓰므로(구버전의 결함 그대로) fail-closed 바인딩과 아래
+없습니다. 거부된 write-ahead 행은 `[refused]`와 충돌 서버 id(알려진 경우)로 남습니다.
+동일한 add는 새 origin을 만들거나 전송하지 않고 refused 상태와 삭제 힌트를 출력하며 종료코드 2로
+끝납니다. `scopefuel reps pending list`로 origin, 상태, profile, recorded_at, 충돌 id와 reason을
+확인하고, 검토 후 `scopefuel reps pending drop ORIGIN`으로 해당 로컬 행을 삭제할 수 있습니다.
+drop은 서버에 요청하지 않고 다른 대기 행이나 확인된 행을 건드리지 않습니다. 삭제 후에만 동일한
+add를 새 쓰기로 시작할 수 있습니다. 옛 서버는 충돌 시 조용히 덮어쓰므로 fail-closed 바인딩과 아래
 shadow 규칙이 로컬 정직성을 지킵니다.
 
-`bench push-local`도 같은 밴드를 씁니다: 로컬 행의 origin_id는 `(hostname, profile, 로컬
-rowid)`의 SHA-256을 밴드에 접은 안정 해시라 재실행은 같은 키를 다시 보내는 멱등 resend이고,
-로컬 rowid가 같은 다른 호스트와도 충돌하지 않습니다. `reps migrate`는 기존 migrate 밴드를 그대로
-씁니다.
+`bench push-local`도 같은 밴드를 씁니다: DB에 한 번 저장한 무작위 128-bit install id,
+로컬 rowid와 전체 canonical rep 내용의 SHA-256을 밴드에 접습니다. hostname 변경은 키를 바꾸지
+않으며, 새 DB 또는 내용이 바뀐 재사용 rowid는 새 키를 얻습니다. DB를 복사하면 install id도
+공유하므로 같은 복사본의 동일 행은 멱등 처리되고 내용이 달라진 행은 별개로 기록됩니다.
+각 PUT 직전에 migrate와 같은 GET pre-check로 다른 내용이 차지한 origin을 거부합니다.
+기존 DB는 install 메타 테이블 생성과 pending 상태 열 추가로 업그레이드되고 기존 페이로드는
+보존됩니다. `reps migrate`는 기존 migrate 밴드를 그대로 씁니다.
+fleet의 push-local 중단과 mbp 레인 전용 reps add 운영 규칙은 계속 유지됩니다.
 
 **shadow 규칙(캐시가 서버와 모순될 때).** refetch한 서버 행 `srv:S`의 내용이 같은 `server_id`의
 캐시 행과 다르면 그 캐시 사본은 덮어쓰인 rep의 증거입니다 — 서버 행이 `srv:S`로 표시되고 로컬

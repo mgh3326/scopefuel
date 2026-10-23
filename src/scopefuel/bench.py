@@ -458,6 +458,10 @@ class RepRecord:
     # For a ``lost:<key>`` row: the server id whose fetched content contradicts
     # this local copy (the overwrite evidence). Display-only.
     shadowed_by: int | None = None
+    # Local write-ahead status; never sent as rep content or counted as evidence.
+    pending_state: str | None = None
+    pending_reason: str | None = None
+    conflict_server_id: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {column: getattr(self, column) for column in _REP_COLUMNS}
@@ -643,6 +647,11 @@ def _backfill_table_grade(conn: sqlite3.Connection) -> None:
 
 
 _CACHE_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS bench_install_meta (
+          singleton  INTEGER PRIMARY KEY CHECK (singleton = 1),
+          install_id TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS bench_cache_meta (
           scope         TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
           fetched_at    TEXT NOT NULL,
@@ -716,7 +725,10 @@ _CACHE_SCHEMA = """
           effort         TEXT,
           grade          TEXT,
           table_grade    TEXT,
-          queued_at      TEXT NOT NULL
+          queued_at      TEXT NOT NULL,
+          state          TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'refused')),
+          reason         TEXT,
+          conflict_server_id INTEGER
         );
 
         -- task #1384: cache rows the server contradicts — a fetched row at the
@@ -825,6 +837,14 @@ def _cache_schema(conn: sqlite3.Connection) -> None:
     existing_meta_columns = {row[1] for row in conn.execute("PRAGMA table_info(bench_cache_meta)").fetchall()}
     if "snapshot_fill" not in existing_meta_columns:
         conn.execute("ALTER TABLE bench_cache_meta ADD COLUMN snapshot_fill TEXT NOT NULL DEFAULT ''")
+    pending_columns = {row[1] for row in conn.execute("PRAGMA table_info(bench_pending_reps)")}
+    for column, definition in (
+        ("state", "TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'refused'))"),
+        ("reason", "TEXT"),
+        ("conflict_server_id", "INTEGER"),
+    ):
+        if column not in pending_columns:
+            conn.execute(f"ALTER TABLE bench_pending_reps ADD COLUMN {column} {definition}")
 
 
 def _schema(conn: sqlite3.Connection) -> None:
@@ -1475,7 +1495,7 @@ def _handoffkeep_request(
         if status in expose_statuses:
             try:
                 parsed = json.loads(exc.body) if exc.body else None
-            except ValueError:
+            except (ValueError, RecursionError):
                 parsed = None
             exposed = parsed if isinstance(parsed, dict) else None
     # Raised after the except block so no context is retained (#1280 B2).
@@ -4402,7 +4422,9 @@ def _reconcile_pending_reps(
     if not own:
         return
     by_origin = {item.origin_id: item for item in fetched if item.created_by in own}
-    for row in conn.execute("SELECT " + _REP_MARK_FIELDS + " FROM bench_pending_reps").fetchall():
+    for row in conn.execute(
+        "SELECT " + _REP_MARK_FIELDS + " FROM bench_pending_reps WHERE state = 'pending'"
+    ).fetchall():
         remote = by_origin.get(row["origin_id"])
         if remote is not None and _same_rep_row(_rep_record_from_row(row), remote.record):
             conn.execute("DELETE FROM bench_pending_reps WHERE origin_id = ?", (row["origin_id"],))
@@ -4412,11 +4434,18 @@ def _pending_rep_items(conn: sqlite3.Connection) -> list[_RemoteRep]:
     """Write-ahead rows awaiting a confirmed server id — displayed as origin:."""
 
     rows = conn.execute(
-        "SELECT " + _REP_MARK_FIELDS + ", queued_at FROM bench_pending_reps ORDER BY queued_at, origin_id"
+        "SELECT " + _REP_MARK_FIELDS + ", state, reason, conflict_server_id "
+        "FROM bench_pending_reps ORDER BY queued_at, origin_id"
     ).fetchall()
     return [
         _RemoteRep(
-            record=replace(_rep_record_from_row(row), ref=f"origin:{row['origin_id']}"),
+            record=replace(
+                _rep_record_from_row(row),
+                ref=f"origin:{row['origin_id']}",
+                pending_state=row["state"],
+                pending_reason=row["reason"],
+                conflict_server_id=row["conflict_server_id"],
+            ),
             origin_id=row["origin_id"],
         )
         for row in rows
@@ -4482,9 +4511,16 @@ def _commit_rep_cache(
         _replace_cached_reps(conn, fetched, backend, now, written=written)
         for item in written:
             _put_cached_rep(conn, item)
+            if item.server_id is None:
+                conn.execute(
+                    "UPDATE bench_pending_reps SET reason = ? WHERE origin_id = ? AND state = 'pending'",
+                    (item.record.pending_reason, item.origin_id),
+                )
         _stamp_cache(conn, "reps", backend, now)
         for origin_id in pending_done:
-            conn.execute("DELETE FROM bench_pending_reps WHERE origin_id = ?", (origin_id,))
+            conn.execute(
+                "DELETE FROM bench_pending_reps WHERE origin_id = ? AND state = 'pending'", (origin_id,)
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -4508,16 +4544,50 @@ def _new_rep_origin_id() -> int:
     return _REP_ORIGIN_BAND_BASE + secrets.randbits(62)
 
 
-def _push_local_origin_id(host: str, record: RepRecord) -> int:
-    """A stable banded origin id for one local reps row.
+def _rep_install_id(path: pathlib.Path | str | None) -> str:
+    """One random 128-bit identity per database, independent of hostname.
 
-    Derived from (host, profile, local rowid): deterministic, so a re-run of
-    ``bench push-local`` resends the same key and the server treats it as an
-    idempotent resend; per-host, so two hosts can never collide the way raw
-    local rowids did.
+    A copied database keeps its identity: equal rows are the same imported
+    evidence, while changed rows derive different origins through their full
+    content. Corrupt/duplicated metadata fails closed instead of minting a
+    new identity that could duplicate previously pushed evidence.
     """
 
-    digest = hashlib.sha256(f"reps-push-local\x00{host}\x00{record.profile}\x00{record.id}".encode()).digest()
+    conn = _cache_connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute("SELECT singleton, install_id FROM bench_install_meta").fetchall()
+        if not rows:
+            conn.execute("INSERT INTO bench_install_meta VALUES (1, ?)", (secrets.token_hex(16),))
+            rows = conn.execute("SELECT singleton, install_id FROM bench_install_meta").fetchall()
+        if (
+            len(rows) != 1
+            or rows[0]["singleton"] != 1
+            or not isinstance(rows[0]["install_id"], str)
+            or re.fullmatch(r"[0-9a-f]{32}", rows[0]["install_id"]) is None
+        ):
+            raise BenchBackendError("bench push-local: corrupt install identity; refusing to push reps")
+        conn.commit()
+        return str(rows[0]["install_id"])
+    finally:
+        conn.close()
+
+
+def _push_local_origin_id(install_id: str, record: RepRecord) -> int:
+    """A stable banded origin id for one local reps row.
+
+    Derived from the install id, local rowid, and all canonical rep fields
+    (the content key itself excludes rowid). Including full content prevents
+    rowid reuse within one installation from overwriting earlier evidence.
+    """
+
+    content = json.dumps(
+        [install_id, record.id, _rep_row_key(record)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=lambda value: value.isoformat(),
+    )
+    digest = hashlib.sha256(("reps-push-local\x00" + content).encode()).digest()
     return _REP_ORIGIN_BAND_BASE + int.from_bytes(digest[:8], "big") % _REP_ORIGIN_BAND_SPAN
 
 
@@ -4541,7 +4611,12 @@ def _rep_conflict_error(exc: BenchHttpStatusError, *, offset: int) -> BenchBacke
                 entry.get("origin_id"),
                 entry.get("conflict_server_id"),
             )
-            if all(isinstance(v, int) and not isinstance(v, bool) for v in (index, origin_id, server_id)):
+            if (
+                all(isinstance(v, int) and not isinstance(v, bool) for v in (index, origin_id, server_id))
+                and index >= 0
+                and 0 < origin_id < (1 << 63)
+                and 0 < server_id < (1 << 63)
+            ):
                 conflicts.append(
                     RepWriteConflict(
                         index=offset + index,
@@ -4553,7 +4628,7 @@ def _rep_conflict_error(exc: BenchHttpStatusError, *, offset: int) -> BenchBacke
 
 
 def _put_rep_batches(
-    backend: BenchBackend, reps: list[_RemoteRep], *, batch_size: int = 500
+    backend: BenchBackend, reps: list[_RemoteRep], *, batch_size: int = 500, check_origins: bool = False
 ) -> list[int] | None:
     """PUT the reps; answer the server ids in input order when the response has them.
 
@@ -4568,6 +4643,8 @@ def _put_rep_batches(
     saw_ids = False
     for start in range(0, len(reps), batch_size):
         batch = reps[start : start + batch_size]
+        if check_origins:
+            _precheck_push_reps(backend, batch, offset=start)
         try:
             payload = _handoffkeep_request(
                 backend,
@@ -4595,6 +4672,28 @@ def _put_rep_batches(
         saw_ids = True
         ids.extend(batch_ids)
     return ids if saw_ids else None
+
+
+def _precheck_push_reps(backend: BenchBackend, reps: list[_RemoteRep], *, offset: int) -> None:
+    """Refuse differing holders before each push-local PUT, on either dialect."""
+
+    remote_before = _fetch_reps_for_migrate(backend, {item.record.profile for item in reps})
+    by_origin: dict[int, list[_RemoteRep]] = {}
+    for remote in remote_before:
+        by_origin.setdefault(remote.origin_id, []).append(remote)
+    conflicts = [
+        RepWriteConflict(
+            offset + index,
+            item.origin_id,
+            remote.server_id or remote.record.id,
+            tuple(_rep_diff_fields(item.record, remote.record)),
+        )
+        for index, item in enumerate(reps)
+        for remote in by_origin.get(item.origin_id, ())
+        if not _same_rep_row(item.record, remote.record)
+    ]
+    if conflicts:
+        raise BenchRepConflictError(conflicts)
 
 
 def _rep_diff_fields(ours: RepRecord, remote: RepRecord) -> list[str]:
@@ -4650,9 +4749,9 @@ def _bind_server_ids(
     """Attach the server pk each written rep got.
 
     ``put_ids`` (task #1384): when the PUT response carried ``ids``, each id
-    is authoritative — the server proved the row under it holds exactly the
-    written content — so the rep binds directly and ``created_by`` is learned
-    from the fetched row of the same pk when present. Old servers answer a
+    proves the write at that instant. The rep binds directly unless the
+    post-write GET contradicts its content; ``created_by`` is learned from
+    the fetched row of the same pk when present. Old servers answer a
     bare upsert count (``put_ids`` is None) and the GET bind below decides;
     it is fail-closed: a rep takes a server pk only from the *unique* holder
     of its ``origin_id`` + identical content, and only inside a provably
@@ -4706,9 +4805,19 @@ def _bind_server_ids(
         server_id = put_ids[index] if put_ids is not None else None
         if server_id is not None:
             remote = by_server.get(server_id)
+            if remote is not None and (
+                remote.origin_id != item.origin_id or not _same_rep_row(item.record, remote.record)
+            ):
+                _warn_unbound_rep(item, "conflict")
+                bound.append(
+                    replace(
+                        item, record=replace(item.record, pending_state="pending", pending_reason="conflict")
+                    )
+                )
+                continue
             bound.append(
                 _RemoteRep(
-                    record=item.record,
+                    record=replace(item.record, pending_state=None, pending_reason=None),
                     origin_id=item.origin_id,
                     created_by=remote.created_by if remote is not None else None,
                     server_id=server_id,
@@ -4718,11 +4827,13 @@ def _bind_server_ids(
         remote, reason = _proven_match(item)
         if remote is None:
             _warn_unbound_rep(item, reason)
-            bound.append(item)
+            bound.append(
+                replace(item, record=replace(item.record, pending_state="pending", pending_reason=reason))
+            )
             continue
         bound.append(
             _RemoteRep(
-                record=item.record,
+                record=replace(item.record, pending_state=None, pending_reason=None),
                 origin_id=item.origin_id,
                 created_by=remote.created_by,
                 server_id=remote.server_id,
@@ -4770,8 +4881,8 @@ def _insert_pending_rep(conn: sqlite3.Connection, item: _RemoteRep, now: dt.date
     record = item.record
     conn.execute(
         "INSERT INTO bench_pending_reps "
-        "(" + _REP_MARK_FIELDS + ", queued_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(" + _REP_MARK_FIELDS + ", queued_at, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting-confirmation')",
         (
             item.origin_id,
             record.profile,
@@ -4810,14 +4921,89 @@ def _open_pending_rep(
 
     conn = _cache_connect(path)
     try:
-        for item in _pending_rep_items(conn):
-            if _pending_rep_matches(item.record, candidate, caller_recorded_at=caller_recorded_at):
-                return item
+        matches = [
+            item
+            for item in _pending_rep_items(conn)
+            if _pending_rep_matches(item.record, candidate, caller_recorded_at=caller_recorded_at)
+        ]
+        # A refusal is terminal until explicitly dropped. It never becomes a
+        # resend and an identical add never silently mints a fresh origin.
+        for item in matches:
+            if item.record.pending_state == "refused":
+                raise _refused_rep_error(item.record)
+        if matches:
+            return matches[0]
         origin_id = _new_rep_origin_id()
         item = _RemoteRep(record=replace(candidate, id=origin_id), origin_id=origin_id)
         _insert_pending_rep(conn, item, _cache_now())
         conn.commit()
         return item
+    finally:
+        conn.close()
+
+
+def _refused_rep_error(record: RepRecord) -> BenchBackendError:
+    holder = f" conflicting=srv:{record.conflict_server_id}" if record.conflict_server_id else ""
+    return BenchBackendError(
+        f"rep origin:{record.id} [refused]{holder}; nothing sent — inspect the refusal, then run "
+        f"scopefuel reps pending drop {record.id} before adding it again"
+    )
+
+
+def _mark_pending_refused(
+    path: pathlib.Path | str | None, reps: list[_RemoteRep], conflicts: list[RepWriteConflict]
+) -> None:
+    holders = {conflict.origin_id: conflict.conflict_server_id for conflict in conflicts}
+    conn = _cache_connect(path)
+    try:
+        for item in reps:
+            conn.execute(
+                "UPDATE bench_pending_reps SET state = 'refused', reason = 'conflict', "
+                "conflict_server_id = ? WHERE origin_id = ? AND state = 'pending'",
+                (holders.get(item.origin_id), item.origin_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_pending_reps(*, path: pathlib.Path | str | None = None) -> list[RepRecord]:
+    """Read only this database's write-ahead rows, without resolving a backend."""
+
+    conn = _cache_connect(path)
+    try:
+        return [item.record for item in _pending_rep_items(conn)]
+    finally:
+        conn.close()
+
+
+def drop_pending_rep(origin: str, *, path: pathlib.Path | str | None = None) -> bool:
+    """Remove exactly one local intent and its unbound cache echo; never send."""
+
+    value = origin.removeprefix("origin:")
+    if not value.isascii() or not value.isdecimal() or len(value) > 19 or not 0 < int(value) < (1 << 63):
+        raise BenchError("pending drop requires an origin id (number or origin:<number>)")
+    origin_id = int(value)
+    conn = _cache_connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT " + _REP_MARK_FIELDS + " FROM bench_pending_reps "
+            "WHERE origin_id = ? AND state IN ('pending', 'refused')",
+            (origin_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        for cached in conn.execute(
+            "SELECT cache_key, " + _REP_MARK_FIELDS + " FROM bench_cache_reps "
+            "WHERE origin_id = ? AND server_id IS NULL AND created_by IS NULL",
+            (origin_id,),
+        ).fetchall():
+            if _same_rep_row(_rep_record_from_row(row), _rep_record_from_row(cached)):
+                conn.execute("DELETE FROM bench_cache_reps WHERE cache_key = ?", (cached["cache_key"],))
+        conn.execute("DELETE FROM bench_pending_reps WHERE origin_id = ?", (origin_id,))
+        conn.commit()
+        return True
     finally:
         conn.close()
 
@@ -4840,7 +5026,8 @@ def _write_reps_handoffkeep(
     propagates without touching the cache — a retried add resends the same
     write-ahead ``origin_id`` and payload, so the failure cannot leave a
     duplicate. ``pending_done`` origin ids are cleared from the write-ahead
-    table in the same commit.
+    table in the same commit only for rows with a confirmed server id. An
+    unbound row keeps its pending intent and bind reason across refreshes.
     """
 
     if not reps:
@@ -4848,16 +5035,20 @@ def _write_reps_handoffkeep(
     try:
         put_ids = _put_rep_batches(backend, reps)
     except BenchRepConflictError as exc:
+        _mark_pending_refused(path, reps, exc.conflicts)
         raise _annotate_rep_conflict(exc, reps, backend) from exc
     fetched = _fetch_reps(backend, query={"limit": _MIGRATE_REP_WINDOW})
     written = _bind_server_ids(reps, fetched, backend=backend, put_ids=put_ids)
+    done = set(pending_done)
     try:
         _commit_rep_cache(
             path=path,
             fetched=fetched,
             written=written,
             backend=backend,
-            pending_done=pending_done,
+            pending_done=[
+                item.origin_id for item in written if item.server_id is not None and item.origin_id in done
+            ],
         )
     except (sqlite3.Error, OSError) as exc:
         raise BenchBackendError("local bench cache update failed") from exc
@@ -4913,11 +5104,15 @@ def _read_reps_handoffkeep(
             rows = cached_for_endpoint
     else:
         rows = cached_for_endpoint
-    confirmed = {(item.origin_id, _rep_row_key(item.record)) for item in rows}
-    records = [item.record for item in rows]
-    records += [
-        item.record for item in pending if (item.origin_id, _rep_row_key(item.record)) not in confirmed
+    local_intents = {(item.origin_id, _rep_row_key(item.record)) for item in pending}
+    # Prefer the durable intent over its disposable anonymous write-through
+    # echo. Even an identical server twin does not prove this intent's write.
+    records = [
+        item.record
+        for item in rows
+        if item.server_id is not None or (item.origin_id, _rep_row_key(item.record)) not in local_intents
     ]
+    records += [item.record for item in pending]
     records += lost
     return _filter_reps(records, limit=limit, grade=grade, profile=profile, effort=effort)
 
@@ -4993,16 +5188,20 @@ def add_rep(
             written = _write_reps_handoffkeep(
                 [item], path=path, backend=backend, pending_done=[item.origin_id]
             )
+        except BenchRepConflictError:
+            refused = next(rep for rep in list_pending_reps(path=path) if rep.id == item.origin_id)
+            print(f"note: {_refused_rep_error(refused)}", file=sys.stderr)
+            raise
         except Exception:
             print(
-                f"note: the rep stays queued locally as origin:{item.origin_id}; "
-                "re-running the same add resends it unchanged",
+                f"note: the rep stays queued locally as origin:{item.origin_id} [pending]; "
+                "inspect scopefuel reps pending list before retrying or dropping it",
                 file=sys.stderr,
             )
             raise
         remote = written[0]
         ref = f"srv:{remote.server_id}" if remote.server_id is not None else f"origin:{item.origin_id}"
-        return replace(item.record, id=remote.server_id or item.origin_id, ref=ref)
+        return replace(remote.record, id=remote.server_id or item.origin_id, ref=ref)
 
     conn = connect(path)
     try:
@@ -5238,22 +5437,20 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     reps follow the ``reps`` opt-in (task #697); a scope with rows requires its
     own resolved handoffkeep backend.
 
-    Each local rep's ``origin_id`` is a stable hash of (hostname, profile,
-    local rowid) inside the task #1384 band [2^62, 2^63): deterministic, so
-    re-running ``bench push-local`` resends the same key and the server's
-    identical-resend rule lands on the same row — never a duplicate — and
-    per-host, so two machines sharing one bearer identity can no longer pin
-    the same raw rowid onto different reps. The hostname keeps two real
-    machines' rows distinct even when their local tables are identical.
+    Each rep's origin hashes a durable random install id, local rowid and
+    canonical content inside [2^62, 2^63). Hostname changes keep the key;
+    fresh databases and reused rowids with changed content get new keys.
+    The migrate GET pre-check refuses held origins before any rep PUT,
+    protecting clients that still meet the old overwriting server.
     """
 
     catalog_backend = bench_backend(use="catalog")
     reps_backend = bench_backend(use="reps")
     scores = _read_local_scores(path=path)
     reps = _read_local_reps_for_push(path=path)
-    host = socket.gethostname() or "local"
+    install_id = _rep_install_id(path) if reps else ""
     remote_reps = [
-        _RemoteRep(record=record, origin_id=_push_local_origin_id(host, record)) for record in reps
+        _RemoteRep(record=record, origin_id=_push_local_origin_id(install_id, record)) for record in reps
     ]
 
     if scores and catalog_backend.name != BENCH_BACKEND_HANDOFFKEEP:
@@ -5292,7 +5489,7 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
         _put_score_batches(catalog_backend, scores)
     if remote_reps:
         try:
-            put_ids = _put_rep_batches(reps_backend, remote_reps)
+            put_ids = _put_rep_batches(reps_backend, remote_reps, check_origins=True)
         except BenchRepConflictError as exc:
             raise _annotate_rep_conflict(exc, remote_reps, reps_backend) from exc
         fetched_reps = _fetch_reps(reps_backend, query={"limit": _MIGRATE_REP_WINDOW})
@@ -5925,6 +6122,12 @@ def format_rep(rep: RepRecord) -> str:
         f"completed={rep.completed if rep.completed is not None else '-'}",
         f"recorded_at={rep.recorded_at}",
     ]
+    if rep.pending_state is not None:
+        fields.append(f"[{rep.pending_state}]")
+        if rep.pending_reason:
+            fields.append(f"reason={rep.pending_reason}")
+        if rep.conflict_server_id is not None:
+            fields.append(f"conflicting=srv:{rep.conflict_server_id}")
     if rep.input_tokens is not None:
         fields.append(f"input-tokens={rep.input_tokens}")
     if rep.output_tokens is not None:
@@ -5955,6 +6158,8 @@ def compare_reps(
     rows = read_reps(path=path, grade=grade, profile=profile, effort=effort)
     by_profile: dict[str, list[RepRecord]] = {}
     for row in rows:
+        if row.pending_state is not None or rep_ref(row).startswith(("lost:", "origin:")):
+            continue
         by_profile.setdefault(row.profile, []).append(row)
 
     comparisons: list[RepComparison] = []

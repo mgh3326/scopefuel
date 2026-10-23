@@ -20,7 +20,6 @@ from __future__ import annotations
 import itertools
 import json
 import re
-import socket
 import sqlite3
 import urllib.parse
 from collections import Counter
@@ -404,7 +403,8 @@ def test_new_server_409_prints_both_ids_and_differing_fields(tmp_path, monkeypat
     out = capsys.readouterr().out
     attacker_line = next(line for line in out.splitlines() if "task=attacker" in line)
     assert f"id=origin:{origin}" in attacker_line
-    assert "srv:" not in attacker_line
+    assert "id=srv:" not in attacker_line
+    assert "[refused]" in attacker_line and "conflicting=srv:1" in attacker_line
 
 
 def test_old_server_contradicted_slot_binds_fail_closed(tmp_path, monkeypatch, capsys):
@@ -697,8 +697,17 @@ def test_409_error_chain_has_no_self_reference(tmp_path, monkeypatch):
     bench.add_rep(**_local_rep("push-1"))
     fake = _remote(monkeypatch, pl)
     record = bench._read_local_reps_for_push()[0]
-    origin = bench._push_local_origin_id(socket.gethostname() or "local", record)
-    fake.reps.append(_remote_row(id=7, origin_id=origin, task_ref="occupied", notes="different rep"))
+    origin = bench._push_local_origin_id(bench._rep_install_id(None), record)
+    # The pre-check is clear; a concurrent writer occupies the slot just
+    # before PUT. Exercise the actual 409 annotate path, not the pre-check.
+    original_request = fake.__call__
+
+    def concurrent_writer(url, **kwargs):
+        if kwargs.get("method") == "PUT":
+            fake.reps.append(_remote_row(id=7, origin_id=origin, task_ref="occupied", notes="different rep"))
+        return original_request(url, **kwargs)
+
+    monkeypatch.setattr(bench, "request_json", concurrent_writer)
     _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
     with pytest.raises(bench.BenchRepConflictError) as excinfo:
         bench.push_local()
