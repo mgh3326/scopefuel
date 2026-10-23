@@ -370,6 +370,7 @@ def test_claude_nonstring_keychain_token_is_credentials(monkeypatch, tmp_path):
 def test_codex_separates_additional_rate_limits(fixture_json, monkeypatch, tmp_path):
     auth = tmp_path / "auth.json"
     auth.write_text(json.dumps({"tokens": {"access_token": "x", "account_id": "acc"}}))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     monkeypatch.setattr(codex, "AUTH", auth)
     monkeypatch.setattr(codex, "request_json", lambda *a, **k: fixture_json("codex_usage"))
 
