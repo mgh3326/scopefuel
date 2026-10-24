@@ -5,7 +5,8 @@ about every 30 s while grok's own startup takes longer than that, so every
 probe timed out with one opaque message — nobody could tell where it stalled.
 
 The probe now reports the furthest stage it reached (no-output / no-prompt /
-no-panel / unparsed) with a byte count and never raw screen text, holds a
+trust-prompt / no-panel / unparsed) with a byte count and never raw screen
+text, holds a
 per-pool flock in the cache dir for the whole probe, persists an exponential
 backoff after each timeout, and reaps its whole process group on timeout.
 
@@ -20,6 +21,7 @@ import datetime as dt
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -48,8 +50,10 @@ def _write_stub(tmp_path: Path, name: str, body: str) -> Path:
     return stub
 
 
-def _install(monkeypatch, tmp_path: Path, stub: Path, *, timeout: float = 3.0) -> Path:
-    workdir = tmp_path / "grok-probe-workdir"
+def _install(
+    monkeypatch, tmp_path: Path, stub: Path, *, timeout: float = 3.0, workdir: Path | None = None
+) -> Path:
+    workdir = workdir if workdir is not None else tmp_path / "grok-probe-workdir"
     monkeypatch.setattr(grok, "BINARY", str(stub))
     monkeypatch.setattr(grok, "PROBE_WORKDIR", workdir)
     monkeypatch.setattr(grok, "TIMEOUT_S", timeout)
@@ -621,3 +625,219 @@ def test_collect_does_not_spawn_during_backoff(monkeypatch, tmp_path):
     results = cache.collect({"grok": boom}, ["grok"], now=now + 1.0, use_cache=False)
     assert "backoff" in (results[0].error or "")
     assert results[0].backoff_until and results[0].backoff_until > now
+
+
+# ------------------------------------------- hk 1964: grok 1.0.70 folder trust
+
+
+# The exact folder-trust question desk captured from grok 1.0.70 (hk 1964
+# comment 7229 — the screen also shows the probed path and Yes/No rows, but
+# the probe matches this sentence only, after ANSI stripping).
+TRUST_QUESTION = "Do you trust the contents of this directory?"
+
+
+def _write_trust_stub(tmp_path: Path, name: str = "fake-grok-1.0.70") -> Path:
+    """A grok 1.0.70 that gates on folder trust before printing its prompt.
+
+    Like the real CLI: it asks TRUST_QUESTION and waits — unless
+    ``git rev-parse --show-toplevel`` in its cwd resolves to
+    FAKE_GROK_TRUSTED_ROOT (the probe keeps PROBE_WORKDIR a git root so one
+    desk trust entry for it covers every ``probe-*`` instance dir).
+    FAKE_GROK_ASK_ALWAYS=1 asks even inside the trusted root — m1's
+    ~/.grok/hooks mode (desk g70b). FAKE_GROK_THEN_PROMPT=1 still prints the
+    prompt after asking, in the same write, for the prompt-wins case.
+    """
+
+    return _write_stub(
+        tmp_path,
+        name,
+        "top=$(git rev-parse --show-toplevel 2>/dev/null)\n"
+        'if [ -n "$top" ]; then top=$(cd "$top" 2>/dev/null && pwd -P); fi\n'
+        "trusted=\n"
+        'if [ -n "${FAKE_GROK_TRUSTED_ROOT:-}" ]; then\n'
+        '    trusted=$(cd "$FAKE_GROK_TRUSTED_ROOT" 2>/dev/null && pwd -P)\n'
+        "fi\n"
+        "ask=1\n"
+        'if [ -n "$top" ] && [ "$top" = "$trusted" ]; then ask=; fi\n'
+        'if [ -n "${FAKE_GROK_ASK_ALWAYS:-}" ]; then ask=1; fi\n'
+        'if [ -n "$ask" ]; then\n'
+        '    if [ -n "${FAKE_GROK_THEN_PROMPT:-}" ]; then\n'
+        f"        printf '{TRUST_QUESTION}\\r\\n{SENTINEL}\\r\\n{PROMPT} '\n"
+        "    else\n"
+        f"        printf '{TRUST_QUESTION}\\r\\n'\n"
+        f"        printf '{SENTINEL}\\r\\n'\n"
+        "        exec sleep 120\n"
+        "    fi\n"
+        "else\n"
+        f"    printf '{PROMPT} '\n"
+        "fi\n"
+        "IFS= read -r command\n"
+        "printf 'Weekly limit: 42%%\\r\\nNext reset: August 14, 04:58\\r\\n'\n"
+        "exit 0\n",
+    )
+
+
+def test_fresh_workdir_probe_is_git_rooted_and_parses(tmp_path, monkeypatch):
+    """A first probe in a workdir that does not exist yet works.
+
+    The probe keeps PROBE_WORKDIR the root of a git repository so one
+    desk-side trust entry for it covers every ``probe-*`` instance dir —
+    grok 1.0.70 inherits folder trust only within the same git repository.
+    On main the stub's trust question stalls the probe as stage=no-prompt:
+    the RED.
+    """
+
+    workdir = _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path))
+    monkeypatch.setenv("FAKE_GROK_TRUSTED_ROOT", str(workdir))
+    assert not workdir.exists(), "this case starts from a missing workdir"
+
+    result = grok.fetch()
+
+    assert result.error is None, f"trusted workdir probe failed: {result.error}"
+    assert result.buckets[0].used_pct == 42.0
+    assert (workdir / ".git").exists(), "the probe did not leave the workdir a git root"
+    # kill_stale_probe_leftovers and the instance-dir lifecycle leave the
+    # .git root in place — it is not a ``probe-*`` dir.
+    proctrack.kill_stale_probe_leftovers(workdir)
+    assert (workdir / ".git").exists()
+    _assert_no_probe_left(workdir)
+
+
+def test_git_init_runs_once_not_once_per_probe(tmp_path, monkeypatch):
+    """The second probe finds workdir/.git and does not run git init again."""
+
+    real_git = shutil.which("git")
+    assert real_git, "this test needs git on PATH"
+    calls = tmp_path / "git-calls.log"
+    bindir = tmp_path / "git-spy-bin"
+    bindir.mkdir()
+    _write_stub(
+        bindir,
+        "git",
+        f'printf \'%s\\n\' "$*" >> {shlex.quote(str(calls))}\nexec {shlex.quote(real_git)} "$@"\n',
+    )
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    workdir = _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path))
+    monkeypatch.setenv("FAKE_GROK_TRUSTED_ROOT", str(workdir))
+
+    first = grok.fetch()
+    second = grok.fetch()
+
+    assert first.error is None and second.error is None, (first.error, second.error)
+    inits = [line for line in calls.read_text().splitlines() if line.strip() == "init -q"]
+    assert inits == ["init -q"], f"git init calls: {calls.read_text()}"
+    _assert_no_probe_left(workdir)
+
+
+def test_untrusted_workdir_reports_trust_prompt_without_the_full_timeout(tmp_path, monkeypatch):
+    """Trust question seen and prompt never seen → stage=trust-prompt, at once.
+
+    It counts as a probe timeout for backoff exactly like no-prompt does,
+    and the error/hint carry no screen text — only the workdir path.
+    """
+
+    workdir = _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path), timeout=5.0)
+    monkeypatch.setenv("FAKE_GROK_TRUSTED_ROOT", str(tmp_path / "trusted-elsewhere"))
+
+    started = time.monotonic()
+    result = grok.fetch()
+    elapsed = time.monotonic() - started
+
+    _assert_stage(result, "trust-prompt")
+    assert elapsed < 5.0, "the probe waited out its whole timeout on the trust question"
+    assert str(workdir) in (result.hint or ""), "the hint must name the workdir"
+    _assert_no_raw_text(result)
+    assert _backoff_entry().get("consecutive") == 1
+    _assert_no_probe_left(workdir)
+
+
+def test_trust_question_inside_the_git_root_is_still_trust_prompt(tmp_path, monkeypatch):
+    """m1 hooks mode (desk g70b): ~/.grok/hooks makes grok ask in every
+    folder, so a git-rooted workdir does not help there — the stage must
+    still be trust-prompt with the workdir-only hint, not no-prompt or
+    unparsed."""
+
+    workdir = _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path))
+    monkeypatch.setenv("FAKE_GROK_TRUSTED_ROOT", str(workdir))
+    monkeypatch.setenv("FAKE_GROK_ASK_ALWAYS", "1")
+
+    result = grok.fetch()
+
+    _assert_stage(result, "trust-prompt")
+    assert str(workdir) in (result.hint or "")
+    _assert_no_raw_text(result)
+    _assert_no_probe_left(workdir)
+
+
+def test_a_seen_prompt_wins_over_the_trust_question(tmp_path, monkeypatch):
+    """Precedence: question and prompt both visible → /usage is still sent.
+
+    trust-prompt applies only when the question is seen and the prompt is
+    not; the stub prints both in one write, so the prompt check must be
+    consulted before the trust-question check.
+    """
+
+    _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path))
+    monkeypatch.setenv("FAKE_GROK_ASK_ALWAYS", "1")
+    monkeypatch.setenv("FAKE_GROK_THEN_PROMPT", "1")
+
+    result = grok.fetch()
+
+    assert result.error is None, f"prompt was visible but /usage never went out: {result.error}"
+    assert result.buckets[0].used_pct == 42.0
+
+
+def test_missing_git_leaves_the_probe_to_report_trust_prompt(tmp_path, monkeypatch):
+    """No git on PATH: the init fails open (never raises) and the question
+    the CLI then asks is still stage=trust-prompt."""
+
+    bindir = tmp_path / "no-git-bin"
+    bindir.mkdir()
+    (bindir / "sleep").symlink_to("/bin/sleep")  # the stub needs sleep; no git here
+    monkeypatch.setenv("PATH", str(bindir))
+
+    workdir = _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path))
+    monkeypatch.setenv("FAKE_GROK_TRUSTED_ROOT", str(workdir))
+
+    result = grok.fetch()
+
+    _assert_stage(result, "trust-prompt")
+    assert str(workdir) in (result.hint or "")
+    _assert_no_raw_text(result)
+    _assert_no_probe_left(workdir)
+
+
+def test_workdir_nested_in_another_repo_becomes_its_own_root(tmp_path, monkeypatch):
+    """A PROBE_WORKDIR inside another repository still gets its own .git.
+
+    git rev-parse from an instance dir then answers the workdir, not the
+    outer root — and the probe leaves the enclosing repository untouched.
+    """
+
+    outer = tmp_path / "outer-repo"
+    outer.mkdir()
+    subprocess.run(["git", "init", "-q", str(outer)], check=True)
+    workdir = outer / "grok-probe-workdir"
+    workdir.mkdir()
+    (workdir / "seed").write_text("x\n")  # the dir shows in outer status either way
+
+    def outer_status() -> str:
+        return subprocess.run(
+            ["git", "-C", str(outer), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    before = outer_status()
+
+    _install(monkeypatch, tmp_path, _write_trust_stub(tmp_path), workdir=workdir)
+    monkeypatch.setenv("FAKE_GROK_TRUSTED_ROOT", str(workdir))
+
+    result = grok.fetch()
+
+    assert result.error is None, f"nested workdir probe failed: {result.error}"
+    assert (workdir / ".git").exists()
+    assert outer_status() == before, "the probe changed the enclosing repository"
+    _assert_no_probe_left(workdir)
