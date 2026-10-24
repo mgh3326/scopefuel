@@ -440,10 +440,26 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
         actual = recommend.recommend(
             _healthy_s_plus_providers(), grade, today=TODAY, now=NOW, bench_scores=[]
         )
+
         # hk 1729 adds two unmeasured B rows. Their placement is asserted in
         # test_task1729_fusion_sol; removing just those rows preserves this
         # baseline check for every prior recommendation line.
-        actual = "\n".join(line for line in actual.splitlines() if "devin-fusion-sol61" not in line)
+        # hk 1862: fusion-sol61 entries may also ride the folded 제외 line —
+        # drop those entries (and fix the count) rather than the whole line.
+        def _strip_fusion(text: str) -> str:
+            out = []
+            for line in text.splitlines():
+                if not line.startswith("✗ 제외"):
+                    if "devin-fusion-sol61" not in line:
+                        out.append(line)
+                    continue
+                entries = [e.strip() for e in line.split(":", 1)[1].split("·")]
+                entries = [e for e in entries if "devin-fusion-sol61" not in e]
+                if entries:
+                    out.append(f"✗ 제외 ({len(entries)}): " + " · ".join(entries))
+            return "\n".join(out)
+
+        actual = _strip_fusion(actual)
         assert actual.encode() == expected.encode(), grade
         assert not any(name in actual for name in ("codex-astra", "fable", "builder-astra", "builder-fable"))
 

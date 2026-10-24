@@ -1799,21 +1799,28 @@ _REP_DECISION_REF = re.compile(
 # on (profile, effort) with a single grade column, so a second placement cannot
 # be expressed as a row. The directive is therefore a cross-grade *listing*:
 # each entry names a rung and the grade ``--recommend`` lists it at while the
-# live table still places it exactly one grade above. The row keeps its own
-# gate — codex-sol@xhigh stays escalation-gated (it still needs
-# --operator-request to launch).
+# live table still places it exactly one grade above.
+#
+# hk 1862 (operator borrow-down policy, hk:task/1786 comment 6689): each entry
+# carries its own *listing* gate — the gate the row is shown under at its
+# listed grade. codex-sol@xhigh lists at S as a default-gated candidate (its
+# own S+ row keeps gate=escalation; the per-grade gate is a listing attribute,
+# and the launch gate has no task-grade input to read it — see gate_check).
+# sonnet@high lists at B borrowed from A.
 #
 # The ``_SOL_PROFILES``-outside-S+ rule is about placements. A borrowed listing
 # places nothing — ``validate_grade_table`` is never called for it — and the
 # one-up listing's exclusion of Sol profiles stays exactly as it is.
 # ``BORROWED_RUNGS`` is the explicit operator exception to both: it is what
 # lets codex-sol@xhigh list at S without placing a Sol row outside S+, and
-# what lets opus@low list at A+ without rep evidence.
+# what lets opus@low list at A+ without rep evidence. r1023grokup keeps grok
+# out of borrowed listings at B and C (grok only at A and above).
 #
-# Shape: (profile, launcher_effort, listed_grade, decision_ref).
-BORROWED_RUNGS: tuple[tuple[str, str, Grade, str], ...] = (
-    ("opus", "low", "A+", "operator d1786ap hk:task/1786"),
-    ("codex-sol", "xhigh", "S", "operator d1786ap hk:task/1786"),
+# Shape: (profile, launcher_effort, listed_grade, listed_gate, decision_ref).
+BORROWED_RUNGS: tuple[tuple[str, str, Grade, Gate, str], ...] = (
+    ("opus", "low", "A+", "default", "operator d1786ap hk:task/1786"),
+    ("codex-sol", "xhigh", "S", "default", "operator hk:task/1786 comment 6689"),
+    ("sonnet", "high", "B", "default", "operator hk:task/1786 comment 6689"),
 )
 BORROWED_TAG_PREFIX = "[borrowed "
 
@@ -1878,29 +1885,76 @@ def _one_up_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tu
     ]
 
 
-def _borrowed_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tuple[Profile, Grade]]:
-    """``BORROWED_RUNGS`` entries the live table places exactly one grade above ``grade``.
+@dataclass(frozen=True)
+class _BorrowedListing:
+    """One ``BORROWED_RUNGS`` entry evaluated against the live table.
 
-    An entry lists only while the table carries its rung at exactly the grade
-    above ``listed_grade``: placed anywhere else, or not carried at all (moved,
-    retired, or dropped — an E6 row at its carrier never reaches the table),
-    the entry is inert and lists nothing, so a stale directive cannot invent a
-    candidate after a later canon move.
+    ``profile``/``placed_grade`` name where the rung actually sits (``None``
+    when the table does not carry it at all). The listing is *active* only
+    while the rung is placed exactly one grade above ``listed_grade`` — placed
+    anywhere else, or not carried (moved, retired, or dropped), it is inert and
+    shows on the folded excluded line instead of ranking, so a stale directive
+    can neither invent a candidate nor vanish silently (hk 1862).
     """
-    out: list[tuple[Profile, Grade]] = []
-    for profile_name, effort, listed_grade, _decision_ref in BORROWED_RUNGS:
+
+    profile_name: str
+    effort: str
+    listed_grade: Grade
+    listed_gate: Gate
+    decision_ref: str
+    expected_upper: Grade | None
+    profile: Profile | None
+    placed_grade: Grade | None
+
+    @property
+    def active(self) -> bool:
+        return self.profile is not None and self.placed_grade == self.expected_upper
+
+    @property
+    def inert_reason(self) -> str:
+        actual = f"placed at {self.placed_grade}" if self.placed_grade is not None else "not carried"
+        return (
+            f"borrowed rung inert: {self.profile_name}@{self.effort} expected at "
+            f"{self.expected_upper or '-'}, {actual} ({self.decision_ref})"
+        )
+
+
+def _borrowed_listings(grade: Grade, table: dict[Grade, list[Profile]]) -> list[_BorrowedListing]:
+    """Every ``BORROWED_RUNGS`` entry listed at ``grade``, active or inert."""
+    out: list[_BorrowedListing] = []
+    for profile_name, effort, listed_grade, listed_gate, decision_ref in BORROWED_RUNGS:
         if listed_grade != grade:
             continue
         upper_index = _GRADE_ORDER.index(listed_grade) - 1
-        if upper_index < 0:
-            continue
-        upper = _GRADE_ORDER[upper_index]
-        out.extend(
-            (profile, upper)
-            for profile in table.get(upper, [])
-            if profile.name == profile_name and normalize_effort(profile.launcher_effort) == effort
+        upper = _GRADE_ORDER[upper_index] if upper_index >= 0 else None
+        placed_grade: Grade | None = None
+        found: Profile | None = None
+        for placed, profiles in table.items():
+            for profile in profiles:
+                if profile.name == profile_name and normalize_effort(profile.launcher_effort) == effort:
+                    placed_grade, found = placed, profile
+        out.append(
+            _BorrowedListing(
+                profile_name=profile_name,
+                effort=effort,
+                listed_grade=listed_grade,
+                listed_gate=listed_gate,
+                decision_ref=decision_ref,
+                expected_upper=upper,
+                profile=found,
+                placed_grade=placed_grade,
+            )
         )
     return out
+
+
+def _borrowed_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tuple[Profile, Grade]]:
+    """The *active* borrowed listings at ``grade`` — rungs the table carries one grade up."""
+    return [
+        (listing.profile, listing.placed_grade)
+        for listing in _borrowed_listings(grade, table)
+        if listing.active and listing.profile is not None and listing.placed_grade is not None
+    ]
 
 
 def _placed_tag_suffix(
@@ -1921,6 +1975,42 @@ def _fold_name(item: _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
     if item.one_up and item.placed_grade is not None:
         return f"{item.profile.name}{ONE_UP_TAG_PREFIX}{item.placed_grade}]"
     return item.profile.name
+
+
+def _fold_effort(item: _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
+    """``@<effort>`` on a folded entry — ``@default`` for an effort-less row."""
+    return f"@{item.profile.launcher_effort or 'default'}"
+
+
+def _excluded_reason(item: _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
+    """The reason string one folded excluded entry carries (text and JSON)."""
+    if isinstance(item, _PolicyExcluded):
+        parts = [f"{item.provider_id} 풀 class=exclude"]
+        if item.until is not None:
+            parts.append(f"until {item.until.isoformat()}")
+        if item.note:
+            parts.append(item.note)
+        return f"policy excluded ({', '.join(parts)})"
+    if isinstance(item, _Unsubscribed):
+        detail = item.detail or f"{item.source} 구독 해지"
+        return f"unsubscribed ({detail})"
+    return item.reason
+
+
+def _fold_entry(item: _Excluded | _PolicyExcluded | _Unsubscribed) -> str:
+    """One folded excluded entry: profile, effort (or default) and its reason."""
+    return f"{_fold_name(item)}{_fold_effort(item)} — {_excluded_reason(item)}"
+
+
+def _fold_excluded_line(items: list[_Excluded | _PolicyExcluded | _Unsubscribed]) -> str:
+    """The single folded excluded line of one grade (hk 1862).
+
+    Every canon row at this grade that is neither ranked nor escalated appears
+    here, each entry naming the profile, the effort (``@default`` when the row
+    carries none) and its reason — barred, unsubscribed, dropped legacy,
+    E6 unmeasured, grok-below-A, inert borrowed, policy/exhausted/unmeasurable.
+    """
+    return f"✗ 제외 ({len(items)}): " + " · ".join(_fold_entry(item) for item in items)
 
 
 # These launcher spellings exist for director-controlled workflows, but they
@@ -2074,6 +2164,22 @@ BARRED_PROFILE_ALIASES: dict[str, tuple[str, str]] = {
     "builder-terra-xhigh": ("codex-terra", "xhigh"),
     "builder-terra-max": ("codex-terra", "max"),
 }
+
+
+# hk 1862 (operator r1023grokup): grok rungs list only at A and above. A grok
+# canon row at B or C — or a one-up/borrowed listing landing there — is never
+# ranked or escalated; it shows on the folded excluded line with this reason.
+GROK_MIN_LISTED_GRADE: Grade = "A"
+GROK_RESTRICTED_REASON = "grok restricted to A and above (operator r1023grokup)"
+
+# hk 1862: an E6 measurement row at its carrier grade is a catalog row, never a
+# candidate — it shows on the folded excluded line with this reason instead of
+# vanishing.
+E6_UNMEASURED_REASON = "E6 unmeasured (미측정 E6 측정 런그 — SCOPEFUEL_E6_ARM 표식 필요)"
+
+
+def _is_grok_profile(name: str) -> bool:
+    return name == "grok" or name.startswith("grok-")
 
 
 def is_barred_model_id(model_id: str | None) -> bool:
@@ -2449,6 +2555,9 @@ class _Unsubscribed:
     placed_grade: Grade | None = None
     one_up: bool = False
     borrowed: bool = False
+    # hk 1862: the deciding flag's own note (``[pools.kimi] subscribed=false``)
+    # — the folded excluded line prints it as the reason.
+    detail: str = ""
 
 
 @dataclass
@@ -4704,6 +4813,12 @@ class _Evaluation:
     policy_excluded: list[_PolicyExcluded]
     unsubscribed: list[_Unsubscribed]
     escalation: list[_EscalationEntry]
+    # hk 1862: canon rows that never reach candidacy — barred rows, grok rungs
+    # below A, E6 rows at their carrier, dropped legacy rows and the other
+    # catalog-assembly skips (``_catalog_grade_table``'s ``dropped``), plus
+    # inert borrowed listings. They are folded onto the excluded line with
+    # their own reasons instead of vanishing.
+    dropped: list[_Excluded]
 
 
 def _recommend_rank_key(
@@ -4770,8 +4885,34 @@ def _evaluate(
     # Filter the final table here, after CLI callers have merged a served canon
     # or catalog. This single candidate boundary also covers exclusion folds,
     # reps-measured one-up rows, local boosts, and the structured JSON output.
+    # Rows the catalog assembly skipped still carry their reason
+    # (``_catalog_grade_table`` sets ``dropped``/``canon_keys`` on the table it
+    # returns). On a plain dict — the bundled snapshot or a test fixture — the
+    # compile-time canon carries the E6 rungs, so their carrier rows fold here.
+    canon_dropped = getattr(table, "dropped", None) or []
+    canon_keys = getattr(table, "canon_keys", None)
+
+    # hk 1862: a barred row is no longer dropped silently — it leaves the
+    # candidate boundary exactly as before but lands on the folded excluded
+    # line as ``barred`` with the decision ref.
+    dropped: list[_Excluded] = [
+        _Excluded(
+            profile,
+            f"barred ({BARRED_MODEL_DECISION_REF})",
+            provider_id=resolved_pool(profile)[0],
+            kind="barred",
+            placed_grade=placed,
+        )
+        for placed, profiles in table.items()
+        for profile in profiles
+        if placed == grade
+        and any(
+            is_barred_model_id(model_id)
+            for model_id in (profile.aa_agent_model_id, profile.benchmark_model_id)
+        )
+    ]
     table = {
-        grade: [
+        g: [
             profile
             for profile in profiles
             if not any(
@@ -4779,8 +4920,24 @@ def _evaluate(
                 for model_id in (profile.aa_agent_model_id, profile.benchmark_model_id)
             )
         ]
-        for grade, profiles in table.items()
+        for g, profiles in table.items()
     }
+
+    dropped.extend(item for item in canon_dropped if item.placed_grade == grade)
+    folded_keys = {(item.profile.name, normalize_effort(item.profile.launcher_effort)) for item in dropped}
+    table_keys = {
+        (profile.name, normalize_effort(profile.launcher_effort))
+        for profiles in table.values()
+        for profile in profiles
+    }
+    for rung_row in E6_ARM_RUNGS:
+        key = (rung_row.name, normalize_effort(rung_row.launcher_effort))
+        if e6_arm_carrier_grade(*key) != grade or key in folded_keys or key in table_keys:
+            continue
+        if canon_keys is not None and key not in canon_keys:
+            continue
+        dropped.append(_Excluded(rung_row, E6_UNMEASURED_REASON, kind="e6_unmeasured", placed_grade=grade))
+        folded_keys.add(key)
 
     by_id = {r.id: r for r in providers}
     included: list[_Candidate] = []
@@ -4798,11 +4955,41 @@ def _evaluate(
     # it in the same exclusion lines as an exact-grade row.
     # d1786ap: borrowed rungs ride the same path after the one-up rows. A row
     # qualifying as both one-up and borrowed lists once, as borrowed.
+    # hk 1862: each borrowed entry carries its own listing gate — at its listed
+    # grade the row is judged under ``listed_gate``, not the row's own gate. An
+    # inert entry (its rung is not carried exactly one grade up) never lists;
+    # it shows on the folded excluded line naming where the rung actually is.
     entries: list[tuple[Profile, Grade]] = [(profile, grade) for profile in table[grade]]
-    borrowed = _borrowed_profiles(grade, table)
+    listings = _borrowed_listings(grade, table)
+    borrowed = [
+        (listing.profile, listing.placed_grade)
+        for listing in listings
+        if listing.active and listing.profile is not None and listing.placed_grade is not None
+    ]
     borrowed_rungs = {
         (profile.name, normalize_effort(profile.launcher_effort)) for profile, _placed in borrowed
     }
+    borrowed_gates = {
+        (listing.profile_name, normalize_effort(listing.effort)): listing.listed_gate
+        for listing in listings
+        if listing.active
+    }
+    for listing in listings:
+        if listing.active:
+            continue
+        folded_key = (listing.profile_name, normalize_effort(listing.effort))
+        if folded_key in folded_keys:
+            continue
+        fold_profile = listing.profile or Profile(listing.profile_name, "", None)
+        dropped.append(
+            _Excluded(
+                fold_profile,
+                listing.inert_reason,
+                kind="borrowed_inert",
+                placed_grade=listing.placed_grade,
+            )
+        )
+        folded_keys.add(folded_key)
     entries += [
         (profile, placed)
         for profile, placed in _one_up_profiles(grade, table)
@@ -4811,15 +4998,41 @@ def _evaluate(
     entries += borrowed
 
     for profile, placed_grade in entries:
-        borrowed_row = (
-            placed_grade != grade
-            and (
-                profile.name,
-                normalize_effort(profile.launcher_effort),
-            )
-            in borrowed_rungs
-        )
+        rung_key = (profile.name, normalize_effort(profile.launcher_effort))
+        borrowed_row = placed_grade != grade and rung_key in borrowed_rungs
         one_up = placed_grade != grade and not borrowed_row
+        # r1023grokup: grok never lists below A — canon row or cross-grade
+        # listing alike, it folds at B and C.
+        if grade not in ("A+", "S", "S+", "A") and _is_grok_profile(profile.name):
+            excluded.append(
+                _Excluded(
+                    profile,
+                    GROK_RESTRICTED_REASON,
+                    provider_id=resolved_pool(profile)[0],
+                    kind="grok_restricted",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                    borrowed=borrowed_row,
+                )
+            )
+            continue
+        # An E6 arm row at its own carrier grade is never a candidate — the
+        # catalog path drops it before the table, so this covers snapshot-mode
+        # tables and fixtures that carry the row in-band.
+        if rung_key in E6_ARM_KEYS and placed_grade == e6_arm_carrier_grade(
+            profile.name, profile.launcher_effort
+        ):
+            excluded.append(
+                _Excluded(
+                    profile,
+                    E6_UNMEASURED_REASON,
+                    kind="e6_unmeasured",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                    borrowed=borrowed_row,
+                )
+            )
+            continue
         provider_id, group_name = resolved_pool(profile)
         # task #742 — 구독 해지(풀 또는 프로필 플래그)는 후보·승급·비상 후보 어떤
         # 경로로도 추천되지 않는다. 행은 지우지 않고 후보 평가만 건너뛴다 —
@@ -4834,14 +5047,18 @@ def _evaluate(
                     placed_grade=placed_grade,
                     one_up=one_up,
                     borrowed=borrowed_row,
+                    detail=subscription.reason,
                 )
             )
             continue
 
         # Escalation profiles → separate section, not in normal ranked candidates.
-        # The row keeps its own gate: a borrowed escalation rung (d1786ap)
-        # lists here too, tagged, and still needs --operator-request to launch.
-        if profile.gate == "escalation":
+        # A borrowed listing is judged under its entry's own ``listed_gate``
+        # (hk 1862): codex-sol@xhigh at S carries listed_gate ``default``, so
+        # it ranks as an ordinary candidate there while its own S+ row keeps
+        # gate ``escalation``. A borrowed row whose listed gate is escalation
+        # still lists here, tagged.
+        if borrowed_gates.get(rung_key, profile.gate) == "escalation":
             entry = _build_escalation_entry(profile, by_id, today, now=now)
             entry.placed_grade = placed_grade
             entry.borrowed = borrowed_row
@@ -5171,6 +5388,7 @@ def _evaluate(
         policy_excluded=policy_excluded,
         unsubscribed=unsubscribed,
         escalation=escalation,
+        dropped=dropped,
     )
 
 
@@ -5426,78 +5644,6 @@ def recommend(
             False,
         )
 
-    def _fold_policy_excluded(items: list[_PolicyExcluded]) -> list[str]:
-        """③ fold policy-excluded profiles by pool into one line per pool."""
-        by_pool: dict[str, list[_PolicyExcluded]] = {}
-        for item in items:
-            by_pool.setdefault(item.provider_id, []).append(item)
-        lines_out: list[str] = []
-        for provider_id, group in by_pool.items():
-            names = "·".join(_fold_name(i) for i in group)
-            sample = group[0]
-            until_s = f"until {sample.until.isoformat()}" if sample.until is not None else ""
-            note_s = sample.note or ""
-            tail_parts = [p for p in (until_s, note_s) if p]
-            tail = (": " + " — ".join(tail_parts)) if tail_parts else ""
-            lines_out.append(f"✗ {provider_id} 풀 제외 — 이 급에서 {len(group)}개({names}){tail}")
-        return lines_out
-
-    def _suppress_policy_excluded(items: list[_PolicyExcluded]) -> bool:
-        """ROB-1219: a deliberately excluded pool is noise, not information.
-
-        `class = exclude` is an operator decision that the pool is out of rotation
-        for a stated period (kiro: subscription ended 2026-08-01, re-evaluate after
-        the 2026-09-01 free-credit reset). Repeating a "✗ pool excluded" line in
-        every grade tells the reader nothing they did not already decide. The
-        record lives on in `policy list` (class, until, note) and in GRADE_TABLE,
-        so restoring the pool is `scopefuel policy clear <pool>` — no code change.
-
-        Suppression is display-only and never applies when the grade has no usable
-        candidate: the emergency-candidate block below still surfaces the pool.
-        """
-        return bool(items)
-
-    def _fold_unsubscribed(items: list[_Unsubscribed]) -> list[str]:
-        """③ fold unsubscribed rows by the deciding level (pool or profile)."""
-        by_key: dict[str, list[_Unsubscribed]] = {}
-        for item in items:
-            key = (
-                f"{item.provider_id} 풀 구독 해지"
-                if item.source == "pool"
-                else f"프로필 {item.profile.name} 구독 해지"
-            )
-            by_key.setdefault(key, []).append(item)
-        return [
-            f"✗ {key} — 이 급에서 {len(group)}개({'·'.join(_fold_name(i) for i in group)})"
-            for key, group in by_key.items()
-        ]
-
-    def _fold_excluded(items: list[_Excluded]) -> list[str]:
-        """③ fold exhausted/unmeasurable by pool; keep kinds separate."""
-        # Group key: (kind, provider_id, reason) so different cutoffs don't merge incorrectly.
-        groups: dict[tuple[str, str, str], list[_Excluded]] = {}
-        for item in items:
-            key = (item.kind, item.provider_id or item.profile.name, item.reason)
-            groups.setdefault(key, []).append(item)
-        lines_out: list[str] = []
-        for (kind, provider_id, reason), group in groups.items():
-            if len(group) == 1 and not group[0].provider_id:
-                lines_out.append(f"✗ {group[0].profile.name:<12} {reason}{_placed_tag_suffix(group[0])}")
-                continue
-            names = "·".join(_fold_name(i) for i in group)
-            if kind == "exhausted":
-                label = f"{provider_id} 풀 소진"
-            elif kind == "unmeasurable":
-                # 429 등 구분된 사유가 있으면 그대로 보여준다(#576) — 없으면 기존 문구.
-                label = reason if reason and reason != "측정 불가" else f"{provider_id} 측정 불가"
-            else:
-                label = provider_id or group[0].profile.name
-            if kind == "unmeasurable":
-                lines_out.append(f"✗ {label} — 이 급에서 {len(group)}개({names})")
-            else:
-                lines_out.append(f"✗ {label} — 이 급에서 {len(group)}개({names}). {reason}")
-        return lines_out
-
     lines: list[str] = []
 
     # Grade discrimination header — LLM-read table.
@@ -5571,12 +5717,19 @@ def recommend(
                     lines.append(f"    가성비: 혼합단가 미상 · {reason}")
                 if cand.profile.estimate_reason and not live_measured:
                     lines.append(f"    추정근거: {cand.profile.estimate_reason}")
-        if not hide_excluded and not _suppress_policy_excluded(policy_excluded):
-            lines.extend(_fold_policy_excluded(policy_excluded))
-
-    if not hide_excluded:
-        lines.extend(_fold_unsubscribed(unsubscribed))
-        lines.extend(_fold_excluded(excluded))
+    # hk 1862: one folded excluded line per grade — every canon row that is
+    # neither ranked nor escalated appears here, tagged with its reason
+    # (barred / unsubscribed / dropped legacy / E6 unmeasured / grok below A /
+    # inert borrowed / policy / exhausted / unmeasurable). Policy-excluded
+    # pools are folded too — ROB-1219 suppression hid them entirely.
+    fold_items: list[_Excluded | _PolicyExcluded | _Unsubscribed] = [
+        *evaluation.dropped,
+        *unsubscribed,
+        *policy_excluded,
+        *excluded,
+    ]
+    if not hide_excluded and fold_items:
+        lines.append(_fold_excluded_line(fold_items))
 
     if escalation:
         lines.append("⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)")
@@ -5699,4 +5852,22 @@ def recommend_dict(
                 "gate_reason": entry.gate_reason,
             }
         )
-    return {"grade": grade, "rows": rows}
+    # hk 1862: ``excluded`` is the folded line's structured form — every canon
+    # row at this grade that is neither ranked nor escalated, as
+    # {profile, effort, reason}. Always present, including under
+    # ``--hide-excluded`` (that flag is text-only).
+    excluded_items = (
+        *evaluation.dropped,
+        *evaluation.unsubscribed,
+        *evaluation.policy_excluded,
+        *evaluation.excluded,
+    )
+    excluded_rows = [
+        {
+            "profile": item.profile.name,
+            "effort": item.profile.launcher_effort or "default",
+            "reason": _excluded_reason(item),
+        }
+        for item in excluded_items
+    ]
+    return {"grade": grade, "rows": rows, "excluded": excluded_rows}

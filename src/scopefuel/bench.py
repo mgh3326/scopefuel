@@ -3774,6 +3774,23 @@ def _profile_from_catalog(entry: CatalogEntry, template: object | None):
     )
 
 
+class CatalogGradeTable(dict):
+    """A grade table rebuilt from the canon, plus the rows assembly dropped.
+
+    ``dropped`` holds one ``recommend._Excluded`` per skipped live canon row —
+    consult_only rows, ungraded trial rows, E6 measurement rungs at their
+    carrier grade, and effort-less legacy projections replaced by a same-grade
+    effort row — so ``--recommend`` can fold each onto the excluded line with
+    its reason instead of the row vanishing (hk 1862). ``canon_keys`` is the
+    set of live ``(profile, effort)`` keys the canon carries.
+    """
+
+    def __init__(self, mapping: dict, *, dropped=(), canon_keys=None) -> None:
+        super().__init__(mapping)
+        self.dropped = list(dropped)
+        self.canon_keys = canon_keys
+
+
 def _catalog_grade_table(view: CatalogView) -> dict | None:
     """Rebuild the grade table with the catalog as the canon, or None if unusable.
 
@@ -3796,8 +3813,10 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
 
     from .recommend import (
         E6_ARM_KEYS,
+        E6_UNMEASURED_REASON,
         GRADE_TABLE,
         UNGRADED_TRIAL_PROFILE_NAMES,
+        _Excluded,
         e6_arm_carrier_grade,
         validate_grade_table,
     )
@@ -3820,21 +3839,49 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
             templates.setdefault((profile.name, profile.launcher_effort or ""), profile)
 
     # A profile-default row (effort "") is the legacy /v1/bench/grades projection
-    # of the profile's default placement, not an extra launchable rung. Once the
-    # same profile carries enumerated rungs, admitting both would list it twice —
-    # once with an effort and once without — and a `bench grades set` during the
-    # rollout would silently add that phantom candidate.
-    enumerated = {entry.profile for entry in live if entry.effort}
+    # of the profile's default placement, not an extra launchable rung — but only
+    # where an effort row of the same profile replaces it *at the same grade*
+    # (hk 1862). An effort-less row at a grade where the profile has no effort
+    # row stays a candidate: the canon said something about that grade.
+    # Only effort rows that will themselves place count as replacements —
+    # an E6 carrier row, a consult_only row or a trial row drops for its own
+    # reason and cannot "replace" the profile's default projection.
+    enumerated_at_grade = {
+        (entry.profile, entry.grade)
+        for entry in live
+        if entry.effort
+        and entry.gate != "consult_only"
+        and entry.profile not in UNGRADED_TRIAL_PROFILE_NAMES
+        and not (
+            entry.key in E6_ARM_KEYS and entry.grade == e6_arm_carrier_grade(entry.profile, entry.effort)
+        )
+    }
 
+    dropped: list = []
     proposed: dict[str, list] = {grade: [] for grade in GRADE_TABLE}
     for entry in sorted(live, key=_catalog_sort_key):
+        if entry.grade not in proposed:
+            return None
+
+        def _drop(reason: str, kind: str, _entry=entry) -> None:
+            dropped.append(
+                _Excluded(
+                    _profile_from_catalog(_entry, templates.get(_entry.key)),
+                    reason,
+                    kind=kind,
+                    placed_grade=_entry.grade,
+                )
+            )
+
         if entry.gate == "consult_only":
+            _drop("consult_only (operator-request spawn only — never a candidate)", "consult_only")
             continue
         # #1620: the ungraded phase-1 trial rows (the Argon spellings) are
         # gate-able catalog rows, never placements — the operator placed no
         # grade, so a canon row's inert C carrier must not become a
         # recommendation candidate either.
         if entry.profile in UNGRADED_TRIAL_PROFILE_NAMES:
+            _drop("ungraded trial row — no grade placement (hk 1620)", "ungraded_trial")
             continue
         # #692: an unmeasured E6 measurement rung is a catalog row, not a
         # candidate. A canon that carries the row (the seed emits them) must not
@@ -3844,11 +3891,28 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
         # stays monotonic. Once the canon moves the rung off its carrier grade
         # (a real measurement) it is an ordinary row again.
         if entry.key in E6_ARM_KEYS and entry.grade == e6_arm_carrier_grade(entry.profile, entry.effort):
+            _drop(E6_UNMEASURED_REASON, "e6_unmeasured")
             continue
-        if not entry.effort and entry.profile in enumerated:
+        if not entry.effort and (entry.profile, entry.grade) in enumerated_at_grade:
+            replacing = sorted(
+                candidate.effort
+                for candidate in live
+                if candidate.profile == entry.profile
+                and candidate.effort
+                and candidate.grade == entry.grade
+                and candidate.gate != "consult_only"
+                and candidate.profile not in UNGRADED_TRIAL_PROFILE_NAMES
+                and not (
+                    candidate.key in E6_ARM_KEYS
+                    and candidate.grade == e6_arm_carrier_grade(candidate.profile, candidate.effort)
+                )
+            )
+            _drop(
+                "dropped legacy — replaced by "
+                + ", ".join(f"{entry.profile}@{effort}" for effort in replacing),
+                "dropped_legacy",
+            )
             continue
-        if entry.grade not in proposed:
-            return None
         proposed[entry.grade].append(_profile_from_catalog(entry, templates.get(entry.key)))
 
     for grade, profiles in GRADE_TABLE.items():
@@ -3865,7 +3929,11 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
             file=sys.stderr,
         )
         return None
-    return proposed
+    return CatalogGradeTable(
+        proposed,
+        dropped=dropped,
+        canon_keys=frozenset(entry.key for entry in live),
+    )
 
 
 def runtime_grade_table(*, path: pathlib.Path | str | None = None) -> dict:

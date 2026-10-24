@@ -224,18 +224,23 @@ def test_recommend_a_lists_the_aplus_rep_rows_tagged_one_up():
         assert label in ranked
 
 
-def test_recommend_b_lists_the_a_rep_rows_tagged_one_up():
+def test_recommend_b_lists_the_a_rep_rows_tagged_one_up_or_borrowed():
     out = recommend(_pool_providers(), "B", today=TODAY, now=NOW)
-    for label in ("devin-swe2-medium", "grok-hi --effort xhigh", "oc-solar4"):
+    # hk 1862: grok folds below A (r1023grokup); the others keep one-up.
+    for label in ("devin-swe2-medium", "oc-solar4"):
         lines = [line for line in out.splitlines() if line[:1].isdigit() and label in line]
         assert len(lines) == 1 and "[one-up A]" in lines[0], (label, out)
+    assert not any(line[:1].isdigit() and "grok-hi" in line for line in out.splitlines())
+    assert "grok-hi[one-up A]@xhigh — grok restricted" in out
 
 
-def test_recommend_b_lists_the_a_sonnet_row_tagged_one_up():
+def test_recommend_b_lists_the_a_sonnet_row_tagged_borrowed():
     """hk 1788: sonnet@high is A now — it takes its one-up slot at B."""
     out = recommend(_pool_providers(), "B", today=TODAY, now=NOW)
     lines = [line for line in out.splitlines() if line[:1].isdigit() and "sonnet --effort high" in line]
-    assert len(lines) == 1 and "[one-up A]" in lines[0], out
+    # hk 1862: sonnet@high lists at B as a borrowed rung — the [borrowed A]
+    # tag wins over [one-up A] (a row qualifying as both lists once).
+    assert len(lines) == 1 and "[borrowed A]" in lines[0], out
     out = recommend(_pool_providers(), "C", today=TODAY, now=NOW)
     assert not any(line[:1].isdigit() and "sonnet --effort high" in line for line in out.splitlines())
 
@@ -299,15 +304,23 @@ def test_every_bundled_row_lists_only_at_its_placement_or_one_below():
     for label, below in sorted(rep_measured_labels):
         if below is None:
             continue
+        # hk 1862 r1023grokup: grok never lists below A — a grok one-up at
+        # B or C folds on the excluded line instead of ranking.
+        if label is not None and label.startswith("grok") and below in ("B", "C"):
+            assert any(
+                label.split(" --effort")[0] in line and "grok restricted" in line
+                for line in outputs[below].splitlines()
+            ), (label, below, outputs[below])
+            continue
         placed = GRADES[_grade_index(below) - 1]
         one_up_lines = [
             line for line in outputs[below].splitlines() if line[:1].isdigit() and _line_label(line) == label
         ]
-        assert one_up_lines and all(f"[one-up {placed}]" in line for line in one_up_lines), (
-            label,
-            below,
-            outputs[below],
-        )
+        # hk 1862: a BORROWED_RUNGS listing wins the tag over one-up — a row
+        # qualifying as both lists once, tagged [borrowed <placed>].
+        assert one_up_lines and all(
+            f"[one-up {placed}]" in line or f"[borrowed {placed}]" in line for line in one_up_lines
+        ), (label, below, outputs[below])
 
 
 def test_e6_arm_rungs_are_never_one_up_or_ranked():
@@ -388,7 +401,9 @@ def test_sol_profiles_never_appear_outside_splus():
     )
     providers = [ProviderResult(id="codex", pool_class="preserve", buckets=[_bucket()])]
     out = recommend(providers, "S", today=TODAY, now=NOW, grade_table=table)
-    assert "codex-sol" not in out
+    # hk 1862: an inert borrowed entry folds instead of ranking — Sol still
+    # never appears as a candidate outside S+.
+    assert not any("codex-sol" in line for line in out.splitlines() if line[:1].isdigit())
 
 
 # ── folds behave like exact-grade rows ───────────────────────────────────────
@@ -434,8 +449,8 @@ def test_policy_excluded_one_up_row_silent_while_candidates_exist(monkeypatch):
     out = recommend(_pool_providers(), "A", today=TODAY, now=NOW)
     ranked = _ranked(out)
     assert not any(name.startswith("devin-") for name in ranked), out
-    # same suppression as exact-grade rows: no ✗ fold while candidates exist
-    assert not any("devin-swe2" in line for line in out.splitlines()), out
+    # hk 1862: policy exclusion folds tagged — ROB-1219 suppression is gone.
+    assert any("devin-swe2" in line and "policy excluded" in line for line in out.splitlines()), out
 
 
 # ── JSON / dict surface (AC5) ────────────────────────────────────────────────
