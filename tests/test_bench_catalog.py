@@ -1302,9 +1302,7 @@ def test_retired_new_bundle_rows_are_covered_and_not_snapshot_filled(catalog_ser
     canon = _canon_without(NEW_TO_BUNDLE)
     retired_at = "2026-10-23T00:00:00Z"
     retired_rows = [
-        {**row, "retired_at": retired_at}
-        for row in _seed_rows()
-        if row["profile"] in NEW_TO_BUNDLE
+        {**row, "retired_at": retired_at} for row in _seed_rows() if row["profile"] in NEW_TO_BUNDLE
     ]
     fake.catalog = canon + retired_rows
     original_request = fake.request_json
