@@ -40,6 +40,8 @@ SENTINEL = "SENTINEL-ACCOUNT-DETAIL-9f3b"
 # U+276F ❯ — the prompt marker the probe waits for before sending /usage.
 PROMPT = "\\342\\235\\257"
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
 
 def _write_stub(tmp_path: Path, name: str, body: str) -> Path:
     stub = tmp_path / name
@@ -168,6 +170,94 @@ def test_timeout_stage_panel_seen_but_unparsed(tmp_path, monkeypatch):
 
     _assert_stage(result, "unparsed")
     _assert_no_raw_text(result)
+    _assert_no_probe_left(workdir)
+
+
+# ------------------------------------------------------------- hk 1965: read-completion race
+
+
+@pytest.mark.parametrize("fixture_name", ["grok_usage_desktop_full.txt", "grok_usage_pi_full.txt"])
+def test_probe_returns_parsed_result_when_the_cli_goes_quiet_after_the_panel(
+    tmp_path, monkeypatch, seoul_tz, fixture_name
+):
+    """hk 1965: the desktop/pi failure shape. The panel's last byte arrives,
+    then the CLI goes quiet — the settle check used to run only when a new
+    chunk arrived, so the probe spun to the deadline and reported
+    stage=unparsed with a parseable panel in hand."""
+    capture = FIXTURES / fixture_name
+    stub = _write_stub(
+        tmp_path,
+        "fake-grok-quiet-after-panel",
+        "trap '' HUP\n"
+        f"printf '{PROMPT} '\n"
+        "IFS= read -r command\n"
+        f"cat {shlex.quote(str(capture))}\n"
+        "exec sleep 120\n",
+    )
+    workdir = _install(monkeypatch, tmp_path, stub)
+
+    started = time.monotonic()
+    result = grok.fetch()
+    elapsed = time.monotonic() - started
+
+    assert result.error is None, f"probe must finish on the settle, not time out: {result.error}"
+    assert result.buckets[0].used_pct == 82.0
+    assert result.buckets[0].resets_at.endswith("T19:58:00Z")
+    assert elapsed < 3.0, "the probe ran to its timeout instead of stopping on the settle"
+    _assert_no_probe_left(workdir)
+
+
+def test_probe_waits_for_the_reset_line_through_a_slow_paint(tmp_path, monkeypatch, seoul_tz):
+    """The stop condition stays panel completeness (_WEEKLY and _RESET both):
+    a capture split just before the Resets row must not end the read on the
+    first half alone — a 'stop at the first _WEEKLY match' mutant goes RED."""
+    capture = FIXTURES / "grok_usage_desktop_full.txt"
+    data = capture.read_bytes()
+    cut = data.rfind(b"\x1b[", 0, data.index(b"Resets"))  # start of the Resets row paint
+    assert 0 < cut < data.index(b"Resets")
+    stub = _write_stub(
+        tmp_path,
+        "fake-grok-slow-paint",
+        "trap '' HUP\n"
+        f"printf '{PROMPT} '\n"
+        "IFS= read -r command\n"
+        f"head -c {cut} {shlex.quote(str(capture))}\n"
+        "sleep 0.4\n"  # longer than the settle, shorter than the timeout
+        f"tail -c +{cut + 1} {shlex.quote(str(capture))}\n"
+        "exec sleep 120\n",
+    )
+    workdir = _install(monkeypatch, tmp_path, stub)
+
+    result = grok.fetch()
+
+    assert result.error is None, f"probe must wait for the whole panel: {result.error}"
+    assert result.buckets[0].used_pct == 82.0
+    _assert_no_probe_left(workdir)
+
+
+def test_probe_reports_an_honest_stage_when_the_panel_is_truncated(tmp_path, monkeypatch):
+    """A partial panel must never report success: cut before the Resets row
+    the Weekly clue still matches, so the honest stage is unparsed — a
+    'report success with no parse' mutant goes RED."""
+    data = (FIXTURES / "grok_usage_desktop_full.txt").read_bytes()
+    cut = data.rfind(b"\x1b[", 0, data.index(b"Resets"))
+    partial = tmp_path / "truncated-capture.bin"
+    partial.write_bytes(data[:cut])
+    stub = _write_stub(
+        tmp_path,
+        "fake-grok-truncated-panel",
+        "trap '' HUP\n"
+        f"printf '{PROMPT} '\n"
+        "IFS= read -r command\n"
+        f"cat {shlex.quote(str(partial))}\n"
+        "exec sleep 120\n",
+    )
+    workdir = _install(monkeypatch, tmp_path, stub)
+
+    result = grok.fetch()
+
+    _assert_stage(result, "unparsed")
+    assert not result.buckets
     _assert_no_probe_left(workdir)
 
 

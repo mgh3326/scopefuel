@@ -1244,7 +1244,7 @@ Next reset: August 14, 04:58
 """
 
 
-def test_grok_parse_is_single_weekly_bucket_and_kst_reset():
+def test_grok_parse_is_single_weekly_bucket_and_kst_reset(seoul_tz):
     result = grok.parse(
         SAMPLE_GROK_USAGE,
         now=__import__("datetime").datetime(2026, 8, 7, 13, 0, tzinfo=__import__("datetime").timezone.utc),
@@ -1255,10 +1255,10 @@ def test_grok_parse_is_single_weekly_bucket_and_kst_reset():
         ("weekly", "7d", "week", 37.0)
     ]
     assert result.buckets[0].resets_at == "2026-08-13T19:58:00Z"
-    assert "KST" in (result.note or "")
+    assert "로컬 타임존" in (result.note or "")
 
 
-def test_grok_parse_accepts_box_and_control_residue_around_usage_lines():
+def test_grok_parse_accepts_box_and_control_residue_around_usage_lines(seoul_tz):
     text = "\x1b[2K│  Weekly limit: 37%  │\x1b[0m\n│ Next reset: August 14, 04:58 │\n"
     result = grok.parse(text)
     assert result.error is None
@@ -1266,7 +1266,7 @@ def test_grok_parse_accepts_box_and_control_residue_around_usage_lines():
     assert result.buckets[0].resets_at.endswith("19:58:00Z")
 
 
-def test_grok_parse_accepts_46_floating_pane_format():
+def test_grok_parse_accepts_46_floating_pane_format(seoul_tz):
     """grok 4.6 CLI: 레이블·진행바·퍼센트·리셋이 플로팅 패널에 흩어져 페인트된다."""
     text = (
         "Context usage  Usage limit  Session info\n"
@@ -1289,7 +1289,7 @@ def test_grok_parse_weekly_window_does_not_grab_other_tab_percent():
     assert result.error is not None
 
 
-def test_grok_parse_infers_next_year_at_december_boundary():
+def test_grok_parse_infers_next_year_at_december_boundary(seoul_tz):
     import datetime as dt
 
     result = grok.parse(
@@ -1299,7 +1299,7 @@ def test_grok_parse_infers_next_year_at_december_boundary():
     assert result.buckets[0].resets_at == "2027-01-01T19:58:00Z"
 
 
-def test_grok_parse_keeps_same_year_when_reset_is_ahead():
+def test_grok_parse_keeps_same_year_when_reset_is_ahead(seoul_tz):
     import datetime as dt
 
     result = grok.parse(
@@ -1307,6 +1307,73 @@ def test_grok_parse_keeps_same_year_when_reset_is_ahead():
         now=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
     )
     assert result.buckets[0].resets_at == "2026-12-31T14:00:00Z"
+
+
+def test_grok_parse_desktop_full_capture(fixture_text, seoul_tz):
+    """hk 1965: desk 의 raw /usage 패널 캡처 — desktop 호스트, grok 1.0.70,
+    PTY 200x50, 호스트 TZ=KST 라 리셋이 "October 30, 04:58" 로 그려졌다."""
+    import datetime as dt
+
+    result = grok.parse(
+        fixture_text("grok_usage_desktop_full"),
+        now=dt.datetime(2026, 10, 25, tzinfo=dt.UTC),
+    )
+
+    assert result.error is None
+    assert result.buckets[0].used_pct == 82.0
+    assert result.buckets[0].resets_at == "2026-10-29T19:58:00Z"
+
+
+def test_grok_parse_pi_full_capture(fixture_text, seoul_tz):
+    """같은 검사를 pi 호스트 캡처에도 — 동일한 패널 렌더(호스트 TZ=KST)."""
+    import datetime as dt
+
+    result = grok.parse(
+        fixture_text("grok_usage_pi_full"),
+        now=dt.datetime(2026, 10, 25, tzinfo=dt.UTC),
+    )
+
+    assert result.error is None
+    assert result.buckets[0].used_pct == 82.0
+    assert result.buckets[0].resets_at == "2026-10-29T19:58:00Z"
+
+
+def test_grok_parse_oci_capture_in_host_utc(fixture_text, host_tz):
+    """hk 1965: oci 는 TZ=UTC 라 같은 리셋 순간이 "October 29, 19:58" 로
+    그려진다. 고정 KST 로 읽으면 9시간 이르게 착시한다 — 프로브 호스트의
+    로컬 타임존으로 읽어야 한다."""
+    import datetime as dt
+
+    with host_tz("UTC"):
+        result = grok.parse(
+            fixture_text("grok_usage_oci"),
+            now=dt.datetime(2026, 10, 25, tzinfo=dt.UTC),
+        )
+
+    assert result.error is None
+    assert result.buckets[0].used_pct == 82.0
+    assert result.buckets[0].resets_at == "2026-10-29T19:58:00Z"
+
+
+@pytest.mark.parametrize(
+    ("tz", "reset_line"),
+    [
+        ("Asia/Seoul", "Resets: October 30, 04:58"),
+        ("UTC", "Resets: October 29, 19:58"),
+    ],
+)
+def test_grok_parse_reads_reset_in_probe_host_local_zone(host_tz, tz, reset_line):
+    """같은 리셋 순간을 각 호스트가 자기 타임존으로 렌더한다 — 둘 다
+    2026-10-29T19:58:00Z. KST 고정 뮤턴트는 UTC 행에서 RED 다."""
+    import datetime as dt
+
+    text = f"Weekly limit (SuperGrok)\n82%\n{reset_line}\n"
+    with host_tz(tz):
+        result = grok.parse(text, now=dt.datetime(2026, 10, 25, tzinfo=dt.UTC))
+
+    assert result.error is None
+    assert result.buckets[0].used_pct == 82.0
+    assert result.buckets[0].resets_at == "2026-10-29T19:58:00Z"
 
 
 @pytest.mark.parametrize(
