@@ -189,6 +189,12 @@ def _remote(monkeypatch, home, mode: str = "new") -> FakeRepStore:
     return fake
 
 
+def _migrate_push_local():
+    """Record the required per-install migration inputs before a local push."""
+
+    return cli.main(["bench", "push-local-migrate", "--apply", "--legacy-created-by", "legacy-shared"])
+
+
 def _add_args(task="1384", notes="rep", **overrides) -> list[str]:
     args = [
         "reps",
@@ -578,6 +584,8 @@ def test_push_local_uses_stable_banded_ids_and_is_idempotent(tmp_path, monkeypat
     capsys.readouterr()
 
     fake = _remote(monkeypatch, home)
+    assert _migrate_push_local() == 0
+    capsys.readouterr()
     scores, reps = bench.push_local()
     assert (scores, reps) == (0, 1)
     assert len(fake.reps) == 1
@@ -696,6 +704,8 @@ def test_409_error_chain_has_no_self_reference(tmp_path, monkeypatch):
     _client_env(pl, monkeypatch, backend="local")
     bench.add_rep(**_local_rep("push-1"))
     fake = _remote(monkeypatch, pl)
+    monkeypatch.setattr(bench, "_fetch_reps", real_fetch_reps)
+    assert _migrate_push_local() == 0
     record = bench._read_local_reps_for_push()[0]
     origin = bench._push_local_origin_id(bench._rep_install_id(None), record)
     # The pre-check is clear; a concurrent writer occupies the slot just

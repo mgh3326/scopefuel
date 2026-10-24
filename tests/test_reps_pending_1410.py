@@ -18,6 +18,7 @@ from test_reps_collision_1384 import (
     BAND_BASE,
     _add_args,
     _client_env,
+    _migrate_push_local,
     _remote,
     _remote_row,
     _seed_cache_row,
@@ -55,9 +56,11 @@ def test_s1_same_hostname_installs_keep_both_reps(tmp_path, monkeypatch, mode):
     first, second = tmp_path / "a", tmp_path / "b"
     _local(first, monkeypatch, notes="identical independent evidence")
     fake = _remote(monkeypatch, first, mode)
+    assert _migrate_push_local() == 0
     assert bench.push_local() == (0, 1)
     _local(second, monkeypatch, notes="identical independent evidence")
     _client_env(second, monkeypatch)
+    assert _migrate_push_local() == 0
     assert bench.push_local() == (0, 1)
     assert len(fake.reps) == 2
     assert {row["notes"] for row in fake.reps} == {"identical independent evidence"}
@@ -69,6 +72,7 @@ def test_s1_same_hostname_installs_keep_both_reps(tmp_path, monkeypatch, mode):
 def test_s1_reused_rowid_keeps_both_contents(tmp_path, monkeypatch, mode, recreate):
     _local(tmp_path, monkeypatch, notes="original")
     fake = _remote(monkeypatch, tmp_path, mode)
+    assert _migrate_push_local() == 0
     bench.push_local()
     if recreate:
         bench.db_path().unlink()
@@ -79,6 +83,8 @@ def test_s1_reused_rowid_keeps_both_contents(tmp_path, monkeypatch, mode, recrea
         conn.close()
     _local(tmp_path, monkeypatch, notes="replacement")
     _client_env(tmp_path, monkeypatch)
+    if recreate:
+        assert _migrate_push_local() == 0
     bench.push_local()
     assert {row["notes"] for row in fake.reps} == {"original", "replacement"}
     assert len({row["origin_id"] for row in fake.reps}) == 2
@@ -89,6 +95,7 @@ def test_s1_hostname_change_does_not_duplicate(tmp_path, monkeypatch, mode):
     _local(tmp_path, monkeypatch)
     fake = _remote(monkeypatch, tmp_path, mode)
     monkeypatch.setattr(socket, "gethostname", lambda: "before")
+    assert _migrate_push_local() == 0
     bench.push_local()
     before = [dict(row) for row in fake.reps]
     monkeypatch.setattr(socket, "gethostname", lambda: "after")
@@ -100,6 +107,7 @@ def test_s1_hostname_change_does_not_duplicate(tmp_path, monkeypatch, mode):
 def test_s1_precheck_refuses_held_origin_without_put(tmp_path, monkeypatch, mode):
     _local(tmp_path, monkeypatch)
     fake = _remote(monkeypatch, tmp_path, mode)
+    assert _migrate_push_local() == 0
     bench.push_local()
     fake.reps[0]["notes"] = "held by different content"
     puts = fake.hits["PUT"]
@@ -366,6 +374,7 @@ def test_install_id_lifecycle_and_copy(tmp_path, monkeypatch):
     first, copied = tmp_path / "first", tmp_path / "copied"
     _local(first, monkeypatch)
     fake = _remote(monkeypatch, first)
+    assert _migrate_push_local() == 0
     bench.push_local()
     install_id = bench._rep_install_id(None)
     assert len(install_id) == 32 and len(bytes.fromhex(install_id)) == 16
@@ -409,6 +418,7 @@ def test_bad_install_meta_fails_closed(tmp_path, monkeypatch, damage):
 def test_precheck_runs_before_every_push_put(tmp_path, monkeypatch):
     _local(tmp_path, monkeypatch)
     fake = _remote(monkeypatch, tmp_path)
+    assert _migrate_push_local() == 0
     record = bench._read_local_reps_for_push()[0]
     records = [dataclasses.replace(record, id=i) for i in range(1, 502)]
     monkeypatch.setattr(bench, "_read_local_reps_for_push", lambda **kw: records)

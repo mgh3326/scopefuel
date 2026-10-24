@@ -287,6 +287,41 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     bench_sub.add_parser("coverage", help="프로필별 출처(AA-agent/AA-model/openrouter) 커버리지")
     bench_sub.add_parser("push-local", help="기존 로컬 bench 행을 handoffkeep으로 1회 이관")
+    legacy_push_local = bench_sub.add_parser(
+        "push-local-migrate",
+        help="legacy push-local row identity를 dry-run 확인하고 로컬에 기록",
+        description=(
+            "Dry run is the default. Nothing is sent to the server in either mode.\n"
+            "Classes: confirmed, never-pushed, conflict, ambiguous.\n"
+            "push-local refuses until conflict and ambiguous rows are resolved."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    legacy_push_local.add_argument(
+        "--legacy-created-by",
+        required=True,
+        action="append",
+        metavar="NAME",
+        help="legacy server creator id (repeat for multiple ids; required)",
+    )
+    legacy_push_local.add_argument(
+        "--legacy-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="former hostname (repeatable; current hostname is always included)",
+    )
+    legacy_push_local.add_argument(
+        "--apply",
+        action="store_true",
+        help="write confirmed mappings and migration inputs to the local bench DB",
+    )
+    legacy_push_local.add_argument(
+        "--accept-new",
+        type=int,
+        metavar="ROWID",
+        help="with --apply, record an explicit accept-new decision for one conflict/ambiguous row",
+    )
 
     grades_parser = bench_sub.add_parser("grades", help="서버 정본 급 배치 관리")
     grades_sub = grades_parser.add_subparsers(dest="grades_command", required=True)
@@ -1786,6 +1821,28 @@ def _bench_command(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(f"bench push-local: pushed {score_count} score(s), {rep_count} rep(s)")
+        return 0
+    if args.bench_command == "push-local-migrate":
+        try:
+            result = bench.migrate_push_local(
+                legacy_created_by=args.legacy_created_by,
+                legacy_host=args.legacy_host,
+                apply=args.apply,
+                accept_new=args.accept_new,
+            )
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for class_name in bench._LEGACY_PUSH_LOCAL_CLASSES:
+            print(f"{class_name}: {len(result.classes[class_name])}")
+        for class_name in ("conflict", "ambiguous"):
+            for record in result.classes[class_name]:
+                server_ids = ",".join(str(value) for value in result.server_ids.get(record.id, ()))
+                print(f"{class_name} rowid={record.id} profile={record.profile} server_ids={server_ids}")
+        if result.applied:
+            print(f"bench push-local-migrate applied: wrote {result.mappings_written} mapping(s)")
+        else:
+            print("bench push-local-migrate dry-run: nothing is sent to the server; pass --apply to write")
         return 0
     if args.bench_command == "grades":
         if args.grades_command == "list":
