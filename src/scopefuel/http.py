@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import email.utils
 import json
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -171,19 +174,39 @@ def classify_error(exc: BaseException) -> tuple[str, int | None, float | None]:
     return "unknown", None, None
 
 
-def _retry_after_seconds(exc: urllib.error.HTTPError) -> float | None:
-    """Retry-After 헤더의 초 값. HTTP-date·비수치·음수는 해석하지 않는다."""
+def _retry_after_seconds(exc: urllib.error.HTTPError, now: float | None = None) -> float | None:
+    """Retry-After 헤더의 초 값 — 숫자 초 또는 RFC 7231 HTTP-date.
+
+    HTTP-date 는 ``now`` 기준 남은 초로 환산하고 과거 날짜는 0(즉시 재시도
+    허용)으로 접는다. 비수치·파싱 불가·음수 초 값은 여전히 해석하지 않는다.
+    """
     try:
         raw = exc.headers.get("Retry-After") if exc.headers is not None else None
     except Exception:
         return None
     if raw is None:
         return None
+    text = str(raw).strip()
     try:
-        value = float(str(raw).strip())
+        value = float(text)
     except ValueError:
-        return None
+        at = _http_date_epoch(text)
+        if at is None:
+            return None
+        return max(0.0, at - (time.time() if now is None else now))
     return value if value >= 0 else None
+
+
+def _http_date_epoch(text: str) -> float | None:
+    """RFC 7231 HTTP-date → epoch 초. 해석 불가는 예외가 아니라 None."""
+    try:
+        parsed = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        # IMF-fixdate 는 GMT 고정 — 시간대 없는 값도 UTC 로 본다.
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.timestamp()
 
 
 def request_json(

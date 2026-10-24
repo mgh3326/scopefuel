@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 
-from . import quota_share
+from . import proctrack, quota_share
 from .http import classify_error
 from .model import (
     PROBE_IN_PROGRESS,
@@ -51,6 +51,11 @@ BACKOFF_SCHEMA = "scopefuel.backoff.v1"
 BACKOFF_BASE_S = 60.0
 BACKOFF_MAX_S = 15 * 60.0
 
+# hk 1918 — 네트워크 실패(타임아웃·URLError)에도 429 와 같은 backoff 를 여는 pool.
+# claude usage API 는 타임아웃이 매 collect 마다 재시도되는 비용이 커서 호스트
+# 전체로 창을 공유한다. 다른 pool 은 종전대로 네트워크 실패에 창을 열지 않는다.
+NETWORK_BACKOFF_POOLS = frozenset({"claude"})
+
 # 구형식 결과(error_kind 없음)에서 429 텍스트를 알아채는 보조 장치.
 _RATE_LIMITED_TEXT = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|too many requests", re.I)
 
@@ -66,6 +71,20 @@ def cache_dir() -> pathlib.Path:
     """Return the cache directory without touching it."""
 
     return cache_path().parent
+
+
+def _collect_lock_dir(name: str) -> pathlib.Path:
+    """collect() 의 pool 당 단일 비행 잠금 디렉터리.
+
+    ``collect-`` 접두가 붙는 이유: 같은 probe-locks 루트 아래 ``grok`` 은
+    hk 1868 부터 grok provider 자체의 안쪽 잠금(_probe_lock_dir)이다. 같은
+    경로를 쓰면 collect 가 잠금을 쥔 채 grok.fetch() 가 자기 잠금을 다시
+    비차단 시도해 항상 실패한다 — flock 은 fd 단위라 같은 프로세스의 두
+    번째 LOCK_NB 도 EWOULDBLOCK 이다. 경로를 분리하면 두 잠금은 collect
+    바깥 → provider 안쪽 한 방향으로만 중첩돼 교착이 없다.
+    """
+
+    return cache_dir() / "probe-locks" / f"collect-{name}"
 
 
 @contextmanager
@@ -157,6 +176,14 @@ def _is_rate_limited(result: ProviderResult) -> bool:
     return bool(result.error and _RATE_LIMITED_TEXT.search(result.error))
 
 
+def _backoffable(name: str, result: ProviderResult) -> bool:
+    """backoff 창을 여는 실패인가 — 429 는 전 pool 공통, 네트워크 실패는
+    NETWORK_BACKOFF_POOLS 만. 결과 라벨(error_kind)은 그대로 남는다."""
+    if _is_rate_limited(result):
+        return True
+    return name in NETWORK_BACKOFF_POOLS and result.error_kind == "network"
+
+
 def _bump_backoff(pools: dict, name: str, result: ProviderResult, now: float) -> None:
     """429 실패의 다음 허용 시각을 기록한다.
 
@@ -201,7 +228,7 @@ def record_failure(name: str, result: ProviderResult, now: float) -> None:
         data = _load()
         data[name] = _audit_failure(data.get(name), result, now)
         _save(data)
-        if _is_rate_limited(result):
+        if _backoffable(name, result):
             state = _load_backoff()
             _bump_backoff(state["pools"], name, result, now)
             _save_backoff(state)
@@ -335,7 +362,8 @@ def _backoff_result(
     return ProviderResult(
         id=name,
         error=f"backoff 중, {remaining:.0f}s 뒤 재시도 가능" + (f" ({last_error})" if last_error else ""),
-        error_kind="rate_limited",
+        # 기록된 사유 그대로 — 네트워크 실패로 열린 창은 rate_limited 로 오표기하지 않는다.
+        error_kind=state.get("last_error_kind") or "rate_limited",
         backoff_until=until,
         age_s=last_good_age,
         # task #653 — policy_class 를 싣지 않으면 기본값 preserve 가 manual
@@ -421,7 +449,7 @@ def _merge_results(
                 backoff_dirty = True
         for name, result in failures.items():
             data[name] = _audit_failure(data.get(name), result, now)
-            if _is_rate_limited(result):
+            if _backoffable(name, result):
                 _bump_backoff(backoff["pools"], name, result, now)
                 backoff_dirty = True
         _save(data)
@@ -507,25 +535,92 @@ def collect(
     elapsed: dict[int, float] = {}
     collect_started = time.monotonic()
 
-    def timed(index: int, fetcher: object) -> ProviderResult:
-        try:
-            return fetch_one(fetcher)
-        finally:
-            elapsed[index] = time.monotonic() - collect_started
+    def probed(
+        index: int,
+        name: str,
+        fetcher: object,
+        entry: dict | None,
+        policy_class: PoolClass,
+        effective_ttl_s: float,
+        use_cache: bool,
+    ) -> tuple[ProviderResult, bool]:
+        """pool 당 단일 비행: 잠금 → 재확인 → fetch → 이 pool 의 병합만.
 
-    fetched: dict[int, Future[ProviderResult]] = {}
+        hk 1918 — 잠금은 이 pool 의 fetch+merge 동안만 쥔다(collect 전체가
+        아니다) 그래서 pool 간 fetch 는 병렬로 남는다. 잠금을 못 잡으면
+        같은 호스트의 다른 프로세스가 지금 이 pool 을 측정 중이라는 뜻이다:
+        fetch 하지 않고 PROBE_IN_PROGRESS 를 돌려주면 _in_progress_result 가
+        스냅샷(fresh/stale)으로 서빙한다. 반환의 두 번째 값은 실제 fetch
+        시도 여부 — 건너뜀·재확인 서빙은 관측이 아니므로 v2 에도 기록하지
+        않는다.
+        """
+        with proctrack.single_probe_lock(_collect_lock_dir(name)) as acquired:
+            if not acquired:
+                return ProviderResult(
+                    id=name,
+                    error=f"{name} 측정이 이미 다른 프로세스에서 실행 중 — 이번 회차 건너뜀",
+                    error_kind=PROBE_IN_PROGRESS,
+                    hint="진행 중인 프로브가 끝나면 캐시가 갱신됨",
+                ), False
+            # 획득 후 재확인 — 첫 스캔 이후 다른 프로세스가 신선한 스냅샷을
+            # 떨궜거나 backoff 창을 열었을 수 있다. 둘 다 네트워크 없이
+            # 파일만 읽는다.
+            with _exclusive_cache_lock():
+                latest = _load().get(name)
+                state = _load_backoff().get("pools", {}).get(name)
+            try:
+                until = float((state or {}).get("next_allowed_at") or 0)
+            except (TypeError, ValueError):
+                until = 0.0
+            if until > now:
+                return _backoff_result(
+                    name,
+                    fetcher,
+                    latest if isinstance(latest, dict) else entry,
+                    state,
+                    now,
+                    until,
+                    policy_class,
+                ), False
+            # use_cache=False(--no-cache)는 첫 스캔과 같은 뜻으로 항상 fetch 한다 —
+            # 재확인도 캐시 히트를 서빙하지 않는다(backoff 창은 위에서 여전히 막는다).
+            if (
+                use_cache
+                and isinstance(latest, dict)
+                and now - float(latest.get("fetched_at") or 0) <= effective_ttl_s
+            ):
+                fresh = _from_entry(latest, name, now, policy_class)
+                fresh.stale = False
+                return fresh, False
+            try:
+                result = fetch_one(fetcher)
+            finally:
+                elapsed[index] = time.monotonic() - collect_started
+            result.id = name
+            result.pool_class = _effective_class(name, fetcher, result.pool_class)
+            if result.error_kind != PROBE_IN_PROGRESS:
+                if result.error or result.warning:
+                    _merge_results({}, {name: result}, now)
+                else:
+                    result.fetched_at = now
+                    result.age_s = 0.0
+                    _merge_results({name: result}, {}, now)
+            return result, True
+
+    fetched: dict[int, Future[tuple[ProviderResult, bool]]] = {}
     if misses:
         with ThreadPoolExecutor(max_workers=min(MAX_FETCH_WORKERS, len(misses))) as pool:
-            for index, _name, fetcher, _entry, _policy_class, _ttl in misses:
-                fetched[index] = pool.submit(timed, index, fetcher)
+            for index, name, fetcher, entry, policy_class, effective_ttl_s in misses:
+                fetched[index] = pool.submit(
+                    probed, index, name, fetcher, entry, policy_class, effective_ttl_s, use_cache
+                )
 
-    successes: dict[str, ProviderResult] = {}
-    failures: dict[str, ProviderResult] = {}
     v2_attempts: dict[str, tuple[ProviderResult, float]] = {}
     for index, name, _fetcher, entry, policy_class, effective_ttl_s in misses:
-        result = fetched[index].result()
+        result, attempted = fetched[index].result()
         result.id = name
-        v2_attempts[name] = (result, now + elapsed.get(index, 0.0))
+        if attempted:
+            v2_attempts[name] = (result, now + elapsed.get(index, 0.0))
 
         result.pool_class = _effective_class(name, _fetcher, result.pool_class)
 
@@ -538,7 +633,9 @@ def collect(
                     name, _fetcher, entry, result, now, effective_ttl_s, policy_class
                 )
                 continue
-            failures[name] = result
+            if not attempted:
+                results[index] = result
+                continue
             if isinstance(entry, dict):
                 age = now - float(entry.get("fetched_at") or 0)
                 stored_fp = (entry.get("result") or {}).get("account_fp")
@@ -570,24 +667,24 @@ def collect(
             results[index] = result
             continue
 
-        if result.warning:
-            failures[name] = result  # warning 도 관측 감사는 남긴다
-        else:
-            result.fetched_at = now
-            result.age_s = 0.0
-            successes[name] = result
+        if not attempted:
+            # 잠금 재확인이 서빙한 신선 스냅샷 — 이번 호출의 관측이 아니므로
+            # 게시·감사·v2 기록 없이 그대로 돌려준다.
+            results[index] = result
+            continue
+        if not result.warning:
             # task #654 — 정상 측정의 정제 스냅샷을 hk 문서로 게시한다.
             # 스케줄러가 아니라 정상 실행의 부산물이며 실패는 fail-open 이다.
+            # fetched_at/age_s 스탬프와 캐시·backoff 병합은 워커가 잠금을
+            # 쥔 채 이미 마쳤다.
             quota_share.publish_result(name, result, now=now)
         results[index] = result
 
-    if successes or failures:
-        _merge_results(successes, failures, now)
-        # 이번 호출에서 실제로 시도한 결과만 account-scoped v2 저장소에 추가한다
-        # (캐시 히트·backoff 는 여기 오지 않는다). legacy 캐시와는 별 파일이다.
-        if v2_identities:
-            with suppress(Exception):
-                quota_v2.record_attempts(v2_attempts, started_at=now, identities=v2_identities)
+    # 이번 호출에서 실제로 시도한 결과만 account-scoped v2 저장소에 추가한다
+    # (캐시 히트·backoff·잠금 재확인 서빙은 여기 오지 않는다). legacy 캐시와는 별 파일이다.
+    if v2_attempts and v2_identities:
+        with suppress(Exception):
+            quota_v2.record_attempts(v2_attempts, started_at=now, identities=v2_identities)
 
     # task #654 — 측정 불가·만료·backoff 인 항목만, 계정 지문이 일치하는 신선한
     # hk 원격 스냅샷으로 대신 채운다. 원격은 로컬 측정이 아니므로 캐시·backoff·
