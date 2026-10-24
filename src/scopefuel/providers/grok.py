@@ -52,6 +52,9 @@ SOURCE = "cli:/usage"
 # 담을 수 있어 절대 넣지 않는다.
 STAGE_NO_OUTPUT = "no-output"  # 출력이 한 바이트도 없음
 STAGE_NO_PROMPT = "no-prompt"  # 출력은 있으나 프롬프트(❯/Shift+Tab) 미출현
+# hk 1964: grok 1.0.70 의 폴더 신뢰 질문이 떴고 프롬프트는 미출현 — 답은 프로브가
+# 아니라 desk 의 몫이다(프로브는 어떤 grok 설정도 읽거나 쓰지 않는다).
+STAGE_TRUST_PROMPT = "trust-prompt"
 STAGE_NO_PANEL = "no-panel"  # /usage 전송 후 Weekly 패널이 전혀 안 그려짐
 STAGE_UNPARSED = "unparsed"  # 패널 단서는 보였으나 정규식이 파싱하지 못함
 STAGE_PROBE_IN_FLIGHT = "probe-in-flight"  # 다른 프로세스가 이 pool 을 측정 중
@@ -89,6 +92,10 @@ _RESET = re.compile(
 )
 # TUI 프롬프트 뒤에 테두리/상태줄이 계속 그려지므로 문자열 끝 anchor를 쓰지 않는다.
 _PROMPT = re.compile(r"❯|Shift\+Tab")
+# hk 1964 — grok 1.0.70 폴더 신뢰 질문의 첫 문장(operator-desk 캡처 문구, hk 1964
+# comment 7229). 화면에는 이 밑에 경로와 Yes/No 행이 커서 이동으로 그려지지만,
+# ANSI 를 걷어낸 텍스트의 이 문장 하나만 본다.
+_TRUST_QUESTION = re.compile(r"Do you trust the contents of this directory\?")
 
 
 def _credential_meta() -> dict[str, bool]:
@@ -144,14 +151,30 @@ def fetch() -> ProviderResult:
             output = _probe_once()
     except ProbeTimeout as exc:
         next_allowed = _note_probe_timeout(time.time(), detail=f"stage={exc.stage}")
-        return _degraded(
-            f"{BINARY} /usage 가 {exc.timeout:.0f}초 안에 끝나지 않음 "
-            f"(stage={exc.stage}, bytes={exc.nbytes})",
-            credential,
-            hint=(
+        if exc.stage == STAGE_TRUST_PROMPT:
+            # hk 1964: 힌트는 workdir 경로만 싣는다 — 화면 원문·계정 정보 없음.
+            error = (
+                f"{BINARY} 가 폴더 신뢰 질문을 띄워 /usage 를 보내지 못함 "
+                f"(stage={exc.stage}, bytes={exc.nbytes})"
+            )
+            hint = (
+                f"stage={exc.stage} — 이 호스트에서 grok 이 {workdir} 폴더를 "
+                "신뢰해야 함 (desk 조치 — 프로브는 신뢰 질문에 답하지 않음; "
+                f"다음 허용 {_iso(next_allowed)})"
+            )
+        else:
+            error = (
+                f"{BINARY} /usage 가 {exc.timeout:.0f}초 안에 끝나지 않음 "
+                f"(stage={exc.stage}, bytes={exc.nbytes})"
+            )
+            hint = (
                 f"stage={exc.stage} — grok 를 직접 실행해 /usage 출력이 나오는지 확인하세요 "
                 f"(다음 허용 {_iso(next_allowed)})"
-            ),
+            )
+        return _degraded(
+            error,
+            credential,
+            hint=hint,
             error_kind="probe_timeout",
             backoff_until=next_allowed,
             probe={"stage": exc.stage, "bytes": exc.nbytes},
@@ -301,6 +324,42 @@ def _degraded(
     )
 
 
+# hk 1964 — workdir git init 은 몇 백 밀리초면 끝난다; 상한만 둔다. git 이
+# 없거나 init 이 실패해도 프로브는 계속한다 — 신뢰 질문이 뜨면 읽기 루프가
+# stage=trust-prompt 로 보고한다.
+GIT_INIT_TIMEOUT_S = 10.0
+
+
+def _ensure_workdir_git_root(workdir: pathlib.Path) -> None:
+    """Keep ``workdir`` the root of a git repository — never raises.
+
+    Since grok 1.0.70 the CLI asks its folder-trust question in any folder
+    it does not trust, and trust is inherited only within the same git
+    repository. The probe's per-run ``probe-*`` instance dirs live under
+    PROBE_WORKDIR, so keeping the workdir its own git root lets a single
+    desk-side trust entry for it cover every instance dir on that host.
+    A workdir nested inside another repository still gets its own ``.git``
+    — it must be its own root. This never commits, never touches another
+    repository or any git config, and never reads or writes grok's
+    trusted_folders file or answers the trust question — that entry stays
+    a desk action. A missing git or a failed init only means the question
+    may still appear, which the read loop reports as stage=trust-prompt.
+    """
+
+    try:
+        if (workdir / ".git").exists():
+            return
+        subprocess.run(  # noqa: S603,S607 - fixed argv; git resolved from PATH
+            ["git", "init", "-q"],
+            cwd=workdir,
+            timeout=GIT_INIT_TIMEOUT_S,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _probe_once() -> str:
     """Run grok in a dedicated process group and send ``/usage`` after its prompt.
 
@@ -324,6 +383,7 @@ def _probe_once() -> str:
 
     workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
     workdir.mkdir(parents=True, exist_ok=True)
+    _ensure_workdir_git_root(workdir)
     proctrack.kill_stale_probe_leftovers(workdir)
     instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
     timeout_s = _probe_timeout_s()
@@ -380,6 +440,17 @@ def _probe_once() -> str:
                     os.write(master_fd, PROBE_INPUT.encode())
                     sent = True
                     last_data = time.monotonic()
+                elif not sent and _TRUST_QUESTION.search(clean):
+                    # hk 1964: grok 1.0.70 의 폴더 신뢰 질문 — 프로브가 답할 수
+                    # 없는 화면이므로 전체 타임아웃을 태우지 않고 즉시 끊는다.
+                    # 프롬프트가 함께 보이면 위의 프롬프트 검사가 이긴다.
+                    # 아래 finally 가 자식을 오늘과 같이 정리한다.
+                    raise ProbeTimeout(
+                        [BINARY],
+                        timeout_s,
+                        stage=STAGE_TRUST_PROMPT,
+                        nbytes=len(output),
+                    )
                 if sent and _WEEKLY.search(clean) and _RESET.search(clean):
                     usage_seen_at = usage_seen_at or time.monotonic()
                     if time.monotonic() - usage_seen_at >= USAGE_SETTLE_S:
@@ -500,6 +571,9 @@ def _timeout_stage(output: bytearray, *, sent: bool, usage_seen_at: float | None
     if not output:
         return STAGE_NO_OUTPUT
     if not sent:
+        clean = _clean(output.decode("utf-8", errors="replace"))
+        if _TRUST_QUESTION.search(clean):
+            return STAGE_TRUST_PROMPT
         return STAGE_NO_PROMPT
     if usage_seen_at is not None:
         return STAGE_UNPARSED
