@@ -411,8 +411,10 @@ def test_every_cli_probe_marks_lock_skip_not_failure(pool, monkeypatch, tmp_path
     stub.write_text("#!/bin/sh\nexit 0\n")
     stub.chmod(0o755)
     monkeypatch.setattr(module, "BINARY", str(stub))
-    workdir = module.PROBE_WORKDIR  # conftest 가 tmp 로 돌려 놓은 값
-    with proctrack.single_probe_lock(workdir) as acquired:
+    # hk 1868: grok 의 잠금은 cache dir 의 per-pool lock dir 로 옮겼다 —
+    # _probe_lock_dir() 를 가진 모듈은 그 위치를, 나머지는 PROBE_WORKDIR 을 쓴다.
+    lock_dir = module._probe_lock_dir() if hasattr(module, "_probe_lock_dir") else module.PROBE_WORKDIR
+    with proctrack.single_probe_lock(lock_dir) as acquired:
         assert acquired is True
         result = module.fetch()
     assert result.error and "이미 실행 중" in result.error

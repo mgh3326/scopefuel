@@ -1776,7 +1776,10 @@ def test_task295_recommend_c_lists_remaining_devin_profiles_as_unmeasured(fixtur
     providers = [devin.parse(_fixture(fixture_text))]
     out = recommend(providers, "C")
     ranked_names = _ranked_names(out)
-    excluded = next((line for line in out.splitlines() if line.startswith("✗ devin 측정 불가")), None)
+    excluded = next(
+        (line for line in out.splitlines() if line.startswith("✗ 제외") and "측정 불가" in line),
+        None,
+    )
     assert excluded is not None, out
     for name in UNMEASURED_DEVIN_PROFILES:
         assert name not in ranked_names, (name, out)

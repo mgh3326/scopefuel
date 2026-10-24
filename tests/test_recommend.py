@@ -189,7 +189,8 @@ def test_recommend_excludes_exhausted_and_unmeasurable():
     ]
     out = recommend(providers, "S", today=TODAY, now=NOW)
     assert any("kimi-k3" in line and "측정 불가" in line for line in out.splitlines())
-    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in out.splitlines())
+    assert not any("codex-terra" in line for line in out.splitlines() if line[:1].isdigit())
+    assert "codex-terra" in out and "barred" in out
 
 
 def test_recommend_excludes_exhausted_spend():
@@ -215,7 +216,8 @@ def test_grade_table_has_expected_a_profiles():
     assert "oc-gflash" not in names
     assert "codex-luna" in names
     rendered = recommend([], "A", today=TODAY, now=NOW)
-    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in rendered.splitlines())
+    assert not any("codex-terra" in line for line in rendered.splitlines() if line[:1].isdigit())
+    assert "barred" in rendered
     assert "codex-sol" not in names
     assert "oc-sonnet46" not in names
 
@@ -440,7 +442,8 @@ def test_ac2_s_grade_profiles():
     names = [p.name for p in GRADE_TABLE["S"]]
     assert {"kimi-k3", "grok-hi"}.issubset(names)
     rendered = recommend([], "S", today=TODAY, now=NOW)
-    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in rendered.splitlines())
+    assert not any("codex-terra" in line for line in rendered.splitlines() if line[:1].isdigit())
+    assert "barred" in rendered
     assert "grok" not in names
 
 
@@ -453,7 +456,8 @@ def test_ac3_aplus_has_four_and_b_relocates_sonnet46_and_luna_medium():
     assert {"kiro-sonnet", "codex-luna-max", "sonnet"}.issubset(aplus_names)
     assert "codex-luna" in aplus_names
     rendered = recommend([], "A+", today=TODAY, now=NOW)
-    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in rendered.splitlines())
+    assert not any("codex-terra" in line for line in rendered.splitlines() if line[:1].isdigit())
+    assert "barred" in rendered
     # ROB-591: opus --effort low moved from A+ (escalation, 57) to S (62)
     # as part of the Opus 5.5 refresh — see test_ac1b_opus_low_moved_to_s below.
     assert not any(p.name == "opus" for p in GRADE_TABLE["A+"])
@@ -795,11 +799,13 @@ def test_rob1193_supplement_claude_cost_efficiency_and_estimates():
     # #1269: the Haiku 5.5 refresh demotes every haiku rung to C — the old
     # high-B (44.0) row was an over-estimate (vendor TB4 puts 4.5 at 0.0).
     assert "haiku --effort" not in b_output
-    assert any(line[:1].isdigit() and "grok --effort low" in line for line in b_output.splitlines())
-    # hk 1788: b953 promote moved sonnet@high to A — at B it lists only
-    # tagged [one-up A].
+    # hk 1862 r1023grokup: grok lists only at A and above — grok@low folds at B
+    assert not any("grok" in line for line in [x for x in b_output.splitlines() if x[:1].isdigit()])
+    assert "grok@low — grok restricted" in b_output
+    # hk 1862: sonnet@high lists at B as a borrowed rung (from A) — a row
+    # qualifying as both one-up and borrowed lists once, tagged [borrowed A].
     assert any(
-        line[:1].isdigit() and "sonnet --effort high" in line and "[one-up A]" in line
+        line[:1].isdigit() and "sonnet --effort high" in line and "[borrowed A]" in line
         for line in b_output.splitlines()
     )
 
@@ -842,9 +848,9 @@ def test_rob1204_grok_estimates_are_numeric_and_low_placement_is_explicit():
     assert "grok-hi" not in aplus
 
     b = recommend(providers, "B", today=TODAY, now=NOW)
-    low_line = next(line for line in b.splitlines() if "grok --effort low" in line)
-    assert "벤치 52.0(추정(외삽))" in low_line
-    assert "보수 배치(B; 점수상 A 범위지만 추정 위의 추정)" in low_line
+    # hk 1862 r1023grokup: grok@low folds at B instead of ranking
+    low_line = next(line for line in b.splitlines() if "grok@low" in line)
+    assert "grok restricted to A and above" in low_line
 
 
 def test_rob1204_unscored_profile_is_last_even_with_boost(monkeypatch):
@@ -1723,7 +1729,8 @@ def test_rob1210_short_window_cutoff_remains_a_brake():
         now=NOW,
     )
     assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
-    assert any("claude 풀 소진" in line and "99%" in line for line in out.splitlines())
+    fold = next(line for line in out.splitlines() if line.startswith("✗ 제외"))
+    assert "99%" in fold and "소진" in fold
 
 
 def test_rob1210_throughput_stays_on_shortest_window():
@@ -1900,7 +1907,8 @@ def test_rob1210_cutoff_still_excludes_at_existing_threshold(pool_class, cutoff)
         now=NOW,
     )
     assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
-    assert any("claude 풀 소진" in line and f"{cutoff:g}%" in line for line in out.splitlines())
+    fold = next(line for line in out.splitlines() if line.startswith("✗ 제외"))
+    assert f"{cutoff:g}%" in fold and "소진" in fold
 
 
 def test_rob1210_explain_only_shows_brake_when_below_knee():
@@ -1945,7 +1953,8 @@ def test_rob1191_any_window_over_cutoff_excludes_candidate():
     ranked = [line for line in out.splitlines() if line[:1].isdigit()]
     assert not any("opus" in line for line in ranked)
     # positive: folded exhausted line names the over-cutoff window usage
-    assert any("claude 풀 소진" in line and "opus" in line and "95%" in line for line in out.splitlines())
+    fold = next(line for line in out.splitlines() if line.startswith("✗ 제외"))
+    assert "opus" in fold and "95%" in fold and "소진" in fold
     # negative: must not keep opus as a ranked candidate via the lower 7d window
     assert not any(line[:1].isdigit() and "opus" in line and "46%" in line for line in out.splitlines())
     assert any(line[:1].isdigit() and "codex-sol" in line for line in ranked)
@@ -2064,9 +2073,10 @@ def test_rob1219_excluded_pool_is_absent_from_recommendation():
     shown = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=False)
     hidden = recommend(providers, "S+", today=TODAY, now=NOW, hide_excluded=True)
 
-    # no exclusion line, and no per-profile leakage either
-    assert "kiro 풀 제외" not in shown
-    assert "kiro" not in shown
+    # hk 1862: the excluded pool folds onto the 제외 line with its reason —
+    # --hide-excluded still hides the whole line
+    assert "kiro-opus@default — policy excluded" in shown
+    assert "무료 전환(구독 종료 2026-08-01)" in shown
     assert "kiro" not in hidden
     # the usable candidates are still there — suppression must not empty the grade
     assert "codex" in shown or "opus" in shown
@@ -2267,7 +2277,6 @@ def test_oc_sonnet46_shows_harness_transfer_estimate_annotation():
     ("grade", "effort", "score", "expected_label"),
     [
         ("A+", "medium", 55.5, "grok --effort medium"),
-        ("B", "low", 41.0, "grok --effort low"),
     ],
 )
 def test_grok_live_aa_agent_match_suppresses_stale_estimate_annotation_and_reason(

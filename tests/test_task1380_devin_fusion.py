@@ -330,7 +330,9 @@ def test_at_b_every_measured_row_precedes_the_first_fusion_row():
         assert not _is_measured(candidate), candidate.profile.name
     # And concretely: the rep-measured one-ups at B sit ahead of the lane.
     rep_measured_names = {c.profile.name for c in included[:first_fusion] if is_rep_measured(c.profile)}
-    assert {"devin-swe2-medium", "grok-hi", "oc-solar4"} <= rep_measured_names
+    # hk 1862 r1023grokup: grok-hi no longer ranks at B (folds as grok
+    # restricted); sonnet@high joins via the borrowed listing.
+    assert {"devin-swe2-medium", "oc-solar4", "sonnet"} <= rep_measured_names
 
 
 def test_recommend_b_fusion_rows_are_exact_unmeasured_and_after_free_swe2(fixture_text):

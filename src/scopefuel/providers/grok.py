@@ -19,18 +19,54 @@ import subprocess
 import termios
 import time
 
-from .. import proctrack
+from .. import cache, proctrack
 from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_GROK_BIN") or "grok"
 # 실측 성공 경로 2.6초 대비 충분한 여유를 두되, PTY가 무한 대기하지 않게 한다.
+# hk 1868: SCOPEFUEL_GROK_TIMEOUT_S 로 올릴 수 있다 — [10, 120] 밖은 거부된다.
+# 이 값보다 바깥 타임아웃이 짧은 호출자(refresh 의 SCOPEFUEL_REFRESH_TIMEOUT_S,
+# 기본 60)는 프로브보다 먼저 울리므로, 키울 때는 호출자 쪽도 같이 올려야 한다.
 TIMEOUT_S = 30.0
+TIMEOUT_MIN_S = 10.0
+TIMEOUT_MAX_S = 120.0
+# hk 1868: 타임아웃 연속 시 프로브 재시도를 늦추는 지수 backoff.
+# window = min(BASE * 2**(n-1), CAP). 상태는 cache.backoff.json 에 pool 단위로
+# 남아 프로세스를 넘나든다 — mbp 의 30초 주기 폴러(panewire·herdr-event)가 매번
+# 새 grok 을 띄우는 것을 막는다.
+BACKOFF_BASE_S = 60.0
+BACKOFF_BASE_MIN_S = 10.0
+BACKOFF_BASE_MAX_S = 600.0
+BACKOFF_CAP_S = 1800.0
+BACKOFF_CAP_MIN_S = 60.0
+BACKOFF_CAP_MAX_S = 7200.0
 STARTUP_DELAY_S = 0.4
 READY_SETTLE_S = 0.5
 USAGE_SETTLE_S = 0.5
 PROBE_INPUT = "/usage\r"
 PROBE_WORKDIR = pathlib.Path.home() / ".local" / "share" / "scopefuel" / "grok-probe-workdir"
 SOURCE = "cli:/usage"
+
+# hk 1868 — 타임아웃이 어느 단계에서 났는지 알리는 고정 단계 이름.
+# 에러·힌트에는 이 이름과 바이트 수만 싣는다 — 화면 원문은 계정 정보를
+# 담을 수 있어 절대 넣지 않는다.
+STAGE_NO_OUTPUT = "no-output"  # 출력이 한 바이트도 없음
+STAGE_NO_PROMPT = "no-prompt"  # 출력은 있으나 프롬프트(❯/Shift+Tab) 미출현
+STAGE_NO_PANEL = "no-panel"  # /usage 전송 후 Weekly 패널이 전혀 안 그려짐
+STAGE_UNPARSED = "unparsed"  # 패널 단서는 보였으나 정규식이 파싱하지 못함
+STAGE_PROBE_IN_FLIGHT = "probe-in-flight"  # 다른 프로세스가 이 pool 을 측정 중
+STAGE_BACKOFF = "backoff"  # 연속 타임아웃 backoff 창 안이라 시도 자체를 건너뜀
+
+
+class ProbeTimeout(subprocess.TimeoutExpired):
+    """TimeoutExpired carrying the furthest stage reached and the bytes seen."""
+
+    def __init__(self, cmd, timeout, *, stage: str, nbytes: int) -> None:
+        super().__init__(cmd, timeout)
+        self.stage = stage
+        self.nbytes = nbytes
+
+
 KST = dt.timezone(dt.timedelta(hours=9), name="Asia/Seoul")
 # A/B 실측: 크기 미설정 PTY에서는 Grok TUI가 usage 패널을 렌더하지 않아 timeout한다.
 PTY_ROWS = 50
@@ -74,27 +110,171 @@ def fetch() -> ProviderResult:
     if shutil.which(BINARY) is None:
         return _degraded(f"{BINARY} 실행 파일 없음", credential)
     workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
+    now = time.time()
+    until = _probe_backoff_until()
+    if until > now:
+        # 연속 타임아웃 backoff 창 — grok 을 띄우지 않는다. 캐시가 있는 호출
+        # 경로(collect·refresh)는 fetch 에 닿기 전에 같은 파일을 보고 이미
+        # 건너뛴다; 여기는 직접 fetch 호출자를 위한 같은 게이트다.
+        return _degraded(
+            f"{BINARY} /usage 탐침 backoff — 다음 시도 {_iso(until)} (stage={STAGE_BACKOFF})",
+            credential,
+            hint=f"stage={STAGE_BACKOFF} — 연속 타임아웃으로 {_iso(until)} 전까지 grok 을 띄우지 않음",
+            error_kind="probe_timeout",
+            backoff_until=until,
+            probe={"stage": STAGE_BACKOFF},
+        )
     proctrack.log_probe_call(workdir, "grok")
     try:
-        with proctrack.single_probe_lock(workdir) as acquired:
+        with proctrack.single_probe_lock(_probe_lock_dir()) as acquired:
             if not acquired:
                 # Not an error: another probe is already measuring this pool.
                 # Reporting it as degraded keeps the caller from treating a
                 # deliberate skip as a measurement; the marker kind lets the
                 # cache/gate layer keep the last good snapshot instead (#639).
                 return _degraded(
-                    f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+                    f"{BINARY} 탐침이 이미 실행 중 — 이번 회차 건너뜀 (stage={STAGE_PROBE_IN_FLIGHT})",
                     credential,
+                    hint=(
+                        f"stage={STAGE_PROBE_IN_FLIGHT} — 다른 프로세스가 이 pool 을 지금 "
+                        "측정 중; 끝나면 캐시가 갱신됨"
+                    ),
                     error_kind=PROBE_IN_PROGRESS,
                 )
             output = _probe_once()
+    except ProbeTimeout as exc:
+        next_allowed = _note_probe_timeout(time.time(), detail=f"stage={exc.stage}")
+        return _degraded(
+            f"{BINARY} /usage 가 {exc.timeout:.0f}초 안에 끝나지 않음 "
+            f"(stage={exc.stage}, bytes={exc.nbytes})",
+            credential,
+            hint=(
+                f"stage={exc.stage} — grok 를 직접 실행해 /usage 출력이 나오는지 확인하세요 "
+                f"(다음 허용 {_iso(next_allowed)})"
+            ),
+            error_kind="probe_timeout",
+            backoff_until=next_allowed,
+            probe={"stage": exc.stage, "bytes": exc.nbytes},
+        )
     except subprocess.TimeoutExpired:
-        return _degraded(f"{BINARY} /usage 가 {TIMEOUT_S:.0f}초 안에 끝나지 않음", credential)
+        return _degraded(f"{BINARY} /usage 가 {_probe_timeout_s():.0f}초 안에 끝나지 않음", credential)
     except OSError as exc:
         return _degraded(f"{BINARY} 실행 실패: {exc}", credential)
     result = parse(output)
+    if result.error is None:
+        _clear_probe_backoff()
     result.raw = _safe_raw(credential=credential, stdout=_redact_output(_clean(output)))
     return result
+
+
+def _iso(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch, dt.UTC).isoformat().replace("+00:00", "Z")
+
+
+def _bounded_env(name: str, default: float, lo: float, hi: float) -> float:
+    """Env-override seconds; values outside ``[lo, hi]`` are refused to the default."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if lo <= value <= hi else default
+
+
+# hk 1868 r3 — refresh 워커는 SIGALRM 을 _timeout_seconds()(기본 60s)로 무장하고,
+# 그게 울리면 워커가 stage 를 보고하기 전에 잘린다. 실효 프로브 타임아웃은
+# 무장된 바깥 타이머의 남은 시간에서 teardown 마진을 뺀 값으로 눌러 쓴다 —
+# 마진은 TERM 유예+KILL wait+pgid poll(~6s)과 backoff 기록을 덮는다.
+# 타이머 없는 호출자(status·herdr-event)는 getitimer 가 0 을 돌려 무보정.
+OUTER_TIMER_MARGIN_S = 10.0
+
+
+def _outer_timer_budget_s() -> float:
+    """Remaining budget of the caller's armed ITIMER_REAL, or inf when none."""
+
+    delay, _interval = signal.getitimer(signal.ITIMER_REAL)
+    return delay - OUTER_TIMER_MARGIN_S if delay > 0 else float("inf")
+
+
+def _probe_timeout_s() -> float:
+    configured = _bounded_env("SCOPEFUEL_GROK_TIMEOUT_S", TIMEOUT_S, TIMEOUT_MIN_S, TIMEOUT_MAX_S)
+    return max(min(configured, _outer_timer_budget_s()), 0.0)
+
+
+def _backoff_base_s() -> float:
+    return _bounded_env(
+        "SCOPEFUEL_GROK_BACKOFF_BASE_S", BACKOFF_BASE_S, BACKOFF_BASE_MIN_S, BACKOFF_BASE_MAX_S
+    )
+
+
+def _backoff_cap_s() -> float:
+    return _bounded_env("SCOPEFUEL_GROK_BACKOFF_CAP_S", BACKOFF_CAP_S, BACKOFF_CAP_MIN_S, BACKOFF_CAP_MAX_S)
+
+
+def _probe_lock_dir() -> pathlib.Path:
+    """Per-pool probe lock dir inside scopefuel's cache dir.
+
+    The lock file is an flock on ``probe-locks/grok/.probe.lock`` — the kernel
+    releases it when its holder dies, so a dead pid frees the lock and no
+    pidfile is trusted on its own. cache_dir() follows SCOPEFUEL_CACHE, so a
+    credential-scoped caller (herdr-event) keeps its own lock scope.
+    """
+
+    return cache.cache_dir() / "probe-locks" / "grok"
+
+
+def _probe_backoff_until() -> float:
+    """Next allowed probe attempt (epoch) for this pool, or 0 when none is set."""
+
+    state = cache._load_backoff().get("pools", {}).get("grok")
+    if not isinstance(state, dict):
+        return 0.0
+    try:
+        return float(state.get("next_allowed_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _note_probe_timeout(now: float, *, detail: str | None = None) -> float:
+    """Persist one probe timeout and return the next allowed attempt (epoch).
+
+    Per-pool state lives in cache.backoff.json — the same file collect() and
+    refresh's worker consult before fetching — so every caller path sees the
+    window without a second mechanism. consecutive doubles the window
+    (base·2^(n-1)) up to the cap; a successful parse clears the entry.
+    """
+
+    with cache._exclusive_cache_lock():
+        state = cache._load_backoff()
+        prev = state["pools"].get("grok")
+        consecutive = int(prev.get("consecutive") or 0) + 1 if isinstance(prev, dict) else 1
+        until = now + min(_backoff_base_s() * (2 ** (consecutive - 1)), _backoff_cap_s())
+        entry = dict(prev) if isinstance(prev, dict) else {}
+        entry.update(
+            {
+                "consecutive": consecutive,
+                "next_allowed_at": until,
+                "last_timeout_at": now,
+                "updated_at": now,
+                "last_error": detail or "probe timeout",
+                "last_error_kind": "probe_timeout",
+            }
+        )
+        state["pools"]["grok"] = entry
+        cache._save_backoff(state)
+    return until
+
+
+def _clear_probe_backoff() -> None:
+    """The first successful parse resets the consecutive-timeout count to 0."""
+
+    with cache._exclusive_cache_lock():
+        state = cache._load_backoff()
+        if state["pools"].pop("grok", None) is not None:
+            cache._save_backoff(state)
 
 
 def _degraded(
@@ -102,14 +282,22 @@ def _degraded(
     credential: dict[str, bool],
     stdout: str | None = None,
     error_kind: str | None = None,
+    hint: str | None = None,
+    backoff_until: float | None = None,
+    probe: dict | None = None,
 ) -> ProviderResult:
     return ProviderResult(
         id="grok",
         error=error,
-        hint="grok 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
+        hint=hint or "grok 를 직접 실행해 /usage 출력이 나오는지 확인하세요",
         source=SOURCE,
-        raw=_safe_raw(credential=credential, stdout=_redact_output(stdout) if stdout else None),
+        raw=_safe_raw(
+            credential=credential,
+            stdout=_redact_output(stdout) if stdout else None,
+            probe=probe,
+        ),
         error_kind=error_kind,
+        backoff_until=backoff_until,
     )
 
 
@@ -138,11 +326,16 @@ def _probe_once() -> str:
     workdir.mkdir(parents=True, exist_ok=True)
     proctrack.kill_stale_probe_leftovers(workdir)
     instance_dir, owner_fd = proctrack.new_probe_dir(workdir)
+    timeout_s = _probe_timeout_s()
     master_fd = slave_fd = -1
     process: subprocess.Popen[bytes] | None = None
     reaper: subprocess.Popen[bytes] | None = None
     child_pgid: int | None = None
     try:
+        if timeout_s <= 0:
+            # 바깥 타이머가 teardown 마진조차 남기지 않았다 — 띄워도 SIGALRM 이
+            # 먼저 울려 stage 가 못 나가니, 스폰 자체를 건너뛰고 즉시 보고한다.
+            raise ProbeTimeout([BINARY], timeout_s, stage=STAGE_NO_OUTPUT, nbytes=0)
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command; binary is explicit/env-configured
@@ -159,13 +352,13 @@ def _probe_once() -> str:
             child_pgid = os.getpgid(process.pid)
         if child_pgid is not None:
             proctrack.register(child_pgid, instance_dir)
-        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=TIMEOUT_S + 90.0)
+        reaper = proctrack.spawn_reaper(instance_dir, ttl_s=timeout_s + 90.0)
         os.close(slave_fd)
         slave_fd = -1
         time.sleep(STARTUP_DELAY_S)
 
         output = bytearray()
-        deadline = time.monotonic() + TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
         last_data = time.monotonic()
         sent = False
         usage_seen_at: float | None = None
@@ -195,11 +388,20 @@ def _probe_once() -> str:
 
             if process.poll() is not None:
                 break
-            if sent and usage_seen_at is None and time.monotonic() - last_data >= TIMEOUT_S:
+            if sent and usage_seen_at is None and time.monotonic() - last_data >= timeout_s:
                 break
 
         if time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired([BINARY], TIMEOUT_S)
+            # The finally below kills the whole registered process group
+            # (SIGTERM, then SIGKILL after a short wait) before the exception
+            # leaves — the reaper stays only as the last line of defence for
+            # a SIGKILLed parent.
+            raise ProbeTimeout(
+                [BINARY],
+                timeout_s,
+                stage=_timeout_stage(output, sent=sent, usage_seen_at=usage_seen_at),
+                nbytes=len(output),
+            )
         return output.decode("utf-8", errors="replace")
     finally:
         if process is not None and process.poll() is None:
@@ -211,10 +413,7 @@ def _probe_once() -> str:
                     os.killpg(process_group, signal.SIGTERM)
                 process.wait(timeout=2.0)
             except (subprocess.TimeoutExpired, OSError):
-                if process_group is not None:
-                    with contextlib.suppress(OSError):
-                        os.killpg(process_group, signal.SIGKILL)
-                else:
+                if process_group is None:
                     with contextlib.suppress(OSError):
                         process.kill()
                 # A wait() that times out here used to escape the finally block,
@@ -222,6 +421,18 @@ def _probe_once() -> str:
                 # pty — and replacing the real TimeoutExpired with its own.
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     process.wait(timeout=2.0)
+            # The leader obeying SIGTERM proves nothing about group members
+            # that ignore it — a straggler keeps the pgid alive, so the group
+            # SIGKILL is unconditional; ESRCH just means it was already gone.
+            if process_group is not None:
+                with contextlib.suppress(OSError):
+                    os.killpg(process_group, signal.SIGKILL)
+                # Reap the leader first so its zombie cannot pin the pgid,
+                # then wait on the pgid itself: stragglers are not our
+                # children and cannot be wait()ed, but SIGKILL cannot be caught.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+                _wait_group_gone(process_group)
         # The direct child exiting is not the end of the probe's descendants. A
         # CLI that backgrounds a helper and returns 0 leaves that helper running,
         # and the block above skips entirely because ``process.poll()`` is not
@@ -248,6 +459,25 @@ def _probe_once() -> str:
             os.close(master_fd)
 
 
+def _wait_group_gone(process_group: int, *, timeout_s: float = 2.0) -> None:
+    """Wait until the probe's own process group is empty after its SIGKILL.
+
+    Stray descendants are not this process's children, so they cannot be
+    wait()ed — poll the pgid instead. SIGKILL cannot be caught, so a live
+    member disappears in milliseconds; ESRCH ends the wait.
+    """
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            os.killpg(process_group, 0)
+        except OSError:
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
+
+
 def _child_env() -> dict[str, str]:
     env = os.environ.copy()
     for name in tuple(env):
@@ -256,6 +486,27 @@ def _child_env() -> dict[str, str]:
     env["COLUMNS"] = str(PTY_COLS)
     env["LINES"] = str(PTY_ROWS)
     return env
+
+
+def _timeout_stage(output: bytearray, *, sent: bool, usage_seen_at: float | None) -> str:
+    """Classify how far a timed-out probe got — a stage name, never screen text.
+
+    "Panel seen but not parsed" covers two real shapes: the full _WEEKLY+_RESET
+    pair matched but the deadline hit before USAGE_SETTLE_S elapsed, and a
+    fragment of the panel (either regex) matched without ever completing —
+    e.g. a CLI update that renames the reset line.
+    """
+
+    if not output:
+        return STAGE_NO_OUTPUT
+    if not sent:
+        return STAGE_NO_PROMPT
+    if usage_seen_at is not None:
+        return STAGE_UNPARSED
+    clean = _clean(output.decode("utf-8", errors="replace"))
+    if _WEEKLY.search(clean) or _RESET.search(clean):
+        return STAGE_UNPARSED
+    return STAGE_NO_PANEL
 
 
 def parse(text: str, *, now: dt.datetime | None = None) -> ProviderResult:

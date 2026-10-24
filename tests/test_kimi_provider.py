@@ -906,7 +906,8 @@ def test_lockout_in_a_clone_home_reaches_recommend(tmp_path, monkeypatch):
         grade_table={"A": [Profile("kimi-k3", "Kimi", 50.0, aa_model_id="kimi-k3")]},
     )
 
-    assert "kimi 풀 소진" in text
+    fold = next(x for x in text.splitlines() if x.startswith("✗ 제외"))
+    assert "kimi-k3" in fold and "소진" in fold
 
 
 def test_lockout_under_default_xdg_clone_home(tmp_path, monkeypatch):

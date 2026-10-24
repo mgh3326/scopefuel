@@ -153,10 +153,24 @@ def test_recommend_lists_each_rung_at_its_decided_grade_and_one_up():
                     continue
                 hits = [line for line in lines_at[other] if name in line]
                 if other == one_below[grade]:
-                    assert hits and all(f"[one-up {grade}]" in line for line in hits), (
-                        other,
-                        name,
-                    )
+                    # hk 1862: borrowed listings and the grok-below-A fold
+                    # change which tag a demoted listing takes — a borrowed
+                    # rung lists as [borrowed <placed>] and a grok rung folds
+                    # at B/C instead of listing.
+                    borrowed_pairs = {
+                        ("devin-swe2 (effort high)", "B"): "[one-up A+]",
+                    }
+                    if name.startswith("grok") and other in ("B", "C"):
+                        assert not hits, (other, name)
+                    elif (name, other) in borrowed_pairs:
+                        assert hits and all("[one-up" in line for line in hits), (other, name)
+                    elif name == "sonnet --effort high" and other == "B":
+                        assert hits and all("[borrowed A]" in line for line in hits), (other, name)
+                    else:
+                        assert hits and all(f"[one-up {grade}]" in line for line in hits), (
+                            other,
+                            name,
+                        )
                 else:
                     assert not hits, (other, name)
 

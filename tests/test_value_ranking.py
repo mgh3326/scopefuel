@@ -322,13 +322,14 @@ def test_ac4_s_has_luna_max_first_and_no_sol_in_candidates_or_alternatives():
         now=NOW,
         model_prices={"gpt-5-6-luna": _price("gpt-5-6-luna", 1.0)},
     )
-    assert not any("codex-terra" in line or "gpt-5.6-terra" in line for line in output.splitlines())
-    assert not any(line.startswith("1.") and "codex-sol" in line for line in output.splitlines())
-    # d1786ap: codex-sol@xhigh lists at S once — tagged [borrowed S+] in the
-    # escalation section, still never a ranked candidate or a placement here.
-    sol_lines = [line for line in output.splitlines() if "codex-sol" in line]
+    # hk 1862: barred rows fold on the 제외 line, never rank.
+    assert not any("codex-terra" in line for line in output.splitlines() if line[:1].isdigit())
+    assert "barred" in output
+    # hk 1862 (comment 6689): codex-sol@xhigh lists at S with listed_gate
+    # default — a ranked candidate, tagged [borrowed S+]. Its own S+ row
+    # stays escalation-gated.
+    sol_lines = [line for line in output.splitlines() if "codex-sol" in line and line[:1].isdigit()]
     assert len(sol_lines) == 1 and "[borrowed S+]" in sol_lines[0]
-    assert "승급 후보" in output
 
 
 def test_ac5_value_sort_preserves_pool_slot_sequence_exactly():
@@ -419,27 +420,43 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         # rows, so position encodes exact-first, a paid row sinks below free
         # and unknown rows at equal standing, and an unmeasured exact row
         # sinks below a measured one-up (amended AC6).
+        # hk 1862 r1023grokup: grok rows fold below A — exclude them from the
+        # oracle at B and C.
+        def _listed(profile, grade=grade) -> bool:
+            return not (grade in ("B", "C") and recommend_mod._is_grok_profile(profile.name))
+
         profiles = [
             profile
             for profile in GRADE_TABLE[grade]
             if profile.gate != "escalation"
             and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
+            and _listed(profile)
         ]
         ordered = [(profile, False) for profile in profiles]
+        borrowed_gate = {(n, e): g for n, e, _g, g, _r in recommend_mod.BORROWED_RUNGS}
+        borrowed_pairs = {
+            (profile.name, profile.launcher_effort)
+            for profile, _placed in recommend_mod._borrowed_profiles(grade, GRADE_TABLE)
+        }
+        # hk 1862: a rung qualifying as both one-up and borrowed lists once —
+        # the borrowed listing wins the tag.
         ordered += [
             (profile, True)
             for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)
             if not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
+            and _listed(profile)
+            and (profile.name, profile.launcher_effort) not in borrowed_pairs
         ]
-        # d1786ap: borrowed rows take the appended non-exact slots, after the
-        # one-up rows — the same order _evaluate builds entries. The
-        # escalation-gated codex-sol rung lists in its own section, so it is
-        # filtered like the exact rows above.
+        # d1786ap/hk 1862: borrowed rows take the appended non-exact slots,
+        # after the one-up rows — the same order _evaluate builds entries.
+        # The *listing* gate decides placement, not the row's own gate:
+        # codex-sol@xhigh lists at S with listed_gate default.
         ordered += [
             (profile, True)
             for profile, _placed in recommend_mod._borrowed_profiles(grade, GRADE_TABLE)
-            if profile.gate != "escalation"
+            if borrowed_gate.get((profile.name, profile.launcher_effort), profile.gate) != "escalation"
             and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
+            and _listed(profile)
         ]
         expected[grade] = [
             label(profile)
