@@ -1290,6 +1290,40 @@ def test_a_bundle_new_profile_does_not_reject_the_canon(catalog_server, capsys):
     assert decision.catalog_stale is True
 
 
+def test_retired_new_bundle_rows_are_covered_and_not_snapshot_filled(catalog_server, monkeypatch):
+    """A retired canon row covers a bundle profile and must not restore it as a candidate."""
+    from urllib.parse import parse_qs, urlsplit
+
+    _, fake = catalog_server
+    bench.read_catalog()  # establish the full last-good profile set
+    canon = _canon_without(NEW_TO_BUNDLE)
+    retired_at = "2026-10-23T00:00:00Z"
+    retired_rows = [
+        {**row, "retired_at": retired_at}
+        for row in _seed_rows()
+        if row["profile"] in NEW_TO_BUNDLE
+    ]
+    fake.catalog = canon + retired_rows
+    original_request = fake.request_json
+
+    def query_sensitive_request(url, **kwargs):
+        payload = original_request(url, **kwargs)
+        if urlsplit(url).path.endswith("/catalog") and kwargs.get("method", "GET") == "GET":
+            if parse_qs(urlsplit(url).query).get("include_retired") != ["1"]:
+                payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
+        return payload
+
+    monkeypatch.setattr(bench, "request_json", query_sensitive_request)
+    _age_catalog_cache(3601)
+
+    view = bench.read_catalog()
+    assert view.source == "server"
+    assert view.snapshot_fill == ()
+    table = bench.runtime_grade_table()
+    candidates = {profile.name for profiles in table.values() for profile in profiles}
+    assert not set(NEW_TO_BUNDLE) & candidates
+
+
 def test_the_cache_after_commit_holds_only_server_rows_and_keeps_warning(catalog_server, capsys):
     """The committed last-good cache carries no snapshot-filled rows: the
     attestation lives in the meta stamp, so the same profiles stay new to the
