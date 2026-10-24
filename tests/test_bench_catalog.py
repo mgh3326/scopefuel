@@ -136,6 +136,71 @@ def test_catalog_cache_is_served_without_a_request_inside_the_ttl(catalog_server
     assert {(e.profile, e.effort, e.grade) for e in cached.entries} >= {("opus", "high", "S+")}
 
 
+def test_catalog_fetch_requests_retired_rows_and_ratchet_accepts_them(catalog_server, monkeypatch):
+    """The server only returns retired rows when include_retired=1 is requested."""
+    _, fake = catalog_server
+    original_request = fake.request_json
+    urls = []
+
+    def query_sensitive_request(url, **kwargs):
+        from urllib.parse import parse_qs, urlsplit
+
+        urls.append(url)
+        payload = original_request(url, **kwargs)
+        if (
+            urlsplit(url).path.endswith("/catalog")
+            and kwargs.get("method", "GET") == "GET"
+            and parse_qs(urlsplit(url).query).get("include_retired") != ["1"]
+        ):
+            payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
+        return payload
+
+    monkeypatch.setattr(bench, "request_json", query_sensitive_request)
+    assert bench.read_catalog().source == "server"
+    last_good_profiles = {entry.profile for entry in bench.read_catalog().entries}
+    retired_profiles = set(sorted(last_good_profiles)[:7])
+    retired_at = "2026-10-23T00:00:00Z"
+    fake.catalog = [
+        ({**row, "retired_at": retired_at} if row["profile"] in retired_profiles else row)
+        for row in fake.catalog
+    ]
+    _age_catalog_cache(3601)
+    refreshed = bench.read_catalog()
+    assert refreshed.source == "server"
+    assert retired_profiles <= {entry.profile for entry in refreshed.entries if entry.retired_at}
+    assert any("include_retired=1" in url for url in urls)
+
+
+def test_push_catalog_preflight_requests_retired_rows(catalog_server, monkeypatch, tmp_path):
+    _, fake = catalog_server
+    fake.catalog = _seed_rows_with("opus", "high", retired_at="2026-10-23T00:00:00Z")
+    original_request = fake.request_json
+    responses = []
+
+    def capture_request(url, **kwargs):
+        from urllib.parse import parse_qs, urlsplit
+
+        payload = original_request(url, **kwargs)
+        if kwargs.get("method", "GET") == "GET" and urlsplit(url).path.endswith("/catalog"):
+            if parse_qs(urlsplit(url).query).get("include_retired") != ["1"]:
+                payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
+            responses.append((url, payload))
+        return payload
+
+    monkeypatch.setattr(bench, "request_json", capture_request)
+    payload = _write_push(tmp_path, _push_rows(["devin-argon"]))
+    bench.push_catalog(payload)
+    from urllib.parse import parse_qs, urlsplit
+
+    assert responses
+    preflight_url, preflight_payload = responses[0]
+    assert parse_qs(urlsplit(preflight_url).query).get("include_retired") == ["1"]
+    assert any(
+        row["profile"] == "opus" and row["effort"] == "high" and row["retired_at"]
+        for row in preflight_payload["catalog"]
+    )
+
+
 def test_catalog_grade_change_reaches_recommend_after_the_ttl(catalog_server):
     _, fake = catalog_server
     assert bench.read_catalog().source == "server"
@@ -751,6 +816,19 @@ def test_a_fully_retired_profile_leaves_the_recommendations(catalog_server):
     assert any(p.name == "haiku" for profiles in table.values() for p in profiles)
 
 
+def test_retired_catalog_rows_are_never_ranked_in_recommend_output(catalog_server):
+    _, fake = catalog_server
+    retired = "2026-10-23T00:00:00Z"
+    fake.catalog = [
+        ({**row, "retired_at": retired} if row["profile"] == "opus" else row) for row in _seed_rows()
+    ]
+
+    output = recommend.recommend([_codex_provider()], "S+", grade_table=bench.runtime_grade_table())
+
+    ranked_lines = [line for line in output.splitlines() if line[:1].isdigit()]
+    assert not any("opus" in line for line in ranked_lines)
+
+
 def test_a_half_set_environment_override_is_not_completed_from_config_env(tmp_path, monkeypatch):
     """Setting one variable must not redirect the stored bearer token.
 
@@ -1213,6 +1291,41 @@ def test_a_bundle_new_profile_does_not_reject_the_canon(catalog_server, capsys):
     assert decision.gate == "default"
     assert decision.catalog_source == "snapshot"
     assert decision.catalog_stale is True
+
+
+def test_retired_new_bundle_rows_are_covered_and_not_snapshot_filled(catalog_server, monkeypatch):
+    """A retired canon row covers a bundle profile and must not restore it as a candidate."""
+    from urllib.parse import parse_qs, urlsplit
+
+    _, fake = catalog_server
+    bench.read_catalog()  # establish the full last-good profile set
+    canon = _canon_without(NEW_TO_BUNDLE)
+    retired_at = "2026-10-23T00:00:00Z"
+    retired_rows = [
+        {**row, "retired_at": retired_at} for row in _seed_rows() if row["profile"] in NEW_TO_BUNDLE
+    ]
+    fake.catalog = canon + retired_rows
+    original_request = fake.request_json
+
+    def query_sensitive_request(url, **kwargs):
+        payload = original_request(url, **kwargs)
+        if (
+            urlsplit(url).path.endswith("/catalog")
+            and kwargs.get("method", "GET") == "GET"
+            and parse_qs(urlsplit(url).query).get("include_retired") != ["1"]
+        ):
+            payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
+        return payload
+
+    monkeypatch.setattr(bench, "request_json", query_sensitive_request)
+    _age_catalog_cache(3601)
+
+    view = bench.read_catalog()
+    assert view.source == "server"
+    assert view.snapshot_fill == ()
+    table = bench.runtime_grade_table()
+    candidates = {profile.name for profiles in table.values() for profile in profiles}
+    assert not set(NEW_TO_BUNDLE) & candidates
 
 
 def test_the_cache_after_commit_holds_only_server_rows_and_keeps_warning(catalog_server, capsys):
