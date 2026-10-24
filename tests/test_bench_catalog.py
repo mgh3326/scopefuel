@@ -147,9 +147,12 @@ def test_catalog_fetch_requests_retired_rows_and_ratchet_accepts_them(catalog_se
 
         urls.append(url)
         payload = original_request(url, **kwargs)
-        if urlsplit(url).path.endswith("/catalog") and kwargs.get("method", "GET") == "GET":
-            if parse_qs(urlsplit(url).query).get("include_retired") != ["1"]:
-                payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
+        if (
+            urlsplit(url).path.endswith("/catalog")
+            and kwargs.get("method", "GET") == "GET"
+            and parse_qs(urlsplit(url).query).get("include_retired") != ["1"]
+        ):
+            payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
         return payload
 
     monkeypatch.setattr(bench, "request_json", query_sensitive_request)
@@ -1308,9 +1311,12 @@ def test_retired_new_bundle_rows_are_covered_and_not_snapshot_filled(catalog_ser
 
     def query_sensitive_request(url, **kwargs):
         payload = original_request(url, **kwargs)
-        if urlsplit(url).path.endswith("/catalog") and kwargs.get("method", "GET") == "GET":
-            if parse_qs(urlsplit(url).query).get("include_retired") != ["1"]:
-                payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
+        if (
+            urlsplit(url).path.endswith("/catalog")
+            and kwargs.get("method", "GET") == "GET"
+            and parse_qs(urlsplit(url).query).get("include_retired") != ["1"]
+        ):
+            payload["catalog"] = [row for row in payload["catalog"] if not row.get("retired_at")]
         return payload
 
     monkeypatch.setattr(bench, "request_json", query_sensitive_request)
