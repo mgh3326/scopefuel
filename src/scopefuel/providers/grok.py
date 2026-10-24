@@ -111,7 +111,7 @@ def fetch() -> ProviderResult:
         return _degraded(f"{BINARY} 실행 파일 없음", credential)
     workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
     now = time.time()
-    until = _probe_backoff_until(now)
+    until = _probe_backoff_until()
     if until > now:
         # 연속 타임아웃 backoff 창 — grok 을 띄우지 않는다. 캐시가 있는 호출
         # 경로(collect·refresh)는 fetch 에 닿기 전에 같은 파일을 보고 이미
@@ -210,7 +210,7 @@ def _probe_lock_dir() -> pathlib.Path:
     return cache.cache_dir() / "probe-locks" / "grok"
 
 
-def _probe_backoff_until(now: float) -> float:
+def _probe_backoff_until() -> float:
     """Next allowed probe attempt (epoch) for this pool, or 0 when none is set."""
 
     state = cache._load_backoff().get("pools", {}).get("grok")
@@ -393,10 +393,7 @@ def _probe_once() -> str:
                     os.killpg(process_group, signal.SIGTERM)
                 process.wait(timeout=2.0)
             except (subprocess.TimeoutExpired, OSError):
-                if process_group is not None:
-                    with contextlib.suppress(OSError):
-                        os.killpg(process_group, signal.SIGKILL)
-                else:
+                if process_group is None:
                     with contextlib.suppress(OSError):
                         process.kill()
                 # A wait() that times out here used to escape the finally block,
@@ -404,6 +401,18 @@ def _probe_once() -> str:
                 # pty — and replacing the real TimeoutExpired with its own.
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     process.wait(timeout=2.0)
+            # The leader obeying SIGTERM proves nothing about group members
+            # that ignore it — a straggler keeps the pgid alive, so the group
+            # SIGKILL is unconditional; ESRCH just means it was already gone.
+            if process_group is not None:
+                with contextlib.suppress(OSError):
+                    os.killpg(process_group, signal.SIGKILL)
+                # Reap the leader first so its zombie cannot pin the pgid,
+                # then wait on the pgid itself: stragglers are not our
+                # children and cannot be wait()ed, but SIGKILL cannot be caught.
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    process.wait(timeout=2.0)
+                _wait_group_gone(process_group)
         # The direct child exiting is not the end of the probe's descendants. A
         # CLI that backgrounds a helper and returns 0 leaves that helper running,
         # and the block above skips entirely because ``process.poll()`` is not
@@ -428,6 +437,25 @@ def _probe_once() -> str:
                 os.close(slave_fd)
         with contextlib.suppress(OSError):
             os.close(master_fd)
+
+
+def _wait_group_gone(process_group: int, *, timeout_s: float = 2.0) -> None:
+    """Wait until the probe's own process group is empty after its SIGKILL.
+
+    Stray descendants are not this process's children, so they cannot be
+    wait()ed — poll the pgid instead. SIGKILL cannot be caught, so a live
+    member disappears in milliseconds; ESRCH ends the wait.
+    """
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            os.killpg(process_group, 0)
+        except OSError:
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
 
 
 def _child_env() -> dict[str, str]:

@@ -218,6 +218,52 @@ def test_timeout_reaps_forked_child_in_probe_group(tmp_path, monkeypatch):
                 os.kill(int(pidfile.read_text()), signal.SIGKILL)
 
 
+def test_timeout_reaps_group_when_only_the_leader_obeys_term(tmp_path, monkeypatch):
+    """The leader dying on SIGTERM proves nothing about its stragglers.
+
+    The hole this guards: wait() returns as soon as the leader exits, so a
+    SIGKILL that only fires when the leader ignores TERM never runs — and a
+    descendant that traps TERM and chdirs out of the instance dir survives
+    both the escalation and the cwd sweep. The group kill is unconditional
+    for exactly this shape.
+    """
+    self_pidfile = tmp_path / "probe-self.pid"
+    child_pidfile = tmp_path / "probe-child.pid"
+    stub = _write_stub(
+        tmp_path,
+        "fake-grok-term-ok",
+        "( trap '' TERM HUP; cd /; exec sleep 120 ) &\n"
+        f"echo $! > {shlex.quote(str(child_pidfile))}\n"
+        f"echo $$ > {shlex.quote(str(self_pidfile))}\n"
+        f"printf '{PROMPT} '\n"
+        "IFS= read -r command\n"
+        f"printf '{SENTINEL}\\r\\n'\n"
+        "exec sleep 120\n",  # leader becomes sleep — default disposition dies on TERM
+    )
+    workdir = _install(monkeypatch, tmp_path, stub, timeout=5.0)
+
+    probe = threading.Thread(target=lambda: grok.fetch())
+    probe.start()
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self_pidfile.exists() and child_pidfile.exists():
+                break
+            time.sleep(0.05)
+        assert self_pidfile.exists() and child_pidfile.exists(), (
+            "the stub never forked — fixture did not exercise the scenario"
+        )
+        probe.join(timeout=30)
+        assert not probe.is_alive(), "probe did not finish at its timeout"
+        pids = {int(self_pidfile.read_text()), int(child_pidfile.read_text())}
+        _assert_no_probe_left(workdir, pids)
+    finally:
+        probe.join(timeout=30)
+        for pidfile in (self_pidfile, child_pidfile):
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+
 # ------------------------------------------------------- timeout env bounds
 
 
