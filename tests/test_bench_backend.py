@@ -469,6 +469,8 @@ def test_push_local_preserves_source_rows_and_rejects_local_backend(tmp_path, mo
     _set_backend(tmp_path, monkeypatch, "handoffkeep")
     fake = FakeHandoffkeep()
     monkeypatch.setattr(bench, "request_json", fake.request_json)
+    assert cli.main(["bench", "push-local-migrate", "--apply", "--legacy-created-by", "legacy-shared"]) == 0
+    capsys.readouterr()
     assert cli.main(["bench", "push-local"]) == 0
     out = capsys.readouterr().out
     assert "3 score(s), 2 rep(s)" in out
@@ -507,6 +509,8 @@ def test_push_local_is_idempotent_in_the_rep_cache(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(bench, "request_json", fake.request_json)
     assert len(fake.reps) == 1  # server fixture only, before any push
 
+    assert cli.main(["bench", "push-local-migrate", "--apply", "--legacy-created-by", "legacy-shared"]) == 0
+    capsys.readouterr()
     assert cli.main(["bench", "push-local"]) == 0
     assert len(fake.reps) == 3  # fixture + 2 pushed local reps
 

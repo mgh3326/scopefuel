@@ -652,6 +652,31 @@ _CACHE_SCHEMA = """
           install_id TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS bench_legacy_identity (
+          rowid            INTEGER PRIMARY KEY,
+          install_id       TEXT NOT NULL,
+          content_key      TEXT NOT NULL,
+          decision         TEXT NOT NULL CHECK (decision IN ('confirmed', 'accept-new')),
+          server_id        INTEGER,
+          legacy_origin    INTEGER,
+          legacy_created_by TEXT,
+          migrated_at      TEXT NOT NULL,
+          CHECK (
+            (decision = 'confirmed' AND server_id IS NOT NULL AND legacy_origin IS NOT NULL
+              AND legacy_created_by IS NOT NULL)
+            OR (decision = 'accept-new' AND server_id IS NULL AND legacy_origin IS NULL
+              AND legacy_created_by IS NULL)
+          )
+        );
+
+        CREATE TABLE IF NOT EXISTS bench_legacy_migration (
+          singleton              INTEGER PRIMARY KEY CHECK (singleton = 1),
+          install_id             TEXT NOT NULL,
+          legacy_created_by_json TEXT NOT NULL,
+          legacy_host_json       TEXT NOT NULL,
+          applied_at             TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS bench_cache_meta (
           scope         TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
           fetched_at    TEXT NOT NULL,
@@ -5442,6 +5467,325 @@ def _commit_push_cache(
         conn.close()
 
 
+_LEGACY_PUSH_LOCAL_CLASSES = ("confirmed", "never-pushed", "conflict", "ambiguous")
+
+
+@dataclass(frozen=True)
+class PushLocalMigrationResult:
+    """Classification and optional local write from ``bench push-local-migrate``."""
+
+    classes: dict[str, list[RepRecord]]
+    server_ids: dict[int, tuple[int, ...]]
+    applied: bool
+    mappings_written: int
+
+
+def _legacy_push_local_origin_id(host: str, record: RepRecord) -> int:
+    """The pre-PR-175 push-local key: hostname, profile, and local rowid."""
+
+    digest = hashlib.sha256(f"reps-push-local\x00{host}\x00{record.profile}\x00{record.id}".encode()).digest()
+    return _REP_ORIGIN_BAND_BASE + int.from_bytes(digest[:8], "big") % _REP_ORIGIN_BAND_SPAN
+
+
+def _legacy_rep_content_json(record: RepRecord) -> str:
+    """Serialize the same canonical content compared by ``_rep_row_key``."""
+
+    def json_value(value: object) -> object:
+        if isinstance(value, dt.datetime):
+            return value.astimezone(dt.UTC).isoformat()
+        return value
+
+    return json.dumps(
+        [json_value(value) for value in _rep_row_key(record)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _legacy_input_names(values: list[str] | tuple[str, ...], field: str, *, required: bool) -> list[str]:
+    names: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise BenchError(f"bench push-local-migrate: {field} must be a non-empty name")
+        name = value.strip()
+        if not name:
+            raise BenchError(f"bench push-local-migrate: {field} must be a non-empty name")
+        if name not in names:
+            names.append(name)
+    if required and not names:
+        raise BenchError(f"bench push-local-migrate: at least one {field} is required")
+    return sorted(names)
+
+
+def _classify_legacy_push_local(
+    local_reps: list[RepRecord],
+    server_reps: list[_RemoteRep],
+    *,
+    hosts: list[str],
+    legacy_created_by: list[str],
+) -> tuple[dict[str, list[RepRecord]], dict[int, tuple[int, ...]], dict[int, _RemoteRep]]:
+    """Classify by old origin and creator first, then compare canonical content."""
+
+    classes = {name: [] for name in _LEGACY_PUSH_LOCAL_CLASSES}
+    findings: dict[int, tuple[int, ...]] = {}
+    confirmed: dict[int, _RemoteRep] = {}
+    allowed_creators = set(legacy_created_by)
+    for record in local_reps:
+        candidate_origins = {_legacy_push_local_origin_id(host, record) for host in hosts}
+        holders = [
+            item
+            for item in server_reps
+            if item.origin_id in candidate_origins and item.created_by in allowed_creators
+        ]
+        matches = [item for item in holders if _same_rep_row(record, item.record)]
+        differing = [item for item in holders if not _same_rep_row(record, item.record)]
+        if len(matches) > 1:
+            label = "ambiguous"
+        elif differing:
+            # A differing holder is overwrite evidence even if another
+            # candidate slot happens to contain an exact copy.
+            label = "conflict"
+        elif matches:
+            label = "confirmed"
+            confirmed[record.id] = matches[0]
+        else:
+            label = "never-pushed"
+        classes[label].append(record)
+        if label in {"conflict", "ambiguous"}:
+            findings[record.id] = tuple(
+                sorted({item.server_id for item in holders if item.server_id is not None})
+            )
+    return classes, findings, confirmed
+
+
+def _legacy_state(
+    *, path: pathlib.Path | str | None, install_id: str
+) -> tuple[list[str] | None, list[str] | None, dict[int, dict[str, object]]]:
+    """Read the install's accepted inputs and mappings without changing them."""
+
+    conn = _cache_connect(path)
+    try:
+        run = conn.execute(
+            "SELECT install_id, legacy_created_by_json, legacy_host_json "
+            "FROM bench_legacy_migration WHERE singleton = 1"
+        ).fetchone()
+        mappings = {
+            int(row["rowid"]): dict(row)
+            for row in conn.execute("SELECT * FROM bench_legacy_identity ORDER BY rowid").fetchall()
+        }
+    finally:
+        conn.close()
+    if run is None or run["install_id"] != install_id:
+        return None, None, mappings
+    try:
+        created_by = json.loads(run["legacy_created_by_json"])
+        hosts = json.loads(run["legacy_host_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise BenchBackendError(
+            "bench push-local: corrupt legacy migration inputs; refusing to push reps"
+        ) from exc
+    for label, values in (("legacy-created-by", created_by), ("legacy-host", hosts)):
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+            raise BenchBackendError(
+                f"bench push-local: corrupt legacy migration {label}; refusing to push reps"
+            )
+    if not created_by:
+        raise BenchBackendError("bench push-local: corrupt legacy migration inputs; refusing to push reps")
+    return created_by, hosts, mappings
+
+
+def _apply_legacy_push_local_mappings(
+    *,
+    path: pathlib.Path | str | None,
+    install_id: str,
+    expected: dict[int, dict[str, object]],
+    legacy_created_by: list[str],
+    legacy_hosts: list[str],
+) -> int:
+    """Record all mappings and the run inputs in one all-or-nothing transaction."""
+
+    conn = _cache_connect(path)
+    inserted = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        installed = conn.execute("SELECT install_id FROM bench_install_meta WHERE singleton = 1").fetchone()
+        if installed is None or installed["install_id"] != install_id:
+            raise BenchBackendError("bench push-local-migrate: install identity changed; refusing the run")
+        for rowid, values in sorted(expected.items()):
+            old = conn.execute(
+                "SELECT install_id, content_key, decision, server_id, legacy_origin, legacy_created_by "
+                "FROM bench_legacy_identity WHERE rowid = ?",
+                (rowid,),
+            ).fetchone()
+            expected_values = tuple(
+                values[field]
+                for field in (
+                    "install_id",
+                    "content_key",
+                    "decision",
+                    "server_id",
+                    "legacy_origin",
+                    "legacy_created_by",
+                )
+            )
+            if old is not None:
+                old_values = tuple(
+                    old[field]
+                    for field in (
+                        "install_id",
+                        "content_key",
+                        "decision",
+                        "server_id",
+                        "legacy_origin",
+                        "legacy_created_by",
+                    )
+                )
+                if old_values != expected_values:
+                    raise BenchBackendError(
+                        f"bench push-local-migrate: rowid={rowid} already has a different identity mapping"
+                    )
+                continue
+            conn.execute(
+                "INSERT INTO bench_legacy_identity "
+                "(rowid, install_id, content_key, decision, server_id, legacy_origin, "
+                "legacy_created_by, migrated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rowid,
+                    values["install_id"],
+                    values["content_key"],
+                    values["decision"],
+                    values["server_id"],
+                    values["legacy_origin"],
+                    values["legacy_created_by"],
+                    _cache_timestamp(_cache_now()),
+                ),
+            )
+            inserted += 1
+
+        created_by_json = json.dumps(legacy_created_by, ensure_ascii=False, separators=(",", ":"))
+        hosts_json = json.dumps(legacy_hosts, ensure_ascii=False, separators=(",", ":"))
+        run = conn.execute(
+            "SELECT install_id, legacy_created_by_json, legacy_host_json "
+            "FROM bench_legacy_migration WHERE singleton = 1"
+        ).fetchone()
+        if (
+            run is None
+            or run["install_id"] != install_id
+            or run["legacy_created_by_json"] != created_by_json
+            or run["legacy_host_json"] != hosts_json
+        ):
+            conn.execute(
+                "INSERT INTO bench_legacy_migration "
+                "(singleton, install_id, legacy_created_by_json, legacy_host_json, applied_at) "
+                "VALUES (1, ?, ?, ?, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET install_id = excluded.install_id, "
+                "legacy_created_by_json = excluded.legacy_created_by_json, "
+                "legacy_host_json = excluded.legacy_host_json, applied_at = excluded.applied_at",
+                (install_id, created_by_json, hosts_json, _cache_timestamp(_cache_now())),
+            )
+        conn.commit()
+        return inserted
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise BenchBackendError(f"bench push-local-migrate: local mapping write failed ({exc})") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def migrate_push_local(
+    *,
+    legacy_created_by: list[str] | tuple[str, ...],
+    legacy_host: list[str] | tuple[str, ...] = (),
+    apply: bool = False,
+    accept_new: int | None = None,
+    path: pathlib.Path | str | None = None,
+) -> PushLocalMigrationResult:
+    """Map confirmed pre-PR-175 push-local rows locally; never PUT to handoffkeep."""
+
+    created_by = _legacy_input_names(legacy_created_by, "--legacy-created-by", required=True)
+    extra_hosts = _legacy_input_names(legacy_host, "--legacy-host", required=False)
+    if accept_new is not None and not apply:
+        raise BenchError("bench push-local-migrate: --accept-new requires --apply")
+    if accept_new is not None and (
+        isinstance(accept_new, bool) or not isinstance(accept_new, int) or accept_new < 1
+    ):
+        raise BenchError("bench push-local-migrate: --accept-new must be a positive rowid")
+
+    local_reps = _read_local_reps_for_push(path=path)
+    hosts = list(dict.fromkeys([socket.gethostname() or "local", *extra_hosts]))
+    if local_reps:
+        backend = bench_backend(use="reps")
+        if backend.name != BENCH_BACKEND_HANDOFFKEEP:
+            raise BenchBackendError(
+                "bench push-local-migrate requires the handoffkeep reps backend "
+                f"(resolved {backend.name}/{backend.reason})"
+            )
+        _check_handoffkeep_scheme(backend.url, allow_plaintext=backend.allow_plaintext_url, use="reps")
+        server_reps = _fetch_reps_for_migrate(backend, {record.profile for record in local_reps})
+    else:
+        server_reps = []
+
+    classes, server_ids, confirmed = _classify_legacy_push_local(
+        local_reps,
+        server_reps,
+        hosts=hosts,
+        legacy_created_by=created_by,
+    )
+    install_id = _rep_install_id(path) if apply else ""
+    expected: dict[int, dict[str, object]] = {}
+    if apply:
+        for record in classes["confirmed"]:
+            remote = confirmed[record.id]
+            if remote.server_id is None or remote.created_by is None:
+                raise BenchBackendError(
+                    f"bench push-local-migrate: confirmed rowid={record.id} lacks server identity"
+                )
+            expected[record.id] = {
+                "install_id": install_id,
+                "content_key": _legacy_rep_content_json(record),
+                "decision": "confirmed",
+                "server_id": remote.server_id,
+                "legacy_origin": remote.origin_id,
+                "legacy_created_by": remote.created_by,
+            }
+        if accept_new is not None:
+            record = next((item for item in local_reps if item.id == accept_new), None)
+            if record is None:
+                raise BenchError(f"bench push-local-migrate: no local rep rowid={accept_new}")
+            class_name = next(name for name in _LEGACY_PUSH_LOCAL_CLASSES if record in classes[name])
+            if class_name not in {"conflict", "ambiguous"}:
+                raise BenchError(
+                    f"bench push-local-migrate: rowid={accept_new} is {class_name}; "
+                    "--accept-new applies only to conflict or ambiguous rows"
+                )
+            expected[record.id] = {
+                "install_id": install_id,
+                "content_key": _legacy_rep_content_json(record),
+                "decision": "accept-new",
+                "server_id": None,
+                "legacy_origin": None,
+                "legacy_created_by": None,
+            }
+        written = _apply_legacy_push_local_mappings(
+            path=path,
+            install_id=install_id,
+            expected=expected,
+            legacy_created_by=created_by,
+            legacy_hosts=extra_hosts,
+        )
+    else:
+        written = 0
+    return PushLocalMigrationResult(
+        classes=classes,
+        server_ids=server_ids,
+        applied=apply,
+        mappings_written=written,
+    )
+
+
 def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     """Upload existing local source rows without deleting or rewriting them.
 
@@ -5449,11 +5793,11 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     reps follow the ``reps`` opt-in (task #697); a scope with rows requires its
     own resolved handoffkeep backend.
 
-    Each rep's origin hashes a durable random install id, local rowid and
-    canonical content inside [2^62, 2^63). Hostname changes keep the key;
-    fresh databases and reused rowids with changed content get new keys.
-    The migrate GET pre-check refuses held origins before any rep PUT,
-    protecting clients that still meet the old overwriting server.
+    Confirmed pre-PR-175 rows are skipped through the local legacy identity
+    map. Unresolved old identities block the entire push. Every other rep's
+    origin still hashes a durable random install id, local rowid and canonical
+    content inside [2^62, 2^63); the migrate GET pre-check refuses held origins
+    before any rep PUT, protecting clients that still meet the old server.
     """
 
     catalog_backend = bench_backend(use="catalog")
@@ -5461,9 +5805,7 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
     scores = _read_local_scores(path=path)
     reps = _read_local_reps_for_push(path=path)
     install_id = _rep_install_id(path) if reps else ""
-    remote_reps = [
-        _RemoteRep(record=record, origin_id=_push_local_origin_id(install_id, record)) for record in reps
-    ]
+    remote_reps: list[_RemoteRep] = []
 
     if scores and catalog_backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchBackendError(
@@ -5471,24 +5813,83 @@ def push_local(*, path: pathlib.Path | str | None = None) -> tuple[int, int]:
             f"(resolved {catalog_backend.name}/{catalog_backend.reason}; needs https, or "
             "[bench] allow_plaintext_catalog = true on a private tunnel)"
         )
-    if remote_reps and reps_backend.name != BENCH_BACKEND_HANDOFFKEEP:
+    if reps and reps_backend.name != BENCH_BACKEND_HANDOFFKEEP:
         raise BenchBackendError(
             "bench push-local: reps require the handoffkeep backend "
             f"(resolved {reps_backend.name}/{reps_backend.reason}; needs https, or "
             "[bench] allow_plaintext_reps = true on a private tunnel)"
         )
-    # The plaintext opt-in is otherwise enforced lazily inside the request
-    # layer — but the reps write now precedes its fetch, so a disallowed reps
-    # endpoint must be refused up front or the scores PUT would leak through
-    # before the check fires.
+    # Check both write scopes before any classification fetch or PUT. In
+    # particular, a disallowed reps endpoint must not be discovered after a
+    # scores PUT has already succeeded.
     if scores:
         _check_handoffkeep_scheme(
             catalog_backend.url, allow_plaintext=catalog_backend.allow_plaintext_url, use="catalog"
         )
-    if remote_reps:
+    if reps:
         _check_handoffkeep_scheme(
             reps_backend.url, allow_plaintext=reps_backend.allow_plaintext_url, use="reps"
         )
+
+    if reps:
+        legacy_created_by, legacy_hosts, mappings = _legacy_state(path=path, install_id=install_id)
+        if legacy_created_by is None or legacy_hosts is None:
+            raise BenchBackendError(
+                "bench push-local: legacy migration missing "
+                f"(local={len(reps)}, unresolved={len(reps)}); "
+                "run scopefuel bench push-local-migrate --legacy-created-by NAME --apply"
+            )
+        current_by_id = {record.id: record for record in reps}
+        for rowid, mapping in mappings.items():
+            record = current_by_id.get(rowid)
+            if record is None:
+                continue
+            if mapping["install_id"] != install_id:
+                raise BenchBackendError(
+                    f"bench push-local: legacy mapping belongs to another install (rowid={rowid})"
+                )
+            if mapping["content_key"] != _legacy_rep_content_json(record):
+                raise BenchBackendError(
+                    f"bench push-local: mapped local rep changed (rowid={rowid}); refusing to push reps"
+                )
+        server_before = _fetch_reps_for_migrate(reps_backend, {record.profile for record in reps})
+        hosts = list(dict.fromkeys([socket.gethostname() or "local", *legacy_hosts]))
+        classes, _, _ = _classify_legacy_push_local(
+            reps,
+            server_before,
+            hosts=hosts,
+            legacy_created_by=legacy_created_by,
+        )
+        class_by_id = {record.id: class_name for class_name, records in classes.items() for record in records}
+        confirmed_unmapped = 0
+        conflicts = 0
+        ambiguous = 0
+        for record in reps:
+            mapping = mappings.get(record.id)
+            if mapping is not None and mapping["decision"] == "confirmed":
+                # The server_id is durable evidence that this exact local row
+                # already became srv:N. Never re-PUT it under another creator.
+                continue
+            class_name = class_by_id[record.id]
+            if mapping is None and class_name == "confirmed":
+                confirmed_unmapped += 1
+                continue
+            if mapping is None and class_name == "conflict":
+                conflicts += 1
+                continue
+            if mapping is None and class_name == "ambiguous":
+                ambiguous += 1
+                continue
+            # An explicit accept-new mapping records the operator's decision;
+            # it deliberately continues through the normal PR 175 origin path.
+            remote_reps.append(_RemoteRep(record=record, origin_id=_push_local_origin_id(install_id, record)))
+        if confirmed_unmapped or conflicts or ambiguous:
+            raise BenchBackendError(
+                "bench push-local: legacy identity unresolved "
+                f"(confirmed-unmapped={confirmed_unmapped}, conflict={conflicts}, ambiguous={ambiguous}); "
+                "run scopefuel bench push-local-migrate --apply, then resolve conflict/ambiguous "
+                "rows with --accept-new ROWID"
+            )
 
     # Fetch scores before the first PUT so a failed refresh or write leaves
     # all local cache tables and their timestamps untouched. Reps are read
