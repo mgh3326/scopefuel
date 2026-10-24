@@ -287,6 +287,39 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
 
     bench_sub.add_parser("coverage", help="프로필별 출처(AA-agent/AA-model/openrouter) 커버리지")
     bench_sub.add_parser("push-local", help="기존 로컬 bench 행을 handoffkeep으로 1회 이관")
+    legacy_migrate = bench_sub.add_parser(
+        "push-local-migrate",
+        help="Confirm legacy push-local identities without server writes",
+        description=(
+            "Dry run by default: classify local reps as confirmed, never-pushed, conflict, or ambiguous. "
+            "Sends nothing to the server; --apply records local decisions only. "
+            "push-local refuses until migration runs and conflict and ambiguous rows are resolved. "
+            "Pass the pre-hk-1398 shared creator id and every former hostname of this host."
+        ),
+    )
+    legacy_migrate.add_argument(
+        "--legacy-created-by",
+        action="append",
+        required=True,
+        metavar="NAME",
+        help="Legacy shared creator id (repeatable; required, no default)",
+    )
+    legacy_migrate.add_argument(
+        "--legacy-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Former hostname, in addition to the current host (repeatable)",
+    )
+    legacy_migrate.add_argument("--apply", action="store_true", help="Record decisions locally; no PUT")
+    legacy_migrate.add_argument(
+        "--accept-new",
+        action="append",
+        default=[],
+        type=int,
+        metavar="ROWID",
+        help="Explicitly accept a conflict/ambiguous row as new (repeatable; needs --apply)",
+    )
 
     grades_parser = bench_sub.add_parser("grades", help="서버 정본 급 배치 관리")
     grades_sub = grades_parser.add_subparsers(dest="grades_command", required=True)
@@ -1778,6 +1811,29 @@ def _bench_command(args: argparse.Namespace) -> int:
         return 0
     if args.bench_command == "coverage":
         print(bench.coverage_report())
+        return 0
+    if args.bench_command == "push-local-migrate":
+        try:
+            result = bench.migrate_push_local(
+                apply=args.apply,
+                legacy_created_by=args.legacy_created_by,
+                legacy_hosts=args.legacy_host,
+                accept_new=args.accept_new,
+            )
+        except bench.BenchError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for name, rows in (
+            ("confirmed", result.confirmed),
+            ("never-pushed", result.never_pushed),
+            ("conflict", result.conflict),
+            ("ambiguous", result.ambiguous),
+        ):
+            print(f"{name}={len(rows)}")
+        for name, rows in (("conflict", result.conflict), ("ambiguous", result.ambiguous)):
+            for row in rows:
+                ids = ",".join(f"srv:{server.server_id}" for server in row.servers)
+                print(f"{name} rowid={row.record.id} profile={row.record.profile} servers={ids}")
         return 0
     if args.bench_command == "push-local":
         try:

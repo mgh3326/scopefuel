@@ -578,6 +578,7 @@ def test_push_local_uses_stable_banded_ids_and_is_idempotent(tmp_path, monkeypat
     capsys.readouterr()
 
     fake = _remote(monkeypatch, home)
+    bench.migrate_push_local(apply=True, legacy_created_by=["legacy-shared"])
     scores, reps = bench.push_local()
     assert (scores, reps) == (0, 1)
     assert len(fake.reps) == 1
@@ -696,6 +697,8 @@ def test_409_error_chain_has_no_self_reference(tmp_path, monkeypatch):
     _client_env(pl, monkeypatch, backend="local")
     bench.add_rep(**_local_rep("push-1"))
     fake = _remote(monkeypatch, pl)
+    monkeypatch.setattr(bench, "_fetch_reps", real_fetch_reps)
+    bench.migrate_push_local(apply=True, legacy_created_by=["legacy-shared"])
     record = bench._read_local_reps_for_push()[0]
     origin = bench._push_local_origin_id(bench._rep_install_id(None), record)
     # The pre-check is clear; a concurrent writer occupies the slot just

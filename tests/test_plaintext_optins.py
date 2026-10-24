@@ -419,6 +419,7 @@ def test_push_local_routes_each_scope_to_its_own_opt_in(hk_plaintext):
         '[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\nallow_plaintext_reps = true\n',
         encoding="utf-8",
     )
+    bench.migrate_push_local(apply=True, legacy_created_by=["legacy-shared"])
     assert bench.push_local() == (1, 1)
     assert fake.hits[("PUT", "scores")] == 1
     assert fake.hits[("PUT", "reps")] == 1
