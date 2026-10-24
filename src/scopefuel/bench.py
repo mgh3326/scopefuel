@@ -2969,7 +2969,7 @@ def _catalog_from_payload(payload: dict) -> list[CatalogEntry]:
 
 
 def _fetch_catalog(backend: BenchBackend) -> list[CatalogEntry]:
-    return _catalog_from_payload(_handoffkeep_request(backend, "catalog"))
+    return _catalog_from_payload(_handoffkeep_request(backend, "catalog", query={"include_retired": 1}))
 
 
 def _catalog_entry_exact(value: object) -> CatalogEntry:
@@ -3021,7 +3021,7 @@ def _fetch_catalog_exact(backend: BenchBackend) -> list[CatalogEntry]:
     the same (profile, effort) keys the server will compare, not stripped
     aliases. Everywhere else keeps the normal _text normalization.
     """
-    payload = _handoffkeep_request(backend, "catalog")
+    payload = _handoffkeep_request(backend, "catalog", query={"include_retired": 1})
     rows = payload.get("catalog")
     if not isinstance(rows, list):
         raise BenchBackendError("handoffkeep returned invalid catalog data")
