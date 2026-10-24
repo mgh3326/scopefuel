@@ -99,6 +99,7 @@ def test_push_local_migrate_help_explains_contract(capsys):
 
 
 def test_fresh_install_requires_one_migration_then_pushes_never_pushed_rows(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(socket, "gethostname", lambda: "current-host")
     _local_rows(tmp_path, monkeypatch, count=2)
     fake = _remote(monkeypatch, tmp_path)
     puts = fake.hits["PUT"]
@@ -113,7 +114,7 @@ def test_fresh_install_requires_one_migration_then_pushes_never_pushed_rows(tmp_
     run = _migration_run()
     assert run is not None
     assert json.loads(run["legacy_created_by_json"]) == [LEGACY_CREATED_BY]
-    assert json.loads(run["legacy_host_json"]) == []
+    assert json.loads(run["legacy_host_json"]) == ["current-host"]
 
     assert cli.main(["bench", "push-local"]) == 0
     assert fake.hits["PUT"] == puts + 1
@@ -317,6 +318,28 @@ def test_conflict_blocks_push_until_explicit_accept_new(tmp_path, monkeypatch, c
     assert fake.hits["PUT"] == puts + 1
     assert fake.reps[0] == original_server_rows[0]
     assert len(fake.reps) == 2 and fake.reps[1]["created_by"] == "ops"
+
+
+@pytest.mark.parametrize("mode", ["old", "new"])
+def test_unresolved_conflict_stays_conflict_after_hostname_change(tmp_path, monkeypatch, capsys, mode):
+    monkeypatch.setattr(socket, "gethostname", lambda: "migration-host")
+    records = _local_rows(tmp_path, monkeypatch)
+    fake = _remote(monkeypatch, tmp_path, mode)
+    _seed_legacy(fake, records, host="migration-host")
+    fake.reps[0]["notes"] = "edited after the legacy push"
+
+    assert cli.main(_migrate_args(apply=True)) == 0
+    assert "conflict: 1" in capsys.readouterr().out
+    assert json.loads(_migration_run()["legacy_host_json"]) == ["migration-host"]
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "renamed-host")
+    original_server_rows = copy.deepcopy(fake.reps)
+    puts = fake.hits["PUT"]
+    assert cli.main(["bench", "push-local"]) == 2
+    error = capsys.readouterr().err
+    assert "conflict=1" in error
+    assert fake.hits["PUT"] == puts
+    assert fake.reps == original_server_rows
 
 
 def test_two_candidate_hosts_confirming_same_row_are_ambiguous(tmp_path, monkeypatch, capsys):

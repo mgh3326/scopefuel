@@ -5530,13 +5530,13 @@ def _classify_legacy_push_local(
     findings: dict[int, tuple[int, ...]] = {}
     confirmed: dict[int, _RemoteRep] = {}
     allowed_creators = set(legacy_created_by)
+    by_origin: dict[int, list[_RemoteRep]] = {}
+    for item in server_reps:
+        if item.created_by in allowed_creators:
+            by_origin.setdefault(item.origin_id, []).append(item)
     for record in local_reps:
         candidate_origins = {_legacy_push_local_origin_id(host, record) for host in hosts}
-        holders = [
-            item
-            for item in server_reps
-            if item.origin_id in candidate_origins and item.created_by in allowed_creators
-        ]
+        holders = [item for origin in candidate_origins for item in by_origin.get(origin, ())]
         matches = [item for item in holders if _same_rep_row(record, item.record)]
         differing = [item for item in holders if not _same_rep_row(record, item.record)]
         if len(matches) > 1:
@@ -5774,7 +5774,7 @@ def migrate_push_local(
             install_id=install_id,
             expected=expected,
             legacy_created_by=created_by,
-            legacy_hosts=extra_hosts,
+            legacy_hosts=hosts,
         )
     else:
         written = 0
