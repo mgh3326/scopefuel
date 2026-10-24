@@ -108,7 +108,8 @@ def test_a_second_probe_is_skipped_while_one_is_running(tmp_path, monkeypatch):
         entered.append(True)
         raise AssertionError("the second probe must not start a grok")
 
-    with proctrack.single_probe_lock(workdir) as acquired:
+    # hk 1868: the per-pool probe lock lives in the cache dir, not the workdir.
+    with proctrack.single_probe_lock(grok._probe_lock_dir()) as acquired:
         assert acquired is True
         monkeypatch.setattr(grok, "_probe_once", _never_called)
         result = grok.fetch()
@@ -287,7 +288,9 @@ def test_per_pool_lock_is_released_when_the_probe_process_is_killed(tmp_path):
     then is SIGKILLed; the lock must be acquirable immediately after.
     """
 
-    workdir = tmp_path / "grok-probe-workdir"
+    # hk 1868: grok's per-pool probe lock lives under the cache dir — hold the
+    # same file the provider's fetch() contends on.
+    workdir = grok._probe_lock_dir()
     ready = tmp_path / "lock-held"
     helper = tmp_path / "lock_holder.py"
     helper.write_text(
