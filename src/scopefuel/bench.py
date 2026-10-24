@@ -5715,7 +5715,15 @@ def migrate_push_local(
         raise BenchError("bench push-local-migrate: --accept-new must be a positive rowid")
 
     local_reps = _read_local_reps_for_push(path=path)
-    hosts = list(dict.fromkeys([socket.gethostname() or "local", *extra_hosts]))
+    hosts = sorted({socket.gethostname() or "local", *extra_hosts})
+    install_id = _rep_install_id(path) if apply else ""
+    if apply:
+        previous_created_by, previous_hosts, _ = _legacy_state(path=path, install_id=install_id)
+        if previous_created_by is not None:
+            created_by = sorted(set(created_by) | set(previous_created_by))
+        if previous_hosts is not None:
+            hosts = sorted(set(hosts) | set(previous_hosts))
+
     if local_reps:
         backend = bench_backend(use="reps")
         if backend.name != BENCH_BACKEND_HANDOFFKEEP:
@@ -5734,7 +5742,6 @@ def migrate_push_local(
         hosts=hosts,
         legacy_created_by=created_by,
     )
-    install_id = _rep_install_id(path) if apply else ""
     expected: dict[int, dict[str, object]] = {}
     if apply:
         for record in classes["confirmed"]:

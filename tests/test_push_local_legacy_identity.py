@@ -403,6 +403,42 @@ def test_apply_is_idempotent_and_refuses_a_changed_mapping(tmp_path, monkeypatch
     assert _migration_rows() == before_mappings
 
 
+def test_reapply_unions_legacy_inputs_and_preserves_classification(tmp_path, monkeypatch, capsys):
+    """Re-applying with fewer flags must not drop previously accepted identities."""
+    monkeypatch.setattr(socket, "gethostname", lambda: "current-host")
+    records = _local_rows(tmp_path, monkeypatch)
+    fake = _remote(monkeypatch, tmp_path)
+    _seed_legacy(fake, records, host="host-B", created_by="legacy-second")
+    fake.reps[0]["notes"] = "edited after the legacy push"
+
+    assert (
+        cli.main(
+            _migrate_args(
+                apply=True,
+                hosts=("host-A", "host-B"),
+                created_by=(LEGACY_CREATED_BY, "legacy-second"),
+            )
+        )
+        == 0
+    )
+    assert "conflict: 1" in capsys.readouterr().out
+    before_run = _migration_run()
+    assert json.loads(before_run["legacy_host_json"]) == ["current-host", "host-A", "host-B"]
+    assert json.loads(before_run["legacy_created_by_json"]) == ["legacy-second", LEGACY_CREATED_BY]
+
+    assert cli.main(_migrate_args(apply=True, hosts=("host-A",), created_by=LEGACY_CREATED_BY)) == 0
+    assert "conflict: 1" in capsys.readouterr().out
+    after_run = _migration_run()
+    assert after_run == before_run
+    assert json.loads(after_run["legacy_host_json"]) == ["current-host", "host-A", "host-B"]
+    assert json.loads(after_run["legacy_created_by_json"]) == ["legacy-second", LEGACY_CREATED_BY]
+
+    puts = fake.hits["PUT"]
+    assert cli.main(["bench", "push-local"]) == 2
+    assert "conflict=1" in capsys.readouterr().err
+    assert fake.hits["PUT"] == puts
+
+
 def test_mapped_row_changed_locally_refuses_before_any_put(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(socket, "gethostname", lambda: "former-host")
     records = _local_rows(tmp_path, monkeypatch)
