@@ -247,8 +247,9 @@ def test_recommend_pool_flag_removes_profiles_and_folds():
     assert "kiro-sol" not in names
     assert "kiro-opus" not in names
     assert "codex-sol" in names  # sibling pools unaffected
-    assert "kiro 풀 구독 해지" in out
-    assert "구독 해지" in out
+    # hk 1862: unsubscribed entries fold on the single ✗ 제외 line
+    assert "kiro-sol@default — unsubscribed" in out
+    assert "pools.kimi" not in out and "[pools.kiro] subscribed=false" in out
 
 
 def test_recommend_profile_flag_marks_fold_with_profile_name():
@@ -257,7 +258,8 @@ def test_recommend_profile_flag_marks_fold_with_profile_name():
     names = _candidate_names(out)
     assert "kiro-sol" not in names
     assert "kiro-opus" in names  # only the flagged profile dropped
-    assert "프로필 kiro-sol 구독 해지" in out
+    assert "kiro-sol@default — unsubscribed" in out
+    assert "[profiles.kiro-sol] subscribed=false" in out
 
 
 def test_recommend_pool_flag_never_emergency_candidate():
@@ -311,7 +313,7 @@ def test_recommend_unsubscribed_escalation_row_absent():
     out = recommend.recommend(providers, "C", today=TODAY, now=NOW, grade_table=table)
     assert "oc-omni" not in _candidate_names(out)
     assert "승급 후보" not in out  # the section never lists it
-    assert "omniroute 풀 구독 해지" in out
+    assert "oc-omni@default — unsubscribed" in out and "pools.omniroute" in out
 
 
 def test_gate_alternatives_never_suggest_unsubscribed():

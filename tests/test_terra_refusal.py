@@ -46,9 +46,13 @@ def test_bundled_table_never_emits_a_terra_candidate_exclusion_or_one_up_row():
         payload = recommend_dict([], grade, today=NOW.date(), now=NOW)
         rows = _all_recommendation_rows(payload)
         assert not any(row["profile"] in TERRA_NAMES for row in rows), (grade, rows)
+        # hk 1862: barred terra rows appear only on the folded excluded line
+        terra_excluded = [e for e in payload["excluded"] if e["profile"] in TERRA_NAMES]
+        assert all("barred" in e["reason"] for e in terra_excluded), (grade, payload["excluded"])
         rendered = recommend([], grade, today=NOW.date(), now=NOW)
-        assert "gpt-5.6-terra" not in rendered
-        assert not any(name in rendered for name in TERRA_NAMES)
+        assert not any(
+            name in line for name in TERRA_NAMES for line in rendered.splitlines() if line[:1].isdigit()
+        )
 
 
 def test_served_canon_promote_row_is_filtered_after_merge_for_exact_and_one_up_views():

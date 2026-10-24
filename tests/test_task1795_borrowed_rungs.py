@@ -116,10 +116,11 @@ def _seed_rows_with(profile: str, effort: str, **patch):
 # ── constant shape ────────────────────────────────────────────────────────────
 
 
-def test_borrowed_rungs_is_exactly_the_two_directive_entries():
+def test_borrowed_rungs_is_exactly_the_directive_entries():
     assert BORROWED_RUNGS == (
-        ("opus", "low", "A+", "operator d1786ap hk:task/1786"),
-        ("codex-sol", "xhigh", "S", "operator d1786ap hk:task/1786"),
+        ("opus", "low", "A+", "default", "operator d1786ap hk:task/1786"),
+        ("codex-sol", "xhigh", "S", "default", "operator hk:task/1786 comment 6689"),
+        ("sonnet", "high", "B", "default", "operator hk:task/1786 comment 6689"),
     )
 
 
@@ -127,7 +128,13 @@ def test_borrowed_entries_list_at_their_named_grade_only():
     for grade in GRADES:
         listed = {(p.name, p.launcher_effort) for p, _ in _borrowed_profiles(grade, GRADE_TABLE)}
         expected = (
-            {("opus", "low")} if grade == "A+" else ({("codex-sol", "xhigh")} if grade == "S" else set())
+            {("opus", "low")}
+            if grade == "A+"
+            else (
+                {("codex-sol", "xhigh")}
+                if grade == "S"
+                else ({("sonnet", "high")} if grade == "B" else set())
+            )
         )
         assert listed == expected, grade
 
@@ -142,17 +149,13 @@ def test_recommend_aplus_lists_opus_low_tagged_borrowed_s():
     assert "[one-up" not in lines[0]
 
 
-def test_recommend_s_lists_codex_sol_xhigh_tagged_borrowed_splus_escalation():
+def test_recommend_s_lists_codex_sol_xhigh_tagged_borrowed_splus_candidate():
     out = recommend(_pool_providers(), "S", today=TODAY, now=NOW)
-    # The row keeps its own gate — it lists in the escalation section, not ranked.
-    assert not any("codex-sol" in line for line in _ranked(out)), out
-    assert "승급 후보" in out
-    section = out.split("승급 후보", 1)[1]
-    assert "codex-sol --effort xhigh" in section
-    entry_line = next(line for line in section.splitlines() if "codex-sol --effort xhigh" in line)
-    assert "[borrowed S+]" in entry_line
-    # the escalation gate reason still rides the entry
-    assert recommend_mod.CODEX_SOL_XHIGH_ESCALATION_REASON in section
+    # hk 1862 (comment 6689): the entry's listed gate is default — at S it
+    # ranks as a normal candidate, tagged borrowed. Its own S+ row keeps
+    # gate=escalation.
+    lines = [line for line in _ranked(out) if "codex-sol --effort xhigh" in line]
+    assert len(lines) == 1 and "[borrowed S+]" in lines[0], out
 
 
 def test_recommend_dict_marks_borrowed_rows():
@@ -165,7 +168,7 @@ def test_recommend_dict_marks_borrowed_rows():
 
     s = recommend_dict(_pool_providers(), "S", today=TODAY, now=NOW)
     sol = next(row for row in s["rows"] if row["profile"] == "codex-sol" and "xhigh" in str(row["display"]))
-    assert sol["kind"] == "escalation"
+    assert sol["kind"] == "candidate"
     assert sol["borrowed"] is True
     assert sol["placed_grade"] == "S+"
     assert sol["one_up"] is False
@@ -182,7 +185,6 @@ def test_canon_fixture_lists_both_borrowed_rows():
     assert len(lines) == 1 and "[borrowed S]" in lines[0], out
 
     out = recommend(providers, "S", today=TODAY, now=NOW, grade_table=table)
-    assert "승급 후보" in out
     entry_line = next(line for line in out.splitlines() if "codex-sol --effort xhigh" in line)
     assert "[borrowed S+]" in entry_line
 
@@ -194,8 +196,8 @@ def test_canon_fixture_json_marks_borrowed_rows():
     opus = next(row for row in aplus["rows"] if row.get("borrowed") is True)
     assert opus["profile"] == "opus" and opus["placed_grade"] == "S" and opus["kind"] == "candidate"
     s = recommend_dict(providers, "S", today=TODAY, now=NOW, grade_table=table)
-    sol = next(row for row in s["rows"] if row.get("borrowed") is True)
-    assert sol["profile"] == "codex-sol" and sol["placed_grade"] == "S+" and sol["kind"] == "escalation"
+    sol = next(row for row in s["rows"] if row.get("borrowed") is True and row["profile"] == "codex-sol")
+    assert sol["placed_grade"] == "S+" and sol["kind"] == "candidate"
 
 
 def test_recommend_json_cli_marks_borrowed(monkeypatch, capsys):
@@ -295,14 +297,23 @@ def test_everything_else_is_byte_identical_text_and_json(fixture, monkeypatch):
     for grade in GRADES:
         text_with, json_with = with_rows[grade]
         text_base, json_base = base_rows[grade]
-        if grade not in ("A+", "S"):
+        if grade not in ("A+", "S", "B"):
             assert text_with == text_base, grade
             assert json_with == json_base, grade
             continue
-        # JSON: removing the borrowed rows reproduces the base rows exactly.
+        # JSON: the borrowed listing is the only added row — at B the same
+        # rung flips one_up -> borrowed (dedupe), so the row sets match once
+        # that rung is set aside either way.
         borrowed_rows = [row for row in json_with if row.get("borrowed") is True]
         assert len(borrowed_rows) == 1, (grade, json_with)
-        assert [row for row in json_with if row.get("borrowed") is not True] == json_base, grade
+        rung = (borrowed_rows[0]["profile"], borrowed_rows[0]["display"])
+
+        def key(r):
+            return (r["profile"], r["display"], r["kind"])
+
+        without = [key(r) for r in json_with if (r["profile"], r["display"]) != rung]
+        base = [key(r) for r in json_base if (r["profile"], r["display"]) != rung]
+        assert sorted(without) == sorted(base), grade
 
         # Text: every row is byte-identical up to the rank renumbering an
         # inserted row causes — stripping the "N." prefix leaves the borrowed
@@ -314,10 +325,12 @@ def test_everything_else_is_byte_identical_text_and_json(fixture, monkeypatch):
         assert added, grade
         if grade == "A+":
             assert len(added) == 1 and "opus --effort low" in added[0] and "[borrowed S]" in added[0]
+        elif grade == "B":
+            joined = "\n".join(added)
+            assert "sonnet --effort high" in joined and "[borrowed A]" in joined
         else:
             joined = "\n".join(added)
             assert "codex-sol --effort xhigh" in joined and "[borrowed S+]" in joined
-            assert "승급 후보" in joined
 
 
 # ── ordering: borrowed sorts like one-up ─────────────────────────────────────
