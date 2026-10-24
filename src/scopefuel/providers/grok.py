@@ -184,8 +184,24 @@ def _bounded_env(name: str, default: float, lo: float, hi: float) -> float:
     return value if lo <= value <= hi else default
 
 
+# hk 1868 r3 — refresh 워커는 SIGALRM 을 _timeout_seconds()(기본 60s)로 무장하고,
+# 그게 울리면 워커가 stage 를 보고하기 전에 잘린다. 실효 프로브 타임아웃은
+# 무장된 바깥 타이머의 남은 시간에서 teardown 마진을 뺀 값으로 눌러 쓴다 —
+# 마진은 TERM 유예+KILL wait+pgid poll(~6s)과 backoff 기록을 덮는다.
+# 타이머 없는 호출자(status·herdr-event)는 getitimer 가 0 을 돌려 무보정.
+OUTER_TIMER_MARGIN_S = 10.0
+
+
+def _outer_timer_budget_s() -> float:
+    """Remaining budget of the caller's armed ITIMER_REAL, or inf when none."""
+
+    delay, _interval = signal.getitimer(signal.ITIMER_REAL)
+    return delay - OUTER_TIMER_MARGIN_S if delay > 0 else float("inf")
+
+
 def _probe_timeout_s() -> float:
-    return _bounded_env("SCOPEFUEL_GROK_TIMEOUT_S", TIMEOUT_S, TIMEOUT_MIN_S, TIMEOUT_MAX_S)
+    configured = _bounded_env("SCOPEFUEL_GROK_TIMEOUT_S", TIMEOUT_S, TIMEOUT_MIN_S, TIMEOUT_MAX_S)
+    return max(min(configured, _outer_timer_budget_s()), 0.0)
 
 
 def _backoff_base_s() -> float:
@@ -316,6 +332,10 @@ def _probe_once() -> str:
     reaper: subprocess.Popen[bytes] | None = None
     child_pgid: int | None = None
     try:
+        if timeout_s <= 0:
+            # 바깥 타이머가 teardown 마진조차 남기지 않았다 — 띄워도 SIGALRM 이
+            # 먼저 울려 stage 가 못 나가니, 스폰 자체를 건너뛰고 즉시 보고한다.
+            raise ProbeTimeout([BINARY], timeout_s, stage=STAGE_NO_OUTPUT, nbytes=0)
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         process = subprocess.Popen(  # noqa: S603 - fixed command; binary is explicit/env-configured

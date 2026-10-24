@@ -290,6 +290,76 @@ def test_probe_timeout_env_is_bounded(monkeypatch, raw, expected):
     assert grok._probe_timeout_s() == expected
 
 
+def test_probe_timeout_clamps_below_the_callers_armed_timer(monkeypatch):
+    """A raised probe timeout must not outlive the refresh worker's SIGALRM.
+
+    refresh.run_worker arms ITIMER_REAL at _timeout_seconds() (default 60 s):
+    a probe timeout above that envelope is cut off before the stage report
+    lands. The effective timeout is clamped below the *remaining* armed
+    budget by the teardown margin; callers with no armed timer keep the
+    full configured value.
+    """
+    monkeypatch.setenv("SCOPEFUEL_GROK_TIMEOUT_S", "120")
+    assert grok._probe_timeout_s() == 120.0  # no timer armed — full budget
+
+    signal.setitimer(signal.ITIMER_REAL, 60.0)  # refresh worker's default
+    try:
+        clamped = grok._probe_timeout_s()
+        assert clamped <= 60.0 - grok.OUTER_TIMER_MARGIN_S
+        assert clamped > 40.0  # the margin eats ~10 s, not the whole budget
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+    # An envelope smaller than the margin leaves no usable budget at all.
+    signal.setitimer(signal.ITIMER_REAL, 5.0)
+    try:
+        assert grok._probe_timeout_s() == 0.0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def test_fetch_reports_stage_inside_an_armed_outer_envelope(tmp_path, monkeypatch):
+    """Under a refresh-like ITIMER_REAL the probe still lands its stage."""
+    stub = _write_stub(tmp_path, "fake-grok-silent-env", "trap '' HUP\nexec sleep 120\n")
+    workdir = _install(monkeypatch, tmp_path, stub)
+    monkeypatch.setenv("SCOPEFUEL_GROK_TIMEOUT_S", "120")
+    # 12 s armed envelope: without the clamp the probe would run to 120 s and
+    # the SIGALRM would kill this process before any stage is reported; with
+    # it the probe times out at ~2 s and reports — the test relies on that.
+    signal.setitimer(signal.ITIMER_REAL, 12.0)
+    try:
+        started = time.monotonic()
+        result = grok.fetch()
+        elapsed = time.monotonic() - started
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    _assert_stage(result, "no-output")
+    assert elapsed < 11.0, "the probe outlived its clamped share of the envelope"
+    entry = _backoff_entry()
+    assert entry.get("consecutive") == 1  # the staged timeout still records backoff
+    _assert_no_probe_left(workdir)
+
+
+def test_fetch_with_no_outer_budget_reports_no_output_without_spawning(tmp_path, monkeypatch):
+    """An envelope smaller than the margin must not even spawn the stub."""
+    pidfile = tmp_path / "stub-pids"
+    stub = _write_stub(
+        tmp_path,
+        "fake-grok-no-budget",
+        f"echo $$ >> {shlex.quote(str(pidfile))}\nexec sleep 120\n",
+    )
+    workdir = _install(monkeypatch, tmp_path, stub)
+    monkeypatch.setenv("SCOPEFUEL_GROK_TIMEOUT_S", "120")
+    signal.setitimer(signal.ITIMER_REAL, 5.0)  # < margin → zero probe budget
+    try:
+        result = grok.fetch()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    _assert_stage(result, "no-output")
+    assert not pidfile.exists(), "a zero-budget probe still spawned the stub"
+    _assert_no_probe_left(workdir)
+
+
 # ------------------------------------------------------- per-pool lock
 
 
