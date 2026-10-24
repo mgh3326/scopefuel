@@ -577,7 +577,7 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     grades_areas.add_argument(
         "--pa-reviews",
         metavar="FILE",
-        help="K3 pa-review-scan 의 TSV 또는 JSON 출력 — 셀에 accepted % 추가",
+        help="K3 pa-review-scan 의 TSV 또는 JSON 출력 — 셀에 accepted 비율 추가",
     )
     grades_areas.add_argument("--json", action="store_true", help="area 표 JSON 출력")
     grades_areas.add_argument(
