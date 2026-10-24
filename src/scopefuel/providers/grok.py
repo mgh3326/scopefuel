@@ -67,7 +67,6 @@ class ProbeTimeout(subprocess.TimeoutExpired):
         self.nbytes = nbytes
 
 
-KST = dt.timezone(dt.timedelta(hours=9), name="Asia/Seoul")
 # A/B 실측: 크기 미설정 PTY에서는 Grok TUI가 usage 패널을 렌더하지 않아 timeout한다.
 PTY_ROWS = 50
 PTY_COLS = 200
@@ -388,20 +387,31 @@ def _probe_once() -> str:
 
             if process.poll() is not None:
                 break
+            # hk 1965: 패널 마지막 청크가 도착한 뒤 CLI 가 조용해지면 readable
+            # 분기가 더는 돌지 않는다 — settle 을 여기서도 재검사해야 한다.
+            # 그렇지 않으면 완성된 패널을 들고도 데드라인까지 돌아 unparsed
+            # 타임아웃이 됐다(desktop/pi 측정: 실패분이 정상보다 ~2.4KB 짧음).
+            if usage_seen_at is not None and time.monotonic() - usage_seen_at >= USAGE_SETTLE_S:
+                break
             if sent and usage_seen_at is None and time.monotonic() - last_data >= timeout_s:
                 break
 
         if time.monotonic() >= deadline:
-            # The finally below kills the whole registered process group
-            # (SIGTERM, then SIGKILL after a short wait) before the exception
-            # leaves — the reaper stays only as the last line of defence for
-            # a SIGKILLed parent.
-            raise ProbeTimeout(
-                [BINARY],
-                timeout_s,
-                stage=_timeout_stage(output, sent=sent, usage_seen_at=usage_seen_at),
-                nbytes=len(output),
-            )
+            # 데드라인에 닿았어도 패널이 완성돼 있으면 파싱으로 넘긴다 — 로드된
+            # 호스트는 조용한 꼬리가 예산을 넘길 수 있다. unparsed 는 패널
+            # 단서만 있고 미완성인 진짜 파싱 실패에만 남는다.
+            clean = _clean(output.decode("utf-8", errors="replace"))
+            if not (sent and _WEEKLY.search(clean) and _RESET.search(clean)):
+                # The finally below kills the whole registered process group
+                # (SIGTERM, then SIGKILL after a short wait) before the exception
+                # leaves — the reaper stays only as the last line of defence for
+                # a SIGKILLed parent.
+                raise ProbeTimeout(
+                    [BINARY],
+                    timeout_s,
+                    stage=_timeout_stage(output, sent=sent, usage_seen_at=usage_seen_at),
+                    nbytes=len(output),
+                )
         return output.decode("utf-8", errors="replace")
     finally:
         if process is not None and process.poll() is None:
@@ -542,18 +552,28 @@ def parse(text: str, *, now: dt.datetime | None = None) -> ProviderResult:
                 horizon="week",
             )
         ],
-        note="PTY /usage 주간 한도; Next reset은 CLI가 KST로 렌더한 시각",
+        note="PTY /usage 주간 한도; Next reset은 CLI가 호스트 로컬 타임존으로 렌더한 시각",
         source=SOURCE,
     )
 
 
 def _reset_iso(match: re.Match[str], *, now: dt.datetime | None = None) -> str:
-    current = now or dt.datetime.now(KST)
-    current = current.astimezone(KST) if current.tzinfo else current.replace(tzinfo=KST)
+    """Read the panel reset in the probe host's local zone (hk 1965).
+
+    grok renders the reset in the host's TZ — oci (TZ=UTC) shows "October 29,
+    19:58" where a KST host shows "October 30, 04:58" for the same instant.
+    A fixed KST frame put oci's reset 9 hours early. The naive candidate is
+    converted with astimezone(), which takes the local zone at that date, so
+    DST hosts still land on the right instant.
+    """
+    if now is None:
+        current = dt.datetime.now()
+    elif now.tzinfo is None:
+        current = now
+    else:
+        current = now.astimezone().replace(tzinfo=None)
     month = dt.datetime.strptime(match["month"], "%B").month
-    candidate = dt.datetime(
-        current.year, month, int(match["day"]), int(match["hour"]), int(match["minute"]), tzinfo=KST
-    )
+    candidate = dt.datetime(current.year, month, int(match["day"]), int(match["hour"]), int(match["minute"]))
     if candidate <= current:
         candidate = candidate.replace(year=current.year + 1)
     return candidate.astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
