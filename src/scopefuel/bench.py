@@ -6637,16 +6637,30 @@ def compare_reps(
     grade: str,
     profile: str | None = None,
     effort: str | None = None,
+    area: str | None = None,
+    rep_area: Callable[[str | None], str | None] | None = None,
     path: pathlib.Path | str | None = None,
 ) -> list[RepComparison]:
-    """Compare representative runs by profile within one recorded grade."""
+    """Compare representative runs by profile within one recorded grade.
+
+    ``area`` (hk 1943, K4) filters to reps whose task carries that hk area —
+    or the ``unlinked``/``untagged`` pseudo-areas — resolved by ``rep_area``,
+    a callable the caller wires to the handoffkeep task lookup
+    (``areas.TaskAreaLookup.area_for_ref``). Reps whose ref resolves to a
+    different area, to no task, or to an untagged task are excluded, never
+    guessed.
+    """
 
     grade = _rep_choice(grade, "grade", REP_GRADES)
     assert grade is not None
+    if area is not None and rep_area is None:
+        raise BenchError("compare --area requires a task-area lookup")
     rows = read_reps(path=path, grade=grade, profile=profile, effort=effort)
     by_profile: dict[str, list[RepRecord]] = {}
     for row in rows:
         if row.pending_state is not None or rep_ref(row).startswith(("lost:", "origin:")):
+            continue
+        if area is not None and rep_area(row.task_ref) != area:
             continue
         by_profile.setdefault(row.profile, []).append(row)
 

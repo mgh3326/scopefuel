@@ -17,6 +17,7 @@ import time
 from dataclasses import replace
 
 from . import (
+    areas,
     bench,
     free_window,
     grades,
@@ -412,6 +413,16 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     reps_compare.add_argument("--profile", help="프로필 필터")
     reps_compare.add_argument("--effort", choices=bench.REP_EFFORTS, help="effort 필터")
+    reps_compare.add_argument(
+        "--area",
+        help="hk task area 필터 (hk 1943; 서버 /v1/task-areas 어휘 또는 unlinked/untagged — "
+        "handoffkeep backend 필요)",
+    )
+    reps_compare.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
+    )
 
     reps_backfill = reps_sub.add_parser(
         "backfill",
@@ -544,6 +555,35 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         metavar="PROFILE[@EFFORT][,...]",
         help="지명된 rung 변경만 적용 — 나머지 변경은 not applied (operator not approved) "
         "로 출력과 산출물에 보고되며 거부되지 않는다",
+    )
+
+    grades_areas = grades_sub.add_parser(
+        "areas",
+        help="태스크 area 별 rep 표 (hk 1943 K4 — b953 packet §2·§3·§4b, 읽기 전용)",
+    )
+    grades_areas.add_argument(
+        "--band",
+        action="append",
+        choices=sorted(areas.BAND_ORDER),
+        metavar="S|A|B|C",
+        help="이 grade band 의 표만 출력 (기본: 전 band 각각의 표; A 는 A+ 포함, S 는 S+ 포함)",
+    )
+    grades_areas.add_argument(
+        "--current-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="현재 카탈로그 행의 model id 를 가진 rep 만 센다 (기본; --no-current-only 로 해제)",
+    )
+    grades_areas.add_argument(
+        "--pa-reviews",
+        metavar="FILE",
+        help="K3 pa-review-scan 의 TSV 또는 JSON 출력 — 셀에 accepted 비율 추가",
+    )
+    grades_areas.add_argument("--json", action="store_true", help="area 표 JSON 출력")
+    grades_areas.add_argument(
+        "--allow-plaintext-http",
+        action="store_true",
+        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
     )
 
     all_profiles = sorted(
@@ -1982,16 +2022,40 @@ def _reps_command(args: argparse.Namespace) -> int:
             )
         return 0
     if args.reps_command == "compare":
+        rep_area = None
+        if args.area is not None:
+            try:
+                lookup = areas.task_area_lookup(allow_plaintext_http=args.allow_plaintext_http)
+                vocabulary = lookup.vocabulary()
+            except bench.BenchError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            if vocabulary is not None and args.area not in set(vocabulary) | set(areas.PSEUDO_AREAS):
+                print(
+                    f"error: unknown area {args.area!r} — areas: {', '.join(vocabulary)}, "
+                    f"{', '.join(areas.PSEUDO_AREAS)}",
+                    file=sys.stderr,
+                )
+                return 2
+            if vocabulary is None:
+                print(
+                    "warning: server has no /v1/task-areas route — --area matched literally",
+                    file=sys.stderr,
+                )
+            rep_area = lookup.area_for_ref
         try:
             comparisons = bench.compare_reps(
                 grade=args.grade,
                 profile=args.profile,
                 effort=args.effort,
+                area=args.area,
+                rep_area=rep_area,
             )
         except bench.BenchError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        print(f"reps 비교 grade={args.grade}")
+        area_note = f" area={args.area}" if args.area is not None else ""
+        print(f"reps 비교 grade={args.grade}{area_note}")
         if not comparisons:
             print("reps 비교 기록 없음 — 비교할 프로필별 대표 실행이 없습니다")
             return 0
@@ -2149,6 +2213,22 @@ def _grades_command(args: argparse.Namespace) -> int:
         else:
             focus = grades.parse_rung_spec(args.rung) if args.rung else None
             print(grades.render_proposal(proposal, view, focus=focus))
+        return 0
+    if args.grades_command == "areas":
+        try:
+            report = areas.gather_areas(
+                current_only=args.current_only,
+                pa_path=args.pa_reviews,
+                bands=tuple(args.band) if args.band else None,
+                allow_plaintext_http=args.allow_plaintext_http,
+            )
+        except (bench.BenchError, OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(areas.areas_to_json(report), indent=2, ensure_ascii=False))
+        else:
+            print(areas.render_areas(report))
         return 0
     if args.grades_command == "apply":
         if args.allow_degraded is not None and not args.allow_degraded.strip():
