@@ -3230,6 +3230,15 @@ def _cross_grade_measured_alternatives(
 
 
 @dataclass(frozen=True)
+class GatePolicyContext:
+    """CLI-resolved policy keys for an implicit launch; never a grade placement."""
+
+    resolved_effort: str | None = None
+    row_effort: str | None = None
+    fully_retired: bool = False
+
+
+@dataclass(frozen=True)
 class GateResult:
     """``scopefuel gate`` 판정 결과."""
 
@@ -3947,6 +3956,7 @@ def gate_check(
     e6_arm: str | None = None,
     retired_rungs: frozenset[tuple[str, str]] | None = None,
     consult_only_rungs: frozenset[tuple[str, str]] = frozenset(),
+    policy_context: GatePolicyContext | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -3969,6 +3979,10 @@ def gate_check(
     ``retired_rungs``는 캐논이 retire 한 모든 (profile, effort) 키다. 정확한
     실험 REF와 같은 런그 표식이 함께 있을 때만 열린다. ``consult_only_rungs``는
     CLI가 같은 catalog view에서 읽은 운영자 요청 전용 런그 키다.
+
+    ``policy_context``는 effort/marker가 없는 호출의 launch 정책 행이다. 빈 effort
+    projection을 요청한 런그로 오인하지 않도록 CLI가 launch의 기본 선택으로 계산한다.
+    정책 키만 선택하며 기존 grade/explicit-rung/escalation 판정은 바꾸지 않는다.
 
     escalation 프로필은 "같은 grade 정상 대안이 전부 비가용"이라는 자격을 먼저 확인한다.
     자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
@@ -4106,30 +4120,44 @@ def gate_check(
     # 캐논이 그 런그를 그 런그의 carrier 급 밖으로 배치했으면 E6 제한은 없다 —
     # 제한은 "미측정" 동안만 유효하다(측정이 끝난 런그는 평범한 런그다). 비교는
     # 런그 자체의 carrier 에 대해 한다 — sonnet@max 는 A+ 가 carrier 다(#1788).
-    retired = (canonical_profile, rung or "") in (retired_rungs or frozenset())
+    retired_effort = (
+        rung if rung is not None else (policy_context.resolved_effort if policy_context else None)
+    )
+    consult_effort = rung if rung is not None else (policy_context.row_effort if policy_context else None)
+    retired = retired_effort is not None and (canonical_profile, retired_effort) in (
+        retired_rungs or frozenset()
+    )
+    fully_retired = policy_context is not None and policy_context.fully_retired
     experiment_retired = (
-        f"{canonical_profile}@{rung}"
+        f"{canonical_profile}@{retired_effort}"
         if retired
         and operator_request == EXPERIMENT_REQUEST_REF
-        and e6_arm_matches(e6_marker, canonical_profile, rung)  # hk1990-experiment
+        and e6_arm_matches(e6_marker, canonical_profile, retired_effort)  # hk1990-experiment
         else None
     )
-    if retired and experiment_retired is None:
+    if (retired or fully_retired) and experiment_retired is None:
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
-            grade=e6_arm_carrier_grade(canonical_profile, rung)
-            if (canonical_profile, rung) in E6_ARM_KEYS
+            grade=e6_arm_carrier_grade(canonical_profile, retired_effort)
+            if (canonical_profile, retired_effort) in E6_ARM_KEYS
             else None,
-            reason=f"profile '{profile_name}' rung '{rung or ''}' is retired in the catalog",
-            e6_arm=f"{canonical_profile}@{rung}" if (canonical_profile, rung) in E6_ARM_KEYS else None,
+            reason=(
+                f"profile '{profile_name}' rung '{retired_effort}' is retired in the catalog"
+                if retired
+                else f"profile '{profile_name}' is retired in the catalog"
+            ),
+            e6_arm=f"{canonical_profile}@{retired_effort}"
+            if (canonical_profile, retired_effort) in E6_ARM_KEYS
+            else None,
         )
     consult_only = (  # hk1990-consult-only
         profile_name in CONSULT_ONLY_PROFILES
         or (
             canonical_profile not in ASTRA_ROLE_PROFILES
-            and (canonical_profile, rung or "") in consult_only_rungs
+            and consult_effort is not None
+            and (canonical_profile, consult_effort) in consult_only_rungs
         )
         or experiment_retired is not None
     )

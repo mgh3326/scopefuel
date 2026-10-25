@@ -1355,6 +1355,36 @@ def _consult_only_rungs() -> frozenset[tuple[str, str]]:
     )
 
 
+def _gate_policy_context(
+    profile: str, effort: str | None, e6_arm: str | None
+) -> recommend.GatePolicyContext | None:
+    """Use launch's default selection for policy keys, without making it explicit."""
+    try:
+        view = bench.read_catalog()
+    except bench.BenchError:
+        return None
+    looked_up = recommend._swe2_lookup_name(profile)
+    canonical = recommend.PROFILE_ALIASES.get(looked_up, looked_up)
+    entries = [entry for entry in view.entries if entry.profile == canonical]
+    if not entries:
+        return None
+    if all(entry.retired_at for entry in entries):
+        return recommend.GatePolicyContext(fully_retired=True)
+    marker = recommend.parse_e6_arm_marker(e6_arm)
+    if recommend.normalize_effort(effort) is not None or (marker and marker.profile == canonical):
+        return None
+    rows = [
+        entry
+        for entry in launch._live_rows(view, canonical)
+        if entry.gate == launch.GATE_CONSULT_ONLY or not launch._unmeasured_e6_row(entry)
+    ]
+    if not rows:
+        return None
+    fallback, resolved = launch._default_effort(canonical, rows)
+    row_effort = resolved if any(row.effort == resolved for row in rows) else fallback
+    return recommend.GatePolicyContext(resolved_effort=resolved, row_effort=row_effort)
+
+
 def _gate_rung_args(args: argparse.Namespace) -> dict:
     """#692: the rung context — the explicit ``--effort`` plus the E6 marker.
 
@@ -1362,11 +1392,14 @@ def _gate_rung_args(args: argparse.Namespace) -> dict:
     in its contract, is not handed keys it cannot consume.
     """
 
+    effort = getattr(args, "effort", None)
+    marker = _e6_arm_marker()
     return {
-        "effort": getattr(args, "effort", None),
-        "e6_arm": _e6_arm_marker(),
+        "effort": effort,
+        "e6_arm": marker,
         "retired_rungs": _retired_rungs(),
         "consult_only_rungs": _consult_only_rungs(),
+        "policy_context": _gate_policy_context(args.profile, effort, marker),
     }
 
 

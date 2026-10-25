@@ -71,7 +71,9 @@ def catalog_gate(monkeypatch):
         else:
             monkeypatch.setenv(recommend.E6_ARM_MARKER_ENV, marker)
         args = cli.build_parser(["claude", "codex"]).parse_args(
-            ["gate", "-m", profile, "--effort", effort] + (["--operator-request", ref] if ref else [])
+            ["gate", "-m", profile]
+            + (["--effort", effort] if effort is not None else [])
+            + (["--operator-request", ref] if ref else [])
         )
         table = bench._catalog_grade_table(view)
         assert table is not None
@@ -290,6 +292,7 @@ def test_catalog_key_failure_is_empty(monkeypatch):
     monkeypatch.setattr(bench, "read_catalog", unavailable)
     assert cli._retired_rungs() == frozenset()
     assert cli._consult_only_rungs() == frozenset()
+    assert cli._gate_policy_context("haiku", None, None) is None
 
 
 def test_retired_experiment_render_and_unmeasurable(catalog_gate, monkeypatch):
@@ -381,3 +384,132 @@ def test_bare_launch_flag_preserves_following_options():
     )
     assert args.operator_request is True
     assert (args.purpose, args.role, args.effort) == ("architect", "counsel", "xhigh")
+
+
+@pytest.fixture
+def implicit_providers(monkeypatch):
+    from dataclasses import replace
+
+    providers = _providers()
+    providers += [replace(providers[0], id=pool) for pool in ("grok", "devin")]
+    monkeypatch.setattr(sys.modules[__name__], "_providers", lambda used=10: providers)
+
+
+@pytest.mark.parametrize("profile", ["grok-hi", "devin-swe2", "devin-swe2-max"])
+@pytest.mark.parametrize("projection", ["retired", "consult_only"])
+def test_implicit_projection_selects_live_effort(catalog_gate, implicit_providers, profile, projection):
+    from dataclasses import replace
+
+    entries = tuple(
+        replace(e, retired_at="2026-10-24T00:00:00Z")
+        if projection == "retired"
+        else replace(e, gate="consult_only")
+        for e in launch.snapshot_entries()
+        if e.key == (profile, "")
+    )
+    assert len(entries) == 1
+    view = bench.CatalogView(
+        entries=tuple(e for e in launch.snapshot_entries() if e.key != (profile, "")) + entries,
+        source="server",
+        backend="handoffkeep",
+    )
+    gate = catalog_gate(view, profile, None)
+    decision = launch.resolve_launch(profile, view=view)
+    assert gate.ok, gate.reason
+    assert decision.effort
+    assert decision.gate == "default"
+
+
+@pytest.mark.parametrize("catalog_effort", ["", "high"])
+@pytest.mark.parametrize("ref", [None, REF])
+def test_implicit_consult_selection_remains_ref_gated(catalog_gate, catalog_effort, ref):
+    view = _view("haiku", catalog_effort)
+    view = bench.CatalogView(
+        entries=tuple(e for e in view.entries if e.profile != "haiku" or e.effort == catalog_effort),
+        source="server",
+        backend="handoffkeep",
+    )
+    gate = catalog_gate(view, "haiku", None, ref=ref)
+    assert gate.ok == bool(ref), gate.reason
+    if ref:
+        assert launch.resolve_launch("haiku", view=view, operator_request=ref).gate == "consult_only"
+    else:
+        assert "consult_only" in gate.reason
+        with pytest.raises(launch.LaunchError, match="consult_only"):
+            launch.resolve_launch("haiku", view=view)
+
+
+@pytest.mark.parametrize("profile", ["haiku", "grok-hi"])
+@pytest.mark.parametrize("marker,ref", [(None, None), (None, REF), ("unlisted", None), ("unlisted", REF)])
+def test_implicit_fully_retired_profile_stays_closed(catalog_gate, implicit_providers, profile, marker, ref):
+    from dataclasses import replace
+
+    view = bench.CatalogView(
+        entries=tuple(
+            replace(e, retired_at="2026-10-24T00:00:00Z") if e.profile == profile else e
+            for e in launch.snapshot_entries()
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    marker = f"{profile}@{marker}" if marker else None
+    gate = catalog_gate(view, profile, None, marker, ref)
+    assert not gate.ok
+    assert "retired" in gate.reason
+    with pytest.raises(launch.LaunchError, match="retired"):
+        launch.resolve_launch(profile, view=view, e6_arm=marker, operator_request=ref or False)
+
+
+def test_fully_retired_profile_keeps_exact_experiment(catalog_gate):
+    from dataclasses import replace
+
+    view = _view("haiku", "xhigh", retired=True)
+    view = bench.CatalogView(
+        entries=tuple(
+            replace(e, retired_at="2026-10-24T00:00:00Z") if e.profile == "haiku" else e for e in view.entries
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+    gate = catalog_gate(view, "haiku", None, "haiku@xhigh", REF)
+    decision = launch.resolve_launch("haiku", view=view, e6_arm="haiku@xhigh", operator_request=REF)
+    assert gate.ok, gate.reason
+    assert gate.experiment_retired == decision.experiment_retired == "haiku@xhigh"
+
+
+def test_implicit_live_snapshot_gate_matches_base(tmp_path, monkeypatch, catalog_gate, implicit_providers):
+    base_recommend, base_bench = _load_base(tmp_path / "base")
+    base_cli = importlib.import_module("scopefuel_1990_base.cli")
+    view = bench.CatalogView(entries=launch.snapshot_entries(), source="server", backend="handoffkeep")
+    monkeypatch.setattr(base_bench, "read_catalog", lambda **k: view)
+    monkeypatch.setattr(base_recommend, "_observe_exhaustion", lambda *a, **k: None)
+    monkeypatch.setattr(base_recommend, "_inflight_gate", lambda *a, **k: None)
+    table = base_bench._catalog_grade_table(view)
+    assert table is not None
+    for profile in sorted({e.profile for e in view.entries}):
+        actual = catalog_gate(view, profile, None)
+        args = base_cli.build_parser(["claude", "codex"]).parse_args(["gate", "-m", profile])
+        expected = base_recommend.gate_check(
+            _providers(),
+            profile,
+            today=NOW.date(),
+            now=NOW,
+            grade_table=table,
+            **base_cli._gate_args(args),
+            **base_cli._gate_rung_args(args),
+        )
+        assert (actual.ok, actual.reason, actual.grade) == (expected.ok, expected.reason, expected.grade), (
+            profile
+        )
+
+
+def test_implicit_policy_context_never_invents_an_ordinary_rung(monkeypatch):
+    view = bench.CatalogView(entries=(), source="server", backend="handoffkeep")
+    monkeypatch.setattr(bench, "read_catalog", lambda **k: view)
+    assert cli._gate_policy_context("haiku", None, None) is None
+    view = bench.CatalogView(
+        entries=tuple(e for e in launch.snapshot_entries() if e.key == ("haiku", "xhigh")),
+        source="server",
+        backend="handoffkeep",
+    )
+    assert cli._gate_policy_context("haiku", None, None) is None
