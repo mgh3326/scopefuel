@@ -91,6 +91,8 @@ def catalog_gate(monkeypatch):
 LIVE_CASES = [
     pytest.param("haiku", "high", False, None, REF, True, id="consult-ref"),
     pytest.param("haiku", "high", False, None, None, False, id="consult-no-ref"),
+    pytest.param("haiku", "xhigh", False, None, REF, True, id="consult-e6-ref"),
+    pytest.param("haiku", "xhigh", False, None, None, False, id="consult-e6-no-ref"),
     pytest.param("fable", "xhigh", False, None, REF, True, id="fable-ref"),
     pytest.param("fable", "xhigh", False, None, None, False, id="fable-no-ref"),
 ]
