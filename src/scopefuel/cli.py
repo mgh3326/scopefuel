@@ -112,6 +112,15 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help="해당 급의 모델 사용 우선순위 추천. " + grade_help_text(),
     )
     parser.add_argument(
+        "--area",
+        dest="recommend_area",
+        metavar="AREA",
+        help=(
+            "--recommend 시 K1 task-area 어휘의 영역 하나 — 그 영역의 bench 예외"
+            "(exclude/prefer)를 오늘 순위 위에 적용한다. 어휘에 없으면 exit 2"
+        ),
+    )
+    parser.add_argument(
         "--explain",
         action="store_true",
         help=(
@@ -1180,6 +1189,24 @@ def _inflight_command(args: argparse.Namespace) -> int:
 
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
+    area = getattr(args, "recommend_area", None)
+    if area is not None:
+        # hk 1945 design item 1: the flag is validated against the K1 server
+        # vocabulary before any provider or catalog work. No vocabulary and no
+        # last-good cache is a refusal, never a silent no-area fallback.
+        vocabulary = bench.read_task_areas()
+        if vocabulary.areas is None:
+            print(
+                "error: --area needs the handoffkeep task-area vocabulary and no cached copy is available",
+                file=sys.stderr,
+            )
+            return 2
+        if area not in vocabulary.areas:
+            print(
+                f"error: unknown area {area!r} — allowed: {', '.join(vocabulary.areas)}",
+                file=sys.stderr,
+            )
+            return 2
     free_limit = free_window.active_record(now=now)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
     automatic_devin = next((item for item in results if item.id == "devin"), None)
@@ -1199,6 +1226,11 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     )
     swe2_result = _refresh_swe2_result(automatic_devin, needed=needs_swe2, now=now)
     catalog = bench.read_catalog()
+    area_exceptions = None
+    catalog_model_ids = None
+    if area is not None:
+        area_exceptions = bench.read_area_exceptions().entries
+        catalog_model_ids = {(entry.profile, entry.effort): entry.model_id for entry in catalog.entries}
     if getattr(args, "json", False):
         payload = recommend.recommend_dict(
             results,
@@ -1210,6 +1242,9 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             grade_table=grade_table,
             free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
             swe2_result=swe2_result,
+            area=area,
+            area_exceptions=area_exceptions,
+            catalog_model_ids=catalog_model_ids,
         )
         payload["catalog"] = catalog.label
         print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
@@ -1229,6 +1264,9 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
                 grade_table=grade_table,
                 free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
                 swe2_result=swe2_result,
+                area=area,
+                area_exceptions=area_exceptions,
+                catalog_model_ids=catalog_model_ids,
             )
         )
         # Provenance line, always printed: a table that silently came from the
@@ -2541,6 +2579,10 @@ def main(argv: list[str] | None = None) -> int:
     fetchers = registry()
     parser = build_parser(list(fetchers))
     args = parser.parse_args(arguments)
+
+    if getattr(args, "recommend_area", None) is not None and not args.recommend:
+        print("error: --area requires --recommend", file=sys.stderr)
+        return 2
 
     if args.command == "bench":
         return _bench_command(args)

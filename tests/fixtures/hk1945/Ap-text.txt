@@ -1,0 +1,16 @@
+A+ | 일반 기능 구현, 기존 패턴 확장, 다단계 리팩터 | 방향은 정해졌고 설계 판단이 좀 남았나?
+1. opus --effort low        Claude 주 10% · 제약=주  spend    벤치 62.0(추정(외삽))  [borrowed S]
+2. grok --effort medium     Grok 주 15% · 제약=주  spend    벤치 59.4(추정(외삽))
+3. codex-luna --effort xhigh Codex 주 20% · 제약=주  spend    벤치 55.0(추정(외삽))
+4. codex-luna-max           Codex 주 20% · 제약=주  spend    벤치 59.0(추정(외삽))
+5. agy-flash                AGY gemini 주 25% · 제약=주  spend    벤치 57.0(AA-agent/opencode/high)
+6. kiro-sonnet              Kiro 주 30% · 제약=주  spend    벤치 53.4(openrouter/unspecified)
+7. cc-qwen38                ClinePass 주 35% · 제약=주  spend    벤치 57.0(AA-agent/claude-code)
+8. devin-swe2 (effort high) Devin 주 5% · 제약=주  spend    벤치 급 실측(A+; evidence reps srv:686, srv:687, srv:693, srv:730, srv:733, srv:737, srv:738, srv:745, srv:750, srv:759, srv:828 · operator 2026-10-08 via operator-desk · hk:task/1296) · AA-agent 점수 미측정
+9. devin-swe2-max (effort max) Devin 주 5% · 제약=주  spend    벤치 급 실측(A+; evidence reps srv:1225, srv:1300, srv:1306, srv:1321, srv:1375, srv:1383 · operator 2026-10-08 via operator-desk · hk:task/1296) · AA-agent 점수 미측정
+10. devin-ds41               Devin 주 5% · 제약=주  spend    벤치 급 실측(A+; DeepSeek 계열, reps 3/3, BLOCKER 1건 탐지; hk:doc 2227) · AA-agent 점수 미측정
+✗ 제외 (4): codex-terra@high — barred (operator 2026-10-12 noterra) · codex-terra@xhigh — barred (operator 2026-10-12 noterra) · devin-swe2@default — dropped legacy — replaced by devin-swe2@high · sonnet@max — E6 unmeasured (미측정 E6 측정 런그 — SCOPEFUEL_E6_ARM 표식 필요)
+⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)
+  sonnet --effort xhigh    Claude  pool=claude
+    근거: 쿼타 여유 시
+    사용 주 10% · 제약=주
