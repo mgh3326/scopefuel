@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import tarfile
@@ -219,6 +220,63 @@ def _load_base(tmp_path):
     return importlib.import_module(f"{spec.name}.recommend"), importlib.import_module(f"{spec.name}.bench")
 
 
+def _drop_aplus_opus_low_text(text):
+    """Base A+ text minus the borrowed opus --effort low listing (hk 2007, r1025p1apply).
+
+    The ranked row is dropped and later ranks renumbered; the folded excluded
+    entry for the same rung is dropped and the fold count corrected. Returns the
+    transformed text and whether anything was dropped.
+    """
+    dropped = False
+    dropped_rank = None
+    kept = []
+    for line in text.split("\n"):
+        match = re.match(r"^(\d+)\. (.*)$", line)
+        body = match.group(2) if match else ""
+        while body.startswith("🔥 "):  # the CLI's hot-rung marker, as in _line_label
+            body = body[len("🔥 ") :]
+        if match and body.startswith("opus --effort low") and "[borrowed S]" in line:
+            assert dropped_rank is None, text  # at most one such row per listing
+            dropped_rank = int(match.group(1))
+            dropped = True
+            continue
+        fold = re.match(r"^✗ 제외 \((\d+)\): (.*)$", line)
+        if fold:
+            items = fold.group(2).split(" · ")
+            kept_items = [item for item in items if not item.startswith("opus[borrowed S]@low")]
+            if len(kept_items) != len(items):
+                assert kept_items, text
+                dropped = True
+                count = int(fold.group(1)) - (len(items) - len(kept_items))
+                line = f"✗ 제외 ({count}): " + " · ".join(kept_items)
+        kept.append(line)
+    renumbered = []
+    for line in kept:
+        match = re.match(r"^(\d+)\. (.*)$", line)
+        if dropped_rank is not None and match and int(match.group(1)) > dropped_rank:
+            line = f"{int(match.group(1)) - 1}. {match.group(2)}"
+        renumbered.append(line)
+    return "\n".join(renumbered), dropped
+
+
+def _drop_aplus_opus_low_payload(payload):
+    """Base A+ payload minus the borrowed opus --effort low row and its excluded entry."""
+    rows = [
+        row
+        for row in payload["rows"]
+        if not (
+            row["profile"] == "opus" and row.get("borrowed") is True and row["display"] == "opus --effort low"
+        )
+    ]
+    excluded = [
+        entry
+        for entry in payload["excluded"]
+        if not (entry["profile"] == "opus" and entry["effort"] == "low")
+    ]
+    dropped = len(rows) != len(payload["rows"]) or len(excluded) != len(payload["excluded"])
+    return {**payload, "rows": rows, "excluded": excluded}, dropped
+
+
 def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
     from test_task1787_inflight_sum import _matrix
     from test_task1795_borrowed_rungs import _pool_providers
@@ -227,6 +285,7 @@ def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
     monkeypatch.setattr(base_recommend, "_observe_exhaustion", lambda *a, **k: None)
     monkeypatch.setattr(recommend, "_observe_exhaustion", lambda *a, **k: None)
     views = [None, _view("haiku", "high", retired=True), _view("opus", "high", retired=True)]
+    a_plus_dropped = 0
     for view in views:
         current_table = recommend.GRADE_TABLE if view is None else bench._catalog_grade_table(view)
         base_table = base_recommend.GRADE_TABLE if view is None else base_bench._catalog_grade_table(view)
@@ -240,7 +299,15 @@ def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
                     text = module.recommend(providers, grade, **kwargs)
                     payload = module.recommend_dict(providers, grade, **kwargs)
                     outputs.append((text, json.dumps(payload, ensure_ascii=False)))
-                assert outputs[0] == outputs[1], (view, grade)
+                expected = outputs[1]
+                if grade == "A+":
+                    # hk 2007: A+ is base minus exactly the borrowed opus --effort low
+                    # row (text: renumbered ranks; JSON: the row dropped). Not a skip.
+                    expected_text, text_dropped = _drop_aplus_opus_low_text(expected[0])
+                    expected_payload, json_dropped = _drop_aplus_opus_low_payload(json.loads(expected[1]))
+                    a_plus_dropped += int(text_dropped or json_dropped)
+                    expected = (expected_text, json.dumps(expected_payload, ensure_ascii=False))
+                assert outputs[0] == expected, (view, grade)
                 if view is not None:
                     retired = {(e.profile, e.effort) for e in view.entries if e.retired_at}
                     assert not any(
@@ -248,6 +315,8 @@ def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
                         for ps in current_table.values()
                         for p in ps
                     )
+    # The A+ exemption must actually be exercised: the base listed the row somewhere.
+    assert a_plus_dropped > 0
 
 
 def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
@@ -275,6 +344,7 @@ def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(catalog, "read_prices", lambda **k: {})
         monkeypatch.setattr(catalog, "read_catalog", lambda **k: view)
         monkeypatch.setattr(catalog, "runtime_grade_table", lambda table=table, **k: table)
+    a_plus_dropped = 0
     for grade in recommend.GRADE_TABLE:
         for output in ([], ["--json"]):
             argv = ["--recommend", grade, *output]
@@ -282,7 +352,19 @@ def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
             actual = capsys.readouterr()
             assert base_cli.main(argv) == 0
             expected = capsys.readouterr()
-            assert actual == expected
+            if grade != "A+":
+                assert actual == expected, argv
+                continue
+            # hk 2007: A+ is base minus exactly the borrowed opus --effort low row.
+            assert actual.err == expected.err, argv
+            if output:
+                payload, dropped = _drop_aplus_opus_low_payload(json.loads(expected.out))
+                assert json.loads(actual.out) == payload, argv
+            else:
+                text, dropped = _drop_aplus_opus_low_text(expected.out)
+                assert actual.out == text, argv
+            a_plus_dropped += int(dropped)
+    assert a_plus_dropped > 0
 
 
 def test_catalog_key_failure_is_empty(monkeypatch):

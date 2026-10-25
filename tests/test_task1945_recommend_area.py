@@ -72,6 +72,7 @@ MODEL_ID = {
     ("kiro-opus", ""): "claude-opus-5",
     ("kiro-sonnet", ""): "claude-sonnet-5",
     ("codex-luna", "xhigh"): "gpt-6-luna",
+    ("codex-luna", "medium"): "gpt-6-luna",
     ("devin-ds41", ""): "deepseek-v4-1-flash-high",
 }
 
@@ -741,37 +742,38 @@ def test_prefer_never_moves_above_a_better_grade(area_server):
     """Mutant: lift to index 0 instead of the own-grade block -> RED."""
 
     _ = area_server
-    # claude is nearly idle, so the S-placed borrowed opus@low row ranks first
-    # at A+; the exact A+ grok@medium row must stop below it.
+    # hk 2007 removed the A+ opus@low borrowed row, so this runs at S: the
+    # borrowed S+ codex-sol@xhigh row ranks first while codex is nearly idle,
+    # and the exact S opus@low row must stop right below it (claude at 50%).
     used = {pool: 50.0 for pool in POOL_USED}
-    used["claude"] = 1.0
+    used["codex"] = 1.0
     providers = _providers(**used)
     baseline = recommend.recommend(
         providers,
-        "A+",
+        "S",
         today=TODAY,
         now=NOW,
         grade_table=_table(),
         bench_scores=None,
         model_prices={},
     )
-    assert "opus --effort low" in _ranked(baseline)[0]
+    assert "codex-sol --effort xhigh" in _ranked(baseline)[0]
 
     out = recommend.recommend(
         providers,
-        "A+",
+        "S",
         today=TODAY,
         now=NOW,
         grade_table=_table(),
         bench_scores=None,
         model_prices={},
         area="blender",
-        area_exceptions=[_exc("grok", "medium", "blender", "prefer", decision_ref="hk:doc/d4")],
+        area_exceptions=[_exc("opus", "low", "blender", "prefer", decision_ref="hk:doc/d4")],
         catalog_model_ids=_model_ids(),
     )
     ranked = _ranked(out)
-    better = next(index for index, line in enumerate(ranked) if "opus --effort low" in line)
-    preferred = next(index for index, line in enumerate(ranked) if "grok --effort medium" in line)
+    better = next(index for index, line in enumerate(ranked) if "codex-sol --effort xhigh" in line)
+    preferred = next(index for index, line in enumerate(ranked) if "opus --effort low" in line)
     assert preferred > better
     assert preferred == better + 1
 
