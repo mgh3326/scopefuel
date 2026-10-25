@@ -17,7 +17,7 @@ import pytest
 from scopefuel import bench, cli, launch, policy, recommend
 from scopefuel.model import Bucket, ProviderResult, Scope
 
-BASE = "6029a7075902ce2ac3425cc5be78bd5b9bc817a2"
+BASE = "3c96924e0bf4b551d52ed5314f858419761c1dbf"
 NOW = dt.datetime(2026, 10, 25, 12, tzinfo=dt.UTC)
 REF = "hk:task/1786"
 
