@@ -520,6 +520,16 @@ class _RoundExtensionBuilderLaunch(LaunchDecision):
 
 
 @dataclass(frozen=True, kw_only=True)
+class _RequestedE6Launch(LaunchDecision):
+    """A marker-admitted E6 request retains its durable audit reference."""
+
+    operator_request_ref: str
+
+    def render(self) -> str:
+        return super().render() + f"\noperator_request_ref {self.operator_request_ref}"
+
+
+@dataclass(frozen=True, kw_only=True)
 class _ExperimentRetiredLaunch(LaunchDecision):
     """Only a retired experiment admission adds its rung and durable REF."""
 
@@ -736,6 +746,18 @@ def resolve_launch(
         raise LaunchError(f"profile '{profile}' refused: {barred} is barred by {BARRED_MODEL_DECISION_REF}")
     e6_row = e6_arm_rung_for(canonical, requested)
     e6_open = e6_row is not None and e6_arm_matches(marker, canonical, requested)
+    if (
+        not e6_open
+        and operator_request
+        and any(
+            row.effort == requested and row.gate != GATE_CONSULT_ONLY and _unmeasured_e6_row(row)
+            for row in rows
+        )
+    ):
+        # R4: a REF cannot turn an unmarked measurement request into a fallback launch.
+        raise LaunchError(
+            f"e6_arm_required: {canonical}@{requested} requires SCOPEFUEL_E6_ARM={canonical}@{requested}"
+        )
     if not e6_open:
         # #692: a C-graded E6 measurement rung is not a placement, so no unmarked
         # request may be answered by one. Dropping the row (rather than refusing)
@@ -896,6 +918,8 @@ def resolve_launch(
             experiment_retired=experiment_retired,
             operator_request_ref=EXPERIMENT_REQUEST_REF,
         )
+    if opened_arm and isinstance(operator_request, str):
+        return _RequestedE6Launch(**dataclasses.asdict(decision), operator_request_ref=operator_request)
     if profile in {"codex-astra", "fable"} and (role or "").strip().casefold() == "builder":
         return _RoundExtensionBuilderLaunch(
             **dataclasses.asdict(decision),

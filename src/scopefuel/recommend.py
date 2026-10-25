@@ -4183,6 +4183,7 @@ def gate_check(
         operator_request is not None
         and (found is None or found[1].gate != "escalation")
         and not consult_only
+        and e6_admitted is None  # An admitted E6 marker accepts a REF without requiring one (R4).
         and not (
             profile_name in ASTRA_ROLE_PROFILES
             and (purpose or "").strip().casefold() == "round-extension"

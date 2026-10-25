@@ -51,6 +51,7 @@ def _view(profile, effort, *, retired=False, gate="consult_only", source="server
             model_id="fixture-model",
             pool="codex" if profile.startswith("codex") else "claude",
             grade="C",
+            score=25.0 if gate == "escalation" else None,
             gate=gate,
             retired_at="2026-10-24T00:00:00Z" if retired else None,
         )
@@ -94,7 +95,7 @@ LIVE_CASES = [
     pytest.param("fable", "xhigh", False, None, None, False, id="fable-no-ref"),
 ]
 RETIRED_CASES = []
-for profile, effort in (("haiku", "high"), ("opus", "high")):
+for profile, effort in (("haiku", "xhigh"), ("opus", "high")):
     for name, marker, ref, ok in (
         ("experiment", f"{profile}@{effort}", REF, True),
         ("no-marker", None, REF, False),
@@ -109,15 +110,33 @@ for profile, effort in (("haiku", "high"), ("opus", "high")):
         ("case-ref", f"{profile}@{effort}", "HK:task/1786", False),
         ("space-ref", f"{profile}@{effort}", "hk:task/1786 ", False),
         ("leading-zero-ref", f"{profile}@{effort}", "hk:task/01786", False),
-        ("normalized-marker", f" {profile.upper()} @ HIGH ", REF, True),
+        ("normalized-marker", f" {profile.upper()} @ {effort.upper()} ", REF, True),
     ):
         RETIRED_CASES.append(pytest.param(profile, effort, True, marker, ref, ok, id=f"{profile}-{name}"))
 
 
-@pytest.mark.parametrize("profile,effort,retired,marker,ref,ok", LIVE_CASES + RETIRED_CASES)
+R4_CASES = []
+for effort in ("xhigh", "max"):
+    for name, marker, ref, ok in (
+        ("marker-ref", f"haiku@{effort}", REF, True),
+        ("marker-only", f"haiku@{effort}", None, True),
+        ("ref-only", None, REF, False),
+    ):
+        R4_CASES.append(
+            pytest.param("haiku", effort, False, marker, ref, ok, "default", id=f"r4-{effort}-{name}")
+        )
+R4_CASES.append(
+    pytest.param("haiku", "high", False, None, REF, True, "escalation", id="r4-measured-escalation-ref")
+)
+PARITY_CASES = [
+    pytest.param(*case.values, "consult_only", id=case.id) for case in LIVE_CASES + RETIRED_CASES
+] + R4_CASES
+
+
+@pytest.mark.parametrize("profile,effort,retired,marker,ref,ok,gate_kind", PARITY_CASES)
 @pytest.mark.parametrize("source", ["server", "cache-stale", "snapshot"])
-def test_gate_launch_parity(catalog_gate, profile, effort, retired, marker, ref, ok, source):
-    view = _view(profile, effort, retired=retired, source=source)
+def test_gate_launch_parity(catalog_gate, profile, effort, retired, marker, ref, ok, gate_kind, source):
+    view = _view(profile, effort, retired=retired, source=source, gate=gate_kind)
     gate = catalog_gate(view, profile, effort, marker, ref)
     try:
         decision = launch.resolve_launch(
@@ -137,8 +156,12 @@ def test_gate_launch_parity(catalog_gate, profile, effort, retired, marker, ref,
         assert record["operator_request_ref"] == REF
         assert decision.as_dict()["experiment_retired"] == f"{profile}@{effort}"
         assert decision.as_dict()["operator_request_ref"] == REF
+    elif ok and gate_kind == "default" and ref:
+        assert cli._gate_record(gate, 0, NOW)["operator_request_ref"] == ref
+        assert decision.as_dict()["operator_request_ref"] == ref
+        assert f"operator_request_ref {ref}" in decision.render()
     elif not ok:
-        expected = "retired" if retired else "consult_only"
+        expected = "retired" if retired else ("e6_arm_required" if gate_kind == "default" else "consult_only")
         if ref in ("HK:task/1786", "hk:task/1786 "):
             assert "operator_request_ref_invalid" in gate.reason
         else:
