@@ -72,7 +72,6 @@ MODEL_ID = {
     ("kiro-opus", ""): "claude-opus-5",
     ("kiro-sonnet", ""): "claude-sonnet-5",
     ("codex-luna", "xhigh"): "gpt-6-luna",
-    ("codex-luna", "medium"): "gpt-6-luna",
     ("devin-ds41", ""): "deepseek-v4-1-flash-high",
 }
 
