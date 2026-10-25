@@ -1355,6 +1355,63 @@ def test_grok_parse_oci_capture_in_host_utc(fixture_text, host_tz):
     assert result.buckets[0].resets_at == "2026-10-29T19:58:00Z"
 
 
+def test_grok_parse_oci_capture_defaults_to_host_now(fixture_text, host_tz, monkeypatch):
+    """The production now=None path uses the host's local clock frame."""
+    import datetime as dt
+
+    frozen_now = dt.datetime(2026, 10, 25, 12, 0)
+
+    class FrozenDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_now
+
+    with host_tz("UTC"):
+        monkeypatch.setattr(grok.dt, "datetime", FrozenDateTime)
+        result = grok.parse(fixture_text("grok_usage_oci"))
+
+    assert result.error is None
+    assert result.buckets[0].resets_at == "2026-10-29T19:58:00Z"
+
+
+def test_grok_parse_defaults_to_host_now_across_year_boundary(host_tz, monkeypatch):
+    """UTC reset just after midnight is next year when local now is Dec 31."""
+    import datetime as dt
+
+    frozen_now = dt.datetime(2026, 12, 31, 20, 0)
+
+    class FrozenDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_now
+
+    with host_tz("UTC"):
+        monkeypatch.setattr(grok.dt, "datetime", FrozenDateTime)
+        result = grok.parse("Weekly limit: 12%\nResets: January 1, 03:00\n")
+
+    assert result.error is None
+    assert result.buckets[0].resets_at == "2027-01-01T03:00:00Z"
+
+
+def test_grok_parse_defaults_to_host_now_before_utc_year_end(host_tz, monkeypatch):
+    """A KST-framed clock wrongly bumps this still future UTC reset to 2027."""
+    import datetime as dt
+
+    frozen_now = dt.datetime(2026, 12, 31, 16, 0)
+
+    class FrozenDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_now
+
+    with host_tz("UTC"):
+        monkeypatch.setattr(grok.dt, "datetime", FrozenDateTime)
+        result = grok.parse("Weekly limit: 12%\nResets: December 31, 23:00\n")
+
+    assert result.error is None
+    assert result.buckets[0].resets_at == "2026-12-31T23:00:00Z"
+
+
 @pytest.mark.parametrize(
     ("tz", "reset_line"),
     [
