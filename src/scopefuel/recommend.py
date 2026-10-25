@@ -1355,7 +1355,7 @@ GRADE_TABLE: dict[Grade, list[Profile]] = {
             None,
             launcher_effort="low",
             benchmark_effort="low",
-            benchmark_annotation=ESTIMATED_EXTRAPOLATED_UNMEASURED_ANNOTATION,
+            benchmark_annotation=UNMEASURED_ANNOTATION,
             estimate_reason=SONNET_5_5_LOW_ESTIMATE_REASON,
             aa_model_id="claude-sonnet-5-5",
         ),
