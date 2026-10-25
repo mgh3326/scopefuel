@@ -1,12 +1,63 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import json
 import os
 import pathlib
+import time
 
 import pytest
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+
+
+def _tzset() -> None:
+    # uv's macOS CPython build omits time.tzset — fall back to libc's.
+    tzset = getattr(time, "tzset", None)
+    if tzset is not None:
+        tzset()
+    else:
+        ctypes.CDLL(None).tzset()
+
+
+@pytest.fixture
+def host_tz():
+    """Pin the process timezone for the length of a ``with`` block.
+
+    Providers render the reset in the probe host's local zone; tests pin TZ so
+    the host the suite runs on cannot change the expected instant.
+    """
+
+    saved = os.environ.get("TZ")
+
+    @contextlib.contextmanager
+    def _use(name: str):
+        prev = os.environ.get("TZ")
+        os.environ["TZ"] = name
+        _tzset()
+        try:
+            yield
+        finally:
+            if prev is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev
+            _tzset()
+
+    yield _use
+    if saved is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = saved
+    _tzset()
+
+
+@pytest.fixture
+def seoul_tz(host_tz):
+    """Pin TZ to Asia/Seoul for the whole test — the zone desk hosts render in."""
+    with host_tz("Asia/Seoul"):
+        yield
 
 
 @pytest.fixture(autouse=True)
