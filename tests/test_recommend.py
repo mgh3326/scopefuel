@@ -26,6 +26,7 @@ from scopefuel.recommend import (
     SONNET_5_5_ESTIMATE_REASON,
     SONNET_5_5_HIGH_GRADE_ANNOTATION,
     SPEND_EXCLUDE_PCT,
+    UNMEASURED_ANNOTATION,
     Profile,
     _brake_factor,
     _score_components,
@@ -517,6 +518,8 @@ def test_task689_aa_model_mappings_pinned_by_exact_equality():
     assert {p.launcher_effort for p in sonnet_rows} == {"xhigh", "high", "medium", "low"}
     for profile in sonnet_rows:
         assert profile.aa_model_id == "claude-sonnet-5-5"
+    low = next(p for p in sonnet_rows if p.launcher_effort == "low")
+    assert low.benchmark_annotation == UNMEASURED_ANNOTATION
 
     # #1269: the vendor TB4 curve gives a point at every launchable rung —
     # all five land at C as ordinary default-gate rows (10-08 operator
