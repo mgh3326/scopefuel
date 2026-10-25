@@ -3694,7 +3694,13 @@ def _commit_task_areas_cache(
         conn.close()
 
 
-def _cached_area_exceptions(conn: sqlite3.Connection) -> list[AreaException]:
+def _cached_area_exceptions(conn: sqlite3.Connection) -> list[AreaException] | None:
+    """The cached rows, or None when the cached evidence is corrupt.
+
+    An empty list is a valid cached value (the real canon has no rows today)
+    and must be distinguishable from corrupt evidence, which is refetched.
+    """
+
     columns = ", ".join(_AREA_EXCEPTION_COLUMNS)
     rows = conn.execute(
         f"SELECT {columns} FROM bench_cache_area_exceptions ORDER BY area, profile, effort"
@@ -3704,9 +3710,9 @@ def _cached_area_exceptions(conn: sqlite3.Connection) -> list[AreaException]:
         try:
             refs = tuple(json.loads(row["evidence_refs"]))
         except (TypeError, ValueError):
-            return []
+            return None
         if not refs or not all(isinstance(ref, str) and ref for ref in refs):
-            return []
+            return None
         out.append(
             AreaException(
                 profile=row["profile"],
@@ -3938,15 +3944,17 @@ def _read_area_exceptions_uncached(
         )
 
     now = _cache_now()
-    cached, row = _scope_cache_snapshot(
+    cached_raw, row = _scope_cache_snapshot(
         path, AREA_EXCEPTIONS_SCOPE, _cached_area_exceptions, commit_cache=commit_cache
     )
-    cached = cached if isinstance(cached, list) else []
+    # None means "no usable cache" (absent, unreadable or corrupt evidence).
+    # An empty list is a real cached value and follows the same TTL rules.
+    cached = cached_raw if isinstance(cached_raw, list) else None
     age_s = _catalog_stamp_age_s(row, backend, now)
     if age_s is None:
-        cached = []
+        cached = None
     fresh_before = min(backend.catalog_ttl_s, backend.catalog_stale_max_s)
-    if cached and age_s is not None and age_s < fresh_before:
+    if cached is not None and age_s is not None and age_s < fresh_before:
         return AreaExceptionsView(
             entries=tuple(cached),
             source=CATALOG_SOURCE_CACHE,
@@ -3981,7 +3989,7 @@ def _read_area_exceptions_uncached(
         pass
 
     rejected = degraded != "server unreachable"
-    if cached and age_s is not None and age_s < backend.catalog_stale_max_s:
+    if cached is not None and age_s is not None and age_s < backend.catalog_stale_max_s:
         if rejected:
             print(
                 f"warning: {degraded}; using cached area exceptions (age {age_s / 3600.0:.1f}h)",
@@ -3997,7 +4005,7 @@ def _read_area_exceptions_uncached(
             reason=backend.reason,
             detail=degraded if rejected else "",
         )
-    if cached and age_s is not None:
+    if cached is not None and age_s is not None:
         if rejected:
             print(
                 f"warning: {degraded}; using cached area exceptions (age {age_s / 3600.0:.1f}h)",

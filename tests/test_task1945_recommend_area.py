@@ -325,6 +325,64 @@ def test_area_exceptions_without_a_route_are_empty(area_server, monkeypatch):
     assert view.source == "unsupported"
 
 
+# --- round 2 (B2): an empty exception list is a valid cached value ----------
+
+
+def test_empty_area_exception_list_is_cached_inside_the_ttl(area_server):
+    """Mutant: truthiness check back -> this test RED (second read refetches)."""
+
+    _, fake = area_server
+    fake.exceptions = []
+    first = bench.read_area_exceptions()
+    assert first.source == "server"
+    assert first.entries == ()
+    assert fake.hits[("GET", "/v1/bench/area-exceptions")] == 1
+
+    # A server-side change inside the TTL must not be picked up: the empty
+    # cached list is a value, not the absence of one.
+    fake.exceptions = [_exception("opus", "high", "blender", "exclude")]
+    bench.reset_catalog_memo()
+    cached = bench.read_area_exceptions()
+    assert cached.source == "cache"
+    assert cached.entries == ()
+    assert fake.hits[("GET", "/v1/bench/area-exceptions")] == 1
+
+
+def test_empty_area_exception_list_survives_a_429(area_server):
+    _, fake = area_server
+    fake.exceptions = []
+    assert bench.read_area_exceptions().source == "server"
+    _age_scope(3601, "area-exceptions")
+    fake.fail_status = 429
+
+    last_good = bench.read_area_exceptions()
+    assert last_good.entries == ()
+    assert last_good.source in ("cache", "cache-stale")
+    # One initial request plus the failed refetch — no retry inside the read.
+    assert fake.hits[("GET", "/v1/bench/area-exceptions")] == 2
+
+
+def test_corrupt_area_exception_cache_is_refetched(area_server):
+    _, fake = area_server
+    fake.exceptions = [_exception("opus", "high", "blender", "exclude")]
+    assert bench.read_area_exceptions().source == "server"
+
+    import sqlite3
+
+    conn = sqlite3.connect(bench.db_path())
+    try:
+        conn.execute("UPDATE bench_cache_area_exceptions SET evidence_refs = ?", ("not-json",))
+        conn.commit()
+    finally:
+        conn.close()
+    bench.reset_catalog_memo()
+    fake.exceptions = [_exception("sonnet", "high", "blender", "prefer")]
+    view = bench.read_area_exceptions()
+    assert view.source == "server"
+    assert [row.profile for row in view.entries] == ["sonnet"]
+    assert fake.hits[("GET", "/v1/bench/area-exceptions")] == 2
+
+
 # ---------------------------------------------------------------------------
 # Ranking inputs
 # ---------------------------------------------------------------------------
@@ -555,6 +613,104 @@ def test_retired_exception_rows_are_not_applied(area_server):
         catalog_model_ids=_model_ids(),
     )
     assert _rank_of(out, "opus --effort high") is not None
+
+
+# --- round 2 (B1): an effort-empty row expires per candidate effort ---------
+
+
+def test_effort_empty_exclude_on_profile_without_default_row_removes_every_effort(area_server):
+    """Mutant: lookup back to (profile, empty effort) -> this test RED."""
+
+    _ = area_server
+    assert _model_ids().get(("opus", "")) is None  # opus has no default-effort row
+    out = _rec(
+        "S+",
+        area="blender",
+        area_exceptions=[
+            _exc(
+                "opus",
+                "",
+                "blender",
+                "exclude",
+                decision_ref="hk:doc/b1a",
+                expires_with_model_id="claude-opus-5-5",
+            )
+        ],
+        catalog_model_ids=_model_ids(),
+    )
+    for effort in ("medium", "high", "xhigh"):
+        assert _rank_of(out, f"opus --effort {effort}") is None
+    fold = next(line for line in out.splitlines() if line.startswith("✗ 제외"))
+    for effort in ("medium", "high", "xhigh"):
+        assert f"opus@{effort} — area:blender exclude (hk:doc/b1a)" in fold
+
+
+def test_effort_empty_exclude_is_per_effort_when_one_model_id_moved(area_server):
+    _, fake = area_server
+    _table()  # prime the catalog cache before ageing it
+    fake.catalog = _seed_rows_with("opus", "high", model_id="claude-opus-6")
+    _age_scope(3601, "catalog")
+
+    out = _rec(
+        "S+",
+        explain=True,
+        area="blender",
+        area_exceptions=[
+            _exc(
+                "opus",
+                "",
+                "blender",
+                "exclude",
+                decision_ref="hk:doc/b1b",
+                expires_with_model_id="claude-opus-5-5",
+            )
+        ],
+        catalog_model_ids=_model_ids(),
+    )
+    # The moved effort is inactive and stays ranked; the matching efforts are
+    # excluded and folded.
+    assert _rank_of(out, "opus --effort high") is not None
+    assert _rank_of(out, "opus --effort medium") is None
+    assert _rank_of(out, "opus --effort xhigh") is None
+    fold = next(line for line in out.splitlines() if line.startswith("✗ 제외"))
+    assert "opus@medium — area:blender exclude (hk:doc/b1b)" in fold
+    assert "opus@xhigh — area:blender exclude (hk:doc/b1b)" in fold
+    assert "opus@high" not in fold
+    expired = [line for line in out.splitlines() if "area exception" in line and "expired" in line]
+    assert any(
+        "key=opus@any" in line and "effort=high" in line and "catalog_model_id=claude-opus-6" in line
+        for line in expired
+    )
+
+
+def test_effort_empty_prefer_lifts_only_efforts_whose_model_id_matches(area_server):
+    _, fake = area_server
+    _table()
+    fake.catalog = _seed_rows_with("opus", "high", model_id="claude-opus-6")
+    _age_scope(3601, "catalog")
+
+    out = _rec(
+        "S+",
+        explain=True,
+        area="blender",
+        area_exceptions=[
+            _exc(
+                "opus",
+                "",
+                "blender",
+                "prefer",
+                decision_ref="hk:doc/b1c",
+                expires_with_model_id="claude-opus-5-5",
+            )
+        ],
+        catalog_model_ids=_model_ids(),
+    )
+    ranked = _ranked(out)
+    assert "opus --effort medium" in ranked[0]
+    assert "opus --effort xhigh" in ranked[1]
+    assert "opus --effort high" not in ranked[0] and "opus --effort high" not in ranked[1]
+    expired = [line for line in out.splitlines() if "area exception" in line and "expired" in line]
+    assert any("key=opus@any" in line and "effort=high" in line for line in expired)
 
 
 # ---------------------------------------------------------------------------

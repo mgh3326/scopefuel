@@ -4934,11 +4934,46 @@ def _area_row_matches(row: AreaException, candidate: _Candidate) -> bool:
 
 
 def _area_row_expired(row: AreaException, catalog_model_ids: Mapping[tuple[str, str], str] | None) -> bool:
-    """A row whose catalog model id moved on (or cannot be verified) is inactive."""
+    """A rung-specific row whose catalog model id moved on is inactive."""
 
     if catalog_model_ids is None:
         return True
     return catalog_model_ids.get((row.profile, row.effort)) != row.expires_with_model_id
+
+
+def _area_candidate_key(candidate: _Candidate) -> tuple[str, str]:
+    return (candidate.profile.name, normalize_effort(candidate.profile.launcher_effort) or "")
+
+
+def _area_candidate_model_id(
+    candidate: _Candidate, catalog_model_ids: Mapping[tuple[str, str], str] | None
+) -> str | None:
+    if catalog_model_ids is None:
+        return None
+    return catalog_model_ids.get(_area_candidate_key(candidate))
+
+
+def _area_wildcard_active(
+    row: AreaException, candidate: _Candidate, catalog_model_ids: Mapping[tuple[str, str], str] | None
+) -> bool:
+    """An effort-empty row is active for a candidate only when that candidate's
+    own (profile, effort) still carries the model id the evidence was measured on.
+
+    Looking up (profile, "") instead was the round-2 B1 bug: profiles without a
+    default-effort catalog row (opus, sonnet, every codex profile) always read as
+    expired, so a profile-wide decision never applied.
+    """
+
+    return _area_candidate_model_id(candidate, catalog_model_ids) == row.expires_with_model_id
+
+
+@dataclass(frozen=True)
+class _AreaExpired:
+    """One expired explanation: a rung row, or one effort of an effort-empty row."""
+
+    row: AreaException
+    effort: str
+    catalog_model_id: str | None
 
 
 def _area_explain_line(
@@ -4946,13 +4981,22 @@ def _area_explain_line(
     *,
     expired: bool,
     catalog_model_ids: Mapping[tuple[str, str], str] | None,
+    effort: str | None = None,
+    model_id: str | None = None,
 ) -> str:
-    model_id = catalog_model_ids.get((row.profile, row.effort)) if catalog_model_ids else None
-    suffix = (
-        f" expired (expires_with_model_id={row.expires_with_model_id}, catalog_model_id={model_id or '-'})"
-        if expired
-        else ""
-    )
+    if expired and effort is not None:
+        suffix = (
+            f" effort={effort} expired (expires_with_model_id={row.expires_with_model_id}, "
+            f"catalog_model_id={model_id or '-'})"
+        )
+    else:
+        catalog_id = catalog_model_ids.get((row.profile, row.effort)) if catalog_model_ids else None
+        suffix = (
+            f" expired (expires_with_model_id={row.expires_with_model_id}, "
+            f"catalog_model_id={catalog_id or '-'})"
+            if expired
+            else ""
+        )
     return (
         f"  area exception: area={row.area} key={row.label} action={row.action} "
         f"decision={row.decision_ref} evidence={','.join(row.evidence_refs)}{suffix}"
@@ -4972,28 +5016,39 @@ def _apply_area_exceptions(
     back from an exclusion. Only exact-grade candidates are lifted: a row
     placed at a better grade (one-up/borrowed) keeps its place, and the lift
     stops after the last better-grade row already ahead of it. The moved rows
-    keep their relative order. Returns the ``--explain`` lines for applied and
-    expired rows.
+    keep their relative order. An effort-empty row is evaluated per candidate:
+    it applies only to the efforts whose own catalog model id still matches the
+    evidence, and each moved effort is named as expired. Returns the
+    ``--explain`` lines for applied and expired rows.
     """
 
-    expired: list[AreaException] = []
+    expired: list[_AreaExpired] = []
     live: list[AreaException] = []
+    wildcard: list[AreaException] = []
     for row in exceptions:
         if row.area != area or row.retired_at is not None:
             continue
-        if _area_row_expired(row, catalog_model_ids):
-            expired.append(row)
+        if not row.effort:
+            wildcard.append(row)
+        elif _area_row_expired(row, catalog_model_ids):
+            model_id = catalog_model_ids.get((row.profile, row.effort)) if catalog_model_ids else None
+            expired.append(_AreaExpired(row, row.effort, model_id))
         else:
             live.append(row)
 
     applied: list[AreaException] = []
+
+    def _mark_applied(row: AreaException) -> None:
+        if all(existing is not row for existing in applied):
+            applied.append(row)
+
     for row in live:
         if row.action != "exclude":
             continue
         removed = [candidate for candidate in evaluation.included if _area_row_matches(row, candidate)]
         if not removed:
             continue
-        applied.append(row)
+        _mark_applied(row)
         for candidate in removed:
             evaluation.included.remove(candidate)
             evaluation.excluded.append(
@@ -5009,8 +5064,45 @@ def _apply_area_exceptions(
                 )
             )
 
+    # Effort-empty rows: one activity decision per candidate effort, collected
+    # before any mutation so both actions see the same picture.
+    wildcard_active: dict[int, list[AreaException]] = {}
+    for row in wildcard:
+        for candidate in evaluation.included:
+            if not _area_row_matches(row, candidate):
+                continue
+            if _area_wildcard_active(row, candidate, catalog_model_ids):
+                wildcard_active.setdefault(id(candidate), []).append(row)
+            else:
+                effort = normalize_effort(candidate.profile.launcher_effort) or "default"
+                model_id = _area_candidate_model_id(candidate, catalog_model_ids)
+                if not any(entry.row is row and entry.effort == effort for entry in expired):
+                    expired.append(_AreaExpired(row, effort, model_id))
+
+    wildcard_excludes = [row for row in wildcard if row.action == "exclude"]
+    if wildcard_excludes:
+        for candidate in list(evaluation.included):
+            active = [row for row in wildcard_active.get(id(candidate), []) if row.action == "exclude"]
+            if not active:
+                continue
+            _mark_applied(active[0])
+            evaluation.included.remove(candidate)
+            evaluation.excluded.append(
+                _Excluded(
+                    candidate.profile,
+                    f"area:{area} exclude ({active[0].decision_ref})",
+                    provider_id=candidate.provider_id,
+                    kind="area_exclude",
+                    placed_grade=candidate.placed_grade,
+                    one_up=candidate.one_up,
+                    borrowed=candidate.borrowed,
+                    area_adjustment=("exclude", active[0].decision_ref),
+                )
+            )
+
     prefer_rows = [row for row in live if row.action == "prefer"]
-    if prefer_rows:
+    wildcard_prefers = [row for row in wildcard if row.action == "prefer"]
+    if prefer_rows or wildcard_prefers:
         grade_index = _GRADE_ORDER.index(grade)
         better = [
             index
@@ -5023,6 +5115,7 @@ def _apply_area_exceptions(
             if candidate.placed_grade != grade:
                 continue
             matches = [row for row in prefer_rows if _area_row_matches(row, candidate)]
+            matches += [row for row in wildcard_active.get(id(candidate), []) if row.action == "prefer"]
             if not matches:
                 continue
             # A rung-specific row is the evidence for that rung; the
@@ -5030,15 +5123,23 @@ def _apply_area_exceptions(
             matches.sort(key=lambda row: 0 if row.effort else 1)
             preferred[id(candidate)] = matches[0]
             candidate.area_adjustment = ("prefer", matches[0].decision_ref)
-        matched_rows = {id(row) for row in preferred.values()}
-        applied.extend(row for row in prefer_rows if id(row) in matched_rows)
+            _mark_applied(matches[0])
         tail = evaluation.included[start:]
         moving = [candidate for candidate in tail if id(candidate) in preferred]
         rest = [candidate for candidate in tail if id(candidate) not in preferred]
         evaluation.included[start:] = moving + rest
 
     lines = [_area_explain_line(row, expired=False, catalog_model_ids=catalog_model_ids) for row in applied]
-    lines += [_area_explain_line(row, expired=True, catalog_model_ids=catalog_model_ids) for row in expired]
+    lines += [
+        _area_explain_line(
+            entry.row,
+            expired=True,
+            catalog_model_ids=catalog_model_ids,
+            effort=entry.effort if not entry.row.effort else None,
+            model_id=entry.catalog_model_id,
+        )
+        for entry in expired
+    ]
     return lines
 
 
