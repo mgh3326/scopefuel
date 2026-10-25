@@ -1281,6 +1281,7 @@ def _gate_record(
             "exhaust_notice": result.exhaust_notice,
             "missing_windows": list(result.missing_windows),
         }
+        | ({"experiment_retired": result.experiment_retired} if result.experiment_retired else {})
         | ({"inflight": result.inflight} if result.inflight else {})
         | ({"account": account} if account else {})
         | (
@@ -1328,11 +1329,11 @@ def _e6_arm_marker() -> str | None:
     return os.environ.get(recommend.E6_ARM_MARKER_ENV)
 
 
-def _retired_e6_rungs() -> frozenset[tuple[str, str]]:
-    """#692: the E6 rungs the canon retired.
+def _retired_rungs() -> frozenset[tuple[str, str]]:
+    """All rungs the canon retired (hk 1990 aligns gate with launch).
 
-    A marker must not revive a rung the operator closed, and the gate has no
-    catalog view of its own — the runtime grade table drops retired rows without
+    Only the exact experiment REF plus marker can reopen a closed rung. The
+    gate has no catalog view of its own — the runtime grade table drops retired rows without
     saying why. Read the view (memoised per process) and hand the keys over.
     """
 
@@ -1340,10 +1341,17 @@ def _retired_e6_rungs() -> frozenset[tuple[str, str]]:
         view = bench.read_catalog()
     except bench.BenchError:
         return frozenset()
+    return frozenset((entry.profile, entry.effort) for entry in view.entries if entry.retired_at)
+
+
+def _consult_only_rungs() -> frozenset[tuple[str, str]]:
+    """Consultation keys from the same memoised catalog view as retirement."""
+    try:
+        view = bench.read_catalog()
+    except bench.BenchError:
+        return frozenset()
     return frozenset(
-        (entry.profile, entry.effort)
-        for entry in view.entries
-        if entry.retired_at and (entry.profile, entry.effort) in recommend.E6_ARM_KEYS
+        entry.key for entry in view.entries if entry.gate == "consult_only" and not entry.retired_at
     )
 
 
@@ -1357,7 +1365,8 @@ def _gate_rung_args(args: argparse.Namespace) -> dict:
     return {
         "effort": getattr(args, "effort", None),
         "e6_arm": _e6_arm_marker(),
-        "retired_rungs": _retired_e6_rungs(),
+        "retired_rungs": _retired_rungs(),
+        "consult_only_rungs": _consult_only_rungs(),
     }
 
 

@@ -3278,6 +3278,7 @@ class GateResult:
     # C 급 E6 런그는 이 표식이 있을 때만 열리므로, 통과 판정의 감사 필드이자
     # allow 라인에 붙는 가시 표식의 원천이다.
     e6_arm: str | None = None
+    experiment_retired: str | None = None
     # task #742 — 구독 해지 플래그 거부 (CLI exit 6). 쿼타(exit 3)·측정불가(exit 4)·
     # 역할 거부(exit 5)와 다른 전용 코드다 — 구독 자체가 없는 판정을 "reset 을
     # 기다리면 풀리는 quota 차단"으로 오독하지 않게 한다.
@@ -3406,6 +3407,7 @@ _ESCALATION_SKIPS_QUOTA_CHECK = frozenset({"oc-omni"})
 # --operator-request 는 durable 참조만 받는다: ``hk:doc/<key>`` 또는
 # ``hk:task/<정수>``. 자유 텍스트·경로 탐색·허용 문자 밖 입력은 전부 거부한다.
 # 이 경로는 감사 가능한 "주장"을 기록할 뿐 신원이나 동의를 증명하지 않는다.
+EXPERIMENT_REQUEST_REF = "hk:task/1786"
 _OPERATOR_REQUEST_TASK_RE = re.compile(r"[0-9]{1,10}")
 _REQUESTED_BY_MAX = 64
 _REQUESTED_BY_RE = re.compile(r"\S+")
@@ -3944,6 +3946,7 @@ def gate_check(
     effort: str | None = None,
     e6_arm: str | None = None,
     retired_rungs: frozenset[tuple[str, str]] | None = None,
+    consult_only_rungs: frozenset[tuple[str, str]] = frozenset(),
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -3963,8 +3966,9 @@ def gate_check(
     없으면 런그 이름을 댄 사유와 함께 거부한다(rc 3). 표식은 그 런그 하나만
     열 수 있다 — 다른 프로필/런그를 가리키면 아무것도 넓히지 못한다.
 
-    ``retired_rungs``(#692)는 캐논이 retire 한 (profile, effort) 키다. 표식은
-    캐논이 닫은 런그를 되살리지 못한다 — retire 는 런그를 닫는 캐논의 수단이다.
+    ``retired_rungs``는 캐논이 retire 한 모든 (profile, effort) 키다. 정확한
+    실험 REF와 같은 런그 표식이 함께 있을 때만 열린다. ``consult_only_rungs``는
+    CLI가 같은 catalog view에서 읽은 운영자 요청 전용 런그 키다.
 
     escalation 프로필은 "같은 grade 정상 대안이 전부 비가용"이라는 자격을 먼저 확인한다.
     자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
@@ -3972,7 +3976,7 @@ def gate_check(
     유효 class·exclude·raw cutoff 를 정상 프로필과 동일하게 검사한다.
 
     ``operator_request``(task #461)는 escalation 프로필과 CONSULT_ONLY_PROFILES
-    (fable)에서만 유효한 운영자 명시 요청의 durable 참조다. escalation 에서는 유효한
+    (fable), catalog consult_only 런그와 retired 실험에서 유효한 durable 참조다. escalation 에서는 유효한
     REF 가 "같은 grade 정상 대안이 가용하므로 거부" 갈래 **하나만** 건너뛰고,
     consult_only 에서는 요청 그 자체가 자격이다(policy launch 와 같은 충족 조건 —
     task #625). 어느 쪽이든 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로
@@ -4102,24 +4106,41 @@ def gate_check(
     # 캐논이 그 런그를 그 런그의 carrier 급 밖으로 배치했으면 E6 제한은 없다 —
     # 제한은 "미측정" 동안만 유효하다(측정이 끝난 런그는 평범한 런그다). 비교는
     # 런그 자체의 carrier 에 대해 한다 — sonnet@max 는 A+ 가 carrier 다(#1788).
+    retired = (canonical_profile, rung or "") in (retired_rungs or frozenset())
+    experiment_retired = (
+        f"{canonical_profile}@{rung}"
+        if retired
+        and operator_request == EXPERIMENT_REQUEST_REF
+        and e6_arm_matches(e6_marker, canonical_profile, rung)  # hk1990-experiment
+        else None
+    )
+    if retired and experiment_retired is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=e6_arm_carrier_grade(canonical_profile, rung)
+            if (canonical_profile, rung) in E6_ARM_KEYS
+            else None,
+            reason=f"profile '{profile_name}' rung '{rung or ''}' is retired in the catalog",
+            e6_arm=f"{canonical_profile}@{rung}" if (canonical_profile, rung) in E6_ARM_KEYS else None,
+        )
+    consult_only = (  # hk1990-consult-only
+        profile_name in CONSULT_ONLY_PROFILES
+        or (
+            canonical_profile not in ASTRA_ROLE_PROFILES
+            and (canonical_profile, rung or "") in consult_only_rungs
+        )
+        or experiment_retired is not None
+    )
     e6_row = (
         None
-        if rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung)
+        if consult_only
+        or (rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung))
         else e6_arm_rung_for(canonical_profile, rung)
     )
     e6_admitted: str | None = None
     if e6_row is not None:
-        if (canonical_profile, rung) in (retired_rungs or frozenset()):
-            # The canon closed the rung. A marker is not a way to reopen it —
-            # otherwise retiring an E6 rung would be a no-op for the arm path.
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=e6_arm_carrier_grade(canonical_profile, rung),
-                reason=f"profile '{profile_name}' rung '{rung}' is retired in the catalog",
-                e6_arm=f"{canonical_profile}@{rung}",
-            )
         # 미측정 E6 측정 런그는 배치가 아니다 — 표식이 정확히 이 런그를 가리킬 때만
         # 열린다. 없으면 런그 이름을 댄 사유로 거부한다(쿼타 판정 이전 — 배치 자체가
         # 없는 런그를 쿼타로 판정하면 "쿼타 소진"으로 오독된다).
@@ -4138,7 +4159,10 @@ def gate_check(
         e6_admitted = f"{canonical_profile}@{rung}"
 
     found = _find_profile(profile_name, grade_table=table)
-    if e6_admitted is not None:
+    if consult_only and profile_name not in CONSULT_ONLY_PROFILES:
+        # Catalog consultation has no candidate placement; use fable's quota path.
+        found = None
+    elif e6_admitted is not None:
         # 열린 런그의 급은 그 런그의 carrier 다 — 프로필 기본 배치(A+ 등)를
         # 보고하면 감사 기록이 실제 측정 런그와 다른 급을 주장하게 된다.
         assert e6_row is not None
@@ -4158,7 +4182,7 @@ def gate_check(
     if (
         operator_request is not None
         and (found is None or found[1].gate != "escalation")
-        and profile_name not in CONSULT_ONLY_PROFILES
+        and not consult_only
         and not (
             profile_name in ASTRA_ROLE_PROFILES
             and (purpose or "").strip().casefold() == "round-extension"
@@ -4183,7 +4207,7 @@ def gate_check(
     # 요청이 없으면 거부가 먼저다(측정불가보다 "실행 자격 없음"이 더 근본적 사실).
     # GRADE_TABLE 소속과 무관하게 검사한다 — 런타임 catalog 가 fable 을 다른 행으로
     # 되돌려 놓는 미래에도 요청 없는 스폰은 열리지 않는다.
-    if profile_name in CONSULT_ONLY_PROFILES and operator_request is None:
+    if consult_only and operator_request is None:
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -4196,9 +4220,9 @@ def gate_check(
         )
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
-        audit: dict[str, object] = {}
+        audit: dict[str, object] = {"experiment_retired": experiment_retired} if experiment_retired else {}
         if operator_request is not None:
-            audit = {
+            audit |= {
                 "operator_request_ref": operator_request,
                 "requested_by": audit_requested_by or "unknown",
                 "ref_resolution": "unverified",
@@ -4300,11 +4324,9 @@ def gate_check(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-        # ROB-591: fail-closed on an active policy exclude, scoped narrowly to
-        # CONSULT_ONLY_PROFILES (fable) only — the D3 path's ordinary "not in
-        # GRADE_TABLE" behavior for every other profile (e.g. a retired oc-*
-        # spelling) is unchanged.
-        if profile_name in CONSULT_ONLY_PROFILES and effective_class == "exclude":
+        # Consultation and retired experiments retain fable's fail-closed
+        # exclude check. Ordinary D3 profiles keep their previous quota behavior.
+        if consult_only and effective_class == "exclude":
             override = get_active_override(provider_id, today=today)
             reason_parts = [f"정책 제외 ({provider_id}"]
             if override is not None and override.until:

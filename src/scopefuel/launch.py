@@ -38,6 +38,7 @@ from .recommend import (
     BARRED_MODEL_DECISION_REF,
     E6_ARM_KEYS,
     E6_ARM_RUNGS,
+    EXPERIMENT_REQUEST_REF,
     GRADE_TABLE,
     PROFILE_ALIASES,
     REP_GRADES_ORDER,
@@ -518,6 +519,21 @@ class _RoundExtensionBuilderLaunch(LaunchDecision):
     round_extension_builder: dict[str, str]
 
 
+@dataclass(frozen=True, kw_only=True)
+class _ExperimentRetiredLaunch(LaunchDecision):
+    """Only a retired experiment admission adds its rung and durable REF."""
+
+    experiment_retired: str
+    operator_request_ref: str
+
+    def render(self) -> str:
+        return (
+            super().render()
+            + f"\nexperiment_retired {self.experiment_retired}"
+            + f"\noperator_request_ref {self.operator_request_ref}"
+        )
+
+
 def _live_rows(view: CatalogView, profile: str) -> list[CatalogEntry]:
     return [e for e in view.entries if e.profile == profile and not e.retired_at]
 
@@ -696,12 +712,28 @@ def resolve_launch(
     view = read_catalog(path=path) if view is None else view
     canonical = PROFILE_ALIASES.get(profile, profile)
     rows = _live_rows(view, canonical)
-    if any(is_barred_model_id(row.model_id) for row in rows):
-        barred = next(row.model_id for row in rows if is_barred_model_id(row.model_id))
-        raise LaunchError(f"profile '{profile}' refused: {barred} is barred by {BARRED_MODEL_DECISION_REF}")
 
     requested = normalize_effort(effort)
     marker = parse_e6_arm_marker(e6_arm)
+    experiment_effort = requested or (marker.effort if marker and marker.profile == canonical else None)
+    experiment_row = next(
+        (entry for entry in view.entries if entry.key == (canonical, experiment_effort) and entry.retired_at),
+        None,
+    )
+    experiment_retired = (
+        f"{canonical}@{experiment_effort}"
+        if experiment_row is not None
+        and operator_request == EXPERIMENT_REQUEST_REF
+        and e6_arm_matches(marker, canonical, experiment_effort)  # hk1990-experiment
+        else None
+    )
+    if experiment_retired:
+        requested = experiment_effort
+        # Local launch projection only: retirement/placement in the catalog is unchanged.
+        rows.append(dataclasses.replace(experiment_row, gate=GATE_CONSULT_ONLY, retired_at=None))
+    if any(is_barred_model_id(row.model_id) for row in rows):
+        barred = next(row.model_id for row in rows if is_barred_model_id(row.model_id))
+        raise LaunchError(f"profile '{profile}' refused: {barred} is barred by {BARRED_MODEL_DECISION_REF}")
     e6_row = e6_arm_rung_for(canonical, requested)
     e6_open = e6_row is not None and e6_arm_matches(marker, canonical, requested)
     if not e6_open:
@@ -717,7 +749,7 @@ def resolve_launch(
         # or gates the preferred rung a leftover C row became the "best-graded
         # ordinary rung" — an unmarked ``policy launch grok-hi`` resolved the
         # unmeasured xhigh rung and the canon's own retirement stopped refusing.
-        rows = [row for row in rows if not _unmeasured_e6_row(row)]
+        rows = [row for row in rows if row.gate == GATE_CONSULT_ONLY or not _unmeasured_e6_row(row)]
 
     from_snapshot = False
     if not rows:
@@ -858,6 +890,12 @@ def resolve_launch(
         billing=_bundled_billing(canonical),
         family=provider_family(canonical),
     )
+    if experiment_retired:
+        return _ExperimentRetiredLaunch(
+            **dataclasses.asdict(decision),
+            experiment_retired=experiment_retired,
+            operator_request_ref=EXPERIMENT_REQUEST_REF,
+        )
     if profile in {"codex-astra", "fable"} and (role or "").strip().casefold() == "builder":
         return _RoundExtensionBuilderLaunch(
             **dataclasses.asdict(decision),
