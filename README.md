@@ -357,8 +357,9 @@ AA-agent 점수만 있는 행, 미측정 행(E6 측정 런그 포함)은 아래�
 ### borrowed 행 — 운영자 지정 런그의 한 급 아래 표시 (d1786ap, hk 1795)
 
 `recommend.BORROWED_RUNGS`는 운영자 지시(d1786ap, hk:task/1786)로 지정된 두
-런그 — `opus@low`(A+에 표시)와 `codex-sol@xhigh`(S에 표시) — 를 배치 급의
-정확히 한 급 아래에도 나열합니다. 한 행이 두 급에 앉는 것(d1786dup)은 카탈로그가
+런그 — `codex-sol@xhigh`(S에 표시)와 `sonnet@high`(B에 표시) — 를 배치 급의
+정확히 한 급 아래에도 나열합니다. `opus@low`의 A+ 나열은 r1025p1apply(hk 1786,
+hk 2007)로 제거되어 A+에는 나타나지 않습니다. 한 행이 두 급에 앉는 것(d1786dup)은 카탈로그가
 (profile, effort) 당 급 하나만 담을 수 있어서 표기 불가하므로, 배치가 아니라
 **표시 나열**로 표현합니다. 표 형식·순서 규칙은 one-up 행과 같습니다(순위 줄
 끝 `[borrowed <배치 급>]` 태그, JSON은 `borrowed: true` + `placed_grade`) —

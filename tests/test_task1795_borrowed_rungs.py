@@ -1,9 +1,10 @@
 """hk 1795 — d1786ap borrowed rungs: a cross-grade listing, not a placement.
 
-``recommend.BORROWED_RUNGS`` names the two operator-directive rows
-(hk:task/1786): ``opus@low`` lists at ``A+`` while the table places it at S,
+``recommend.BORROWED_RUNGS`` names the operator-directive rows (hk:task/1786):
 ``codex-sol@xhigh`` lists at ``S`` while the table places it at S+ keeping its
-escalation gate. An entry lists only while the live table (canon view or
+escalation gate, and ``sonnet@high`` lists at ``B`` while the table places it at
+A. (``opus@low``'s former A+ listing was removed by r1025p1apply, hk 2007.) An
+entry lists only while the live table (canon view or
 snapshot) carries the rung exactly one grade above its listed grade — anywhere
 else or absent, it is inert. A borrowed row is a ranked candidate ordered like
 a one-up row, tagged ``[borrowed <placed grade>]``; a row qualifying as both
@@ -118,7 +119,6 @@ def _seed_rows_with(profile: str, effort: str, **patch):
 
 def test_borrowed_rungs_is_exactly_the_directive_entries():
     assert BORROWED_RUNGS == (
-        ("opus", "low", "A+", "default", "operator d1786ap hk:task/1786"),
         ("codex-sol", "xhigh", "S", "default", "operator hk:task/1786 comment 6689"),
         ("sonnet", "high", "B", "default", "operator hk:task/1786 comment 6689"),
     )
@@ -128,25 +128,12 @@ def test_borrowed_entries_list_at_their_named_grade_only():
     for grade in GRADES:
         listed = {(p.name, p.launcher_effort) for p, _ in _borrowed_profiles(grade, GRADE_TABLE)}
         expected = (
-            {("opus", "low")}
-            if grade == "A+"
-            else (
-                {("codex-sol", "xhigh")}
-                if grade == "S"
-                else ({("sonnet", "high")} if grade == "B" else set())
-            )
+            {("codex-sol", "xhigh")} if grade == "S" else ({("sonnet", "high")} if grade == "B" else set())
         )
         assert listed == expected, grade
 
 
 # ── AC1: snapshot fixture ─────────────────────────────────────────────────────
-
-
-def test_recommend_aplus_lists_opus_low_tagged_borrowed_s():
-    out = recommend(_pool_providers(), "A+", today=TODAY, now=NOW)
-    lines = [line for line in _ranked(out) if "opus --effort low" in line]
-    assert len(lines) == 1 and "[borrowed S]" in lines[0], out
-    assert "[one-up" not in lines[0]
 
 
 def test_recommend_s_lists_codex_sol_xhigh_tagged_borrowed_splus_candidate():
@@ -159,19 +146,19 @@ def test_recommend_s_lists_codex_sol_xhigh_tagged_borrowed_splus_candidate():
 
 
 def test_recommend_dict_marks_borrowed_rows():
-    aplus = recommend_dict(_pool_providers(), "A+", today=TODAY, now=NOW)
-    opus = next(row for row in aplus["rows"] if row["profile"] == "opus" and "low" in str(row["display"]))
-    assert opus["kind"] == "candidate"
-    assert opus["borrowed"] is True
-    assert opus["placed_grade"] == "S"
-    assert opus["one_up"] is False
-
     s = recommend_dict(_pool_providers(), "S", today=TODAY, now=NOW)
     sol = next(row for row in s["rows"] if row["profile"] == "codex-sol" and "xhigh" in str(row["display"]))
     assert sol["kind"] == "candidate"
     assert sol["borrowed"] is True
     assert sol["placed_grade"] == "S+"
     assert sol["one_up"] is False
+
+    b = recommend_dict(_pool_providers(), "B", today=TODAY, now=NOW)
+    sonnet = next(row for row in b["rows"] if row["profile"] == "sonnet" and "high" in str(row["display"]))
+    assert sonnet["kind"] == "candidate"
+    assert sonnet["borrowed"] is True
+    assert sonnet["placed_grade"] == "A"
+    assert sonnet["one_up"] is False
 
 
 # ── AC1: canon fixture ────────────────────────────────────────────────────────
@@ -180,24 +167,24 @@ def test_recommend_dict_marks_borrowed_rows():
 def test_canon_fixture_lists_both_borrowed_rows():
     table = _canon_table()
     providers = _pool_providers(table)
-    out = recommend(providers, "A+", today=TODAY, now=NOW, grade_table=table)
-    lines = [line for line in _ranked(out) if "opus --effort low" in line]
-    assert len(lines) == 1 and "[borrowed S]" in lines[0], out
-
     out = recommend(providers, "S", today=TODAY, now=NOW, grade_table=table)
     entry_line = next(line for line in out.splitlines() if "codex-sol --effort xhigh" in line)
     assert "[borrowed S+]" in entry_line
+
+    out = recommend(providers, "B", today=TODAY, now=NOW, grade_table=table)
+    lines = [line for line in _ranked(out) if "sonnet --effort high" in line]
+    assert len(lines) == 1 and "[borrowed A]" in lines[0], out
 
 
 def test_canon_fixture_json_marks_borrowed_rows():
     table = _canon_table()
     providers = _pool_providers(table)
-    aplus = recommend_dict(providers, "A+", today=TODAY, now=NOW, grade_table=table)
-    opus = next(row for row in aplus["rows"] if row.get("borrowed") is True)
-    assert opus["profile"] == "opus" and opus["placed_grade"] == "S" and opus["kind"] == "candidate"
     s = recommend_dict(providers, "S", today=TODAY, now=NOW, grade_table=table)
     sol = next(row for row in s["rows"] if row.get("borrowed") is True and row["profile"] == "codex-sol")
     assert sol["placed_grade"] == "S+" and sol["kind"] == "candidate"
+    b = recommend_dict(providers, "B", today=TODAY, now=NOW, grade_table=table)
+    sonnet = next(row for row in b["rows"] if row.get("borrowed") is True and row["profile"] == "sonnet")
+    assert sonnet["placed_grade"] == "A" and sonnet["kind"] == "candidate"
 
 
 def test_recommend_json_cli_marks_borrowed(monkeypatch, capsys):
@@ -209,38 +196,42 @@ def test_recommend_json_cli_marks_borrowed(monkeypatch, capsys):
             for name in {recommend_mod.resolved_pool(p)[0] for ps in GRADE_TABLE.values() for p in ps}
         },
     )
-    assert cli.main(["--recommend", "A+", "--json", "--no-cache"]) == 0
+    assert cli.main(["--recommend", "S", "--json", "--no-cache"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    opus = next(row for row in payload["rows"] if row["profile"] == "opus" and "low" in str(row["display"]))
-    assert opus["borrowed"] is True and opus["placed_grade"] == "S"
+    sol = next(
+        row for row in payload["rows"] if row["profile"] == "codex-sol" and "xhigh" in str(row["display"])
+    )
+    assert sol["borrowed"] is True and sol["placed_grade"] == "S+"
 
 
 # ── AC2: inert cases, one each ────────────────────────────────────────────────
+# hk 2007 removed the opus@low A+ entry; the inert cases below run on the
+# sonnet@high B entry (listed at B, expected to be placed at A).
 
 
-def test_inert_when_canon_places_opus_low_at_aplus_itself():
+def test_inert_when_canon_places_sonnet_high_at_b_itself():
     """A canon move to the listed grade makes it an exact row, not borrowed."""
-    table = _canon_table(_seed_rows_with("opus", "low", grade="A+"))
-    out = recommend(_pool_providers(table), "A+", today=TODAY, now=NOW, grade_table=table)
-    lines = [line for line in _ranked(out) if "opus --effort low" in line]
+    table = _canon_table(_seed_rows_with("sonnet", "high", grade="B"))
+    out = recommend(_pool_providers(table), "B", today=TODAY, now=NOW, grade_table=table)
+    lines = [line for line in _ranked(out) if "sonnet --effort high" in line]
     assert len(lines) == 1 and "[borrowed" not in lines[0] and "[one-up" not in lines[0]
     assert "[borrowed" not in out
 
 
-def test_inert_when_canon_places_opus_low_at_splus():
+def test_inert_when_canon_places_sonnet_high_at_s():
     """Placed two grades above the listed grade the entry stays silent."""
-    table = _canon_table(_seed_rows_with("opus", "low", grade="S+"))
+    table = _canon_table(_seed_rows_with("sonnet", "high", grade="S"))
     for grade in GRADES:
         out = recommend(_pool_providers(table), grade, today=TODAY, now=NOW, grade_table=table)
-        assert "[borrowed S]" not in out, grade  # the codex-sol [borrowed S+] row may still list
+        assert "[borrowed A]" not in out, grade
 
 
-def test_inert_when_canon_retires_opus_low():
+def test_inert_when_canon_retires_sonnet_high():
     """A retired rung is not carried — the entry finds nothing to list."""
-    table = _canon_table(_seed_rows_with("opus", "low", retired_at="2026-10-21T00:00:00Z"))
+    table = _canon_table(_seed_rows_with("sonnet", "high", retired_at="2026-10-21T00:00:00Z"))
     for grade in GRADES:
         out = recommend(_pool_providers(table), grade, today=TODAY, now=NOW, grade_table=table)
-        assert "opus --effort low" not in out and "[borrowed S]" not in out, grade
+        assert "sonnet --effort high" not in out and "[borrowed A]" not in out, grade
 
 
 def test_inert_when_codex_sol_xhigh_placed_at_s():
@@ -297,7 +288,9 @@ def test_everything_else_is_byte_identical_text_and_json(fixture, monkeypatch):
     for grade in GRADES:
         text_with, json_with = with_rows[grade]
         text_base, json_base = base_rows[grade]
-        if grade not in ("A+", "S", "B"):
+        # hk 2007: A+ carries no borrowed entry any more, so A+ is byte-identical
+        # to the run with BORROWED_RUNGS emptied, like every other grade but S, B.
+        if grade not in ("S", "B"):
             assert text_with == text_base, grade
             assert json_with == json_base, grade
             continue
@@ -323,9 +316,7 @@ def test_everything_else_is_byte_identical_text_and_json(fixture, monkeypatch):
 
         added = _added_lines("\n".join(strip(text_base)), "\n".join(strip(text_with)))
         assert added, grade
-        if grade == "A+":
-            assert len(added) == 1 and "opus --effort low" in added[0] and "[borrowed S]" in added[0]
-        elif grade == "B":
+        if grade == "B":
             joined = "\n".join(added)
             assert "sonnet --effort high" in joined and "[borrowed A]" in joined
         else:
@@ -341,8 +332,10 @@ def test_better_value_borrowed_outranks_exact_exact_first_only_on_full_tie():
     exact/borrowed tie-break, so a better-value borrowed row lists first — and
     a full tie restores exact-first."""
     table = {grade: [] for grade in GRADES}
-    table["S"].append(Profile("opus", "Opus (low)", 62.0, launcher_effort="low", aa_model_id="m-opus"))
-    table["A+"].append(Profile("sonnet", "Exact", 62.0, aa_model_id="m-exact"))
+    table["A"].append(
+        Profile("sonnet", "Sonnet (high)", 62.0, launcher_effort="high", aa_model_id="m-borrow")
+    )
+    table["B"].append(Profile("haiku", "Exact", 62.0, aa_model_id="m-exact"))
     providers = [ProviderResult(id="claude", pool_class="preserve", buckets=[_bucket()])]
 
     def price(model_id: str, blended: float) -> bench.ModelPrice:
@@ -357,25 +350,25 @@ def test_better_value_borrowed_outranks_exact_exact_first_only_on_full_tie():
     ranked = _ranked_labels(
         recommend(
             providers,
-            "A+",
+            "B",
             today=TODAY,
             now=NOW,
             grade_table=table,
-            model_prices={"m-opus": price("m-opus", 5.0), "m-exact": price("m-exact", 10.0)},
+            model_prices={"m-borrow": price("m-borrow", 5.0), "m-exact": price("m-exact", 10.0)},
         )
     )
-    assert ranked == ["opus --effort low", "sonnet"], ranked
+    assert ranked == ["sonnet --effort high", "haiku"], ranked
     tied = _ranked_labels(
         recommend(
             providers,
-            "A+",
+            "B",
             today=TODAY,
             now=NOW,
             grade_table=table,
-            model_prices={"m-opus": price("m-opus", 10.0), "m-exact": price("m-exact", 10.0)},
+            model_prices={"m-borrow": price("m-borrow", 10.0), "m-exact": price("m-exact", 10.0)},
         )
     )
-    assert tied == ["sonnet", "opus --effort low"], tied
+    assert tied == ["haiku", "sonnet --effort high"], tied
 
 
 def test_rank_key_treats_borrowed_like_one_up(monkeypatch):
@@ -411,30 +404,31 @@ def test_rank_key_treats_borrowed_like_one_up(monkeypatch):
 
 
 def test_a_row_qualifying_as_both_one_up_and_borrowed_lists_once_as_borrowed():
-    """Mutant pin for the dedup: make opus@low rep-measured (one-up eligible,
-    default gate, not Sol) — it must still list exactly once, tagged
-    [borrowed S], never [one-up S]."""
+    """Mutant pin for the dedup: make sonnet@high rep-measured at its placed
+    grade A (one-up eligible at B, default gate, not Sol) — it must still list
+    exactly once, tagged [borrowed A], never [one-up A]. (hk 2007: the opus@low
+    A+ entry is gone, so the dedup is pinned on the sonnet@high B entry.)"""
     table = {grade: list(profiles) for grade, profiles in GRADE_TABLE.items()}
     rep = Profile(
-        "opus",
-        "Opus (low)",
-        62.0,
-        launcher_effort="low",
-        benchmark_annotation="급 실측(S; reps 3/3)",
-        aa_agent_model_id="claude-opus-5-5",
-        aa_model_id="claude-opus-5-5",
+        "sonnet",
+        "Sonnet (high)",
+        43.0,
+        launcher_effort="high",
+        benchmark_annotation="급 실측(A; reps 3/3)",
+        aa_agent_model_id="claude-sonnet-5-5",
+        aa_model_id="claude-sonnet-5-5",
     )
-    table["S"] = [rep if (p.name, p.launcher_effort) == ("opus", "low") else p for p in table["S"]]
-    one_up = [p for p, _ in recommend_mod._one_up_profiles("A+", table)]
-    borrowed = [p for p, _ in _borrowed_profiles("A+", table)]
+    table["A"] = [rep if (p.name, p.launcher_effort) == ("sonnet", "high") else p for p in table["A"]]
+    one_up = [p for p, _ in recommend_mod._one_up_profiles("B", table)]
+    borrowed = [p for p, _ in _borrowed_profiles("B", table)]
     assert rep in one_up and rep in borrowed  # both paths independently qualify
 
-    out = recommend(_pool_providers(table), "A+", today=TODAY, now=NOW, grade_table=table)
-    lines = [line for line in _ranked(out) if "opus --effort low" in line]
-    assert len(lines) == 1 and "[borrowed S]" in lines[0] and "[one-up" not in lines[0], out
+    out = recommend(_pool_providers(table), "B", today=TODAY, now=NOW, grade_table=table)
+    lines = [line for line in _ranked(out) if "sonnet --effort high" in line]
+    assert len(lines) == 1 and "[borrowed A]" in lines[0] and "[one-up" not in lines[0], out
 
-    payload = recommend_dict(_pool_providers(table), "A+", today=TODAY, now=NOW, grade_table=table)
-    rows = [row for row in payload["rows"] if row["profile"] == "opus" and "low" in str(row["display"])]
+    payload = recommend_dict(_pool_providers(table), "B", today=TODAY, now=NOW, grade_table=table)
+    rows = [row for row in payload["rows"] if row["profile"] == "sonnet" and "high" in str(row["display"])]
     assert len(rows) == 1
     assert rows[0]["borrowed"] is True and rows[0]["one_up"] is False
 

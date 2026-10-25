@@ -231,7 +231,6 @@ def test_policy_excluded_pool_folds_not_hidden():
 
 def test_borrowed_rungs_entries_and_refs():
     assert BORROWED_RUNGS == (
-        ("opus", "low", "A+", "default", "operator d1786ap hk:task/1786"),
         ("codex-sol", "xhigh", "S", "default", "operator hk:task/1786 comment 6689"),
         ("sonnet", "high", "B", "default", "operator hk:task/1786 comment 6689"),
     )
@@ -270,27 +269,28 @@ def test_no_grok_rung_ranked_or_borrowed_at_b_or_c():
 
 
 def test_inert_borrowed_entry_folds_with_source_grade():
-    """opus@low moved to S+ (two grades above the A+ listing) — the entry is
-    inert and folds at A+ naming where the rung actually is. Dropping this
-    fold (mutant) turns this case RED."""
+    """sonnet@high moved to S (one grade above its A source, not the B listing's
+    expected source) — the entry is inert and folds at B naming where the rung
+    actually is. Dropping this fold (mutant) turns this case RED. hk 2007 removed
+    the opus@low A+ entry, so the inert fold is pinned on the sonnet@high B entry."""
     rows = _cleaned_canon_rows()
-    target = next(row for row in rows if row["profile"] == "opus" and row["effort"] == "low")
-    target["grade"] = "S+"
+    target = next(row for row in rows if row["profile"] == "sonnet" and row["effort"] == "high")
+    target["grade"] = "S"
     table = _canon_table(rows)
-    out = recommend(_pool_providers(table), "A+", today=TODAY, now=NOW, grade_table=table)
-    assert not any("opus --effort low" in line for line in _ranked(out)), out
+    out = recommend(_pool_providers(table), "B", today=TODAY, now=NOW, grade_table=table)
+    assert not any("sonnet --effort high" in line for line in _ranked(out)), out
     fold = _fold_line(out)
-    assert "opus@low — borrowed rung inert" in fold, fold
-    assert "expected at S" in fold and "placed at S+" in fold
+    assert "sonnet@high — borrowed rung inert" in fold, fold
+    assert "expected at A" in fold and "placed at S" in fold
 
 
 def test_retired_borrowed_rung_folds_as_not_carried():
     rows = _cleaned_canon_rows()
-    target = next(row for row in rows if row["profile"] == "opus" and row["effort"] == "low")
+    target = next(row for row in rows if row["profile"] == "sonnet" and row["effort"] == "high")
     target["retired_at"] = "2026-10-23T00:00:00Z"
     table = _canon_table(rows)
-    out = recommend(_pool_providers(table), "A+", today=TODAY, now=NOW, grade_table=table)
-    assert "opus@low" in _fold_line(out)
+    out = recommend(_pool_providers(table), "B", today=TODAY, now=NOW, grade_table=table)
+    assert "sonnet@high" in _fold_line(out)
     assert "not carried" in _fold_line(out)
 
 

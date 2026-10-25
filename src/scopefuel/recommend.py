@@ -1812,13 +1812,13 @@ _REP_DECISION_REF = re.compile(
 # places nothing — ``validate_grade_table`` is never called for it — and the
 # one-up listing's exclusion of Sol profiles stays exactly as it is.
 # ``BORROWED_RUNGS`` is the explicit operator exception to both: it is what
-# lets codex-sol@xhigh list at S without placing a Sol row outside S+, and
-# what lets opus@low list at A+ without rep evidence. r1023grokup keeps grok
-# out of borrowed listings at B and C (grok only at A and above).
+# lets codex-sol@xhigh list at S without placing a Sol row outside S+.
+# opus@low's A+ listing was removed by r1025p1apply (hk 1786, hk 2007): at A+
+# the claude seat is sonnet@xhigh, and opus@low lists at S only. r1023grokup
+# keeps grok out of borrowed listings at B and C (grok only at A and above).
 #
 # Shape: (profile, launcher_effort, listed_grade, listed_gate, decision_ref).
 BORROWED_RUNGS: tuple[tuple[str, str, Grade, Gate, str], ...] = (
-    ("opus", "low", "A+", "default", "operator d1786ap hk:task/1786"),
     ("codex-sol", "xhigh", "S", "default", "operator hk:task/1786 comment 6689"),
     ("sonnet", "high", "B", "default", "operator hk:task/1786 comment 6689"),
 )

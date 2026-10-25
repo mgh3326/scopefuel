@@ -2,27 +2,6 @@
   "grade": "A+",
   "rows": [
     {
-      "profile": "opus",
-      "display": "opus --effort low",
-      "launch": "opus --effort low",
-      "provider": "claude",
-      "placed_grade": "S",
-      "one_up": false,
-      "billing": "unknown",
-      "borrowed": true,
-      "kind": "candidate",
-      "provider_label": "Claude",
-      "windows": "주 10% · 제약=주",
-      "remaining_pct": 90.0,
-      "pool_class": "spend",
-      "boost": null,
-      "weight": 1.0,
-      "effective_remaining": 90.0,
-      "score": 112.5,
-      "urgent": false,
-      "imminent_exhaustion": false
-    },
-    {
       "profile": "grok",
       "display": "grok --effort medium",
       "launch": "grok --effort medium",
