@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from . import cache, exhaust, free_window, inflight, manual, quota_share
-from .bench import ModelPrice, ModelScore, display_effort, normalize_aa_model_id
+from .bench import AreaException, ModelPrice, ModelScore, display_effort, normalize_aa_model_id
 from .model import (
     PROBE_IN_PROGRESS,
     SWE2_BACKOFF,
@@ -2515,6 +2515,9 @@ class _Candidate:
     placed_grade: Grade | None = None
     one_up: bool = False
     borrowed: bool = False
+    # hk 1945: (action, decision_ref) when a live area exception adjusted this
+    # row — the additive JSON marker only, never part of the text row.
+    area_adjustment: tuple[str, str] | None = None
 
 
 @dataclass
@@ -2522,10 +2525,11 @@ class _Excluded:
     profile: Profile
     reason: str
     provider_id: str = ""
-    kind: str = "other"  # "exhausted" | "unmeasurable" | "other"
+    kind: str = "other"  # "exhausted" | "unmeasurable" | "other" | "area_exclude"
     placed_grade: Grade | None = None
     one_up: bool = False
     borrowed: bool = False
+    area_adjustment: tuple[str, str] | None = None
 
 
 @dataclass
@@ -3230,6 +3234,15 @@ def _cross_grade_measured_alternatives(
 
 
 @dataclass(frozen=True)
+class GatePolicyContext:
+    """CLI-resolved policy keys for an implicit launch; never a grade placement."""
+
+    resolved_effort: str | None = None
+    row_effort: str | None = None
+    fully_retired: bool = False
+
+
+@dataclass(frozen=True)
 class GateResult:
     """``scopefuel gate`` 판정 결과."""
 
@@ -3278,6 +3291,7 @@ class GateResult:
     # C 급 E6 런그는 이 표식이 있을 때만 열리므로, 통과 판정의 감사 필드이자
     # allow 라인에 붙는 가시 표식의 원천이다.
     e6_arm: str | None = None
+    experiment_retired: str | None = None
     # task #742 — 구독 해지 플래그 거부 (CLI exit 6). 쿼타(exit 3)·측정불가(exit 4)·
     # 역할 거부(exit 5)와 다른 전용 코드다 — 구독 자체가 없는 판정을 "reset 을
     # 기다리면 풀리는 quota 차단"으로 오독하지 않게 한다.
@@ -3406,6 +3420,7 @@ _ESCALATION_SKIPS_QUOTA_CHECK = frozenset({"oc-omni"})
 # --operator-request 는 durable 참조만 받는다: ``hk:doc/<key>`` 또는
 # ``hk:task/<정수>``. 자유 텍스트·경로 탐색·허용 문자 밖 입력은 전부 거부한다.
 # 이 경로는 감사 가능한 "주장"을 기록할 뿐 신원이나 동의를 증명하지 않는다.
+EXPERIMENT_REQUEST_REF = "hk:task/1786"
 _OPERATOR_REQUEST_TASK_RE = re.compile(r"[0-9]{1,10}")
 _REQUESTED_BY_MAX = 64
 _REQUESTED_BY_RE = re.compile(r"\S+")
@@ -3944,6 +3959,8 @@ def gate_check(
     effort: str | None = None,
     e6_arm: str | None = None,
     retired_rungs: frozenset[tuple[str, str]] | None = None,
+    consult_only_rungs: frozenset[tuple[str, str]] = frozenset(),
+    policy_context: GatePolicyContext | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -3963,8 +3980,13 @@ def gate_check(
     없으면 런그 이름을 댄 사유와 함께 거부한다(rc 3). 표식은 그 런그 하나만
     열 수 있다 — 다른 프로필/런그를 가리키면 아무것도 넓히지 못한다.
 
-    ``retired_rungs``(#692)는 캐논이 retire 한 (profile, effort) 키다. 표식은
-    캐논이 닫은 런그를 되살리지 못한다 — retire 는 런그를 닫는 캐논의 수단이다.
+    ``retired_rungs``는 캐논이 retire 한 모든 (profile, effort) 키다. 정확한
+    실험 REF와 같은 런그 표식이 함께 있을 때만 열린다. ``consult_only_rungs``는
+    CLI가 같은 catalog view에서 읽은 운영자 요청 전용 런그 키다.
+
+    ``policy_context``는 effort/marker가 없는 호출의 launch 정책 행이다. 빈 effort
+    projection을 요청한 런그로 오인하지 않도록 CLI가 launch의 기본 선택으로 계산한다.
+    정책 키만 선택하며 기존 grade/explicit-rung/escalation 판정은 바꾸지 않는다.
 
     escalation 프로필은 "같은 grade 정상 대안이 전부 비가용"이라는 자격을 먼저 확인한다.
     자격 충족은 추가 자격일 뿐 기본 쿼타/정책 검사의 우회가 아니므로, 자격 충족 후에도
@@ -3972,7 +3994,7 @@ def gate_check(
     유효 class·exclude·raw cutoff 를 정상 프로필과 동일하게 검사한다.
 
     ``operator_request``(task #461)는 escalation 프로필과 CONSULT_ONLY_PROFILES
-    (fable)에서만 유효한 운영자 명시 요청의 durable 참조다. escalation 에서는 유효한
+    (fable), catalog consult_only 런그와 retired 실험에서 유효한 durable 참조다. escalation 에서는 유효한
     REF 가 "같은 grade 정상 대안이 가용하므로 거부" 갈래 **하나만** 건너뛰고,
     consult_only 에서는 요청 그 자체가 자격이다(policy launch 와 같은 충족 조건 —
     task #625). 어느 쪽이든 나머지 검사(측정불가·exclude·cutoff·quota)는 그대로
@@ -4102,24 +4124,55 @@ def gate_check(
     # 캐논이 그 런그를 그 런그의 carrier 급 밖으로 배치했으면 E6 제한은 없다 —
     # 제한은 "미측정" 동안만 유효하다(측정이 끝난 런그는 평범한 런그다). 비교는
     # 런그 자체의 carrier 에 대해 한다 — sonnet@max 는 A+ 가 carrier 다(#1788).
+    retired_effort = (
+        rung if rung is not None else (policy_context.resolved_effort if policy_context else None)
+    )
+    consult_effort = rung if rung is not None else (policy_context.row_effort if policy_context else None)
+    retired = retired_effort is not None and (canonical_profile, retired_effort) in (
+        retired_rungs or frozenset()
+    )
+    fully_retired = policy_context is not None and policy_context.fully_retired
+    experiment_retired = (
+        f"{canonical_profile}@{retired_effort}"
+        if retired
+        and operator_request == EXPERIMENT_REQUEST_REF
+        and e6_arm_matches(e6_marker, canonical_profile, retired_effort)  # hk1990-experiment
+        else None
+    )
+    if (retired or fully_retired) and experiment_retired is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=e6_arm_carrier_grade(canonical_profile, retired_effort)
+            if (canonical_profile, retired_effort) in E6_ARM_KEYS
+            else None,
+            reason=(
+                f"profile '{profile_name}' rung '{retired_effort}' is retired in the catalog"
+                if retired
+                else f"profile '{profile_name}' is retired in the catalog"
+            ),
+            e6_arm=f"{canonical_profile}@{retired_effort}"
+            if (canonical_profile, retired_effort) in E6_ARM_KEYS
+            else None,
+        )
+    consult_only = (  # hk1990-consult-only
+        profile_name in CONSULT_ONLY_PROFILES
+        or (
+            canonical_profile not in ASTRA_ROLE_PROFILES
+            and consult_effort is not None
+            and (canonical_profile, consult_effort) in consult_only_rungs
+        )
+        or experiment_retired is not None
+    )
     e6_row = (
         None
-        if rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung)
+        if consult_only
+        or (rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung))
         else e6_arm_rung_for(canonical_profile, rung)
     )
     e6_admitted: str | None = None
     if e6_row is not None:
-        if (canonical_profile, rung) in (retired_rungs or frozenset()):
-            # The canon closed the rung. A marker is not a way to reopen it —
-            # otherwise retiring an E6 rung would be a no-op for the arm path.
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=e6_arm_carrier_grade(canonical_profile, rung),
-                reason=f"profile '{profile_name}' rung '{rung}' is retired in the catalog",
-                e6_arm=f"{canonical_profile}@{rung}",
-            )
         # 미측정 E6 측정 런그는 배치가 아니다 — 표식이 정확히 이 런그를 가리킬 때만
         # 열린다. 없으면 런그 이름을 댄 사유로 거부한다(쿼타 판정 이전 — 배치 자체가
         # 없는 런그를 쿼타로 판정하면 "쿼타 소진"으로 오독된다).
@@ -4138,7 +4191,10 @@ def gate_check(
         e6_admitted = f"{canonical_profile}@{rung}"
 
     found = _find_profile(profile_name, grade_table=table)
-    if e6_admitted is not None:
+    if consult_only and profile_name not in CONSULT_ONLY_PROFILES:
+        # Catalog consultation has no candidate placement; use fable's quota path.
+        found = None
+    elif e6_admitted is not None:
         # 열린 런그의 급은 그 런그의 carrier 다 — 프로필 기본 배치(A+ 등)를
         # 보고하면 감사 기록이 실제 측정 런그와 다른 급을 주장하게 된다.
         assert e6_row is not None
@@ -4158,7 +4214,8 @@ def gate_check(
     if (
         operator_request is not None
         and (found is None or found[1].gate != "escalation")
-        and profile_name not in CONSULT_ONLY_PROFILES
+        and not consult_only
+        and e6_admitted is None  # An admitted E6 marker accepts a REF without requiring one (R4).
         and not (
             profile_name in ASTRA_ROLE_PROFILES
             and (purpose or "").strip().casefold() == "round-extension"
@@ -4183,7 +4240,7 @@ def gate_check(
     # 요청이 없으면 거부가 먼저다(측정불가보다 "실행 자격 없음"이 더 근본적 사실).
     # GRADE_TABLE 소속과 무관하게 검사한다 — 런타임 catalog 가 fable 을 다른 행으로
     # 되돌려 놓는 미래에도 요청 없는 스폰은 열리지 않는다.
-    if profile_name in CONSULT_ONLY_PROFILES and operator_request is None:
+    if consult_only and operator_request is None:
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -4196,9 +4253,9 @@ def gate_check(
         )
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
-        audit: dict[str, object] = {}
+        audit: dict[str, object] = {"experiment_retired": experiment_retired} if experiment_retired else {}
         if operator_request is not None:
-            audit = {
+            audit |= {
                 "operator_request_ref": operator_request,
                 "requested_by": audit_requested_by or "unknown",
                 "ref_resolution": "unverified",
@@ -4300,11 +4357,9 @@ def gate_check(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-        # ROB-591: fail-closed on an active policy exclude, scoped narrowly to
-        # CONSULT_ONLY_PROFILES (fable) only — the D3 path's ordinary "not in
-        # GRADE_TABLE" behavior for every other profile (e.g. a retired oc-*
-        # spelling) is unchanged.
-        if profile_name in CONSULT_ONLY_PROFILES and effective_class == "exclude":
+        # Consultation and retired experiments retain fable's fail-closed
+        # exclude check. Ordinary D3 profiles keep their previous quota behavior.
+        if consult_only and effective_class == "exclude":
             override = get_active_override(provider_id, today=today)
             reason_parts = [f"정책 제외 ({provider_id}"]
             if override is not None and override.until:
@@ -4868,6 +4923,226 @@ def _recommend_rank_key(
     )
 
 
+def _area_row_matches(row: AreaException, candidate: _Candidate) -> bool:
+    """Whether one exception row names this candidate (``effort ""`` = any)."""
+
+    if candidate.profile.name != row.profile:
+        return False
+    if not row.effort:
+        return True
+    return normalize_effort(candidate.profile.launcher_effort) == normalize_effort(row.effort)
+
+
+def _area_row_expired(row: AreaException, catalog_model_ids: Mapping[tuple[str, str], str] | None) -> bool:
+    """A rung-specific row whose catalog model id moved on is inactive."""
+
+    if catalog_model_ids is None:
+        return True
+    return catalog_model_ids.get((row.profile, row.effort)) != row.expires_with_model_id
+
+
+def _area_candidate_key(candidate: _Candidate) -> tuple[str, str]:
+    return (candidate.profile.name, normalize_effort(candidate.profile.launcher_effort) or "")
+
+
+def _area_candidate_model_id(
+    candidate: _Candidate, catalog_model_ids: Mapping[tuple[str, str], str] | None
+) -> str | None:
+    if catalog_model_ids is None:
+        return None
+    return catalog_model_ids.get(_area_candidate_key(candidate))
+
+
+def _area_wildcard_active(
+    row: AreaException, candidate: _Candidate, catalog_model_ids: Mapping[tuple[str, str], str] | None
+) -> bool:
+    """An effort-empty row is active for a candidate only when that candidate's
+    own (profile, effort) still carries the model id the evidence was measured on.
+
+    Looking up (profile, "") instead was the round-2 B1 bug: profiles without a
+    default-effort catalog row (opus, sonnet, every codex profile) always read as
+    expired, so a profile-wide decision never applied.
+    """
+
+    return _area_candidate_model_id(candidate, catalog_model_ids) == row.expires_with_model_id
+
+
+@dataclass(frozen=True)
+class _AreaExpired:
+    """One expired explanation: a rung row, or one effort of an effort-empty row."""
+
+    row: AreaException
+    effort: str
+    catalog_model_id: str | None
+
+
+def _area_explain_line(
+    row: AreaException,
+    *,
+    expired: bool,
+    catalog_model_ids: Mapping[tuple[str, str], str] | None,
+    effort: str | None = None,
+    model_id: str | None = None,
+) -> str:
+    if expired and effort is not None:
+        suffix = (
+            f" effort={effort} expired (expires_with_model_id={row.expires_with_model_id}, "
+            f"catalog_model_id={model_id or '-'})"
+        )
+    else:
+        catalog_id = catalog_model_ids.get((row.profile, row.effort)) if catalog_model_ids else None
+        suffix = (
+            f" expired (expires_with_model_id={row.expires_with_model_id}, "
+            f"catalog_model_id={catalog_id or '-'})"
+            if expired
+            else ""
+        )
+    return (
+        f"  area exception: area={row.area} key={row.label} action={row.action} "
+        f"decision={row.decision_ref} evidence={','.join(row.evidence_refs)}{suffix}"
+    )
+
+
+def _apply_area_exceptions(
+    evaluation: _Evaluation,
+    grade: Grade,
+    area: str,
+    exceptions: list[AreaException] | tuple[AreaException, ...],
+    catalog_model_ids: Mapping[tuple[str, str], str] | None,
+) -> list[str]:
+    """Apply the live rows for ``area`` after today's ranking is final.
+
+    Excludes first — exclude beats prefer, and a preferred row is never lifted
+    back from an exclusion. Only exact-grade candidates are lifted: a row
+    placed at a better grade (one-up/borrowed) keeps its place, and the lift
+    stops after the last better-grade row already ahead of it. The moved rows
+    keep their relative order. An effort-empty row is evaluated per candidate:
+    it applies only to the efforts whose own catalog model id still matches the
+    evidence, and each moved effort is named as expired. Returns the
+    ``--explain`` lines for applied and expired rows.
+    """
+
+    expired: list[_AreaExpired] = []
+    live: list[AreaException] = []
+    wildcard: list[AreaException] = []
+    for row in exceptions:
+        if row.area != area or row.retired_at is not None:
+            continue
+        if not row.effort:
+            wildcard.append(row)
+        elif _area_row_expired(row, catalog_model_ids):
+            model_id = catalog_model_ids.get((row.profile, row.effort)) if catalog_model_ids else None
+            expired.append(_AreaExpired(row, row.effort, model_id))
+        else:
+            live.append(row)
+
+    applied: list[AreaException] = []
+
+    def _mark_applied(row: AreaException) -> None:
+        if all(existing is not row for existing in applied):
+            applied.append(row)
+
+    for row in live:
+        if row.action != "exclude":
+            continue
+        removed = [candidate for candidate in evaluation.included if _area_row_matches(row, candidate)]
+        if not removed:
+            continue
+        _mark_applied(row)
+        for candidate in removed:
+            evaluation.included.remove(candidate)
+            evaluation.excluded.append(
+                _Excluded(
+                    candidate.profile,
+                    f"area:{area} exclude ({row.decision_ref})",
+                    provider_id=candidate.provider_id,
+                    kind="area_exclude",
+                    placed_grade=candidate.placed_grade,
+                    one_up=candidate.one_up,
+                    borrowed=candidate.borrowed,
+                    area_adjustment=("exclude", row.decision_ref),
+                )
+            )
+
+    # Effort-empty rows: one activity decision per candidate effort, collected
+    # before any mutation so both actions see the same picture.
+    wildcard_active: dict[int, list[AreaException]] = {}
+    for row in wildcard:
+        for candidate in evaluation.included:
+            if not _area_row_matches(row, candidate):
+                continue
+            if _area_wildcard_active(row, candidate, catalog_model_ids):
+                wildcard_active.setdefault(id(candidate), []).append(row)
+            else:
+                effort = normalize_effort(candidate.profile.launcher_effort) or "default"
+                model_id = _area_candidate_model_id(candidate, catalog_model_ids)
+                if not any(entry.row is row and entry.effort == effort for entry in expired):
+                    expired.append(_AreaExpired(row, effort, model_id))
+
+    wildcard_excludes = [row for row in wildcard if row.action == "exclude"]
+    if wildcard_excludes:
+        for candidate in list(evaluation.included):
+            active = [row for row in wildcard_active.get(id(candidate), []) if row.action == "exclude"]
+            if not active:
+                continue
+            _mark_applied(active[0])
+            evaluation.included.remove(candidate)
+            evaluation.excluded.append(
+                _Excluded(
+                    candidate.profile,
+                    f"area:{area} exclude ({active[0].decision_ref})",
+                    provider_id=candidate.provider_id,
+                    kind="area_exclude",
+                    placed_grade=candidate.placed_grade,
+                    one_up=candidate.one_up,
+                    borrowed=candidate.borrowed,
+                    area_adjustment=("exclude", active[0].decision_ref),
+                )
+            )
+
+    prefer_rows = [row for row in live if row.action == "prefer"]
+    wildcard_prefers = [row for row in wildcard if row.action == "prefer"]
+    if prefer_rows or wildcard_prefers:
+        grade_index = _GRADE_ORDER.index(grade)
+        better = [
+            index
+            for index, candidate in enumerate(evaluation.included)
+            if candidate.placed_grade is not None and _GRADE_ORDER.index(candidate.placed_grade) < grade_index
+        ]
+        start = better[-1] + 1 if better else 0
+        preferred: dict[int, AreaException] = {}
+        for candidate in evaluation.included:
+            if candidate.placed_grade != grade:
+                continue
+            matches = [row for row in prefer_rows if _area_row_matches(row, candidate)]
+            matches += [row for row in wildcard_active.get(id(candidate), []) if row.action == "prefer"]
+            if not matches:
+                continue
+            # A rung-specific row is the evidence for that rung; the
+            # profile-wide ("") row is the fallback when no rung row matches.
+            matches.sort(key=lambda row: 0 if row.effort else 1)
+            preferred[id(candidate)] = matches[0]
+            candidate.area_adjustment = ("prefer", matches[0].decision_ref)
+            _mark_applied(matches[0])
+        tail = evaluation.included[start:]
+        moving = [candidate for candidate in tail if id(candidate) in preferred]
+        rest = [candidate for candidate in tail if id(candidate) not in preferred]
+        evaluation.included[start:] = moving + rest
+
+    lines = [_area_explain_line(row, expired=False, catalog_model_ids=catalog_model_ids) for row in applied]
+    lines += [
+        _area_explain_line(
+            entry.row,
+            expired=True,
+            catalog_model_ids=catalog_model_ids,
+            effort=entry.effort if not entry.row.effort else None,
+            model_id=entry.catalog_model_id,
+        )
+        for entry in expired
+    ]
+    return lines
+
+
 def _evaluate(
     providers: list[ProviderResult],
     grade: Grade,
@@ -5407,6 +5682,9 @@ def recommend(
     free_rate_limit: str | None = None,
     swe2_result: ProviderResult | None = None,
     _swe2_model_scope: bool = True,
+    area: str | None = None,
+    area_exceptions: list[AreaException] | tuple[AreaException, ...] | None = None,
+    catalog_model_ids: Mapping[tuple[str, str], str] | None = None,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -5433,6 +5711,9 @@ def recommend(
     policy_excluded = evaluation.policy_excluded
     unsubscribed = evaluation.unsubscribed
     escalation = evaluation.escalation
+    area_lines: list[str] = []
+    if area is not None and area_exceptions:
+        area_lines = _apply_area_exceptions(evaluation, grade, area, area_exceptions, catalog_model_ids)
 
     def _compact_bench(
         profile: Profile,
@@ -5744,6 +6025,9 @@ def recommend(
             if explain and entry.profile.estimate_reason:
                 lines.append(f"    추정근거: {entry.profile.estimate_reason}")
 
+    if explain and area_lines:
+        lines.extend(area_lines)
+
     return "\n".join(lines)
 
 
@@ -5759,6 +6043,9 @@ def recommend_dict(
     grade_table: dict[Grade, list[Profile]] | None = None,
     free_rate_limit: str | None = None,
     swe2_result: ProviderResult | None = None,
+    area: str | None = None,
+    area_exceptions: list[AreaException] | tuple[AreaException, ...] | None = None,
+    catalog_model_ids: Mapping[tuple[str, str], str] | None = None,
 ) -> dict[str, object]:
     """Structured ``--recommend`` rows — the same fold ``recommend()`` renders.
 
@@ -5790,6 +6077,8 @@ def recommend_dict(
         free_rate_limit=free_rate_limit,
         swe2_result=swe2_result,
     )
+    if area is not None and area_exceptions:
+        _apply_area_exceptions(evaluation, grade, area, area_exceptions, catalog_model_ids)
 
     def _row(
         item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed | _EscalationEntry,
@@ -5809,6 +6098,9 @@ def recommend_dict(
         # everywhere would move every other row off the base bytes.
         if item.borrowed:
             row["borrowed"] = True
+        adjustment = getattr(item, "area_adjustment", None)
+        if adjustment is not None:
+            row["area_adjustment"] = {"action": adjustment[0], "decision_ref": adjustment[1]}
         return row
 
     rows: list[dict[str, object]] = []
@@ -5862,12 +6154,21 @@ def recommend_dict(
         *evaluation.policy_excluded,
         *evaluation.excluded,
     )
-    excluded_rows = [
-        {
+    excluded_rows = []
+    for item in excluded_items:
+        row: dict[str, object] = {
             "profile": item.profile.name,
             "effort": item.profile.launcher_effort or "default",
             "reason": _excluded_reason(item),
         }
-        for item in excluded_items
-    ]
-    return {"grade": grade, "rows": rows, "excluded": excluded_rows}
+        adjustment = getattr(item, "area_adjustment", None)
+        if adjustment is not None:
+            row["area_adjustment"] = {"action": adjustment[0], "decision_ref": adjustment[1]}
+        excluded_rows.append(row)
+    payload: dict[str, object] = {"grade": grade, "rows": rows, "excluded": excluded_rows}
+    # hk 1945 (operator ruling 2026-10-25): the key exists only when --area was
+    # given. Without it the JSON stays byte-identical to main, which is the
+    # design's main regression guard.
+    if area is not None:
+        payload["area"] = area
+    return payload

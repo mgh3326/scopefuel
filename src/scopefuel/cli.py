@@ -112,6 +112,15 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         help="해당 급의 모델 사용 우선순위 추천. " + grade_help_text(),
     )
     parser.add_argument(
+        "--area",
+        dest="recommend_area",
+        metavar="AREA",
+        help=(
+            "--recommend 시 K1 task-area 어휘의 영역 하나 — 그 영역의 bench 예외"
+            "(exclude/prefer)를 오늘 순위 위에 적용한다. 어휘에 없으면 exit 2"
+        ),
+    )
+    parser.add_argument(
         "--explain",
         action="store_true",
         help=(
@@ -1180,6 +1189,24 @@ def _inflight_command(args: argparse.Namespace) -> int:
 
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
+    area = getattr(args, "recommend_area", None)
+    if area is not None:
+        # hk 1945 design item 1: the flag is validated against the K1 server
+        # vocabulary before any provider or catalog work. No vocabulary and no
+        # last-good cache is a refusal, never a silent no-area fallback.
+        vocabulary = bench.read_task_areas()
+        if vocabulary.areas is None:
+            print(
+                "error: --area needs the handoffkeep task-area vocabulary and no cached copy is available",
+                file=sys.stderr,
+            )
+            return 2
+        if area not in vocabulary.areas:
+            print(
+                f"error: unknown area {area!r} — allowed: {', '.join(vocabulary.areas)}",
+                file=sys.stderr,
+            )
+            return 2
     free_limit = free_window.active_record(now=now)
     results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
     automatic_devin = next((item for item in results if item.id == "devin"), None)
@@ -1199,6 +1226,11 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
     )
     swe2_result = _refresh_swe2_result(automatic_devin, needed=needs_swe2, now=now)
     catalog = bench.read_catalog()
+    area_exceptions = None
+    catalog_model_ids = None
+    if area is not None:
+        area_exceptions = bench.read_area_exceptions().entries
+        catalog_model_ids = {(entry.profile, entry.effort): entry.model_id for entry in catalog.entries}
     if getattr(args, "json", False):
         payload = recommend.recommend_dict(
             results,
@@ -1210,6 +1242,9 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             grade_table=grade_table,
             free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
             swe2_result=swe2_result,
+            area=area,
+            area_exceptions=area_exceptions,
+            catalog_model_ids=catalog_model_ids,
         )
         payload["catalog"] = catalog.label
         print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
@@ -1229,6 +1264,9 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
                 grade_table=grade_table,
                 free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
                 swe2_result=swe2_result,
+                area=area,
+                area_exceptions=area_exceptions,
+                catalog_model_ids=catalog_model_ids,
             )
         )
         # Provenance line, always printed: a table that silently came from the
@@ -1281,6 +1319,7 @@ def _gate_record(
             "exhaust_notice": result.exhaust_notice,
             "missing_windows": list(result.missing_windows),
         }
+        | ({"experiment_retired": result.experiment_retired} if result.experiment_retired else {})
         | ({"inflight": result.inflight} if result.inflight else {})
         | ({"account": account} if account else {})
         | (
@@ -1328,11 +1367,11 @@ def _e6_arm_marker() -> str | None:
     return os.environ.get(recommend.E6_ARM_MARKER_ENV)
 
 
-def _retired_e6_rungs() -> frozenset[tuple[str, str]]:
-    """#692: the E6 rungs the canon retired.
+def _retired_rungs() -> frozenset[tuple[str, str]]:
+    """All rungs the canon retired (hk 1990 aligns gate with launch).
 
-    A marker must not revive a rung the operator closed, and the gate has no
-    catalog view of its own — the runtime grade table drops retired rows without
+    Only the exact experiment REF plus marker can reopen a closed rung. The
+    gate has no catalog view of its own — the runtime grade table drops retired rows without
     saying why. Read the view (memoised per process) and hand the keys over.
     """
 
@@ -1340,11 +1379,48 @@ def _retired_e6_rungs() -> frozenset[tuple[str, str]]:
         view = bench.read_catalog()
     except bench.BenchError:
         return frozenset()
+    return frozenset((entry.profile, entry.effort) for entry in view.entries if entry.retired_at)
+
+
+def _consult_only_rungs() -> frozenset[tuple[str, str]]:
+    """Consultation keys from the same memoised catalog view as retirement."""
+    try:
+        view = bench.read_catalog()
+    except bench.BenchError:
+        return frozenset()
     return frozenset(
-        (entry.profile, entry.effort)
-        for entry in view.entries
-        if entry.retired_at and (entry.profile, entry.effort) in recommend.E6_ARM_KEYS
+        entry.key for entry in view.entries if entry.gate == "consult_only" and not entry.retired_at
     )
+
+
+def _gate_policy_context(
+    profile: str, effort: str | None, e6_arm: str | None
+) -> recommend.GatePolicyContext | None:
+    """Use launch's default selection for policy keys, without making it explicit."""
+    try:
+        view = bench.read_catalog()
+    except bench.BenchError:
+        return None
+    looked_up = recommend._swe2_lookup_name(profile)
+    canonical = recommend.PROFILE_ALIASES.get(looked_up, looked_up)
+    entries = [entry for entry in view.entries if entry.profile == canonical]
+    if not entries:
+        return None
+    if all(entry.retired_at for entry in entries):
+        return recommend.GatePolicyContext(fully_retired=True)
+    marker = recommend.parse_e6_arm_marker(e6_arm)
+    if recommend.normalize_effort(effort) is not None or (marker and marker.profile == canonical):
+        return None
+    rows = [
+        entry
+        for entry in launch._live_rows(view, canonical)
+        if entry.gate == launch.GATE_CONSULT_ONLY or not launch._unmeasured_e6_row(entry)
+    ]
+    if not rows:
+        return None
+    fallback, resolved = launch._default_effort(canonical, rows)
+    row_effort = resolved if any(row.effort == resolved for row in rows) else fallback
+    return recommend.GatePolicyContext(resolved_effort=resolved, row_effort=row_effort)
 
 
 def _gate_rung_args(args: argparse.Namespace) -> dict:
@@ -1354,10 +1430,14 @@ def _gate_rung_args(args: argparse.Namespace) -> dict:
     in its contract, is not handed keys it cannot consume.
     """
 
+    effort = getattr(args, "effort", None)
+    marker = _e6_arm_marker()
     return {
-        "effort": getattr(args, "effort", None),
-        "e6_arm": _e6_arm_marker(),
-        "retired_rungs": _retired_e6_rungs(),
+        "effort": effort,
+        "e6_arm": marker,
+        "retired_rungs": _retired_rungs(),
+        "consult_only_rungs": _consult_only_rungs(),
+        "policy_context": _gate_policy_context(args.profile, effort, marker),
     }
 
 
@@ -2499,6 +2579,10 @@ def main(argv: list[str] | None = None) -> int:
     fetchers = registry()
     parser = build_parser(list(fetchers))
     args = parser.parse_args(arguments)
+
+    if getattr(args, "recommend_area", None) is not None and not args.recommend:
+        print("error: --area requires --recommend", file=sys.stderr)
+        return 2
 
     if args.command == "bench":
         return _bench_command(args)

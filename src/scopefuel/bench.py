@@ -57,7 +57,7 @@ _CACHE_CLOCK_SKEW_S = 60.0
 # CWE-319: the bearer token must never leave the process over plaintext HTTP,
 # except to a local test/dev server where "plaintext" never leaves the host.
 _HANDOFFKEEP_PLAINTEXT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_BENCH_SCOPES = frozenset({"scores", "reps", "grades", "catalog"})
+_BENCH_SCOPES = frozenset({"scores", "reps", "grades", "catalog", "area-exceptions"})
 CATALOG_GATES = ("default", "escalation", "consult_only")
 # "" is the profile-default row and sorts first; the named rungs are ordered.
 CATALOG_EFFORT_RANKS: dict[str, int] = {"": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
@@ -76,7 +76,13 @@ PLAINTEXT_USES = ("catalog", "quota_share", "reps")
 _PLAINTEXT_ALIAS_KEY = "allow_plaintext_url"
 # Each bench wire scope belongs to exactly one use (task #697): the canonical
 # tables are the catalog use; only rep records are the reps use.
-_SCOPE_USE = {"catalog": "catalog", "grades": "catalog", "scores": "catalog", "reps": "reps"}
+_SCOPE_USE = {
+    "catalog": "catalog",
+    "grades": "catalog",
+    "scores": "catalog",
+    "area-exceptions": "catalog",
+    "reps": "reps",
+}
 
 
 def plaintext_opt_in_key(use: str) -> str:
@@ -678,7 +684,9 @@ _CACHE_SCHEMA = """
         );
 
         CREATE TABLE IF NOT EXISTS bench_cache_meta (
-          scope         TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
+          scope         TEXT PRIMARY KEY CHECK (scope IN (
+            'scores', 'reps', 'grades', 'catalog', 'task-areas', 'area-exceptions'
+          )),
           fetched_at    TEXT NOT NULL,
           endpoint_id   TEXT NOT NULL DEFAULT '',
           snapshot_fill TEXT NOT NULL DEFAULT ''
@@ -814,17 +822,41 @@ _CACHE_SCHEMA = """
           retired_at           TEXT,
           PRIMARY KEY (profile, effort)
         );
+
+        -- hk 1945 (K6): the K1 closed task-area vocabulary and the K5 per-area
+        -- routing exception list, cached with the catalog's TTL and last-good
+        -- rules. They are canon reads (catalog use), never writes.
+        CREATE TABLE IF NOT EXISTS bench_cache_task_areas (
+          position INTEGER PRIMARY KEY,
+          area     TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bench_cache_area_exceptions (
+          profile              TEXT NOT NULL,
+          effort               TEXT NOT NULL DEFAULT '',
+          area                 TEXT NOT NULL,
+          action               TEXT NOT NULL,
+          evidence_refs        TEXT NOT NULL,
+          decision_ref         TEXT NOT NULL,
+          decided_by           TEXT NOT NULL DEFAULT '',
+          decided_at           TEXT NOT NULL DEFAULT '',
+          expires_with_model_id TEXT NOT NULL DEFAULT '',
+          retired_at           TEXT,
+          PRIMARY KEY (profile, effort, area)
+        );
 """
 
 
 def _migrate_cache_meta_scopes(conn: sqlite3.Connection) -> None:
-    """Widen ``bench_cache_meta``'s scope CHECK to admit ``catalog``.
+    """Widen ``bench_cache_meta``'s scope CHECK to admit every current scope.
 
     ``CREATE TABLE IF NOT EXISTS`` never revises an existing table's
     constraints, so a database created before #593 still carries
     ``CHECK (scope IN ('scores','reps','grades'))`` and rejects every catalog
-    stamp. Only an already-created, already-narrow table is rebuilt; the rows
-    are carried over, so the rebuild is idempotent and loses no cache age.
+    stamp, and a database created before hk 1945 rejects the task-area and
+    area-exception stamps. Only an already-created, already-narrow table is
+    rebuilt; the rows are carried over (including ``snapshot_fill`` when the
+    old shape has it), so the rebuild is idempotent and loses no cache age.
     """
 
     row = conn.execute(
@@ -833,18 +865,23 @@ def _migrate_cache_meta_scopes(conn: sqlite3.Connection) -> None:
     if row is None:
         return
     existing_sql = row[0] or ""
-    if "catalog" in existing_sql:
+    required = ("scores", "reps", "grades", "catalog", "task-areas", "area-exceptions")
+    if all(f"'{scope}'" in existing_sql for scope in required):
         return
+    columns = {item[1] for item in conn.execute("PRAGMA table_info(bench_cache_meta)").fetchall()}
+    fill = ", snapshot_fill" if "snapshot_fill" in columns else ""
     conn.executescript(
-        """
+        f"""
         CREATE TABLE bench_cache_meta_new (
-          scope         TEXT PRIMARY KEY CHECK (scope IN ('scores', 'reps', 'grades', 'catalog')),
+          scope         TEXT PRIMARY KEY CHECK (scope IN (
+            'scores', 'reps', 'grades', 'catalog', 'task-areas', 'area-exceptions'
+          )),
           fetched_at    TEXT NOT NULL,
           endpoint_id   TEXT NOT NULL DEFAULT '',
           snapshot_fill TEXT NOT NULL DEFAULT ''
         );
-        INSERT INTO bench_cache_meta_new(scope, fetched_at, endpoint_id)
-          SELECT scope, fetched_at, endpoint_id FROM bench_cache_meta;
+        INSERT INTO bench_cache_meta_new(scope, fetched_at, endpoint_id{fill})
+          SELECT scope, fetched_at, endpoint_id{fill} FROM bench_cache_meta;
         DROP TABLE bench_cache_meta;
         ALTER TABLE bench_cache_meta_new RENAME TO bench_cache_meta;
         """
@@ -3230,9 +3267,15 @@ _CATALOG_MEMO: dict[tuple[str, str, str], CatalogView] = {}
 
 
 def reset_catalog_memo() -> None:
-    """Drop the per-process catalog memo (tests, and long-lived --watch loops)."""
+    """Drop the per-process catalog, task-area and area-exception memos.
+
+    Tests use this, and so do long-lived ``--watch`` loops: the three reads
+    share the catalog's lifetimes, so one reset must drop all of them.
+    """
 
     _CATALOG_MEMO.clear()
+    _TASK_AREAS_MEMO.clear()
+    _AREA_EXCEPTIONS_MEMO.clear()
 
 
 def read_catalog(
@@ -3442,6 +3485,549 @@ def _read_catalog_uncached(
         backend=backend.name,
         reason=backend.reason,
         detail=degraded if rejected else "",
+    )
+
+
+# ---------------------------------------------------------------------------
+# hk 1945 (K6): the K1 task-area vocabulary and the K5 area routing exceptions
+# ---------------------------------------------------------------------------
+#
+# Both are canon reads with the catalog's lifetimes: below ``catalog_ttl_s``
+# the cache is served without a request, a failed refetch (a 429 included)
+# keeps the last-good rows, and past ``catalog_stale_max_s`` the cache keeps
+# serving labelled cache-stale. Unlike the catalog there is no bundled
+# snapshot: a vocabulary with no cache is None (the caller refuses --area),
+# and an exception list with no cache is empty.
+
+TASK_AREAS_SCOPE = "task-areas"
+AREA_EXCEPTIONS_SCOPE = "area-exceptions"
+AREA_EXCEPTIONS_ACTIONS = frozenset({"exclude", "prefer"})
+TASK_AREAS_SOURCE_LOCAL = "local"
+AREA_EXCEPTIONS_SOURCE_LOCAL = "local"
+AREA_EXCEPTIONS_SOURCE_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class TaskAreasView:
+    """The closed task-area vocabulary plus the provenance of the read."""
+
+    areas: tuple[str, ...] | None
+    source: str
+    age_s: float | None = None
+    backend: str = BENCH_BACKEND_LOCAL
+    reason: str = ""
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class AreaException:
+    """One live-or-retired row of the (profile, effort, area) exception list.
+
+    Effort ``""`` means every effort of that profile. ``expires_with_model_id``
+    names the catalog model id the evidence was measured on; the reader
+    deactivates a row whose catalog row has moved on (hk 1945 design item 2).
+    """
+
+    profile: str
+    effort: str
+    area: str
+    action: str
+    evidence_refs: tuple[str, ...]
+    decision_ref: str
+    decided_by: str = ""
+    decided_at: str | None = None
+    expires_with_model_id: str = ""
+    retired_at: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.profile, self.effort, self.area)
+
+    @property
+    def label(self) -> str:
+        return f"{self.profile}@{self.effort or 'any'}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "profile": self.profile,
+            "effort": self.effort,
+            "area": self.area,
+            "action": self.action,
+            "evidence_refs": list(self.evidence_refs),
+            "decision_ref": self.decision_ref,
+            "decided_by": self.decided_by,
+            "decided_at": self.decided_at,
+            "expires_with_model_id": self.expires_with_model_id,
+            "retired_at": self.retired_at,
+        }
+
+
+@dataclass(frozen=True)
+class AreaExceptionsView:
+    """The area exception canon plus the provenance of the read."""
+
+    entries: tuple[AreaException, ...]
+    source: str
+    age_s: float | None = None
+    backend: str = BENCH_BACKEND_LOCAL
+    reason: str = ""
+    detail: str = ""
+
+
+_AREA_EXCEPTION_COLUMNS = (
+    "profile",
+    "effort",
+    "area",
+    "action",
+    "evidence_refs",
+    "decision_ref",
+    "decided_by",
+    "decided_at",
+    "expires_with_model_id",
+    "retired_at",
+)
+
+
+def _area_exception_from_wire(value: object) -> AreaException:
+    if not isinstance(value, dict):
+        raise BenchError("invalid handoffkeep area exception row")
+    profile = _text(value.get("profile"), "profile")
+    area = _text(value.get("area"), "area")
+    action = _text(value.get("action"), "action")
+    decision_ref = _text(value.get("decision_ref"), "decision_ref")
+    expires = _text(value.get("expires_with_model_id"), "expires_with_model_id")
+    assert profile is not None and area is not None and action is not None
+    assert decision_ref is not None and expires is not None
+    if action not in AREA_EXCEPTIONS_ACTIONS:
+        raise BenchError("invalid handoffkeep area exception action")
+    evidence = value.get("evidence_refs")
+    if (
+        not isinstance(evidence, list)
+        or not evidence
+        or not all(isinstance(ref, str) and ref for ref in evidence)
+    ):
+        raise BenchError("invalid handoffkeep area exception evidence_refs")
+    return AreaException(
+        profile=profile,
+        effort=_optional_text(value.get("effort"), "effort") or "",
+        area=area,
+        action=action,
+        evidence_refs=tuple(evidence),
+        decision_ref=decision_ref,
+        decided_by=_optional_text(value.get("decided_by"), "decided_by") or "",
+        decided_at=_optional_text(value.get("decided_at"), "decided_at"),
+        expires_with_model_id=expires,
+        retired_at=_optional_text(value.get("retired_at"), "retired_at"),
+    )
+
+
+def _area_exceptions_from_payload(payload: dict) -> list[AreaException]:
+    return _decode_wire_rows(
+        payload,
+        "exceptions",
+        _area_exception_from_wire,
+        fields=_AREA_EXCEPTION_COLUMNS,
+        kind="area exception",
+    )
+
+
+def _scope_meta_row(conn: sqlite3.Connection, scope: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT fetched_at, endpoint_id FROM bench_cache_meta WHERE scope = ?", (scope,)
+    ).fetchone()
+
+
+def _scope_cache_snapshot(
+    path: pathlib.Path | str | None,
+    scope: str,
+    reader: Callable[[sqlite3.Connection], object],
+    *,
+    commit_cache: bool,
+) -> tuple[object, sqlite3.Row | None]:
+    """(rows, meta row) from one cache scope — creating the DB only when allowed."""
+
+    if commit_cache:
+        try:
+            conn = _cache_connect(path)
+            try:
+                return reader(conn), _scope_meta_row(conn, scope)
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return None, None
+    target = pathlib.Path(path) if path is not None else db_path()
+    if str(target) == ":memory:" or not target.expanduser().exists():
+        return None, None
+    try:
+        conn = _readonly_connect(target)
+        try:
+            return reader(conn), _scope_meta_row(conn, scope)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None, None
+
+
+def _cached_task_areas(conn: sqlite3.Connection) -> tuple[str, ...]:
+    rows = conn.execute("SELECT area FROM bench_cache_task_areas ORDER BY position").fetchall()
+    return tuple(row["area"] for row in rows)
+
+
+def _commit_task_areas_cache(
+    *, path: pathlib.Path | str | None, areas: tuple[str, ...], backend: BenchBackend
+) -> None:
+    conn = _cache_connect(path)
+    try:
+        now = _cache_now()
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM bench_cache_task_areas")
+        conn.executemany(
+            "INSERT INTO bench_cache_task_areas(position, area) VALUES (?, ?)",
+            list(enumerate(areas)),
+        )
+        _stamp_cache(conn, TASK_AREAS_SCOPE, backend, now)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _cached_area_exceptions(conn: sqlite3.Connection) -> list[AreaException] | None:
+    """The cached rows, or None when the cached evidence is corrupt.
+
+    An empty list is a valid cached value (the real canon has no rows today)
+    and must be distinguishable from corrupt evidence, which is refetched.
+    """
+
+    columns = ", ".join(_AREA_EXCEPTION_COLUMNS)
+    rows = conn.execute(
+        f"SELECT {columns} FROM bench_cache_area_exceptions ORDER BY area, profile, effort"
+    ).fetchall()
+    out: list[AreaException] = []
+    for row in rows:
+        try:
+            refs = tuple(json.loads(row["evidence_refs"]))
+        except (TypeError, ValueError):
+            return None
+        if not refs or not all(isinstance(ref, str) and ref for ref in refs):
+            return None
+        out.append(
+            AreaException(
+                profile=row["profile"],
+                effort=row["effort"],
+                area=row["area"],
+                action=row["action"],
+                evidence_refs=refs,
+                decision_ref=row["decision_ref"],
+                decided_by=row["decided_by"],
+                decided_at=row["decided_at"] or None,
+                expires_with_model_id=row["expires_with_model_id"],
+                retired_at=row["retired_at"],
+            )
+        )
+    return out
+
+
+def _commit_area_exceptions_cache(
+    *, path: pathlib.Path | str | None, entries: list[AreaException], backend: BenchBackend
+) -> None:
+    conn = _cache_connect(path)
+    try:
+        now = _cache_now()
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM bench_cache_area_exceptions")
+        conn.executemany(
+            "INSERT INTO bench_cache_area_exceptions("
+            + ", ".join(_AREA_EXCEPTION_COLUMNS)
+            + ") VALUES ("
+            + ", ".join("?" for _ in _AREA_EXCEPTION_COLUMNS)
+            + ")",
+            [
+                (
+                    entry.profile,
+                    entry.effort,
+                    entry.area,
+                    entry.action,
+                    json.dumps(list(entry.evidence_refs)),
+                    entry.decision_ref,
+                    entry.decided_by,
+                    entry.decided_at or "",
+                    entry.expires_with_model_id,
+                    entry.retired_at,
+                )
+                for entry in entries
+            ],
+        )
+        _stamp_cache(conn, AREA_EXCEPTIONS_SCOPE, backend, now)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _task_areas_url(backend: BenchBackend) -> str:
+    if not backend.url or not backend.token:
+        raise BenchBackendError("handoffkeep URL and token are required")
+    _check_handoffkeep_scheme(backend.url, allow_plaintext=backend.allow_plaintext_url, use="catalog")
+    return f"{backend.url.rstrip('/')}/v1/task-areas"
+
+
+def _handoffkeep_url_get(url: str, backend: BenchBackend) -> dict:
+    """One authenticated non-bench URL read, with the bench 404 distinction."""
+
+    status: int | None = None
+    try:
+        payload = _handoffkeep_send(url, token=backend.token or "", timeout=20.0)
+    except HttpError as exc:
+        status = exc.status
+        payload = None
+    if status == 404:
+        raise BenchRouteMissing("handoffkeep has no task-area route")
+    if status is not None:
+        raise BenchBackendError("handoffkeep request failed")
+    if not isinstance(payload, dict):
+        raise BenchBackendError("handoffkeep returned an invalid response")
+    return payload
+
+
+_TASK_AREAS_MEMO: dict[tuple[str, str, str], TaskAreasView] = {}
+_AREA_EXCEPTIONS_MEMO: dict[tuple[str, str, str], AreaExceptionsView] = {}
+
+
+def read_task_areas(
+    *,
+    path: pathlib.Path | str | None = None,
+    commit_cache: bool = True,
+    allow_plaintext_http: bool = False,
+) -> TaskAreasView:
+    """Read the K1 vocabulary with the catalog's TTL, last-good and 429 rules."""
+
+    backend = bench_backend(use="catalog", allow_plaintext_http=allow_plaintext_http)
+    memo_key = (str(path or ""), backend.name, backend.endpoint_id)
+    memoized = _TASK_AREAS_MEMO.get(memo_key)
+    if memoized is not None:
+        return memoized
+    view = _read_task_areas_uncached(backend, path=path, commit_cache=commit_cache)
+    _TASK_AREAS_MEMO[memo_key] = view
+    return view
+
+
+def _read_task_areas_uncached(
+    backend: BenchBackend, *, path: pathlib.Path | str | None, commit_cache: bool = True
+) -> TaskAreasView:
+    if backend.name == BENCH_BACKEND_LOCAL:
+        return TaskAreasView(
+            areas=None,
+            source=TASK_AREAS_SOURCE_LOCAL,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    now = _cache_now()
+    cached, row = _scope_cache_snapshot(path, TASK_AREAS_SCOPE, _cached_task_areas, commit_cache=commit_cache)
+    cached = cached if isinstance(cached, tuple) else ()
+    age_s = _catalog_stamp_age_s(row, backend, now)
+    if age_s is None:
+        cached = ()
+    fresh_before = min(backend.catalog_ttl_s, backend.catalog_stale_max_s)
+    if cached and age_s is not None and age_s < fresh_before:
+        return TaskAreasView(
+            areas=cached,
+            source=CATALOG_SOURCE_CACHE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    degraded = "server unreachable"
+    try:
+        payload = _handoffkeep_url_get(_task_areas_url(backend), backend)
+        values = payload.get("areas")
+        if not isinstance(values, list) or not all(isinstance(value, str) and value for value in values):
+            raise BenchBackendError("handoffkeep returned invalid task-area data")
+        areas = tuple(values)
+        if commit_cache:
+            _commit_task_areas_cache(path=path, areas=areas, backend=backend)
+        return TaskAreasView(
+            areas=areas,
+            source=CATALOG_SOURCE_SERVER,
+            age_s=0.0,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+    except BenchRouteMissing:
+        return TaskAreasView(
+            areas=None,
+            source=CATALOG_SOURCE_UNSUPPORTED,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+    except BenchCfAccessError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+    except (BenchBackendError, sqlite3.Error, OSError, ValueError):
+        pass
+
+    rejected = degraded != "server unreachable"
+    if cached and age_s is not None and age_s < backend.catalog_stale_max_s:
+        if rejected:
+            print(
+                f"warning: {degraded}; using cached task-area vocabulary (age {age_s / 3600.0:.1f}h)",
+                file=sys.stderr,
+            )
+        else:
+            _warn_cached("task-areas", age_hours=age_s / 3600.0, has_data=True)
+        return TaskAreasView(
+            areas=cached,
+            source=CATALOG_SOURCE_CACHE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+            detail=degraded if rejected else "",
+        )
+    if cached and age_s is not None:
+        if rejected:
+            print(
+                f"warning: {degraded}; using cached task-area vocabulary (age {age_s / 3600.0:.1f}h)",
+                file=sys.stderr,
+            )
+        else:
+            _warn_cached("task-areas", age_hours=age_s / 3600.0, has_data=True)
+        return TaskAreasView(
+            areas=cached,
+            source=CATALOG_SOURCE_CACHE_STALE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+            detail=degraded,
+        )
+    return TaskAreasView(
+        areas=None,
+        source=AREA_EXCEPTIONS_SOURCE_UNAVAILABLE,
+        age_s=age_s,
+        backend=backend.name,
+        reason=backend.reason,
+        detail=degraded,
+    )
+
+
+def read_area_exceptions(
+    *,
+    path: pathlib.Path | str | None = None,
+    commit_cache: bool = True,
+    allow_plaintext_http: bool = False,
+) -> AreaExceptionsView:
+    """Read the K5 exception canon with the catalog's TTL, last-good and 429 rules."""
+
+    backend = bench_backend(use="catalog", allow_plaintext_http=allow_plaintext_http)
+    memo_key = (str(path or ""), backend.name, backend.endpoint_id)
+    memoized = _AREA_EXCEPTIONS_MEMO.get(memo_key)
+    if memoized is not None:
+        return memoized
+    view = _read_area_exceptions_uncached(backend, path=path, commit_cache=commit_cache)
+    _AREA_EXCEPTIONS_MEMO[memo_key] = view
+    return view
+
+
+def _read_area_exceptions_uncached(
+    backend: BenchBackend, *, path: pathlib.Path | str | None, commit_cache: bool = True
+) -> AreaExceptionsView:
+    if backend.name == BENCH_BACKEND_LOCAL:
+        return AreaExceptionsView(
+            entries=(),
+            source=AREA_EXCEPTIONS_SOURCE_LOCAL,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    now = _cache_now()
+    cached_raw, row = _scope_cache_snapshot(
+        path, AREA_EXCEPTIONS_SCOPE, _cached_area_exceptions, commit_cache=commit_cache
+    )
+    # None means "no usable cache" (absent, unreadable or corrupt evidence).
+    # An empty list is a real cached value and follows the same TTL rules.
+    cached = cached_raw if isinstance(cached_raw, list) else None
+    age_s = _catalog_stamp_age_s(row, backend, now)
+    if age_s is None:
+        cached = None
+    fresh_before = min(backend.catalog_ttl_s, backend.catalog_stale_max_s)
+    if cached is not None and age_s is not None and age_s < fresh_before:
+        return AreaExceptionsView(
+            entries=tuple(cached),
+            source=CATALOG_SOURCE_CACHE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+
+    degraded = "server unreachable"
+    try:
+        payload = _handoffkeep_request(backend, AREA_EXCEPTIONS_SCOPE, query={"include_retired": 1})
+        entries = _area_exceptions_from_payload(payload)
+        if commit_cache:
+            _commit_area_exceptions_cache(path=path, entries=entries, backend=backend)
+        return AreaExceptionsView(
+            entries=tuple(entries),
+            source=CATALOG_SOURCE_SERVER,
+            age_s=0.0,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+    except BenchRouteMissing:
+        return AreaExceptionsView(
+            entries=(),
+            source=CATALOG_SOURCE_UNSUPPORTED,
+            backend=backend.name,
+            reason=backend.reason,
+        )
+    except BenchCfAccessError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+    except (BenchBackendError, sqlite3.Error, OSError, ValueError):
+        pass
+
+    rejected = degraded != "server unreachable"
+    if cached is not None and age_s is not None and age_s < backend.catalog_stale_max_s:
+        if rejected:
+            print(
+                f"warning: {degraded}; using cached area exceptions (age {age_s / 3600.0:.1f}h)",
+                file=sys.stderr,
+            )
+        else:
+            _warn_cached("area-exceptions", age_hours=age_s / 3600.0, has_data=True)
+        return AreaExceptionsView(
+            entries=tuple(cached),
+            source=CATALOG_SOURCE_CACHE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+            detail=degraded if rejected else "",
+        )
+    if cached is not None and age_s is not None:
+        if rejected:
+            print(
+                f"warning: {degraded}; using cached area exceptions (age {age_s / 3600.0:.1f}h)",
+                file=sys.stderr,
+            )
+        else:
+            _warn_cached("area-exceptions", age_hours=age_s / 3600.0, has_data=True)
+        return AreaExceptionsView(
+            entries=tuple(cached),
+            source=CATALOG_SOURCE_CACHE_STALE,
+            age_s=age_s,
+            backend=backend.name,
+            reason=backend.reason,
+            detail=degraded,
+        )
+    return AreaExceptionsView(
+        entries=(),
+        source=AREA_EXCEPTIONS_SOURCE_UNAVAILABLE,
+        age_s=age_s,
+        backend=backend.name,
+        reason=backend.reason,
+        detail=degraded,
     )
 
 
