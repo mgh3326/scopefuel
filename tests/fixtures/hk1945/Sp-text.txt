@@ -1,0 +1,15 @@
+S+ | 되돌리기 어려운 판단, 설계 분기, 안전장치 설계, 다중 시스템 영향 | 틀리면 되돌리는 비용이 큰가?
+1. opus --effort medium     Claude 주 10% · 제약=주  spend    벤치 66.0(추정(외삽))
+2. opus --effort high       Claude 주 10% · 제약=주  spend    벤치 67.0(추정(외삽))
+3. opus --effort xhigh      Claude 주 10% · 제약=주  spend    벤치 69.0(추정(외삽))
+4. codex-sol --effort max   Codex 주 20% · 제약=주  spend    벤치 67.0(추정(외삽))
+5. kiro-opus                Kiro 주 30% · 제약=주  spend    벤치 67.0(AA-agent/claude-code/xhigh)
+6. kiro-sol                 Kiro 주 30% · 제약=주  spend    벤치 58.9(openrouter/unspecified)
+✗ 제외 (2): codex-astra@default — consult_only (operator-request spawn only — never a candidate) · fable@default — consult_only (operator-request spawn only — never a candidate)
+⚠ 승급 후보 (조건 충족 시에만 · 근거를 이슈에 기록)
+  codex-sol --effort xhigh Codex  pool=codex
+    근거: 쿼타 절약·속도 우선
+    사용 주 20% · 제약=주
+  opus --effort max        Claude  pool=claude
+    근거: 더 깊은 탐색이 필요하거나 xhigh 실패 후 재시도할 때
+    사용 주 10% · 제약=주
