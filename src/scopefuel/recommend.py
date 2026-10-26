@@ -1692,6 +1692,19 @@ E6_WORKER_TESTER_ONLY_REASON = (
 )
 
 
+def credit_effort_required_reason(profile: str) -> str:
+    """The one refusal line a bare credit-profile spelling gets, in gate and launch alike.
+
+    pi's thinking level is the effort, so the profile name alone names no rung and
+    no sibling row stands in for it: the request must carry ``--effort <rung>``.
+    """
+
+    return (
+        f"effort_required: {profile} needs an explicit --effort "
+        f"({'|'.join(PI_THINKING_RUNGS)}); a bare spelling names no rung"
+    )
+
+
 def is_e6_unmeasured_key(profile: str, effort: str | None) -> bool:
     """Whether a catalog (profile, effort) key is an unmeasured E6 measurement key.
 
@@ -1826,10 +1839,11 @@ def e6_arm_rung_for(profile: str, effort: str | None) -> Profile | None:
 
 
 def e6_bare_rung(profile: str) -> str | None:
-    """The rung a bare spelling of an E6-only profile names (hk 2079).
+    """The launcher-default E6 rung of a profile: the one rung ``--recommend`` offers (hk 2079).
 
-    It is the launcher's default effort when the catalog carries that rung as an
-    E6 row; ``None`` for every other profile, so no existing spelling changes.
+    It is not a way to request the profile: a bare credit-profile spelling is
+    refused (credit_effort_required_reason), so this never names a rung for the
+    gate or launch. ``None`` for every profile without an E6 default rung.
     """
 
     # launch imports this module, so the table is read lazily (the same cycle
@@ -4255,15 +4269,18 @@ def gate_check(
         e6_marker.effort if e6_marker is not None and e6_marker.profile == canonical_profile else None
     )
     rung = normalize_effort(effort) or marker_rung
-    # hk 2079: a profile that exists only as E6 rows (the pi credit profiles) has
-    # no placement for a bare ``gate -m <profile>`` to fall back on — the D3 quota
-    # path below would admit it. The bare spelling names the launcher's default
-    # rung instead, so the missing marker is refused like any other unmeasured rung.
-    if rung is None and (
-        canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
-        or _find_profile(profile_name, grade_table=table) is None
-    ):
-        rung = e6_bare_rung(canonical_profile)
+    # hk 2079: pi's thinking level is the effort, so a credit profile is requested
+    # with an explicit --effort and nothing else names a rung — not the marker, not
+    # a launcher default, not a sibling row. A bare spelling is refused here with
+    # the same line launch uses.
+    if canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES and normalize_effort(effort) is None:
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=credit_effort_required_reason(canonical_profile),
+        )
     rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
     # #716: --effort 는 명령 단위의 명시적 런그 지명이다 — 배치 행을 가리키면
     # 그 런그를 배치로 판정한다(escalation 대안 거부 생략). 표식으로만 골라진

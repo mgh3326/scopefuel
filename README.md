@@ -113,8 +113,10 @@ scopefuel manual list --pool anthropic-api
   `--expires-on`이 모두 필요하고, `used_pct`는 `(1 - remaining/total) × 100`으로 파생됩니다.
   만료일이 지난 값은 TTL이 남아 있어도 효력이 없습니다.
 - 행은 pi 프로필 `pi-haiku55`·`pi-sonnet55`·`pi-opus55`(thinking 수준 = `--effort`)이며 모두
-  미측정 E6 런그입니다. `SCOPEFUEL_E6_ARM=<profile>@<effort>` 표식과 `--role worker|tester`가
-  있어야 gate가 열리고, 표식이 없거나 다른 좌석이면 거부합니다. pi에는 MCP가 없으므로 MCP가 필요한
+  미측정 E6 런그입니다. `--effort <low|medium|high|xhigh|max>`(thinking 수준이 곧 effort)는 필수이고, 맨몸 철자는
+  `gate`와 `policy launch`가 같은 한 줄(`effort_required`)로 거부합니다 — 표식이나 기본값, 형제 행이
+  런그를 대신 지정하지 않습니다. 그 위에 `SCOPEFUEL_E6_ARM=<profile>@<effort>` 표식과
+  `--role worker|tester`가 있어야 gate가 열리고, 표식이 없거나 다른 좌석이면 거부합니다. pi에는 MCP가 없으므로 MCP가 필요한
   작업에는 배치하지 않습니다.
 - `--recommend`는 C 급에서 잔액과 만료까지 남은 일수를 붙여 각 프로필의 기본 런그만 구독 후보
   뒤에 병렬 옵션으로 보여줍니다.

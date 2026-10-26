@@ -48,6 +48,7 @@ from .recommend import (
     _operator_request_ref_valid,
     astra_purpose_allowed,
     barred_model_id_for_profile,
+    credit_effort_required_reason,
     e6_arm_carrier_grade,
     e6_arm_matches,
     e6_arm_rung_for,
@@ -151,10 +152,10 @@ DEFAULT_LAUNCH_EFFORTS: dict[str, str] = {
     "cc-qwen38": "high",
     "cc-glm": "high",
     # hk 2079: pi's thinking level is the effort (wrk maps ``--effort`` onto the
-    # model's ``:<thinking>`` suffix). The default mirrors the claude profile of
-    # the same model; it is only the rung a bare spelling names, and every pi
-    # rung is an unmeasured E6 row, so a bare spelling is refused without the
-    # E6 marker.
+    # model's ``:<thinking>`` suffix), so these profiles take the flag. The value
+    # mirrors the claude profile of the same model and is only the one rung
+    # ``--recommend`` offers: a bare pi spelling names no rung and is refused by
+    # gate and launch (recommend.credit_effort_required_reason).
     "pi-haiku55": "low",
     "pi-sonnet55": "high",
     "pi-opus55": "high",
@@ -750,6 +751,12 @@ def resolve_launch(
 
     requested = normalize_effort(effort)
     marker = parse_e6_arm_marker(e6_arm)
+    if requested is None and canonical in E6_WORKER_TESTER_ONLY_PROFILES:
+        # hk 2079: pi's thinking level is the effort, so a credit profile is launched
+        # with an explicit effort and nothing else names a rung — not the marker, not
+        # a launcher default, and never the canon's best-graded sibling. The same line
+        # the gate prints.
+        raise LaunchError(credit_effort_required_reason(canonical))
     experiment_effort = requested or (marker.effort if marker and marker.profile == canonical else None)
     experiment_row = next(
         (entry for entry in view.entries if entry.key == (canonical, experiment_effort) and entry.retired_at),
@@ -811,9 +818,8 @@ def resolve_launch(
         if mentioned and canonical in E6_WORKER_TESTER_ONLY_PROFILES:
             # hk 2079: a profile that exists only as unmeasured E6 rows has no
             # placement to fall back on — name the marker it needs.
-            rung = requested or DEFAULT_LAUNCH_EFFORTS.get(canonical, "")
             raise LaunchError(
-                f"e6_arm_required: {canonical}@{rung} requires SCOPEFUEL_E6_ARM={canonical}@{rung}"
+                f"e6_arm_required: {canonical}@{requested} requires SCOPEFUEL_E6_ARM={canonical}@{requested}"
             )
         if mentioned:
             # The catalog carries this profile and every rung of it is retired —
