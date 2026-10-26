@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import pathlib
 
 import pytest
@@ -153,6 +154,21 @@ def test_existing_devin_model_ids_unchanged():
 
 def _gate_capture(monkeypatch, capsys, tmp_path, result, profile: str) -> dict:
     monkeypatch.setattr(cli, "registry", lambda: {"devin": lambda: result})
+    # hk 2114 — --no-cache no longer bypasses the negative cache: a failed
+    # devin probe is remembered for NEGATIVE_TTL_S. Clear only those stamps
+    # between cases so each models-list variant is judged on its own probe;
+    # snapshots stay, because the stale-fallback case needs the previous
+    # case's success to remain in the cache.
+    cache_file = pathlib.Path(os.environ["SCOPEFUEL_CACHE"])
+    try:
+        cached = json.loads(cache_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    if isinstance(cached, dict):
+        for entry in cached.values():
+            if isinstance(entry, dict):
+                entry.pop("negative_until", None)
+        cache_file.write_text(json.dumps(cached))
     record_path = tmp_path / f"{profile}.json"
     rc = cli.main(["gate", "-m", profile, "--no-cache", "--gate-output", str(record_path)])
     out = capsys.readouterr()
