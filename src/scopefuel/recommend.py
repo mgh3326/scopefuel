@@ -99,6 +99,7 @@ _POOL_LABEL = {
     "kimi": "Kimi",
     "devin": "Devin",
     "upstage": "Upstage",
+    "anthropic-api": "Anthropic API",
 }
 
 _WINDOW_LABEL = {
@@ -106,6 +107,7 @@ _WINDOW_LABEL = {
     "1d": "일",
     "7d": "주",
     "30d": "월",
+    "credit": "credit",
 }
 
 # Claude settings.json (read-only). Overridable for tests via CLAUDE_SETTINGS_PATH.
@@ -1545,6 +1547,38 @@ def _e6_arm_profile(name: str, model: str, effort: str, reference: str, **kwargs
     )
 
 
+# hk 2079 (operator r1026ocant, r1026pi, r1026piready): the Anthropic API credit
+# is spent through pi, where the thinking level IS the effort — wrk launches
+# ``--model anthropic/claude-*-5-5:<thinking>`` and maps ``--effort`` onto the
+# suffix, so these are ordinary effort-bearing profiles (launch.py carries them
+# in DEFAULT_LAUNCH_EFFORTS). They are unmeasured: each (profile, thinking level)
+# is a C-carrier E6 row that inherits no grade from claude-haiku, claude-sonnet
+# or claude-opus — the harness differs, and the stored numbers are the claude
+# subscription harness. pi accepts off, minimal, low, medium, high, xhigh and
+# max; hk 2080 maps wrk's efforts low..max one to one (ultra is refused, off and
+# minimal are not exposed), so the rungs are the catalog's own effort vocabulary
+# (CATALOG_EFFORT_RANKS) from low to max.
+PI_CREDIT_MODELS: dict[str, str] = {
+    "pi-haiku55": "Claude Haiku 5.5",
+    "pi-sonnet55": "Claude Sonnet 5.5",
+    "pi-opus55": "Claude Opus 5.5",
+}
+PI_THINKING_RUNGS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+# Placement exclusions, recorded in the catalog notes: no builder placement
+# until reps exist (the same worker/tester-only rule as the devin-fusion and
+# grok lanes), and no MCP — pi has none, so a task that needs an MCP must not be
+# placed on these rows. First reps are small (the credit is paid).
+PI_CREDIT_PLACEMENT_NOTE = (
+    "AA 미측정 (pi harness — anthropic-api credit · worker/tester 전용 · "
+    "builder 배치 금지, reps 필요 · MCP 필요 작업 배치 금지: pi 는 MCP 없음 · "
+    "첫 reps 소액, 유료 credit)"
+)
+
+
+def _pi_credit_rung(profile: str, model: str, rung: str) -> Profile:
+    return _e6_arm_profile(profile, f"{model} (pi {rung})", rung, PI_CREDIT_PLACEMENT_NOTE)
+
+
 # #920: sonnet@max left the E6 table — the Sonnet 5.5 refresh places it at S
 # (estimated, one step below the vendor TB4 70.6 raw-S+ read).
 E6_ARM_RUNGS: tuple[Profile, ...] = (
@@ -1636,11 +1670,65 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "claude-sonnet-5-5 AA-agent 미발표 — 벤더 TB4 max 70.6",
         aa_model_id="claude-sonnet-5-5",
     ),
+    # hk 2079 (operator r1026ocant, r1026pi, r1026piready): the Anthropic API
+    # credit rungs. One unmeasured rung per pi thinking level per profile.
+    *(
+        _pi_credit_rung(profile, model, rung)
+        for profile, model in PI_CREDIT_MODELS.items()
+        for rung in PI_THINKING_RUNGS
+    ),
 )
 
 E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
     (row.name, row.launcher_effort or "") for row in E6_ARM_RUNGS
 )
+# hk 2079: the credit rows have no builder placement until reps exist. The E6
+# marker opens a rung for the worker and tester seats only; any other seat
+# (builder, captain, reviewer, or none named) is refused even with the marker.
+E6_WORKER_TESTER_ONLY_PROFILES: frozenset[str] = frozenset(PI_CREDIT_MODELS)
+E6_WORKER_TESTER_SEATS: frozenset[str] = frozenset({"worker", "tester"})
+E6_WORKER_TESTER_ONLY_REASON = (
+    "worker/tester 전용 — 미측정 E6 런그는 builder 배치 금지 (reps 필요, devin-fusion/grok 과 같은 규칙)"
+)
+
+
+def e6_worker_tester_seat_denied(profile: str, role: str | None) -> bool:
+    """Whether a worker/tester-only profile is asked for on any other seat."""
+
+    return profile in E6_WORKER_TESTER_ONLY_PROFILES and (role or "").strip().casefold() not in (
+        E6_WORKER_TESTER_SEATS
+    )
+
+
+def is_credit_row(profile: Profile) -> bool:
+    """A pi anthropic-api credit row (hk 2079)."""
+
+    return profile.name in E6_WORKER_TESTER_ONLY_PROFILES
+
+
+def credit_row_offered(profile: Profile, available: bool) -> bool:
+    """Whether ``--recommend`` lists this credit row at its C carrier grade.
+
+    Only each profile's default rung is offered, so the list carries one
+    parallel option per model instead of every thinking level; the other rungs
+    stay on the folded E6-unmeasured line, like every other E6 rung.
+    """
+
+    return available and is_credit_row(profile) and profile.launcher_effort == e6_bare_rung(profile.name)
+
+
+def credit_row_available(providers: list[ProviderResult]) -> bool:
+    """Whether the anthropic-api manual credit is usable for recommendation.
+
+    The credit rows are only offered while the pool carries a fresh manual
+    observation with credit left. A missing or stale observation leaves the
+    rows folded as unmeasured, the same fail-closed rule the gate applies.
+    """
+
+    result = next((item for item in providers if item.id == "anthropic-api"), None)
+    if result is None or result.error:
+        return False
+    return any(_is_valid_used_pct(bucket.used_pct) and bucket.used_pct < 100.0 for bucket in result.buckets)
 
 
 def e6_arm_carrier_grade(profile: str, effort: str | None) -> Grade:
@@ -1722,6 +1810,21 @@ def e6_arm_rung_for(profile: str, effort: str | None) -> Profile | None:
         if row.name == canonical and row.launcher_effort == normalized:
             return row
     return None
+
+
+def e6_bare_rung(profile: str) -> str | None:
+    """The rung a bare spelling of an E6-only profile names (hk 2079).
+
+    It is the launcher's default effort when the catalog carries that rung as an
+    E6 row; ``None`` for every other profile, so no existing spelling changes.
+    """
+
+    # launch imports this module, so the table is read lazily (the same cycle
+    # break ``_launch_spelling`` uses).
+    from .launch import DEFAULT_LAUNCH_EFFORTS
+
+    rung = DEFAULT_LAUNCH_EFFORTS.get(profile)
+    return rung if rung is not None and e6_arm_rung_for(profile, rung) is not None else None
 
 
 def e6_arm_matches(marker: E6ArmRequest | None, profile: str, effort: str | None) -> bool:
@@ -2232,6 +2335,17 @@ _OC_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
     "oc-kimi-k3": ("clinepass", None),
 }
 
+# hk 2079 (operator r1026ocant, r1026pi): the pi profiles are not opencode
+# profiles, so they get their own explicit map — the same explicit-map rule as
+# ``_OC_PROFILE_POOLS``: a pi- spelling that is not registered here inherits no
+# route. They bill the Anthropic API credit, a pool separate from the claude
+# subscription pool; it has no probe, and its balance is a manual observation.
+_PI_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
+    "pi-haiku55": ("anthropic-api", None),
+    "pi-sonnet55": ("anthropic-api", None),
+    "pi-opus55": ("anthropic-api", None),
+}
+
 
 def _profile_label(profile: Profile) -> str:
     if profile.launcher_effort:
@@ -2352,6 +2466,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return "kimi", None
     if profile.startswith("oc-"):
         return _OC_PROFILE_POOLS.get(profile, ("", None))
+    if profile.startswith("pi-"):
+        return _PI_PROFILE_POOLS.get(profile, ("", None))
     if profile in ("grok", "grok-hi", "grok-med", "grok45", "grok45-med", "grok46", "grok46-med"):
         return "grok", None
     # ROB-1252: cc-qwen38/cc-glm run the Claude Code CLI harness itself against
@@ -2385,6 +2501,13 @@ PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
     "devin-argon": "google",
     "devin-argon-medium": "google",
     "devin-argon-low": "google",
+    # hk 2079: the pi Anthropic API rungs serve Claude models on the
+    # anthropic-api credit pool. The family names the model vendor, so these
+    # are "anthropic" even though the quota pool is anthropic-api — and a
+    # different family from the claude subscription rows for tester separation.
+    "pi-haiku55": "anthropic",
+    "pi-sonnet55": "anthropic",
+    "pi-opus55": "anthropic",
 }
 
 
@@ -2518,6 +2641,9 @@ class _Candidate:
     # hk 1945: (action, decision_ref) when a live area exception adjusted this
     # row — the additive JSON marker only, never part of the text row.
     area_adjustment: tuple[str, str] | None = None
+    # hk 2079 (r1026prio): the anthropic-api credit marker — remaining balance
+    # and days to expiry, rendered with the row. None for every other pool.
+    credit_note: str | None = None
 
 
 @dataclass
@@ -4116,6 +4242,12 @@ def gate_check(
         e6_marker.effort if e6_marker is not None and e6_marker.profile == canonical_profile else None
     )
     rung = normalize_effort(effort) or marker_rung
+    # hk 2079: a profile that exists only as E6 rows (the pi credit profiles) has
+    # no placement for a bare ``gate -m <profile>`` to fall back on — the D3 quota
+    # path below would admit it. The bare spelling names the launcher's default
+    # rung instead, so the missing marker is refused like any other unmeasured rung.
+    if rung is None and _find_profile(profile_name, grade_table=table) is None:
+        rung = e6_bare_rung(canonical_profile)
     rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
     # #716: --effort 는 명령 단위의 명시적 런그 지명이다 — 배치 행을 가리키면
     # 그 런그를 배치로 판정한다(escalation 대안 거부 생략). 표식으로만 골라진
@@ -4189,6 +4321,19 @@ def gate_check(
                 e6_arm=f"{canonical_profile}@{rung}",
             )
         e6_admitted = f"{canonical_profile}@{rung}"
+        # hk 2079: the anthropic-api credit rows have no builder placement until
+        # reps exist. The E6 marker opens the rung for the worker and tester
+        # seats only; any other seat is refused before any quota judgement.
+        if e6_worker_tester_seat_denied(canonical_profile, role):
+            return GateResult(
+                ok=False,
+                profile=profile_name,
+                provider_id=provider_id,
+                grade=e6_arm_carrier_grade(canonical_profile, rung),
+                reason=f"role_restricted: {e6_admitted} — {E6_WORKER_TESTER_ONLY_REASON}",
+                role_denied=True,
+                e6_arm=e6_admitted,
+            )
 
     found = _find_profile(profile_name, grade_table=table)
     if consult_only and profile_name not in CONSULT_ONLY_PROFILES:
@@ -4882,8 +5027,15 @@ def _recommend_rank_key(
     value_order: dict[int, int],
     intra_pool_rank: dict[int, int],
     slot: int,
-) -> tuple[int, int, int, int, float, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, float, int, int, int, int, int]:
     """The one total order every included ``--recommend`` candidate sorts by.
+
+    hk 2079 (operator r1026prio): the anthropic-api credit row is a parallel
+    option, never a promotion over the standard lanes. The leading key keeps
+    every credit row after every non-credit row (SWE-2 free and the
+    subscription quota alike), so it can never rank above an eligible
+    subscription row for the same seat; the remaining keys are unchanged, so
+    the standard lanes keep their existing order byte for byte.
 
     #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
     comparator — the round-2 comparator could express cyclic preferences
@@ -4910,6 +5062,7 @@ def _recommend_rank_key(
     the same cost-first policy direction as the in-pool rule.
     """
     return (
+        0 if not is_credit_row(candidate.profile) else 1,
         0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
         0 if candidate.imminent_exhaustion else 1,
         0 if candidate.boost is not None else 1,
@@ -5198,7 +5351,17 @@ def _evaluate(
         for g, profiles in table.items()
     }
 
-    dropped.extend(item for item in canon_dropped if item.placed_grade == grade)
+    # hk 2079 (r1026prio): the anthropic-api credit rows are offered at their C
+    # carrier while the manual balance is usable — as a parallel option after
+    # the SWE-2 free and subscription lanes. Every other credit row (and all of
+    # them without a usable balance) folds as E6 unmeasured like every other
+    # carrier row, so no canon row goes unaccounted (hk 1862).
+    credit_available = credit_row_available(providers)
+    dropped.extend(
+        item
+        for item in canon_dropped
+        if item.placed_grade == grade and not credit_row_offered(item.profile, credit_available)
+    )
     folded_keys = {(item.profile.name, normalize_effort(item.profile.launcher_effort)) for item in dropped}
     table_keys = {
         (profile.name, normalize_effort(profile.launcher_effort))
@@ -5210,6 +5373,8 @@ def _evaluate(
         if e6_arm_carrier_grade(*key) != grade or key in folded_keys or key in table_keys:
             continue
         if canon_keys is not None and key not in canon_keys:
+            continue
+        if credit_row_offered(rung_row, credit_available):
             continue
         dropped.append(_Excluded(rung_row, E6_UNMEASURED_REASON, kind="e6_unmeasured", placed_grade=grade))
         folded_keys.add(key)
@@ -5271,6 +5436,14 @@ def _evaluate(
         if (profile.name, normalize_effort(profile.launcher_effort)) not in borrowed_rungs
     ]
     entries += borrowed
+    if grade == "C":
+        entries += [
+            (row, grade)
+            for row in E6_ARM_RUNGS
+            if credit_row_offered(row, credit_available)
+            and (row.name, normalize_effort(row.launcher_effort)) not in table_keys
+            and (canon_keys is None or (row.name, normalize_effort(row.launcher_effort)) in canon_keys)
+        ]
 
     for profile, placed_grade in entries:
         rung_key = (profile.name, normalize_effort(profile.launcher_effort))
@@ -5294,8 +5467,10 @@ def _evaluate(
         # An E6 arm row at its own carrier grade is never a candidate — the
         # catalog path drops it before the table, so this covers snapshot-mode
         # tables and fixtures that carry the row in-band.
-        if rung_key in E6_ARM_KEYS and placed_grade == e6_arm_carrier_grade(
-            profile.name, profile.launcher_effort
+        if (
+            rung_key in E6_ARM_KEYS
+            and placed_grade == e6_arm_carrier_grade(profile.name, profile.launcher_effort)
+            and not credit_row_offered(profile, credit_available)
         ):
             excluded.append(
                 _Excluded(
@@ -5545,6 +5720,7 @@ def _evaluate(
             )
             continue
 
+        credit_note = manual.credit_display(result.manual, now=now) if is_credit_row(profile) else None
         included.append(
             _Candidate(
                 profile=profile,
@@ -5579,6 +5755,7 @@ def _evaluate(
                 placed_grade=placed_grade,
                 one_up=one_up,
                 borrowed=borrowed_row,
+                credit_note=credit_note,
             )
         )
 
@@ -5948,24 +6125,25 @@ def recommend(
             placed_tag = _placed_tag_suffix(cand)
             profile_label = _text_label(cand.profile)
             usage = cand.windows_display
+            credit_s = f" · {cand.credit_note}" if cand.credit_note else ""
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"  소멸 임박 우선 (boost 역전){bench}{placed_tag}"
+                    f"  소멸 임박 우선 (boost 역전){bench}{placed_tag}{credit_s}"
                 )
             elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"{bench}{placed_tag}"
+                    f"{bench}{placed_tag}{credit_s}"
                 )
             else:
                 lines.append(
                     f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}"
-                    f"{bench}{placed_tag}"
+                    f"{bench}{placed_tag}{credit_s}"
                 )
             if explain:
                 brake_explain = ""
@@ -6027,6 +6205,20 @@ def recommend(
 
     if explain and area_lines:
         lines.extend(area_lines)
+
+    # hk 2079 (r1026prio): the credit balance is a parallel option, so it is
+    # disclosed on its own line for every grade — the dispatcher can spend the
+    # expiring credit even when no credit row is listed at this grade.
+    credit_line = next(
+        (
+            manual.credit_display(item.manual, now=now)
+            for item in providers
+            if item.id == "anthropic-api" and item.manual
+        ),
+        None,
+    )
+    if credit_line:
+        lines.append(f"credit | {credit_line}")
 
     return "\n".join(lines)
 
@@ -6105,22 +6297,23 @@ def recommend_dict(
 
     rows: list[dict[str, object]] = []
     for cand in evaluation.included:
-        rows.append(
-            {
-                **_row(cand),
-                "kind": "candidate",
-                "provider_label": cand.provider_label,
-                "windows": cand.windows_display,
-                "remaining_pct": cand.remaining_pct,
-                "pool_class": cand.pool_class,
-                "boost": cand.boost,
-                "weight": cand.weight,
-                "effective_remaining": cand.effective_remaining,
-                "score": cand.score,
-                "urgent": cand.urgent,
-                "imminent_exhaustion": cand.imminent_exhaustion,
-            }
-        )
+        row = {
+            **_row(cand),
+            "kind": "candidate",
+            "provider_label": cand.provider_label,
+            "windows": cand.windows_display,
+            "remaining_pct": cand.remaining_pct,
+            "pool_class": cand.pool_class,
+            "boost": cand.boost,
+            "weight": cand.weight,
+            "effective_remaining": cand.effective_remaining,
+            "score": cand.score,
+            "urgent": cand.urgent,
+            "imminent_exhaustion": cand.imminent_exhaustion,
+        }
+        if cand.credit_note:
+            row["credit"] = cand.credit_note
+        rows.append(row)
     for item in evaluation.excluded:
         rows.append({**_row(item), "kind": item.kind, "reason": item.reason})
     for item in evaluation.policy_excluded:

@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import sys
@@ -91,7 +92,20 @@ def _manual_used_arg(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def build_parser(available: list[str]) -> argparse.ArgumentParser:
+def _manual_money_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("USD 금액은 숫자여야 합니다") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("USD 금액은 0 이상 유한 숫자여야 합니다")
+    return parsed
+
+
+def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset()) -> argparse.ArgumentParser:
+    # hk 2079: a manual-only pool has no probe, so it is not in ``available``
+    # (the probe list) but its manual observations still need a valid pool name.
+    manual_pool_choices = sorted(set(available) | set(manual_pools))
     parser = argparse.ArgumentParser(
         prog="scopefuel",
         description="AI 코딩 플랜의 남은 여유를 스코프(계정/모델/그룹)와 지평(지금/이번주)으로 구분해 조회",
@@ -259,8 +273,27 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     manual_sub = manual_parser.add_subparsers(dest="manual_command", required=True)
 
     manual_set = manual_sub.add_parser("set", help="수동 관측 추가")
-    manual_set.add_argument("--pool", required=True, choices=available, help="provider pool 이름")
-    manual_set.add_argument("--used", required=True, type=_manual_used_arg, help="사용률 0..100")
+    manual_set.add_argument("--pool", required=True, choices=manual_pool_choices, help="provider pool 이름")
+    manual_set.add_argument(
+        "--used", type=_manual_used_arg, help="사용률 0..100 (credit window 는 --remaining/--total)"
+    )
+    manual_set.add_argument(
+        "--remaining",
+        type=_manual_money_arg,
+        metavar="USD",
+        help="hk 2079 credit window: 남은 크레딧 (USD)",
+    )
+    manual_set.add_argument(
+        "--total",
+        type=_manual_money_arg,
+        metavar="USD",
+        help="hk 2079 credit window: 총 크레딧 (USD, 예: 200)",
+    )
+    manual_set.add_argument(
+        "--expires-on",
+        metavar="YYYY-MM-DD",
+        help="hk 2079 credit window: console 에서 읽은 크레딧 만료일",
+    )
     manual_set.add_argument(
         "--window",
         choices=sorted(manual.WINDOW_ALIASES),
@@ -276,10 +309,10 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     manual_set.add_argument("--ttl", default="15m", metavar="DURATION", help="효력 기간, 최대 2h")
 
     manual_list = manual_sub.add_parser("list", help="append-only 수동 관측 이력 보기")
-    manual_list.add_argument("--pool", choices=available, help="provider pool 필터")
+    manual_list.add_argument("--pool", choices=manual_pool_choices, help="provider pool 필터")
 
     manual_clear = manual_sub.add_parser("clear", help="pool의 현재 수동 관측 무효화")
-    manual_clear.add_argument("--pool", required=True, choices=available, help="provider pool 이름")
+    manual_clear.add_argument("--pool", required=True, choices=manual_pool_choices, help="provider pool 이름")
 
     bench_parser = subparsers.add_parser("bench", help="출처별 벤치 점수 SQLite DB")
     bench_sub = bench_parser.add_subparsers(dest="bench_command", required=True)
@@ -606,6 +639,10 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
         # #1620: the ungraded Argon trial spellings are gate choices — they
         # are gate-able catalog rows, never GRADE_TABLE entries.
         | set(recommend.UNGRADED_TRIAL_PROFILE_NAMES)
+        # hk 2079: the opencode anthropic-api rungs are E6 catalog rows, not
+        # GRADE_TABLE placements, but `gate -m oc-sonnet55` must be a valid
+        # choice so the missing marker is refused rather than argparse-erroring.
+        | {row.name for row in recommend.E6_ARM_RUNGS}
     )
     gate_parser = subparsers.add_parser(
         "gate",
@@ -1064,14 +1101,25 @@ def _manual_command(args: argparse.Namespace) -> int:
                 ttl_s=ttl_s,
                 resets_in_s=resets_in_s,
                 resets_at=resets_at,
+                remaining_usd=args.remaining,
+                total_usd=args.total,
+                credit_expires_on=args.expires_on,
                 now=now,
             )
             if args.json:
                 print(json.dumps(entry, indent=2, ensure_ascii=False, allow_nan=False))
             else:
+                credit = entry.get("credit")
+                credit_s = (
+                    f" remaining_usd={credit['remaining_usd']:g}"
+                    f" total_usd={credit['total_usd']:g}"
+                    f" expires_on={credit['expires_on']}"
+                    if isinstance(credit, dict)
+                    else ""
+                )
                 print(
                     f"manual set pool={entry['pool']} window={entry['window']} "
-                    f"used_pct={entry['used_pct']:g} measured_at={entry['measured_at']} "
+                    f"used_pct={entry['used_pct']:g}{credit_s} measured_at={entry['measured_at']} "
                     f"expires_at={entry['expires_at']} source={manual.SOURCE} "
                     f"source_verification={manual.SOURCE_VERIFICATION} label={manual.SOURCE_LABEL} "
                     f"id={entry['manual_observation_id']}"
@@ -1208,7 +1256,9 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             )
             return 2
     free_limit = free_window.active_record(now=now)
-    results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    results = _with_manual_only_results(
+        collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    )
     automatic_devin = next((item for item in results if item.id == "devin"), None)
     results = manual.apply_for_display(results, now=now)
     bench_scores = bench.read_scores()
@@ -1444,6 +1494,8 @@ def _gate_rung_args(args: argparse.Namespace) -> dict:
 def _manual_gate_audit(
     result: recommend.GateResult,
     resolution: manual.Resolution,
+    *,
+    now: dt.datetime | None = None,
 ) -> recommend.GateResult:
     selected = resolution.selected_entries
     observed_age_s = max(float(entry.get("age_s") or 0.0) for entry in selected)
@@ -1456,6 +1508,7 @@ def _manual_gate_audit(
             "account_ref": entry["account_ref"],
             "entitlement_and_limits": entry["entitlement_and_limits"],
             "window": entry["window"],
+            "credit": entry.get("credit"),
             "measured_at": entry["measured_at"],
             "entered_at": entry["entered_at"],
             "expires_at": entry["expires_at"],
@@ -1470,6 +1523,7 @@ def _manual_gate_audit(
     observation_ids = ",".join(str(entry["manual_observation_id"]) for entry in selected)
     covered_windows = ",".join(str(entry["window"]) for entry in selected)
     supersedes_prior = any(entry.get("supersedes_ref") is not None for entry in selected)
+    credit = manual.credit_display({"latest_valid": list(selected)}, now=now or dt.datetime.now(dt.UTC))
     audit = (
         f"source={manual.SOURCE} · {manual.SOURCE_LABEL} · "
         f"수동 항목 {observation_ids} · covered limits {covered_windows} · "
@@ -1478,6 +1532,8 @@ def _manual_gate_audit(
         f"남은 효력 {manual.format_age_seconds(remaining_effect_s)} · "
         f"자동 측정 마지막 오류 {resolution.last_auto_error}"
     )
+    if credit:
+        audit += f" · {credit}"
     return replace(
         result,
         reason=f"{result.reason} [{audit}]",
@@ -1529,6 +1585,21 @@ def _refresh_swe2_result(
     return updated if updated is not None else result
 
 
+def _with_manual_only_results(results: list[ProviderResult]) -> list[ProviderResult]:
+    """Append the synthetic result for every manual-only pool (hk 2079).
+
+    A manual-only pool has no fetcher, so ``collect`` never returns it. The
+    synthetic result is what routes the pool through the ordinary manual
+    fallback (TTL + REQUIRED_WINDOWS coverage), so a missing or stale manual
+    observation still fails closed instead of silently vanishing.
+    """
+
+    present = {item.id for item in results}
+    return results + [
+        manual.manual_only_result(pool) for pool in sorted(manual.MANUAL_ONLY_POOLS) if pool not in present
+    ]
+
+
 def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     barred_model_id = recommend.barred_model_id_for_profile(args.profile)
     if barred_model_id:
@@ -1540,7 +1611,9 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         return 3
 
     now = dt.datetime.now(dt.UTC)
-    automatic_results = collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    automatic_results = _with_manual_only_results(
+        collect(fetchers, list(fetchers), ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+    )
     # ``read_scores`` itself preserves the legacy local route and only enters
     # the cache/network path for the configured canonical backend.  Passing it
     # here keeps gate alternatives on the same benchmark view as recommend.
@@ -1638,7 +1711,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         **_gate_args(args),
                         **_gate_rung_args(args),
                     )
-                    result = _manual_gate_audit(replace(result, unknown_plan=None), resolution)
+                    result = _manual_gate_audit(replace(result, unknown_plan=None), resolution, now=now)
                 elif resolution is not None:
                     result = replace(
                         result,
@@ -2577,7 +2650,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     fetchers = registry()
-    parser = build_parser(list(fetchers))
+    parser = build_parser(list(fetchers), manual.MANUAL_ONLY_POOLS)
     args = parser.parse_args(arguments)
 
     if getattr(args, "recommend_area", None) is not None and not args.recommend:

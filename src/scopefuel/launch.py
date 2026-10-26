@@ -38,6 +38,8 @@ from .recommend import (
     BARRED_MODEL_DECISION_REF,
     E6_ARM_KEYS,
     E6_ARM_RUNGS,
+    E6_WORKER_TESTER_ONLY_PROFILES,
+    E6_WORKER_TESTER_ONLY_REASON,
     EXPERIMENT_REQUEST_REF,
     GRADE_TABLE,
     PROFILE_ALIASES,
@@ -50,6 +52,7 @@ from .recommend import (
     e6_arm_carrier_grade,
     e6_arm_matches,
     e6_arm_rung_for,
+    e6_worker_tester_seat_denied,
     is_barred_model_id,
     normalize_effort,
     parse_e6_arm_marker,
@@ -120,6 +123,11 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     "oc-solar4": "solar-pro4",
     # A router, not a model — this is the identity the launcher actually requests.
     "oc-omni": "omniroute/auto/coding",
+    # hk 2079: the pi Anthropic API credit profiles. The id is the base model pi
+    # receives; wrk appends the rung as the ``:<thinking>`` suffix.
+    "pi-haiku55": "anthropic/claude-haiku-5-5",
+    "pi-sonnet55": "anthropic/claude-sonnet-5-5",
+    "pi-opus55": "anthropic/claude-opus-5-5",
 }
 
 # The rung a profile starts on when the caller pins no effort.  Only profiles
@@ -142,6 +150,14 @@ DEFAULT_LAUNCH_EFFORTS: dict[str, str] = {
     "kiro-haiku": "high",
     "cc-qwen38": "high",
     "cc-glm": "high",
+    # hk 2079: pi's thinking level is the effort (wrk maps ``--effort`` onto the
+    # model's ``:<thinking>`` suffix). The default mirrors the claude profile of
+    # the same model; it is only the rung a bare spelling names, and every pi
+    # rung is an unmeasured E6 row, so a bare spelling is refused without the
+    # E6 marker.
+    "pi-haiku55": "low",
+    "pi-sonnet55": "high",
+    "pi-opus55": "high",
 }
 
 
@@ -785,12 +801,28 @@ def resolve_launch(
     from_snapshot = False
     if not rows:
         mentioned = any(entry.profile == canonical for entry in view.entries)
+        if mentioned and canonical in E6_WORKER_TESTER_ONLY_PROFILES:
+            # hk 2079: a profile that exists only as unmeasured E6 rows has no
+            # placement to fall back on — name the marker it needs.
+            rung = requested or DEFAULT_LAUNCH_EFFORTS.get(canonical, "")
+            raise LaunchError(
+                f"e6_arm_required: {canonical}@{rung} requires SCOPEFUEL_E6_ARM={canonical}@{rung}"
+            )
         if mentioned:
             # The catalog carries this profile and every rung of it is retired —
             # or (with the E6 rows dropped above) it carries no placement for it
             # at all. Either way the canon has spoken and the answer is no.
             raise LaunchError(f"profile '{profile}' is retired in the catalog")
         snapshot_rows = [e for e in snapshot_entries() if e.profile == canonical]
+        if not snapshot_rows and e6_open:
+            # hk 2079: a profile that exists only as E6 rows (the pi credit
+            # profiles) has no placement in the bundled snapshot either. A served
+            # canon that has not been seeded with it yet is silent, and the marker
+            # names the rung — the bundled measurement row answers, exactly as it
+            # does for an unseeded rung of a placed profile below.
+            snapshot_rows = [
+                entry for entry in e6_arm_entries() if (entry.profile, entry.effort) == (canonical, requested)
+            ]
         if not snapshot_rows or view.source == CATALOG_SOURCE_SNAPSHOT:
             raise LaunchError(
                 f"profile '{profile}' is not in the catalog"
@@ -861,6 +893,11 @@ def resolve_launch(
         and (row.profile, row.effort) == (canonical, resolved_effort)
         else None
     )
+
+    # hk 2079: the anthropic-api credit rows are worker/tester only until reps
+    # exist — any other seat is refused even with the E6 marker.
+    if opened_arm is not None and e6_worker_tester_seat_denied(canonical, role):
+        raise LaunchError(f"role_restricted: {opened_arm} — {E6_WORKER_TESTER_ONLY_REASON}")
 
     # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라
     # 카탈로그·snapshot·arm 어떤 경로로도 동일하게 닫히고 --operator-request 가

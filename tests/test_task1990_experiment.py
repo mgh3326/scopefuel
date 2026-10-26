@@ -421,6 +421,34 @@ def _drop_aplus_opus_low_payload(payload):
     return {**payload, "rows": rows, "excluded": excluded}, dropped
 
 
+def _drop_pi_credit_folds(text, payload):
+    """The current output minus the folded E6-unmeasured entries of the pi credit rows.
+
+    hk 2079 adds the pi anthropic-api profiles as E6 rows, and every E6 carrier
+    row rides the folded excluded line at C (hk 1862's accounting). The pre-1990
+    base has no such rows, so the only intended difference on these providers
+    (none carries an anthropic-api pool) is those fold entries: they are removed
+    from the current output and the fold count corrected. Ranked rows are not
+    touched, so a pi row leaking in as a candidate still fails the comparison.
+    """
+    lines = []
+    for line in text.split("\n"):
+        fold = re.match(r"^✗ 제외 \((\d+)\): (.*)$", line)
+        if fold:
+            items = fold.group(2).split(" · ")
+            kept = [item for item in items if not item.startswith("pi-")]
+            if len(kept) != len(items):
+                assert kept, text
+                count = int(fold.group(1)) - (len(items) - len(kept))
+                line = f"✗ 제외 ({count}): " + " · ".join(kept)
+        lines.append(line)
+    payload = {
+        **payload,
+        "excluded": [entry for entry in payload["excluded"] if not entry["profile"].startswith("pi-")],
+    }
+    return "\n".join(lines), payload
+
+
 def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
     from test_task1787_inflight_sum import _matrix
     from test_task1795_borrowed_rungs import _pool_providers
@@ -443,6 +471,10 @@ def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
                     text = module.recommend(providers, grade, **kwargs)
                     payload = module.recommend_dict(providers, grade, **kwargs)
                     outputs.append((text, json.dumps(payload, ensure_ascii=False)))
+                current_text, current_payload = _drop_pi_credit_folds(
+                    outputs[0][0], json.loads(outputs[0][1])
+                )
+                outputs[0] = (current_text, json.dumps(current_payload, ensure_ascii=False))
                 expected = outputs[1]
                 if grade == "A+":
                     # hk 2007: A+ is base minus exactly the borrowed opus --effort low

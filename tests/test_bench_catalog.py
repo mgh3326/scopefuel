@@ -68,6 +68,18 @@ def _seed_rows_with(profile, effort, **changes):
     return rows
 
 
+def _seed_profiles() -> set[str]:
+    """Every profile the seed carries.
+
+    hk 2079: the seed is the full catalog snapshot, which also holds the
+    profiles that exist only as E6 rows (the pi credit profiles). The
+    placement snapshot — the validity floor — does not list those, so the
+    seed's profiles are the floor plus the E6 profiles.
+    """
+
+    return bench.snapshot_profiles() | {row.name for row in recommend.E6_ARM_RUNGS}
+
+
 def _cached_catalog_count() -> int:
     """Rows in bench_cache_catalog — 0 when the table/database does not exist."""
 
@@ -1262,7 +1274,7 @@ def test_a_bundle_new_profile_does_not_reject_the_canon(catalog_server, capsys):
 
     _, fake = catalog_server
     canon = _canon_without(NEW_TO_BUNDLE)
-    assert {row["profile"] for row in canon} == bench.snapshot_profiles() - set(NEW_TO_BUNDLE)
+    assert {row["profile"] for row in canon} == _seed_profiles() - set(NEW_TO_BUNDLE)
     _commit_canon(canon)  # the pre-bundle last-good cache
     _age_catalog_cache(3601)
     fake.catalog = canon
@@ -1394,10 +1406,13 @@ def test_a_one_row_catalog_against_a_full_cache_is_still_rejected(catalog_server
 
     view = bench.read_catalog()
     assert view.source == "cache"
-    assert view.detail == "server catalog rejected: 1 row, missing 38 snapshot profiles"
+    # The cache holds the seed, which carries the three E6-only pi profiles the
+    # bundled placement snapshot does not — so the dropped set is "cached".
+    assert view.detail == "server catalog rejected: 1 row, missing 41 cached profiles"
     # hk 1885: 68 = the 67 pre-1885 rows + the sonnet@low C row (the profile
     # count of "missing 38" is unchanged — sonnet was already a profile).
-    assert _cached_catalog_count() == 68
+    # hk 2079: 83 = those 68 + the 15 pi credit E6 rows (3 profiles x 5 rungs).
+    assert _cached_catalog_count() == 83
 
 
 def test_no_cache_keeps_the_bundle_floor(catalog_server):
@@ -2106,7 +2121,7 @@ def test_push_refetch_without_a_cache_uses_the_bundle_floor(catalog_server, tmp_
     capsys.readouterr()
     bench.push_catalog(_write_push(tmp_path, full))
     assert "was rejected" not in capsys.readouterr().err
-    assert len(_cache_profiles()) == len(bench.snapshot_profiles())
+    assert _cache_profiles() == _seed_profiles()
 
 
 def test_push_refetch_cli_output_unchanged_on_a_rejected_refresh(catalog_server, tmp_path, capsys):
