@@ -123,7 +123,11 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--recommend",
         choices=["S+", "S", "A+", "A", "B", "C"],
         metavar="GRADE",
-        help="해당 급의 모델 사용 우선순위 추천. " + grade_help_text(),
+        help=(
+            "해당 급의 모델 사용 우선순위 추천. Pace는 풀을 정렬하고 초과 경고만 표시하며, "
+            "실제 소진만 gate에서 거부합니다. Pace ranks and warns; only real exhaustion refuses. "
+            + grade_help_text()
+        ),
     )
     parser.add_argument(
         "--area",
@@ -306,7 +310,12 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--measured-at", required=True, metavar="TIMESTAMP|now", help="실제로 관측한 시각"
     )
     manual_set.add_argument("--reason", required=True, help="측정 장애 또는 정정 사유")
-    manual_set.add_argument("--ttl", default="15m", metavar="DURATION", help="효력 기간, 최대 2h")
+    manual_set.add_argument(
+        "--ttl",
+        default=None,
+        metavar="DURATION",
+        help="효력 기간, 최대 2h (credit window 최대 24h)",
+    )
 
     manual_list = manual_sub.add_parser("list", help="append-only 수동 관측 이력 보기")
     manual_list.add_argument("--pool", choices=manual_pool_choices, help="provider pool 필터")
@@ -647,9 +656,10 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
     gate_parser = subparsers.add_parser(
         "gate",
         help=(
-            "profile 하나의 스폰 가능 여부 판정. spend 풀은 어느 창이든 소진 예상이 reset보다 빠르면 거부 "
-            "(첫 5%% 창과 pace-unknown은 제외); non-spend와 SWE-2 free 창은 면제. "
-            "필요하면 --pace-override REF로만 pace 거부를 해제합니다 "
+            "profile 하나의 스폰 가능 여부 판정. Pace는 spend 풀을 정렬하고 초과 경고만 표시합니다; "
+            "gate는 실제 소진에서만 거부합니다. Pace ranks and warns; only real exhaustion refuses. "
+            "(첫 5%% 창과 pace-unknown은 계산하지 않음); "
+            "non-spend와 SWE-2 free 창은 면제. "
             "(exit 0=가능/3=차단/4=측정불가/5=역할 거부/6=구독 해지)"
         ),
     )
@@ -682,9 +692,11 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--pace-override",
         metavar="REF",
         help=(
-            "pace_exhaustion만 해제하는 별도 필수 REF (hk:doc/<key> 또는 hk:task/<정수>). "
-            "spend 풀의 어느 창이든 소진 예상이 reset보다 빠르면 거부; 첫 5%% 창, 계산 불가 창, "
-            "non-spend 풀과 SWE-2 free 창은 pace-unknown 또는 면제입니다"
+            "pace 거부는 없으며 이 REF는 감사용으로만 기록합니다 "
+            "(hk:doc/<key> 또는 hk:task/<정수> 형식 검증). Pace는 정렬과 경고에만 쓰고, "
+            "실제 소진만 gate에서 거부합니다. Pace ranks and warns; only real exhaustion refuses. "
+            "첫 5%% 창과 계산 불가 창은 pace-unknown이며, "
+            "non-spend 풀과 SWE-2 free 창은 면제됩니다"
         ),
     )
     gate_parser.add_argument(
@@ -1102,7 +1114,12 @@ def _manual_command(args: argparse.Namespace) -> int:
     now = dt.datetime.now(dt.UTC)
     try:
         if args.manual_command == "set":
-            ttl_s = manual.parse_duration(args.ttl)
+            default_ttl_s = (
+                manual.CREDIT_MAX_TTL_S
+                if manual.normalize_window(args.pool, args.window) == manual.CREDIT_WINDOW
+                else manual.DEFAULT_TTL_S
+            )
+            ttl_s = manual.parse_duration(args.ttl) if args.ttl is not None else default_ttl_s
             resets_in_s = manual.parse_duration(args.resets_in) if args.resets_in else None
             resets_at = manual.parse_timestamp(args.resets_at, now=now) if args.resets_at else None
             measured_at = manual.parse_timestamp(args.measured_at, now=now)
