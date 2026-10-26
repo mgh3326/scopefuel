@@ -424,8 +424,8 @@ def test_recommend_rows_are_named_unmeasurable_without_declared_account(monkeypa
 # ------------------------------------------------------------ free-limit hold
 
 
-def test_free_limit_hold_still_refuses_sol61_after_billing_admission(monkeypatch, tmp_path):
-    """M5 — 선언 계정 문서가 통과시킨 뒤에도 free-limit hold 가 그대로 거부한다."""
+def test_free_limit_observation_notes_sol61_after_billing_admission(monkeypatch, tmp_path):
+    """M5 — a free-limit observation adds context after the billing gate admits."""
     _isolate_free_window(tmp_path, monkeypatch)
     hk = _enable(monkeypatch)
     monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
@@ -435,9 +435,9 @@ def test_free_limit_hold_still_refuses_sol61_after_billing_admission(monkeypatch
     _observe_sol61_hold()
 
     for name in PROFILES:
-        rc, _out, err = _capture_cli(["gate", "-m", name])
-        assert rc == 3, (name, err)
-        assert "free_rate_limited" in err, (name, err)
+        rc, out, err = _capture_cli(["gate", "-m", name])
+        assert rc == 0, (name, err)
+        assert "last observed free_rate_limited" in out, (name, out)
 
 
 # ------------------------------------------------------------ policy set path

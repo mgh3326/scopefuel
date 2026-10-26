@@ -317,7 +317,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         payload = json.loads(free_window.state_path().read_text(encoding="utf-8"))
         self.assertEqual(len(payload["records"]), 1)
 
-    def test_live_hold_preserves_base_refusal_tuples_without_record_lookup(self):
+    def test_live_observation_notes_existing_refusal_for_free_profiles(self):
         self.freeze_cli()
         self.gate_stubs()
         original_active_record = free_window.active_record
@@ -358,7 +358,6 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                     self._save_empty_records()
                     baseline = self.call_gate(profile)
                     self.assertEqual(baseline[0], expected_rc)
-                    before_hold_lookups = len(lookups)
                     self.seed_record(
                         free_window.FreeLimitRecord(
                             FIXED_NOW + dt.timedelta(minutes=45),
@@ -367,8 +366,15 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                             "job:known-limit",
                         )
                     )
-                    self.assertEqual(self.call_gate(profile), baseline)
-                    self.assertEqual(len(lookups), before_hold_lookups)
+                    observed = self.call_gate(profile)
+                    self.assertEqual(observed[0], baseline[0])
+                    self.assertEqual(observed[1], baseline[1])
+                    self.assertIn(reason, observed[2])
+                    self.assertIn(
+                        "last observed free_rate_limited until 2026-10-19T08:45:00Z "
+                        "(observed 2026-10-19T07:55:00Z via job:known-limit)",
+                        observed[2],
+                    )
 
     def _save_empty_records(self):
         free_window._save_records({})
@@ -448,7 +454,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                 self.assertEqual(self.call_gate(profile), baseline)
                 self.assertEqual(len(lookups), before_hold, profile)
 
-    def test_live_record_refuses_every_free_spelling_and_paid_outputs_match_base(self):
+    def test_live_record_is_admitted_with_note_for_every_free_spelling(self):
         self.freeze_cli()
         self.gate_stubs()
         baseline_paid = {profile: self.call_gate(profile) for profile in PAID_PROFILES}
@@ -460,17 +466,15 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.seed_record(free_window.FreeLimitRecord(reset, observed, "devin-swe2", "job:known-limit"))
 
         for profile in FREE_PROFILES:
-            actual = self.call_gate(profile)
-            self.assertNotEqual(actual[0], 0, profile)
-            if baseline_free[profile][0] == 0:
-                rc, stdout, stderr = actual
-                self.assertEqual(rc, 3, profile)
-                self.assertIn("free_rate_limited", stderr, profile)
-                self.assertIn("until 2026-10-19T08:45:00Z", stderr, profile)
-                self.assertIn("observed 2026-10-19T07:55:00Z via job:known-limit", stderr, profile)
-                self.assertNotIn("used_pct=0.0", stdout)
-            else:
-                self.assertEqual(actual, baseline_free[profile], profile)
+            rc, stdout, stderr = self.call_gate(profile)
+            self.assertEqual(rc, 0, profile)
+            self.assertIn(
+                "last observed free_rate_limited until 2026-10-19T08:45:00Z "
+                "(observed 2026-10-19T07:55:00Z via job:known-limit)",
+                stdout,
+                profile,
+            )
+            self.assertEqual(stderr, "", profile)
 
         for profile in PAID_PROFILES:
             actual = self.call_gate(profile)
@@ -506,10 +510,11 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.assertEqual(record.rung, "devin-ds41")
 
         for profile in FREE_PROFILES:
-            rc, _, gate_stderr = self.call_gate(profile)
-            self.assertEqual(rc, 3, profile)
-            self.assertIn("free_rate_limited", gate_stderr, profile)
-            self.assertIn("rung devin-ds41", gate_stderr, profile)
+            rc, gate_stdout, gate_stderr = self.call_gate(profile)
+            self.assertEqual(rc, 0, profile)
+            self.assertIn("last observed free_rate_limited", gate_stdout, profile)
+            self.assertIn("via job:paid-devin-observation", gate_stdout, profile)
+            self.assertEqual(gate_stderr, "", profile)
         for profile in PAID_PROFILES:
             self.assertEqual(self.call_gate(profile), baseline_paid[profile], profile)
         self.assertFalse(free_window.is_free_profile("devin-ds41"))
@@ -539,7 +544,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             self.seed_record(free_window.FreeLimitRecord(reset, FIXED_NOW, "devin-swe2", "job:reset"))
             self.assertEqual(self.call_gate(profile), reset_baselines[profile])
 
-    def test_live_record_refuses_when_provider_quota_is_missing(self):
+    def test_live_record_does_not_change_unmeasurable_gate_status(self):
         self.freeze_cli()
         self.gate_stubs()
         reset = FIXED_NOW + dt.timedelta(minutes=45)
@@ -561,9 +566,11 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                 "job:no-provider-data",
             )
         )
-        self.assertEqual(run(), baseline)
+        observed = run()
+        self.assertEqual(observed[0], baseline[0])
+        self.assertIn("last observed free_rate_limited", observed[2])
 
-    def test_recommendation_only_holds_base_admissible_rows(self):
+    def test_recommendation_keeps_free_row_and_marks_it_for_fallback(self):
         profile_by_name = {
             profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows
         }
@@ -581,9 +588,9 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                 pool_class="preserve",
             ),
         ]
-        reason = (
-            "free_rate_limited until 2026-10-19T08:45:00Z "
-            "(observed 2026-10-19T07:55:00Z via job:known-limit; rung devin-swe2)"
+        note = (
+            "last observed free_rate_limited until 2026-10-19T08:45:00Z "
+            "(observed 2026-10-19T07:55:00Z via job:known-limit)"
         )
         original_subscription = recommend.profile_subscription
 
@@ -602,15 +609,18 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             today=FIXED_NOW.date(),
             now=FIXED_NOW,
             grade_table=table,
-            free_rate_limit=reason,
+            free_rate_limit=note,
         )
         baseline_rows = {row["profile"]: row for row in baseline["rows"]}
         limited_rows = {row["profile"]: row for row in limited["rows"]}
         self.assertEqual(baseline_rows["devin-swe2-medium"]["kind"], "unsubscribed")
         self.assertEqual(limited_rows["devin-swe2-medium"], baseline_rows["devin-swe2-medium"])
         self.assertEqual(baseline_rows["devin-swe2"]["kind"], "candidate")
-        self.assertEqual(limited_rows["devin-swe2"]["kind"], "free_rate_limited")
-        self.assertIn("free_rate_limited", limited_rows["devin-swe2"]["reason"])
+        self.assertEqual(limited_rows["devin-swe2"]["kind"], "candidate")
+        self.assertIn(note, limited_rows["devin-swe2"]["windows"])
+        candidate_rows = [row for row in limited["rows"] if row["kind"] == "candidate"]
+        self.assertEqual(candidate_rows[0]["profile"], "devin-swe2")
+        self.assertEqual(candidate_rows[1]["profile"], "codex-luna")
 
     def test_recommendation_keeps_unsubscribed_unmeasurable_and_exhausted_reasons(self):
         profile_by_name = {
@@ -699,7 +709,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         ]
         return custom_table, results
 
-    def test_recommend_demotes_free_rows_and_drops_them_without_an_alternative(self):
+    def test_recommend_lists_free_row_then_best_non_free_fallback(self):
         profile_by_name = {
             profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows
         }
@@ -715,9 +725,9 @@ class DevinFreeShortWindowTests(unittest.TestCase):
                 pool_class="preserve",
             ),
         ]
-        reason = (
-            "free_rate_limited until 2026-10-19T08:45:00Z "
-            "(observed 2026-10-19T07:55:00Z via job:known-limit; rung devin-swe2)"
+        note = (
+            "last observed free_rate_limited until 2026-10-19T08:45:00Z "
+            "(observed 2026-10-19T07:55:00Z via job:known-limit)"
         )
         base = recommend.recommend_dict(
             providers, "A+", today=FIXED_NOW.date(), now=FIXED_NOW, grade_table=custom_table
@@ -728,14 +738,17 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             today=FIXED_NOW.date(),
             now=FIXED_NOW,
             grade_table=custom_table,
-            free_rate_limit=reason,
+            free_rate_limit=note,
         )
         kinds = {(row["profile"], row["kind"]) for row in limited["rows"]}
         self.assertIn(("codex-luna", "candidate"), kinds)
         for name in FREE_PROFILES[:3]:
-            self.assertIn((name, "free_rate_limited"), kinds)
+            self.assertIn((name, "candidate"), kinds)
+        candidate_rows = [row for row in limited["rows"] if row["kind"] == "candidate"]
+        self.assertEqual(candidate_rows[0]["profile"], "devin-swe2")
+        self.assertEqual(candidate_rows[1]["profile"], "codex-luna")
         self.assertTrue(
-            all(row.get("reason") == reason for row in limited["rows"] if row["kind"] == "free_rate_limited")
+            all(note in row["windows"] for row in candidate_rows if row["profile"] in FREE_PROFILES)
         )
         self.assertTrue(
             any(row["profile"] == "devin-swe2" and row["kind"] == "candidate" for row in base["rows"])
@@ -749,10 +762,12 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             today=FIXED_NOW.date(),
             now=FIXED_NOW,
             grade_table=limited_only,
-            free_rate_limit=reason,
+            free_rate_limit=note,
         )
-        self.assertFalse(any(row["kind"] == "candidate" for row in no_alternative["rows"]))
-        self.assertEqual({row["kind"] for row in no_alternative["rows"]}, {"free_rate_limited"})
+        self.assertEqual(
+            {row["kind"] for row in no_alternative["rows"]},
+            {"candidate"},
+        )
 
     def test_cli_recommendation_is_byte_identical_without_or_after_live_record(self):
         self.freeze_cli()
@@ -795,12 +810,14 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         active_json = run(json_output=True)
         payload = json.loads(active_json[1])
         rows = payload["rows"]
-        self.assertTrue(any(row["profile"] == "codex-luna" and row["kind"] == "candidate" for row in rows))
-        limited_rows = [row for row in rows if row["kind"] == "free_rate_limited"]
-        self.assertEqual({row["profile"] for row in limited_rows}, set(FREE_PROFILES[:3]))
-        self.assertTrue(
-            all("free_rate_limited until 2026-10-19T08:45:00Z" in row["reason"] for row in limited_rows)
+        candidate_rows = [row for row in rows if row["kind"] == "candidate"]
+        self.assertEqual(candidate_rows[0]["profile"], "devin-swe2")
+        self.assertEqual(candidate_rows[1]["profile"], "codex-luna")
+        self.assertIn(
+            "last observed free_rate_limited until 2026-10-19T08:45:00Z",
+            candidate_rows[0]["windows"],
         )
+        self.assertIn("observed 2026-10-19T07:55:00Z via job:known-limit", candidate_rows[0]["windows"])
 
     def test_free_limit_does_not_claim_healthy_alternatives_are_exhausted(self):
         self.freeze_cli()
@@ -818,14 +835,18 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             today=FIXED_NOW.date(),
             now=FIXED_NOW,
             grade_table=table,
-            free_rate_limit=free_window.reason(record),
+            free_rate_limit=free_window.display_value(record),
         )["rows"]
         self.assertTrue(any(row["profile"] == "codex-luna" and row["kind"] == "candidate" for row in rows))
+        self.assertEqual(
+            [row["profile"] for row in rows if row["kind"] == "candidate"][:2],
+            ["devin-swe2", "codex-luna"],
+        )
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             rc = cli.main(["gate", "-m", "devin-swe2", "--no-cache"])
-        self.assertEqual(rc, 3)
-        self.assertIn("free_rate_limited", stderr.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertIn("last observed free_rate_limited", stdout.getvalue())
         self.assertNotIn("정상 후보 전부 소진/측정불가", stderr.getvalue())
 
     def call_clear(self, *extra):
@@ -846,7 +867,7 @@ class DevinFreeShortWindowTests(unittest.TestCase):
             "job:clear-me",
         )
         self.seed_record(record)
-        self.assertEqual(self.call_gate("devin-swe2")[0], 3)
+        self.assertEqual(self.call_gate("devin-swe2")[0], 0)
         identity = free_window._identity_key()
 
         rc, stdout, stderr = self.call_clear()
@@ -1024,12 +1045,19 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         limited = json.loads(cli._render([result], args, FIXED_NOW))
         self.assertEqual(
             {bucket["free_short_window"] for bucket in limited["providers"][0]["buckets"][-3:]},
-            {"limited until 2026-10-19T08:45:00Z via job:known-limit"},
+            {
+                "last observed free_rate_limited until 2026-10-19T08:45:00Z "
+                "(observed 2026-10-19T07:55:00Z via job:known-limit)"
+            },
         )
         args.json = False
         table = cli._render([result], args, FIXED_NOW)
         self.assertEqual(
-            table.count("free_short_window=limited until 2026-10-19T08:45:00Z via job:known-limit"), 3
+            table.count(
+                "free_short_window=last observed free_rate_limited until 2026-10-19T08:45:00Z "
+                "(observed 2026-10-19T07:55:00Z via job:known-limit)"
+            ),
+            3,
         )
 
 
