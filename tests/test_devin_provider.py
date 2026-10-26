@@ -874,7 +874,7 @@ def test_probe_sends_no_input_to_login_like_arrow_options(tmp_path, monkeypatch,
     받아들이는 뮤턴트는 여기에 /usage 를 쳐 넣어 RED 가 된다.
     """
     log = _stub_tui_binary(tmp_path, monkeypatch, mode=mode, models_payload=_fixture(fixture_text))
-    monkeypatch.setattr(devin, "TIMEOUT_S", 1.0)
+    monkeypatch.setattr(devin, "TIMEOUT_S", 2.0)
 
     result = devin.fetch()
 

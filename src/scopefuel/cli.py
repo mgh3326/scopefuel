@@ -314,7 +314,10 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--ttl",
         default=None,
         metavar="DURATION",
-        help="효력 기간, 최대 2h (credit window 최대 24h)",
+        help=(
+            "효력 기간. 일반 pool 은 최대 2h, credit window 는 "
+            "expires_on midnight UTC 까지 (--ttl 이 더 짧으면 --ttl 적용)"
+        ),
     )
 
     manual_list = manual_sub.add_parser("list", help="append-only 수동 관측 이력 보기")
@@ -1114,12 +1117,7 @@ def _manual_command(args: argparse.Namespace) -> int:
     now = dt.datetime.now(dt.UTC)
     try:
         if args.manual_command == "set":
-            default_ttl_s = (
-                manual.CREDIT_MAX_TTL_S
-                if manual.normalize_window(args.pool, args.window) == manual.CREDIT_WINDOW
-                else manual.DEFAULT_TTL_S
-            )
-            ttl_s = manual.parse_duration(args.ttl) if args.ttl is not None else default_ttl_s
+            ttl_s = manual.parse_duration(args.ttl) if args.ttl is not None else None
             resets_in_s = manual.parse_duration(args.resets_in) if args.resets_in else None
             resets_at = manual.parse_timestamp(args.resets_at, now=now) if args.resets_at else None
             measured_at = manual.parse_timestamp(args.measured_at, now=now)

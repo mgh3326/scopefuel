@@ -688,7 +688,7 @@ def test_ttl_above_two_hours_is_rejected_without_writing(claude_error_registry, 
 
 
 def test_noncredit_manual_observation_two_hours_and_one_minute_old_is_expired():
-    """Mutant: apply the 24h credit TTL to all pools -> this value stays active."""
+    """Mutant: apply the v2 credit rule to non-credit pools -> this stays active."""
 
     now = dt.datetime(2026, 10, 26, 12, 0, tzinfo=dt.UTC)
     manual.record_observation(
