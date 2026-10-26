@@ -105,9 +105,7 @@ def _snapshot_view() -> launch.CatalogView:
     )
 
 
-def _set_manual_credit_cli(
-    *, remaining: str = "150", total: str = "200", ttl: str | None = None
-) -> int:
+def _set_manual_credit_cli(*, remaining: str = "150", total: str = "200", ttl: str | None = None) -> int:
     args = [
         "manual",
         "set",
@@ -371,9 +369,7 @@ def test_hand_edited_noncredit_expiry_beyond_two_hours_is_rejected():
     path = manual.manual_path()
     store = json.loads(path.read_text())
     entry = store["history"][-1]
-    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(
-        seconds=manual.MAX_TTL_S + 1
-    )
+    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(seconds=manual.MAX_TTL_S + 1)
     entry["expires_at"] = too_late.isoformat()
     path.write_text(json.dumps(store))
     with pytest.raises(manual.ManualError, match="expiry 불일치"):
