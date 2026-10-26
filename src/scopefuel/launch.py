@@ -796,7 +796,14 @@ def resolve_launch(
         # or gates the preferred rung a leftover C row became the "best-graded
         # ordinary rung" — an unmarked ``policy launch grok-hi`` resolved the
         # unmeasured xhigh rung and the canon's own retirement stopped refusing.
-        rows = [row for row in rows if row.gate == GATE_CONSULT_ONLY or not _unmeasured_e6_row(row)]
+        # hk 2079: the credit profiles are the exception — a consult_only gate on
+        # an unmeasured credit row does not lift the marker and seat rules.
+        rows = [
+            row
+            for row in rows
+            if (row.gate == GATE_CONSULT_ONLY and canonical not in E6_WORKER_TESTER_ONLY_PROFILES)
+            or not _unmeasured_e6_row(row)
+        ]
 
     from_snapshot = False
     if not rows:

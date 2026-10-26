@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -684,3 +685,208 @@ def test_credit_rows_are_not_listed_above_their_carrier_grade():
     credit = _credit_result()
     out = recommend_text([_claude_result(), credit], "A", today=TODAY, now=NOW)
     assert not set(_ranked_names(out)) & set(PI_PROFILES)
+
+
+# ---------------------------------------------------------------------------
+# 7. tester round 1 findings, kept as regressions
+# ---------------------------------------------------------------------------
+
+
+def _consult_only_view(profile: str = "pi-sonnet55", rung: str = "high") -> launch.CatalogView:
+    """A served canon whose only change is the gate of one unmeasured credit row."""
+
+    entries = tuple(
+        replace(entry, gate="consult_only") if entry.key == (profile, rung) else entry
+        for entry in bench.catalog_snapshot()
+    )
+    return launch.CatalogView(entries=entries, source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+
+
+@pytest.mark.parametrize(
+    "marker", ["pi-sonnet55@bogus", "pi-sonnet55@ultra", "pi-sonnet55@off", "pi-sonnet55@default"]
+)
+@pytest.mark.parametrize("role", [None, "builder", "worker"])
+def test_gate_cli_refuses_a_marker_that_names_an_unregistered_rung(monkeypatch, capsys, marker, role):
+    """F1: a marker rung that is not a registered row must not fall into the quota-only path."""
+
+    assert _set_manual_credit_cli() == 0
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "registry", lambda: {})
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, marker)
+    argv = ["gate", "-m", "pi-sonnet55", "--no-cache"]
+    if role is not None:
+        argv += ["--role", role]
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc in {3, 5}, captured.out + captured.err
+    assert "e6_arm_required" in captured.out + captured.err
+
+
+@pytest.mark.parametrize("rung", ["bogus", "ultra", "off", "default"])
+@pytest.mark.parametrize("role", [None, "builder", "worker", "tester"])
+def test_gate_refuses_every_unregistered_marker_rung_for_every_seat(rung, role):
+    credit = _credit_result()
+    result = gate_check(
+        [credit], "pi-sonnet55", role=role, e6_arm=f"pi-sonnet55@{rung}", today=TODAY, now=NOW
+    )
+    assert result.ok is False
+    assert "e6_arm_required" in result.reason
+
+
+@pytest.mark.parametrize("role", [None, "builder", "worker"])
+def test_launch_refuses_a_consult_only_credit_row_without_the_marker(role):
+    """F2: a consult_only gate on an unmeasured credit row keeps the marker rule."""
+
+    with pytest.raises(launch.LaunchError):
+        launch.resolve_launch(
+            "pi-sonnet55",
+            effort="high",
+            role=role,
+            operator_request="hk:task/2079",
+            view=_consult_only_view(),
+        )
+
+
+@pytest.mark.parametrize("role", [None, "builder", "reviewer"])
+def test_launch_refuses_a_consult_only_credit_row_for_any_other_seat_with_the_marker(role):
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch(
+            "pi-sonnet55",
+            effort="high",
+            role=role,
+            operator_request="hk:task/2079",
+            e6_arm="pi-sonnet55@high",
+            view=_consult_only_view(),
+        )
+
+
+def test_launch_admits_a_consult_only_credit_row_for_a_worker_with_marker_and_request():
+    decision = launch.resolve_launch(
+        "pi-sonnet55",
+        effort="high",
+        role="worker",
+        operator_request="hk:task/2079",
+        e6_arm="pi-sonnet55@high",
+        view=_consult_only_view(),
+    )
+    assert (decision.model_id, decision.gate, decision.effort) == (
+        "anthropic/claude-sonnet-5-5",
+        "consult_only",
+        "high",
+    )
+
+
+@pytest.mark.parametrize("role", [None, "builder", "worker"])
+def test_gate_cli_keeps_the_marker_rule_on_a_consult_only_credit_row(monkeypatch, capsys, role):
+    assert _set_manual_credit_cli() == 0
+    capsys.readouterr()
+    view = _consult_only_view()
+    monkeypatch.setattr(cli, "registry", lambda: {})
+    monkeypatch.setattr(bench, "read_catalog", lambda **kwargs: view)
+    monkeypatch.setattr(bench, "runtime_grade_table", lambda **kwargs: bench._catalog_grade_table(view))
+    monkeypatch.delenv(E6_ARM_MARKER_ENV, raising=False)
+    argv = [
+        "gate",
+        "-m",
+        "pi-sonnet55",
+        "--effort",
+        "high",
+        "--operator-request",
+        "hk:task/2079",
+        "--no-cache",
+    ]
+    if role is not None:
+        argv += ["--role", role]
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc in {3, 5}, captured.out + captured.err
+
+
+def test_gate_keeps_the_seat_rule_on_a_consult_only_credit_row_with_the_marker():
+    credit = _credit_result()
+    for role, ok in (("worker", True), ("tester", True), ("builder", False), (None, False)):
+        result = gate_check(
+            [credit],
+            "pi-sonnet55",
+            role=role,
+            effort="high",
+            e6_arm="pi-sonnet55@high",
+            operator_request="hk:task/2079",
+            consult_only_rungs=frozenset({("pi-sonnet55", "high")}),
+            today=TODAY,
+            now=NOW,
+        )
+        assert result.ok is ok, (role, result.reason)
+        if not ok:
+            assert result.role_denied is True
+
+
+def test_recommend_does_not_restore_a_consult_only_credit_row():
+    """F3: the canon's consult_only exclusion stays; the offering only replaces the E6 fold."""
+
+    view = _consult_only_view()
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    payload = recommend.recommend_dict([_credit_result()], "C", today=TODAY, now=NOW, grade_table=table)
+    rows = [r for r in payload["rows"] if r["profile"] == "pi-sonnet55" and r["kind"] == "candidate"]
+    assert not rows, rows
+    assert any(
+        r["profile"] == "pi-sonnet55" and r["effort"] == "high" and "consult_only" in r["reason"]
+        for r in payload["excluded"]
+    )
+    # The other default rungs are still offered, once each.
+    offered = {
+        r["profile"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
+    }
+    assert offered == {"pi-haiku55", "pi-opus55"}
+
+
+@pytest.mark.parametrize(
+    "edit", ["used", "zero-remaining", "negative", "nan", "zero-total", "missing-credit", "invalid-date"]
+)
+def test_hand_edited_credit_store_is_rejected(edit):
+    """F4: the stored used_pct must equal the value the USD numbers derive."""
+
+    _record_credit()
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    if edit == "used":
+        entry["used_pct"] = 0.0
+        entry["entitlement_and_limits"]["used_pct"] = 0.0
+    elif edit == "zero-remaining":
+        entry["credit"]["remaining_usd"] = 0.0
+    elif edit == "negative":
+        entry["credit"]["remaining_usd"] = -1
+    elif edit == "nan":
+        entry["credit"]["remaining_usd"] = float("nan")
+    elif edit == "zero-total":
+        entry["credit"]["total_usd"] = 0
+    elif edit == "missing-credit":
+        entry.pop("credit")
+    elif edit == "invalid-date":
+        entry["credit"]["expires_on"] = "nonsense"
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError):
+        manual.load_store()
+
+
+@pytest.mark.parametrize("pool", sorted(providers.BUILTIN))
+def test_used_is_still_required_for_every_probed_pool(pool, capsys):
+    rc = cli.main(
+        [
+            "manual",
+            "set",
+            "--pool",
+            pool,
+            "--window",
+            "7d",
+            "--measured-at",
+            "now",
+            "--reason",
+            "missing used",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "--used" in captured.err

@@ -4297,9 +4297,11 @@ def gate_check(
         )
         or experiment_retired is not None
     )
+    # hk 2079: a consult_only gate on an unmeasured credit row is still an
+    # unmeasured row — it keeps the E6 marker and the worker/tester seat rule.
     e6_row = (
         None
-        if consult_only
+        if (consult_only and canonical_profile not in E6_WORKER_TESTER_ONLY_PROFILES)
         or (rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung))
         else e6_arm_rung_for(canonical_profile, rung)
     )
@@ -4394,6 +4396,22 @@ def gate_check(
             reason=(
                 f"consult_only: {profile_name} — 운영자 명시 요청 없이 스폰 불가 "
                 "(--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)"
+            ),
+        )
+    if found is None and canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES and e6_admitted is None:
+        # hk 2079: the credit profiles exist only as unmeasured E6 rows, so there
+        # is no placement for the quota-only path below to judge. A request that
+        # reached here named no registered rung (an unregistered marker rung, for
+        # example) — it is refused, never admitted on the balance alone.
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=(
+                f"e6_arm_required: {canonical_profile} 은 미측정 E6 측정 런그뿐이다 (#594) — "
+                f"SCOPEFUEL_E6_ARM={canonical_profile}@<rung> 표식이 등록된 런그 "
+                f"({', '.join(PI_THINKING_RUNGS)}) 하나를 가리켜야 연다"
             ),
         )
     if found is None:
@@ -5357,10 +5375,13 @@ def _evaluate(
     # them without a usable balance) folds as E6 unmeasured like every other
     # carrier row, so no canon row goes unaccounted (hk 1862).
     credit_available = credit_row_available(providers)
+    # Only the E6-unmeasured fold is replaced by the offering: a credit row the
+    # canon dropped for another reason (consult_only, barred) stays dropped.
     dropped.extend(
         item
         for item in canon_dropped
-        if item.placed_grade == grade and not credit_row_offered(item.profile, credit_available)
+        if item.placed_grade == grade
+        and not (item.kind == "e6_unmeasured" and credit_row_offered(item.profile, credit_available))
     )
     folded_keys = {(item.profile.name, normalize_effort(item.profile.launcher_effort)) for item in dropped}
     table_keys = {
@@ -5442,6 +5463,7 @@ def _evaluate(
             for row in E6_ARM_RUNGS
             if credit_row_offered(row, credit_available)
             and (row.name, normalize_effort(row.launcher_effort)) not in table_keys
+            and (row.name, normalize_effort(row.launcher_effort)) not in folded_keys
             and (canon_keys is None or (row.name, normalize_effort(row.launcher_effort)) in canon_keys)
         ]
 
