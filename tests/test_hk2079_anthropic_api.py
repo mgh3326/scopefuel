@@ -890,3 +890,107 @@ def test_used_is_still_required_for_every_probed_pool(pool, capsys):
     captured = capsys.readouterr()
     assert rc == 2
     assert "--used" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 8. tester round 2 findings, kept as regressions
+# ---------------------------------------------------------------------------
+
+
+def _canon_with_pi_row_at(effort: str, *, keep_registered: bool):
+    """A served canon whose pi-sonnet55@high carrier row also appears under another key."""
+
+    entries = list(bench.catalog_snapshot())
+    high = next(entry for entry in entries if entry.key == ("pi-sonnet55", "high"))
+    if not keep_registered:
+        entries.remove(high)
+    entries.append(replace(high, effort=effort))
+    entries = bench._catalog_from_payload({"catalog": [entry.as_dict() for entry in entries]})
+    assert bench._server_catalog_rejection(entries) is None
+    view = launch.CatalogView(tuple(entries), source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    return view, table
+
+
+def _serve_canon(monkeypatch, view, table):
+    monkeypatch.setattr(cli, "registry", lambda: {})
+    monkeypatch.setattr(bench, "read_catalog", lambda **kwargs: view)
+    monkeypatch.setattr(launch, "read_catalog", lambda **kwargs: view)
+    monkeypatch.setattr(bench, "runtime_grade_table", lambda **kwargs: table)
+
+
+@pytest.mark.parametrize("keep_registered", [True, False])
+@pytest.mark.parametrize("effort", ["", "bogus", "off", "default"])
+@pytest.mark.parametrize("command", ["gate", "launch"])
+@pytest.mark.parametrize("role", [None, "builder", "worker"])
+def test_a_carrier_row_under_another_key_is_not_a_placement(
+    monkeypatch, capsys, command, role, effort, keep_registered
+):
+    """F5: an effort-less or unregistered canon key for a credit profile is still unmeasured."""
+
+    _record_credit()
+    view, table = _canon_with_pi_row_at(effort, keep_registered=keep_registered)
+    _serve_canon(monkeypatch, view, table)
+    monkeypatch.delenv(E6_ARM_MARKER_ENV, raising=False)
+    argv = (
+        ["gate", "-m", "pi-sonnet55", "--no-cache"]
+        if command == "gate"
+        else ["policy", "launch", "pi-sonnet55"]
+    )
+    if role is not None:
+        argv += ["--role", role]
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc != 0, captured.out + captured.err
+    if command == "gate":
+        assert rc in {3, 5}
+
+
+@pytest.mark.parametrize("effort", ["", "bogus"])
+def test_a_carrier_row_under_another_key_does_not_hide_the_registered_rung(monkeypatch, capsys, effort):
+    """The registered rung still opens through its marker for the right seat."""
+
+    _record_credit()
+    view, table = _canon_with_pi_row_at(effort, keep_registered=True)
+    _serve_canon(monkeypatch, view, table)
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
+    for role, expected in (("worker", 0), ("tester", 0), ("builder", 5), (None, 5)):
+        argv = ["gate", "-m", "pi-sonnet55", "--effort", "high", "--no-cache"]
+        if role is not None:
+            argv += ["--role", role]
+        assert cli.main(argv) == expected, role
+        capsys.readouterr()
+
+
+@pytest.mark.parametrize("keep_registered", [True, False])
+@pytest.mark.parametrize("effort", ["", "bogus", "off", "default"])
+def test_recommend_lists_one_default_rung_whatever_other_keys_the_canon_carries(effort, keep_registered):
+    _, table = _canon_with_pi_row_at(effort, keep_registered=keep_registered)
+    payload = recommend.recommend_dict([_credit_result()], "C", today=TODAY, now=NOW, grade_table=table)
+    launches = [
+        r["launch"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] == "pi-sonnet55"
+    ]
+    # Only the registered default rung is ever offered, and only if the canon carries it.
+    assert launches == (["pi-sonnet55 --effort high"] if keep_registered else [])
+
+
+@pytest.mark.parametrize("gate", ["escalation", "consult_only"])
+def test_recommend_keeps_a_non_default_canon_gate_on_the_credit_row(gate):
+    """F6: the offering replaces only a plain default-gate E6 fold."""
+
+    entries = tuple(
+        replace(entry, gate=gate) if entry.key == ("pi-sonnet55", "high") else entry
+        for entry in bench.catalog_snapshot()
+    )
+    view = launch.CatalogView(entries, source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    credit = _credit_result()
+    payload = recommend.recommend_dict([credit], "C", today=TODAY, now=NOW, grade_table=table)
+    assert not [r for r in payload["rows"] if r["profile"] == "pi-sonnet55" and r["kind"] == "candidate"]
+    assert any(r["profile"] == "pi-sonnet55" and r["effort"] == "high" for r in payload["excluded"])
+    text = recommend_text([credit], "C", today=TODAY, now=NOW, grade_table=table)
+    assert "pi-sonnet55 --effort high " not in "\n".join(
+        line for line in text.splitlines() if line[:1].isdigit()
+    )

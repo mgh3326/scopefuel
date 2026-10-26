@@ -1692,6 +1692,19 @@ E6_WORKER_TESTER_ONLY_REASON = (
 )
 
 
+def is_e6_unmeasured_key(profile: str, effort: str | None) -> bool:
+    """Whether a catalog (profile, effort) key is an unmeasured E6 measurement key.
+
+    A registered E6 rung is one. So is *any* effort key of a credit profile (hk
+    2079): those profiles exist only as unmeasured E6 rows, so a canon row for
+    one at an effort-less or unregistered key is the same measurement row under
+    another spelling — it never becomes a placement unless the canon moves it
+    above its carrier grade (a real measurement).
+    """
+
+    return (profile, effort or "") in E6_ARM_KEYS or profile in E6_WORKER_TESTER_ONLY_PROFILES
+
+
 def e6_worker_tester_seat_denied(profile: str, role: str | None) -> bool:
     """Whether a worker/tester-only profile is asked for on any other seat."""
 
@@ -4246,7 +4259,10 @@ def gate_check(
     # no placement for a bare ``gate -m <profile>`` to fall back on — the D3 quota
     # path below would admit it. The bare spelling names the launcher's default
     # rung instead, so the missing marker is refused like any other unmeasured rung.
-    if rung is None and _find_profile(profile_name, grade_table=table) is None:
+    if rung is None and (
+        canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
+        or _find_profile(profile_name, grade_table=table) is None
+    ):
         rung = e6_bare_rung(canonical_profile)
     rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
     # #716: --effort 는 명령 단위의 명시적 런그 지명이다 — 배치 행을 가리키면
@@ -4398,11 +4414,17 @@ def gate_check(
                 "(--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)"
             ),
         )
-    if found is None and canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES and e6_admitted is None:
-        # hk 2079: the credit profiles exist only as unmeasured E6 rows, so there
-        # is no placement for the quota-only path below to judge. A request that
-        # reached here named no registered rung (an unregistered marker rung, for
-        # example) — it is refused, never admitted on the balance alone.
+    if (
+        canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
+        and e6_admitted is None
+        and (found is None or found[0] == e6_arm_carrier_grade(canonical_profile, rung))
+    ):
+        # hk 2079: the credit profiles exist only as unmeasured E6 rows. A request
+        # is admitted either through the E6 marker on a registered rung, or when
+        # the canon placed the resolved row above its carrier grade (a real
+        # measurement). Anything else reached here with no placement to judge, or
+        # with a carrier-grade row under an effort-less or unregistered key — it is
+        # refused, never admitted on the balance alone.
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -5381,7 +5403,11 @@ def _evaluate(
         item
         for item in canon_dropped
         if item.placed_grade == grade
-        and not (item.kind == "e6_unmeasured" and credit_row_offered(item.profile, credit_available))
+        and not (
+            item.kind == "e6_unmeasured"
+            and item.profile.gate == "default"
+            and credit_row_offered(item.profile, credit_available)
+        )
     )
     folded_keys = {(item.profile.name, normalize_effort(item.profile.launcher_effort)) for item in dropped}
     table_keys = {

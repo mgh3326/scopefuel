@@ -4423,12 +4423,12 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
     """
 
     from .recommend import (
-        E6_ARM_KEYS,
         E6_UNMEASURED_REASON,
         GRADE_TABLE,
         UNGRADED_TRIAL_PROFILE_NAMES,
         _Excluded,
         e6_arm_carrier_grade,
+        is_e6_unmeasured_key,
         validate_grade_table,
     )
 
@@ -4464,7 +4464,8 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
         and entry.gate != "consult_only"
         and entry.profile not in UNGRADED_TRIAL_PROFILE_NAMES
         and not (
-            entry.key in E6_ARM_KEYS and entry.grade == e6_arm_carrier_grade(entry.profile, entry.effort)
+            is_e6_unmeasured_key(entry.profile, entry.effort)
+            and entry.grade == e6_arm_carrier_grade(entry.profile, entry.effort)
         )
     }
 
@@ -4501,7 +4502,9 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
         # carrier is per-row (#1788): sonnet@max carries A+ so the canon ladder
         # stays monotonic. Once the canon moves the rung off its carrier grade
         # (a real measurement) it is an ordinary row again.
-        if entry.key in E6_ARM_KEYS and entry.grade == e6_arm_carrier_grade(entry.profile, entry.effort):
+        if is_e6_unmeasured_key(entry.profile, entry.effort) and entry.grade == e6_arm_carrier_grade(
+            entry.profile, entry.effort
+        ):
             _drop(E6_UNMEASURED_REASON, "e6_unmeasured")
             continue
         if not entry.effort and (entry.profile, entry.grade) in enumerated_at_grade:
@@ -4514,7 +4517,7 @@ def _catalog_grade_table(view: CatalogView) -> dict | None:
                 and candidate.gate != "consult_only"
                 and candidate.profile not in UNGRADED_TRIAL_PROFILE_NAMES
                 and not (
-                    candidate.key in E6_ARM_KEYS
+                    is_e6_unmeasured_key(candidate.profile, candidate.effort)
                     and candidate.grade == e6_arm_carrier_grade(candidate.profile, candidate.effort)
                 )
             )

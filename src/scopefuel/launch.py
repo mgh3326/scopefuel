@@ -36,7 +36,6 @@ from .recommend import (
     ASTRA_FORBIDDEN_SEATS,
     ASTRA_ROLE_PROFILES,
     BARRED_MODEL_DECISION_REF,
-    E6_ARM_KEYS,
     E6_ARM_RUNGS,
     E6_WORKER_TESTER_ONLY_PROFILES,
     E6_WORKER_TESTER_ONLY_REASON,
@@ -54,6 +53,7 @@ from .recommend import (
     e6_arm_rung_for,
     e6_worker_tester_seat_denied,
     is_barred_model_id,
+    is_e6_unmeasured_key,
     normalize_effort,
     parse_e6_arm_marker,
     profile_pool,
@@ -573,7 +573,7 @@ def _unmeasured_e6_row(row: CatalogEntry) -> bool:
     again.
     """
 
-    return (row.profile, row.effort) in E6_ARM_KEYS and row.grade == e6_arm_carrier_grade(
+    return is_e6_unmeasured_key(row.profile, row.effort) and row.grade == e6_arm_carrier_grade(
         row.profile, row.effort
     )
 
