@@ -60,6 +60,17 @@ AREAS = [
 ]
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "hk1945"
+PACE_VERDICT_RE = re.compile(
+    r"(?: · )?(?:pace-unknown window=\S+|pace=within-limit window=\S+)"
+    r"(?: (?:pace-unknown window=\S+|pace=within-limit window=\S+))*"
+    r"|(?: · )?pace=exempt \(SWE-2 free bucket\)"
+)
+
+
+def _strip_pace_verdicts(text: str) -> str:
+    """Keep the historical area golden focused on area behavior; pace has its own tests."""
+    return PACE_VERDICT_RE.sub("", text).rstrip(" ")
+
 
 # Model ids the bundled snapshot carries for the profiles these tests use.
 MODEL_ID = {
@@ -523,7 +534,7 @@ def test_without_area_text_matches_the_main_golden(area_server, grade):
         _exception("grok", "medium", "blender", "exclude", expires_with_model_id="grok-4.6"),
     ]
     golden = (FIXTURES / f"{grade.replace('+', 'p')}-text.txt").read_text(encoding="utf-8")
-    assert _rec(grade) == golden
+    assert _strip_pace_verdicts(_rec(grade)) == golden
 
 
 @pytest.mark.parametrize("grade", ["S+", "A+", "A"])
@@ -536,7 +547,11 @@ def test_without_area_json_matches_the_main_golden(area_server, grade):
         _exception("sonnet", "high", "blender", "prefer"),
     ]
     golden = json.loads((FIXTURES / f"{grade.replace('+', 'p')}-json.json").read_text(encoding="utf-8"))
-    assert _rec_dict(grade) == golden
+    actual = _rec_dict(grade)
+    for row in actual["rows"]:
+        if "windows" in row:
+            row["windows"] = _strip_pace_verdicts(row["windows"])
+    assert actual == golden
     assert "area" not in _rec_dict(grade)
 
 

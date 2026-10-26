@@ -1264,3 +1264,31 @@ def test_the_credit_rows_are_accounted_once_each_on_the_c_surface():
             r["profile"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
         }
         assert offered == (set(PI_PROFILES) if credit_state == "fresh" else set())
+
+
+# ---------------------------------------------------------------------------
+# 11. the spend-pool pace gate (main #196) and the credit pool
+# ---------------------------------------------------------------------------
+
+
+def test_the_credit_pool_is_pace_unknown_and_needs_no_pace_override():
+    """The credit window has no length or reset time, so the pace gate cannot judge it.
+
+    It is a parallel, expiry-driven balance (r1026prio): even a heavily used one is
+    admitted on its own cutoff, never refused as pace_exhaustion.
+    """
+
+    credit = _credit_result(remaining=20.0)
+    result = gate_check(
+        [credit],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm="pi-sonnet55@high",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True, result.reason
+    assert result.pace_override_ref is None
+    assert "pace-unknown window=credit" in result.reason
+    assert "pace_exhaustion" not in result.reason

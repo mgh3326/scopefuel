@@ -461,7 +461,7 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
                     out.append(f"✗ 제외 ({len(entries)}): " + " · ".join(entries))
             return "\n".join(out)
 
-        actual = _strip_fusion(actual)
+        actual = _strip_fusion(actual).replace(" · pace-unknown window=30d", "")
         assert actual.encode() == expected.encode(), grade
         assert not any(name in actual for name in ("codex-astra", "fable", "builder-astra", "builder-fable"))
 

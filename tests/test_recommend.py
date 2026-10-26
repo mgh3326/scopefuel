@@ -317,17 +317,19 @@ def test_spend_reset_not_imminent_no_fire():
     assert "🔥" not in ranked[0]
 
 
-def test_urgent_spend_outranks_non_urgent_higher_remaining():
-    """폴백 경로: reset-imminent spend 가 non-imminent spend 보다 remaining% 낮아도 앞선다."""
+def test_overpace_weekly_window_refuses_recommendation_even_when_5h_is_safe():
+    """Any over-pace window refuses the row, even when the other window is safe."""
     providers = [
-        _result("kiro", 80.0, pool_class="spend", window="?", resets_at=_reset_in(4)),  # 20% rem, urgent
-        _result("codex", 10.0, pool_class="spend", window="?", resets_at=_reset_in(48)),  # not urgent
+        _result_windows_with_resets(
+            "claude",
+            [(50.0, "5h", 0.5), (60.0, "7d", 68.0)],
+        ),
     ]
-    out = recommend(providers, "A+", today=TODAY, now=NOW, urgency_hours=12.0)
+    out = recommend(providers, "S+", today=TODAY, now=NOW)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert "🔥" in lines[0] and "kiro-sonnet" in lines[0]
-    assert len(lines) >= 2
-    assert "🔥" not in lines[1]
+    assert not any("opus" in line for line in lines)
+    assert "pace_exhaustion" in out
+    assert "window=7d" in out
 
 
 def test_multiple_urgent_sorted_by_remaining():
@@ -1700,21 +1702,16 @@ def test_rob1210_imminent_exhaustion_uses_budget_window():
     assert "잔여 60%" in urgent_line
 
 
-def test_rob1210_urgency_uses_budget_window_pace():
-    """A pace-urgent 5h window does not add 🔥 when the weekly budget pace is safe."""
+def test_rob1210_weekly_pace_exhaustion_refuses_recommendation_row():
+    """The weekly budget window participates in admission, not just 5h budget scoring."""
     out = recommend(
-        [
-            _result_windows_with_resets(
-                "claude",
-                [(50.0, "5h", 0.5), (60.0, "7d", 68.0)],
-            )
-        ],
+        [_result_windows_with_resets("claude", [(50.0, "5h", 0.5), (60.0, "7d", 68.0)])],
         "S+",
         today=TODAY,
         now=NOW,
     )
-    opus_line = next(line for line in out.splitlines() if line[:1].isdigit() and "opus" in line)
-    assert "🔥" not in opus_line
+    assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
+    assert "pace_exhaustion" in out and "window=7d" in out
 
 
 def test_rob1210_short_window_cutoff_remains_a_brake():

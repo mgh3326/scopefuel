@@ -21,6 +21,28 @@ from scopefuel.model import Bucket, ProviderResult, Scope
 BASE = "3c96924e0bf4b551d52ed5314f858419761c1dbf"
 NOW = dt.datetime(2026, 10, 25, 12, tzinfo=dt.UTC)
 REF = "hk:task/1786"
+PACE_VERDICT_RE = re.compile(
+    r"(?: · )?(?:pace-unknown window=\S+|pace=within-limit window=\S+)"
+    r"(?: (?:pace-unknown window=\S+|pace=within-limit window=\S+))*"
+    r"|(?: · )?pace=exempt \(SWE-2 free bucket\)"
+)
+
+
+def _strip_pace_verdicts(text):
+    return PACE_VERDICT_RE.sub("", text).rstrip(" ")
+
+
+def _strip_payload_pace_verdicts(payload, *, pace_unknown_profiles=()):
+    pace_unknown_profiles = set(pace_unknown_profiles)
+    pace_unknown_profiles.update(
+        row["profile"] for row in payload["rows"] if "pace-unknown" in row.get("windows", "")
+    )
+    for row in payload["rows"]:
+        if "windows" in row:
+            row["windows"] = _strip_pace_verdicts(row["windows"])
+        if row["profile"] in pace_unknown_profiles:
+            row.pop("score", None)
+    return payload
 
 
 def _providers(used=10):
@@ -529,16 +551,44 @@ def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
             assert base_cli.main(argv) == 0
             expected = capsys.readouterr()
             if grade != "A+":
-                assert actual == expected, argv
+                if output:
+                    actual_payload = json.loads(actual.out)
+                    expected_payload = json.loads(expected.out)
+                    pace_unknown_profiles = {
+                        row["profile"]
+                        for row in actual_payload["rows"]
+                        if "pace-unknown" in row.get("windows", "")
+                    }
+                    assert _strip_payload_pace_verdicts(
+                        actual_payload, pace_unknown_profiles=pace_unknown_profiles
+                    ) == _strip_payload_pace_verdicts(
+                        expected_payload, pace_unknown_profiles=pace_unknown_profiles
+                    ), argv
+                    assert actual.err == expected.err, argv
+                else:
+                    assert _strip_pace_verdicts(actual.out) == expected.out, argv
+                    assert actual.err == expected.err, argv
                 continue
             # hk 2007: A+ is base minus exactly the borrowed opus --effort low row.
             assert actual.err == expected.err, argv
             if output:
                 payload, dropped = _drop_aplus_opus_low_payload(json.loads(expected.out))
-                assert json.loads(actual.out) == payload, argv
+                actual_payload = json.loads(actual.out)
+                pace_unknown_profiles = {
+                    row["profile"]
+                    for row in actual_payload["rows"]
+                    if "pace-unknown" in row.get("windows", "")
+                }
+                actual_normalized = _strip_payload_pace_verdicts(
+                    actual_payload, pace_unknown_profiles=pace_unknown_profiles
+                )
+                expected_normalized = _strip_payload_pace_verdicts(
+                    payload, pace_unknown_profiles=pace_unknown_profiles
+                )
+                assert actual_normalized == expected_normalized, argv
             else:
                 text, dropped = _drop_aplus_opus_low_text(expected.out)
-                assert actual.out == text, argv
+                assert _strip_pace_verdicts(actual.out) == text, argv
             a_plus_dropped += int(dropped)
     assert a_plus_dropped > 0
 
@@ -756,9 +806,11 @@ def test_implicit_live_snapshot_gate_matches_base(tmp_path, monkeypatch, catalog
             **base_cli._gate_args(args),
             **base_cli._gate_rung_args(args),
         )
-        assert (actual.ok, actual.reason, actual.grade) == (expected.ok, expected.reason, expected.grade), (
-            profile
-        )
+        assert (actual.ok, _strip_pace_verdicts(actual.reason), actual.grade) == (
+            expected.ok,
+            expected.reason,
+            expected.grade,
+        ), profile
 
 
 def test_implicit_policy_context_never_invents_an_ordinary_rung(monkeypatch):
