@@ -413,6 +413,27 @@ def test_recommend_lists_over_pace_rows_with_warnings_and_headroom_order():
     assert "pace-warning pool=kimi window=7d" in kimi["windows"]
 
 
+def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_headroom():
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["C"] = [profiles["sonnet"], profiles["kimi-k3-low"]]
+    providers = [
+        _provider("claude", _bucket("7d", 50, 144)),
+        _provider("kimi", _bucket("7d", 70, 144)),
+        _provider("anthropic-api", _bucket("7d", 25, 144)),
+    ]
+
+    data = recommend.recommend_dict(providers, "C", today=TODAY, now=NOW, grade_table=table)
+    rows = [row for row in data["rows"] if row["kind"] == "candidate"]
+    names = [row["profile"] for row in rows]
+    credit = next(row for row in rows if row["profile"] == "pi-sonnet55")
+
+    assert names.index("sonnet") < names.index("kimi-k3-low") < names.index("pi-sonnet55")
+    assert "pace-warning pool=claude window=7d" in next(row for row in rows if row["profile"] == "sonnet")["windows"]
+    assert "pace-warning pool=kimi window=7d" in next(row for row in rows if row["profile"] == "kimi-k3-low")["windows"]
+    assert "pace-warning pool=anthropic-api window=7d" in credit["windows"]
+
+
 def test_swe2_free_bucket_stays_listed_and_exempt_from_pace_and_waste():
     profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
     table = {grade: [] for grade in recommend.GRADE_TABLE}
