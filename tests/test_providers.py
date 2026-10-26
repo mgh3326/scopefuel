@@ -1364,7 +1364,7 @@ def test_grok_parse_oci_capture_defaults_to_host_now(fixture_text, host_tz, monk
     class FrozenDateTime(dt.datetime):
         @classmethod
         def now(cls, tz=None):
-            return frozen_now
+            return frozen_now if tz is None else frozen_now.replace(tzinfo=dt.UTC).astimezone(tz)
 
     with host_tz("UTC"):
         monkeypatch.setattr(grok.dt, "datetime", FrozenDateTime)
@@ -1383,7 +1383,7 @@ def test_grok_parse_defaults_to_host_now_across_year_boundary(host_tz, monkeypat
     class FrozenDateTime(dt.datetime):
         @classmethod
         def now(cls, tz=None):
-            return frozen_now
+            return frozen_now if tz is None else frozen_now.replace(tzinfo=dt.UTC).astimezone(tz)
 
     with host_tz("UTC"):
         monkeypatch.setattr(grok.dt, "datetime", FrozenDateTime)
@@ -1402,7 +1402,7 @@ def test_grok_parse_defaults_to_host_now_before_utc_year_end(host_tz, monkeypatc
     class FrozenDateTime(dt.datetime):
         @classmethod
         def now(cls, tz=None):
-            return frozen_now
+            return frozen_now if tz is None else frozen_now.replace(tzinfo=dt.UTC).astimezone(tz)
 
     with host_tz("UTC"):
         monkeypatch.setattr(grok.dt, "datetime", FrozenDateTime)
