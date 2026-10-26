@@ -31,6 +31,7 @@ SOURCE_VERIFICATION = "unverified"
 SOURCE_LABEL = "자기신고 · 미검증"
 DEFAULT_TTL_S = 15 * 60.0
 MAX_TTL_S = 2 * 3600.0
+CREDIT_MAX_TTL_S = 24 * 3600.0
 MAX_FUTURE_SKEW_S = 300.0
 MAX_REASON_CHARS = 1000
 
@@ -223,9 +224,17 @@ def _validate_store(store: dict) -> None:
             seen_observations.add(observation_key)
             if measured > entered + dt.timedelta(seconds=MAX_FUTURE_SKEW_S):
                 raise ManualError(f"manual history {index} future measurement 불일치")
-            if expires > measured + dt.timedelta(seconds=MAX_TTL_S) or expires > entered + dt.timedelta(
-                seconds=MAX_TTL_S
-            ):
+            ttl_limit_s = CREDIT_MAX_TTL_S if event["window"] == CREDIT_WINDOW else MAX_TTL_S
+            expiry_bounds = [
+                measured + dt.timedelta(seconds=ttl_limit_s),
+                entered + dt.timedelta(seconds=ttl_limit_s),
+            ]
+            if event["window"] == CREDIT_WINDOW:
+                credit = event["credit"]
+                expires_on = _parse_date(credit["expires_on"])
+                assert expires_on is not None
+                expiry_bounds.append(dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC))
+            if expires > min(expiry_bounds):
                 raise ManualError(f"manual history {index} expiry 불일치")
             if not isinstance(event.get("reason"), str) or not event["reason"].strip():
                 raise ManualError(f"manual history {index} reason 불일치")
@@ -517,7 +526,7 @@ def _validate_credit(event: dict, index: int) -> None:
 
 
 def credit_display(summary: dict | None, *, now: dt.datetime) -> str | None:
-    """One human line for a fresh credit observation: balance and days left."""
+    """One human line for a fresh credit observation: balance and validity."""
 
     if not summary:
         return None
@@ -531,14 +540,31 @@ def credit_display(summary: dict | None, *, now: dt.datetime) -> str | None:
         expires = _parse_date(credit.get("expires_on"))
         if expires is None:
             continue
+        valid_until = _parse_iso(entry.get("expires_at"))
+        if valid_until is None:
+            continue
         days = (expires - _as_utc(now).date()).days
         left = f"{days}일 남음" if days >= 0 else f"{-days}일 지남(만료)"
+        remaining_s = (valid_until - _as_utc(now)).total_seconds()
+        remaining = _format_remaining_validity(remaining_s)
         pool = str(entry.get("pool") or "")
         return (
             f"{pool} credit ${float(credit['remaining_usd']):.2f}/"
-            f"${float(credit['total_usd']):.2f} · {left} (만료 {expires.isoformat()})"
+            f"${float(credit['total_usd']):.2f} · {left} (만료 {expires.isoformat()}) · "
+            f"valid_until={_iso(valid_until)} ({remaining})"
         )
     return None
+
+
+def _format_remaining_validity(seconds: float) -> str:
+    if seconds <= 0:
+        return "expired"
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes = remainder // 60
+    if hours:
+        suffix = f" {minutes}m" if minutes else ""
+        return f"in {hours}h{suffix}"
+    return f"in {max(1, math.ceil(seconds / 60))}m"
 
 
 def manual_only_result(pool: str) -> ProviderResult:
@@ -637,7 +663,7 @@ def record_observation(
     window: str | None,
     measured_at: dt.datetime,
     reason: str,
-    ttl_s: float = DEFAULT_TTL_S,
+    ttl_s: float | None = None,
     resets_in_s: float | None = None,
     resets_at: dt.datetime | None = None,
     remaining_usd: float | None = None,
@@ -647,8 +673,6 @@ def record_observation(
 ) -> dict:
     entered_at = _as_utc(now or dt.datetime.now(dt.UTC))
     measured_at = _as_utc(measured_at)
-    if not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > MAX_TTL_S:
-        raise ManualError("--ttl 은 0보다 크고 2h 이하여야 합니다")
     if measured_at > entered_at + dt.timedelta(seconds=MAX_FUTURE_SKEW_S):
         raise ManualError("--measured-at 은 미래 시각일 수 없습니다")
     reason = reason.strip()
@@ -657,7 +681,15 @@ def record_observation(
     if len(reason) > MAX_REASON_CHARS:
         raise ManualError(f"--reason 은 {MAX_REASON_CHARS}자 이하여야 합니다")
     normalized_window = normalize_window(pool, window)
+    ttl_limit_s = CREDIT_MAX_TTL_S if normalized_window == CREDIT_WINDOW else MAX_TTL_S
+    if ttl_s is None:
+        ttl_s = CREDIT_MAX_TTL_S if normalized_window == CREDIT_WINDOW else DEFAULT_TTL_S
+    if not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > ttl_limit_s:
+        if normalized_window == CREDIT_WINDOW:
+            raise ManualError("--ttl 은 0보다 크고 credit window 는 24h 이하, 그 외는 2h 이하여야 합니다")
+        raise ManualError("--ttl 은 0보다 크고 2h 이하여야 합니다")
     credit: dict | None = None
+    credit_expiry_start: dt.datetime | None = None
     if normalized_window == CREDIT_WINDOW:
         if used_pct is not None:
             raise ManualError("credit window 는 --used 대신 --remaining/--total 을 씁니다")
@@ -670,6 +702,9 @@ def record_observation(
         expires = _parse_date(credit_expires_on)
         if expires is None:
             raise ManualError("--expires-on 은 YYYY-MM-DD 형식이어야 합니다")
+        credit_expiry_start = dt.datetime.combine(expires, dt.time.min, tzinfo=dt.UTC)
+        if entered_at >= credit_expiry_start:
+            raise ManualError("--expires-on credit balance 는 입력 시각에 이미 만료됐습니다")
         used_pct = credit_used_pct(float(remaining_usd), float(total_usd))
         credit = {
             "remaining_usd": float(remaining_usd),
@@ -688,8 +723,10 @@ def record_observation(
         resets_at = measured_at + dt.timedelta(seconds=resets_in_s)
     expires_at = min(
         measured_at + dt.timedelta(seconds=ttl_s),
-        entered_at + dt.timedelta(seconds=MAX_TTL_S),
+        entered_at + dt.timedelta(seconds=ttl_limit_s),
     )
+    if credit_expiry_start is not None:
+        expires_at = min(expires_at, credit_expiry_start)
     if resets_at is not None:
         expires_at = min(expires_at, _as_utc(resets_at))
 
