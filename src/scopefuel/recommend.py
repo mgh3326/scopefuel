@@ -4417,14 +4417,15 @@ def gate_check(
     if (
         canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
         and e6_admitted is None
-        and (found is None or found[0] == e6_arm_carrier_grade(canonical_profile, rung))
+        and (rung_row is None or rung_row[0] == e6_arm_carrier_grade(canonical_profile, rung))
     ):
         # hk 2079: the credit profiles exist only as unmeasured E6 rows. A request
         # is admitted either through the E6 marker on a registered rung, or when
-        # the canon placed the resolved row above its carrier grade (a real
-        # measurement). Anything else reached here with no placement to judge, or
-        # with a carrier-grade row under an effort-less or unregistered key — it is
-        # refused, never admitted on the balance alone.
+        # the canon placed the requested rung's own row above its carrier grade (a
+        # real measurement). A rung the canon has no placement for does not fall
+        # back to the profile's default placement here — that would let a measured
+        # sibling graduate it — and a carrier-grade row is unmeasured whatever its
+        # key. Both are refused, never admitted on the balance alone.
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -5320,7 +5321,14 @@ def _apply_area_exceptions(
         tail = evaluation.included[start:]
         moving = [candidate for candidate in tail if id(candidate) in preferred]
         rest = [candidate for candidate in tail if id(candidate) not in preferred]
-        evaluation.included[start:] = moving + rest
+        reordered = moving + rest
+        # hk 2079 (r1026prio): the credit is a parallel option, so an area
+        # preference reorders credit rows among themselves but never lifts one
+        # above a non-credit candidate.
+        reordered = [c for c in reordered if not is_credit_row(c.profile)] + [
+            c for c in reordered if is_credit_row(c.profile)
+        ]
+        evaluation.included[start:] = reordered
 
     lines = [_area_explain_line(row, expired=False, catalog_model_ids=catalog_model_ids) for row in applied]
     lines += [

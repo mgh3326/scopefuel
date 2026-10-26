@@ -489,6 +489,10 @@ def _validate_credit(event: dict, index: int) -> None:
     """
 
     credit = event.get("credit")
+    # The credit window belongs to the manual-only pool and nothing else, in the
+    # reader as in the writer (normalize_window): a hand-edited store cannot move it.
+    if (event.get("window") == CREDIT_WINDOW) != (event.get("pool") in MANUAL_ONLY_POOLS):
+        raise ManualError(f"manual history {index} credit pool 불일치")
     if event.get("window") != CREDIT_WINDOW:
         if credit is not None:
             raise ManualError(f"manual history {index} credit window 불일치")

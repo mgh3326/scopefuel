@@ -994,3 +994,150 @@ def test_recommend_keeps_a_non_default_canon_gate_on_the_credit_row(gate):
     assert "pi-sonnet55 --effort high " not in "\n".join(
         line for line in text.splitlines() if line[:1].isdigit()
     )
+
+
+# ---------------------------------------------------------------------------
+# 9. tester round 3 findings, kept as regressions
+# ---------------------------------------------------------------------------
+
+
+def _canon_with_measured_siblings(extra_effort: str):
+    """high/xhigh/max placed at B by the canon, low/medium still carriers, plus one unmeasured extra key."""
+
+    base = list(bench.catalog_snapshot())
+    carrier_high = next(entry for entry in base if entry.key == ("pi-sonnet55", "high"))
+    entries = [
+        replace(entry, grade="B")
+        if entry.profile == "pi-sonnet55" and entry.effort in {"high", "xhigh", "max"}
+        else entry
+        for entry in base
+    ]
+    entries.append(replace(carrier_high, effort=extra_effort))
+    entries = bench._catalog_from_payload({"catalog": [entry.as_dict() for entry in entries]})
+    assert bench._server_catalog_rejection(entries) is None
+    view = launch.CatalogView(tuple(entries), source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    return view, table
+
+
+@pytest.mark.parametrize("extra", ["off", "bogus", "default"])
+@pytest.mark.parametrize("role", [None, "builder", "worker"])
+def test_a_measured_sibling_does_not_graduate_an_unmeasured_key_in_the_gate(extra, role):
+    """F8: an unknown rung never borrows the profile's default placement (a measured sibling)."""
+
+    _, table = _canon_with_measured_siblings(extra)
+    credit = _credit_result()
+    result = gate_check(
+        [credit],
+        "pi-sonnet55",
+        role=role,
+        e6_arm=f"pi-sonnet55@{extra}",
+        grade_table=table,
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False, result.reason
+
+
+@pytest.mark.parametrize("extra", ["off", "bogus", "default"])
+@pytest.mark.parametrize("role", [None, "builder", "worker"])
+def test_a_measured_sibling_does_not_graduate_an_unmeasured_key_in_launch(extra, role):
+    view, _ = _canon_with_measured_siblings(extra)
+    with pytest.raises(launch.LaunchError, match="e6_arm_required"):
+        launch.resolve_launch("pi-sonnet55", effort=extra, role=role, view=view)
+
+
+def test_a_canon_placed_credit_rung_is_an_ordinary_placement():
+    """Control: graduation is the canon moving the rung's own row above the carrier."""
+
+    view, table = _canon_with_measured_siblings("off")
+    decision = launch.resolve_launch("pi-sonnet55", effort="high", role="builder", view=view)
+    assert (decision.effort, decision.grade) == ("high", "B")
+    credit = _credit_result()
+    result = gate_check(
+        [credit], "pi-sonnet55", role="builder", effort="high", grade_table=table, today=TODAY, now=NOW
+    )
+    assert result.ok is True, result.reason
+    # The unmeasured sibling rungs stay marker-gated next to it.
+    refused = gate_check(
+        [credit], "pi-sonnet55", role="builder", effort="low", grade_table=table, today=TODAY, now=NOW
+    )
+    assert refused.ok is False
+
+
+def _area_prefer(profile: str, effort: str, area: str, model_id: str):
+    return bench._area_exception_from_wire(
+        {
+            "profile": profile,
+            "effort": effort,
+            "area": area,
+            "action": "prefer",
+            "evidence_refs": ["hk:task/1945"],
+            "decision_ref": "hk:doc/decision/2026-10-25/area-example",
+            "decided_by": "operator-desk",
+            "decided_at": "2026-10-25T00:00:00Z",
+            "expires_with_model_id": model_id,
+            "retired_at": None,
+        }
+    )
+
+
+def test_an_area_preference_never_lifts_a_credit_row_above_a_subscription_row():
+    """F9: the credit is a parallel option on the final ranking too."""
+
+    credit = _credit_result()
+    exception = _area_prefer("pi-sonnet55", "high", "python", "anthropic/claude-sonnet-5-5")
+    kwargs = dict(
+        today=TODAY,
+        now=NOW,
+        bench_scores=[],
+        model_prices={},
+        area="python",
+        area_exceptions=[exception],
+        catalog_model_ids={("pi-sonnet55", "high"): "anthropic/claude-sonnet-5-5"},
+    )
+    payload = recommend.recommend_dict([_claude_result(), credit], "C", **kwargs)
+    names = [r["profile"] for r in payload["rows"] if r["kind"] == "candidate"]
+    credit_idx = [i for i, name in enumerate(names) if name in PI_PROFILES]
+    other_idx = [i for i, name in enumerate(names) if name not in PI_PROFILES]
+    assert credit_idx and other_idx, names
+    assert max(other_idx) < min(credit_idx), names
+    # The preference still orders the credit rows among themselves.
+    assert [names[i] for i in credit_idx][0] == "pi-sonnet55", names
+    text = recommend_text([_claude_result(), credit], "C", **kwargs)
+    ranked = _ranked_names(text)
+    assert [i for i, n in enumerate(ranked) if n in PI_PROFILES][0] > max(
+        i for i, n in enumerate(ranked) if n not in PI_PROFILES
+    ), ranked
+
+
+def test_launch_reports_the_explicit_pool_whatever_the_canon_row_says():
+    """F10: the canon pool field cannot move a credit profile onto the claude pool."""
+
+    entries = tuple(
+        replace(entry, pool="claude") if entry.profile == "pi-sonnet55" else entry
+        for entry in bench.catalog_snapshot()
+    )
+    view = launch.CatalogView(entries, source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+    decision = launch.resolve_launch(
+        "pi-sonnet55", effort="high", role="worker", e6_arm="pi-sonnet55@high", view=view
+    )
+    assert decision.pool == "anthropic-api"
+
+
+def test_a_hand_edited_credit_window_on_another_pool_is_rejected_on_load():
+    """F11: the reader enforces what normalize_window enforces for the writer."""
+
+    _record_credit()
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    entry["pool"] = "claude"
+    entry["account_ref"]["pool"] = "claude"
+    store["latest"] = {
+        key.replace("anthropic-api", "claude"): value for key, value in store["latest"].items()
+    }
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError):
+        manual.load_store()

@@ -878,6 +878,14 @@ def resolve_launch(
     if not matched:
         if _retired_rung(view, canonical, resolved_effort):
             raise LaunchError(f"profile '{profile}' rung '{resolved_effort}' is retired in the catalog")
+        if canonical in E6_WORKER_TESTER_ONLY_PROFILES:
+            # hk 2079: a credit profile has no default placement for an unknown or
+            # unmeasured rung to fall back on — borrowing a measured sibling row
+            # would graduate it. The rung needs its own row or the E6 marker.
+            raise LaunchError(
+                f"e6_arm_required: {canonical}@{resolved_effort} requires "
+                f"SCOPEFUEL_E6_ARM={canonical}@{resolved_effort}"
+            )
         # The catalog enumerates rungs to say where each one is *placed*, not to
         # list which rungs the CLI accepts — ``wrk -m codex`` runs Sol at effort
         # high, a rung the grade table has never placed. A rung the catalog says
@@ -953,7 +961,11 @@ def resolve_launch(
         profile=canonical,
         model_id=row.model_id,
         effort=resolved_effort,
-        pool=row.pool or profile_pool(canonical)[0],
+        pool=(
+            profile_pool(canonical)[0]
+            if canonical in E6_WORKER_TESTER_ONLY_PROFILES
+            else row.pool or profile_pool(canonical)[0]
+        ),
         gate=row.gate,
         grade=row.grade,
         gate_reason=row.gate_reason,
