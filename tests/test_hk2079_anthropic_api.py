@@ -340,6 +340,65 @@ def test_credit_expiry_is_midnight_utc_and_stale_at_that_boundary():
     assert result.unmeasurable is True
 
 
+def test_legacy_credit_overrun_is_clamped_on_read_without_rewriting_store():
+    expiry_start = dt.datetime.combine(TODAY, dt.time.min, tzinfo=dt.UTC)
+    measured_at = expiry_start - dt.timedelta(hours=1)
+    manual.record_observation(
+        pool="anthropic-api",
+        window="credit",
+        remaining_usd=150,
+        total_usd=200,
+        credit_expires_on=TODAY.isoformat(),
+        measured_at=measured_at,
+        reason="legacy credit fixture",
+        ttl_s=manual.CREDIT_MAX_TTL_S,
+        now=measured_at,
+    )
+
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    legacy = store["history"][-1]
+    legacy.pop("credit_ttl_policy")
+    legacy["expires_at"] = manual._iso(measured_at + dt.timedelta(hours=2))
+    path.write_text(json.dumps(store))
+    original = path.read_bytes()
+
+    loaded = manual.load_store()
+    assert loaded["history"][-1]["expires_at"] == legacy["expires_at"]
+    before_expiry = measured_at + dt.timedelta(minutes=30)
+    payload = manual.list_payload(pool="anthropic-api", now=before_expiry)
+    (view,) = payload["entries"]
+    assert view["status"] == "active"
+    assert view["expires_at"] == manual._iso(expiry_start)
+    assert view["legacy_clamped"] is True
+    list_line = manual.format_list(payload)
+    assert f"valid_until={manual._iso(expiry_start)} (in 30m)" in list_line
+    assert "legacy-clamped=true" in list_line
+    display = manual.credit_display(payload, now=before_expiry)
+    assert display is not None
+    assert "legacy-clamped" in display
+    assert path.read_bytes() == original
+
+    resolution = manual.resolve_result(
+        manual.manual_only_result("anthropic-api"),
+        now=expiry_start,
+        store=manual.load_store(),
+    )
+    assert resolution.applied is False
+    result = gate_check(
+        [resolution.result],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm="pi-sonnet55@high",
+        today=TODAY,
+        now=expiry_start,
+    )
+    assert result.ok is False
+    assert result.unmeasurable is True
+    assert path.read_bytes() == original
+
+
 def test_hand_edited_credit_expiry_beyond_credit_bounds_is_rejected():
     """Mutant: let _validate_store accept any expiry -> this hand edit passes."""
 
@@ -349,6 +408,41 @@ def test_hand_edited_credit_expiry_beyond_credit_bounds_is_rejected():
     entry = store["history"][-1]
     too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(hours=24, seconds=1)
     entry["expires_at"] = too_late.isoformat()
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError, match="expiry 불일치"):
+        manual.load_store()
+
+
+def test_legacy_credit_expiry_beyond_old_two_hour_bound_is_rejected():
+    _record_credit()
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    entry.pop("credit_ttl_policy")
+    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(
+        hours=2, seconds=1
+    )
+    entry["expires_at"] = manual._iso(too_late)
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError, match="expiry 불일치"):
+        manual.load_store()
+
+
+def test_hand_edited_credit_expiry_beyond_expires_on_is_rejected():
+    """Mutant: omit the new credit date bound -> this hand edit passes."""
+
+    expires_on = TODAY + dt.timedelta(days=1)
+    measured_at = dt.datetime.combine(
+        TODAY, dt.time(0, 2), tzinfo=dt.UTC
+    )
+    _record_credit(expires_on=expires_on.isoformat(), measured_at=measured_at)
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    beyond_midnight = dt.datetime.combine(
+        expires_on, dt.time.min, tzinfo=dt.UTC
+    ) + dt.timedelta(seconds=30)
+    entry["expires_at"] = manual._iso(beyond_midnight)
     path.write_text(json.dumps(store))
     with pytest.raises(manual.ManualError, match="expiry 불일치"):
         manual.load_store()

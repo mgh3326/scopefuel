@@ -32,6 +32,7 @@ SOURCE_LABEL = "자기신고 · 미검증"
 DEFAULT_TTL_S = 15 * 60.0
 MAX_TTL_S = 2 * 3600.0
 CREDIT_MAX_TTL_S = 24 * 3600.0
+CREDIT_TTL_POLICY = "credit-24h-v1"
 MAX_FUTURE_SKEW_S = 300.0
 MAX_REASON_CHARS = 1000
 
@@ -224,12 +225,25 @@ def _validate_store(store: dict) -> None:
             seen_observations.add(observation_key)
             if measured > entered + dt.timedelta(seconds=MAX_FUTURE_SKEW_S):
                 raise ManualError(f"manual history {index} future measurement 불일치")
-            ttl_limit_s = CREDIT_MAX_TTL_S if event["window"] == CREDIT_WINDOW else MAX_TTL_S
+            credit_policy = event.get("credit_ttl_policy")
+            if event["window"] == CREDIT_WINDOW:
+                if credit_policy is not None and credit_policy != CREDIT_TTL_POLICY:
+                    raise ManualError(f"manual history {index} credit TTL policy 불일치")
+                # Pre-hk-2106 events had the general two-hour cap. Keep those
+                # append-only records readable when their only new-policy
+                # overrun is expires_on midnight; clamp their read view below.
+                ttl_limit_s = (
+                    CREDIT_MAX_TTL_S if credit_policy == CREDIT_TTL_POLICY else MAX_TTL_S
+                )
+            else:
+                if "credit_ttl_policy" in event:
+                    raise ManualError(f"manual history {index} credit TTL policy 불일치")
+                ttl_limit_s = MAX_TTL_S
             expiry_bounds = [
                 measured + dt.timedelta(seconds=ttl_limit_s),
                 entered + dt.timedelta(seconds=ttl_limit_s),
             ]
-            if event["window"] == CREDIT_WINDOW:
+            if event["window"] == CREDIT_WINDOW and credit_policy == CREDIT_TTL_POLICY:
                 credit = event["credit"]
                 expires_on = _parse_date(credit["expires_on"])
                 assert expires_on is not None
@@ -552,6 +566,7 @@ def credit_display(summary: dict | None, *, now: dt.datetime) -> str | None:
             f"{pool} credit ${float(credit['remaining_usd']):.2f}/"
             f"${float(credit['total_usd']):.2f} · {left} (만료 {expires.isoformat()}) · "
             f"valid_until={_iso(valid_until)} ({remaining})"
+            f"{' · legacy-clamped' if entry.get('legacy_clamped') else ''}"
         )
     return None
 
@@ -790,6 +805,7 @@ def record_observation(
         }
         if credit is not None:
             entry["credit"] = credit
+            entry["credit_ttl_policy"] = CREDIT_TTL_POLICY
         history.append(entry)
         store["latest"][f"{pool}:{normalized_window}"] = observation_id
         _save_unlocked(store)
@@ -909,6 +925,15 @@ def _entry_views(
         view = dict(event)
         measured = _parse_iso(event.get("measured_at"))
         expires = _parse_iso(event.get("expires_at"))
+        credit = _credit(event)
+        if credit is not None and expires is not None:
+            expires_on = _parse_date(credit.get("expires_on"))
+            if expires_on is not None:
+                credit_expiry_start = dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC)
+                if expires > credit_expiry_start:
+                    expires = credit_expiry_start
+                    view["expires_at"] = _iso(expires)
+                    view["legacy_clamped"] = True
         auto_fetched, auto_fresh, auto_success = auto_states.get(
             str(event.get("pool") or ""), (None, False, False)
         )
@@ -1259,10 +1284,18 @@ def format_list(payload: dict) -> str:
             if credit is not None
             else ""
         )
+        remaining_effect_s = entry.get("remaining_effect_s")
+        validity_s = (
+            f" valid_until={entry['expires_at']} "
+            f"({_format_remaining_validity(float(remaining_effect_s))})"
+            if credit is not None and remaining_effect_s is not None
+            else ""
+        )
         lines.append(
             f"{entry['pool']} window={entry['window']} used_pct={entry['used_pct']:g} "
             f"status={entry['status']} measured_at={entry['measured_at']} "
-            f"expires_at={entry['expires_at']}{credit_s} source={SOURCE} "
+            f"expires_at={entry['expires_at']}{credit_s}{validity_s} "
+            f"{'legacy-clamped=true ' if entry.get('legacy_clamped') else ''}source={SOURCE} "
             f"source_verification={SOURCE_VERIFICATION} label={SOURCE_LABEL} "
             f"id={entry['manual_observation_id']}"
         )

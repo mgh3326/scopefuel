@@ -706,6 +706,20 @@ def test_noncredit_manual_observation_two_hours_and_one_minute_old_is_expired():
     assert payload["entries"][0]["status"] == "expired"
 
 
+def test_noncredit_default_manual_ttl_remains_fifteen_minutes():
+    now = dt.datetime(2026, 10, 26, 12, 0, tzinfo=dt.UTC)
+    entry = manual.record_observation(
+        pool="devin",
+        used_pct=8.0,
+        window="daily",
+        measured_at=now,
+        reason="daily console reading",
+        now=now,
+    )
+
+    assert manual.parse_timestamp(entry["expires_at"]) == now + dt.timedelta(minutes=15)
+
+
 def test_reset_boundary_shortens_effect_before_ttl():
     now = dt.datetime(2026, 9, 22, 6, 0, tzinfo=dt.UTC)
     entry = manual.record_observation(
