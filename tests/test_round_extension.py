@@ -446,6 +446,8 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
         # baseline check for every prior recommendation line.
         # hk 1862: fusion-sol61 entries may also ride the folded 제외 line —
         # drop those entries (and fix the count) rather than the whole line.
+        # hk 2079: the pi anthropic-api credit rows are E6 carrier rows, so
+        # their unmeasured entries ride that folded line at C too.
         def _strip_fusion(text: str) -> str:
             out = []
             for line in text.splitlines():
@@ -454,7 +456,7 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
                         out.append(line)
                     continue
                 entries = [e.strip() for e in line.split(":", 1)[1].split("·")]
-                entries = [e for e in entries if "devin-fusion-sol61" not in e]
+                entries = [e for e in entries if "devin-fusion-sol61" not in e and not e.startswith("pi-")]
                 if entries:
                     out.append(f"✗ 제외 ({len(entries)}): " + " · ".join(entries))
             return "\n".join(out)

@@ -25,6 +25,7 @@ from scopefuel.recommend import (
     E6_ARM_KEYS,
     E6_ARM_MARKER_ENV,
     E6_ARM_RUNGS,
+    E6_WORKER_TESTER_ONLY_PROFILES,
     GRADE_TABLE,
     Profile,
     e6_arm_carrier_grade,
@@ -116,7 +117,12 @@ def _gate_cli(monkeypatch, capsys, tmp_path, provider_id: str, argv: list[str]) 
 
 
 def test_the_new_rungs_are_exactly_the_missing_ones():
-    assert set(E6_ARM_KEYS) == set(NEW_RUNGS)
+    # hk 2079: the pi anthropic-api credit rungs are E6 rows too, but they are
+    # worker/tester-only and admitted on a manual-only pool, which the generic
+    # per-rung checks below (role-less, probed pool) cannot express — they have
+    # their own file, tests/test_hk2079_anthropic_api.py.
+    pi_credit = {key for key in E6_ARM_KEYS if key[0] in E6_WORKER_TESTER_ONLY_PROFILES}
+    assert set(E6_ARM_KEYS) - pi_credit == set(NEW_RUNGS)
 
 
 def test_no_new_row_appears_for_a_rung_that_already_existed():

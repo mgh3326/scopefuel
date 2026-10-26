@@ -96,6 +96,31 @@ scopefuel manual clear --pool claude
   입력해야 합니다. 향후 계정별 hub 저장소가 이 스키마를 승격하기 전까지 중앙 인증이나 동기화를
   주장하지 않습니다.
 
+### anthropic-api — probe 없는 크레딧 pool (hk 2079)
+
+Anthropic API 선불 크레딧(haiku/sonnet/opus 5.5)은 claude 구독 pool과 **별개 pool**
+`anthropic-api`입니다. 자동 probe가 없고(API를 호출하지 않으며 키나 env 파일도 읽지 않습니다),
+운영자가 Anthropic console에서 읽은 잔액을 직접 입력합니다. 입력이 없거나 TTL이 지나면 gate는
+측정불가로 닫힙니다.
+
+```bash
+scopefuel manual set --pool anthropic-api --remaining 150 --total 200 \
+  --expires-on 2026-11-25 --measured-at now --reason "console 크레딧 잔액" --ttl 2h
+scopefuel manual list --pool anthropic-api
+```
+
+- `credit` window는 이 pool 전용입니다. `--remaining`·`--total`(USD)과 console의 만료일
+  `--expires-on`이 모두 필요하고, `used_pct`는 `(1 - remaining/total) × 100`으로 파생됩니다.
+  만료일이 지난 값은 TTL이 남아 있어도 효력이 없습니다.
+- 행은 pi 프로필 `pi-haiku55`·`pi-sonnet55`·`pi-opus55`(thinking 수준 = `--effort`)이며 모두
+  미측정 E6 런그입니다. `--effort <low|medium|high|xhigh|max>`(thinking 수준이 곧 effort)는 필수이고, 맨몸 철자는
+  `gate`와 `policy launch`가 같은 한 줄(`effort_required`)로 거부합니다 — 표식이나 기본값, 형제 행이
+  런그를 대신 지정하지 않습니다. 그 위에 `SCOPEFUEL_E6_ARM=<profile>@<effort>` 표식과
+  `--role worker|tester`가 있어야 gate가 열리고, 표식이 없거나 다른 좌석이면 거부합니다. pi에는 MCP가 없으므로 MCP가 필요한
+  작업에는 배치하지 않습니다.
+- `--recommend`는 C 급에서 잔액과 만료까지 남은 일수를 붙여 각 프로필의 기본 런그만 구독 후보
+  뒤에 병렬 옵션으로 보여줍니다.
+
 ## gate — 프로필 스폰 판정
 
 ```bash
