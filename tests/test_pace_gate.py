@@ -429,8 +429,12 @@ def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_hea
     credit = next(row for row in rows if row["profile"] == "pi-sonnet55")
 
     assert names.index("sonnet") < names.index("kimi-k3-low") < names.index("pi-sonnet55")
-    assert "pace-warning pool=claude window=7d" in next(row for row in rows if row["profile"] == "sonnet")["windows"]
-    assert "pace-warning pool=kimi window=7d" in next(row for row in rows if row["profile"] == "kimi-k3-low")["windows"]
+    assert "pace-warning pool=claude window=7d" in next(
+        row for row in rows if row["profile"] == "sonnet"
+    )["windows"]
+    assert "pace-warning pool=kimi window=7d" in next(
+        row for row in rows if row["profile"] == "kimi-k3-low"
+    )["windows"]
     assert "pace-warning pool=anthropic-api window=7d" in credit["windows"]
 
 
