@@ -169,9 +169,10 @@ def test_gate_launch_parity(catalog_gate, profile, effort, retired, marker, ref,
         expected = "retired" if retired else ("e6_arm_required" if gate_kind == "default" else "consult_only")
         if ref in ("HK:task/1786", "hk:task/1786 "):
             assert "operator_request_ref_invalid" in gate.reason
+            assert "operator_request_ref_invalid" in reason
         else:
             assert expected in gate.reason
-        assert expected in reason
+            assert expected in reason
 
 
 def test_default_row_ref_still_not_applicable(catalog_gate):
@@ -197,6 +198,149 @@ def test_retired_bare_launch_refused(monkeypatch, capsys):
     monkeypatch.setenv(recommend.E6_ARM_MARKER_ENV, "haiku@high")
     assert cli.main(["policy", "launch", "haiku", "--effort", "high", "--operator-request"]) == 3
     assert "retired" in capsys.readouterr().err
+
+
+# hk 2021: launch checks the REF shape on every path, the same way the gate does.
+REF_MESSAGE = "operator_request_ref_invalid: {ref!r} — hk:doc/<key> 또는 hk:task/<정수> 만 허용"
+OVERLONG_REF = "hk:doc/" + "a" * (recommend.OPERATOR_REQUEST_REF_MAX - len("hk:doc/") + 1)
+BOUNDARY_REF = "hk:doc/" + "a" * (recommend.OPERATOR_REQUEST_REF_MAX - len("hk:doc/"))
+MALFORMED_REFS = [
+    pytest.param("hk:task/1786\n", id="newline"),
+    pytest.param("hk:task/1786\r", id="carriage-return"),
+    pytest.param("hk:task/1786\t", id="tab"),
+    pytest.param("hk:task/1786 x", id="space"),
+    pytest.param("hk:task/1786\x07", id="control-byte"),
+    pytest.param("hk:task/1786\x00", id="nul"),
+    pytest.param("hk:task/1786 ", id="line-separator"),
+    pytest.param("hk:task/1786 ", id="paragraph-separator"),
+    pytest.param("hk:doc/Briefs/b953/x", id="uppercase-doc-key"),
+    pytest.param("hk:task/1x", id="task-not-integer"),
+    pytest.param(OVERLONG_REF, id="overlong"),
+]
+VALID_REFS = [
+    pytest.param("hk:task/1786", id="task"),
+    pytest.param("hk:doc/briefs/b953/x", id="doc"),
+    pytest.param(BOUNDARY_REF, id="length-boundary"),
+]
+LAUNCH_PATHS = [
+    pytest.param("haiku", "high", "consult_only", None, id="R1-consult"),
+    pytest.param("haiku", "xhigh", "default", "haiku@xhigh", id="R4-e6"),
+]
+
+
+@pytest.mark.parametrize("ref", MALFORMED_REFS)
+@pytest.mark.parametrize("profile,effort,gate_kind,marker", LAUNCH_PATHS)
+def test_launch_refuses_malformed_ref_like_the_gate(catalog_gate, profile, effort, gate_kind, marker, ref):
+    view = _view(profile, effort, gate=gate_kind)
+    gate = catalog_gate(view, profile, effort, marker, ref)
+    with pytest.raises(launch.LaunchError) as raised:
+        launch.resolve_launch(profile, effort=effort, view=view, e6_arm=marker, operator_request=ref)
+    message = REF_MESSAGE.format(ref=ref)
+    assert str(raised.value) == message
+    assert gate.reason == message
+
+
+@pytest.mark.parametrize("ref", MALFORMED_REFS)
+def test_policy_launch_refusal_is_one_exact_line_without_ref_text(monkeypatch, capsys, ref):
+    view = _view("haiku", "high")
+    monkeypatch.setattr(launch, "read_catalog", lambda **k: view)
+    monkeypatch.delenv(recommend.E6_ARM_MARKER_ENV, raising=False)
+    assert cli.main(["policy", "launch", "haiku", "--effort", "high", "--operator-request", ref]) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {REF_MESSAGE.format(ref=ref)}\n"
+
+
+@pytest.mark.parametrize("ref", [*VALID_REFS, pytest.param("hk:task/1786\n", id="malformed")])
+@pytest.mark.parametrize("profile,effort,gate_kind,marker", LAUNCH_PATHS)
+def test_gate_and_launch_agree_on_every_ref(catalog_gate, profile, effort, gate_kind, marker, ref):
+    view = _view(profile, effort, gate=gate_kind)
+    gate = catalog_gate(view, profile, effort, marker, ref)
+    try:
+        launch.resolve_launch(profile, effort=effort, view=view, e6_arm=marker, operator_request=ref)
+    except launch.LaunchError:
+        launch_ok = False
+    else:
+        launch_ok = True
+    assert gate.ok == launch_ok
+
+
+@pytest.mark.parametrize("ref", VALID_REFS)
+@pytest.mark.parametrize("profile,effort,gate_kind,marker", LAUNCH_PATHS)
+def test_valid_ref_still_launches_on_r1_and_r4(profile, effort, gate_kind, marker, ref):
+    view = _view(profile, effort, gate=gate_kind)
+    decision = launch.resolve_launch(profile, effort=effort, view=view, e6_arm=marker, operator_request=ref)
+    assert decision.operator_request is True
+    if marker:
+        assert decision.e6_arm == marker
+        assert f"operator_request_ref {ref}" in decision.render()
+
+
+def test_valid_ref_still_launches_on_round_extension_builder():
+    ref = "hk:doc/round-ext/b1632-sol"
+    view = _view("codex-astra", "high", gate="consult_only")
+    decision = launch.resolve_launch(
+        "codex-astra",
+        effort="high",
+        view=view,
+        role="builder",
+        purpose="round-extension",
+        operator_request=ref,
+    )
+    assert decision.as_dict()["round_extension_builder"]["ref"] == ref
+
+
+def test_bare_operator_request_flag_unchanged(monkeypatch, capsys):
+    view = _view("haiku", "high")
+    monkeypatch.setattr(launch, "read_catalog", lambda **k: view)
+    monkeypatch.delenv(recommend.E6_ARM_MARKER_ENV, raising=False)
+    assert cli.main(["policy", "launch", "haiku", "--effort", "high", "--operator-request"]) == 0
+    assert "gate consult_only" in capsys.readouterr().out
+
+
+# The astra/fable role check runs before the REF shape check (as in the gate), so a
+# malformed REF on that path keeps its role_restricted refusal and must not echo the REF.
+ROLE_PATH_REFS = [
+    pytest.param("hk:doc/round-ext/b1632-sol\nINJECTED", id="newline"),
+    pytest.param("hk:doc/round-ext/b1632-sol\rINJECTED", id="carriage-return"),
+    pytest.param("hk:doc/round-ext/b1632-sol\x07INJECTED", id="control-byte"),
+]
+
+
+@pytest.mark.parametrize("ref", ROLE_PATH_REFS)
+def test_role_restricted_path_does_not_echo_malformed_ref(monkeypatch, capsys, ref):
+    view = _view("codex-astra", "high", gate="consult_only")
+    monkeypatch.setattr(launch, "read_catalog", lambda **k: view)
+    monkeypatch.delenv(recommend.E6_ARM_MARKER_ENV, raising=False)
+    with pytest.raises(launch.LaunchError) as raised:
+        launch.resolve_launch(
+            "codex-astra", effort="high", role="builder", purpose="round-extension", operator_request=ref
+        )
+    message = str(raised.value)
+    assert message.startswith("role_restricted")
+    assert "INJECTED" not in message and "\n" not in message and "\r" not in message
+    assert (
+        cli.main(
+            [
+                "policy",
+                "launch",
+                "codex-astra",
+                "--effort",
+                "high",
+                "--role",
+                "builder",
+                "--purpose",
+                "round-extension",
+                "--operator-request",
+                ref,
+            ]
+        )
+        == 3
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("\n") == 1
+    assert "INJECTED" not in captured.err
 
 
 def _load_base(tmp_path):
