@@ -419,9 +419,7 @@ def test_legacy_credit_expiry_beyond_old_two_hour_bound_is_rejected():
     store = json.loads(path.read_text())
     entry = store["history"][-1]
     entry.pop("credit_ttl_policy")
-    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(
-        hours=2, seconds=1
-    )
+    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(hours=2, seconds=1)
     entry["expires_at"] = manual._iso(too_late)
     path.write_text(json.dumps(store))
     with pytest.raises(manual.ManualError, match="expiry 불일치"):
@@ -432,16 +430,12 @@ def test_hand_edited_credit_expiry_beyond_expires_on_is_rejected():
     """Mutant: omit the new credit date bound -> this hand edit passes."""
 
     expires_on = TODAY + dt.timedelta(days=1)
-    measured_at = dt.datetime.combine(
-        TODAY, dt.time(0, 2), tzinfo=dt.UTC
-    )
+    measured_at = dt.datetime.combine(TODAY, dt.time(0, 2), tzinfo=dt.UTC)
     _record_credit(expires_on=expires_on.isoformat(), measured_at=measured_at)
     path = manual.manual_path()
     store = json.loads(path.read_text())
     entry = store["history"][-1]
-    beyond_midnight = dt.datetime.combine(
-        expires_on, dt.time.min, tzinfo=dt.UTC
-    ) + dt.timedelta(seconds=30)
+    beyond_midnight = dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC) + dt.timedelta(seconds=30)
     entry["expires_at"] = manual._iso(beyond_midnight)
     path.write_text(json.dumps(store))
     with pytest.raises(manual.ManualError, match="expiry 불일치"):

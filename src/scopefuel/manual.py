@@ -232,9 +232,7 @@ def _validate_store(store: dict) -> None:
                 # Pre-hk-2106 events had the general two-hour cap. Keep those
                 # append-only records readable when their only new-policy
                 # overrun is expires_on midnight; clamp their read view below.
-                ttl_limit_s = (
-                    CREDIT_MAX_TTL_S if credit_policy == CREDIT_TTL_POLICY else MAX_TTL_S
-                )
+                ttl_limit_s = CREDIT_MAX_TTL_S if credit_policy == CREDIT_TTL_POLICY else MAX_TTL_S
             else:
                 if "credit_ttl_policy" in event:
                     raise ManualError(f"manual history {index} credit TTL policy 불일치")
@@ -1286,8 +1284,7 @@ def format_list(payload: dict) -> str:
         )
         remaining_effect_s = entry.get("remaining_effect_s")
         validity_s = (
-            f" valid_until={entry['expires_at']} "
-            f"({_format_remaining_validity(float(remaining_effect_s))})"
+            f" valid_until={entry['expires_at']} ({_format_remaining_validity(float(remaining_effect_s))})"
             if credit is not None and remaining_effect_s is not None
             else ""
         )
