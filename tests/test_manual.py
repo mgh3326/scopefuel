@@ -687,6 +687,39 @@ def test_ttl_above_two_hours_is_rejected_without_writing(claude_error_registry, 
     assert not manual.manual_path().exists()
 
 
+def test_noncredit_manual_observation_two_hours_and_one_minute_old_is_expired():
+    """Mutant: apply the 24h credit TTL to all pools -> this value stays active."""
+
+    now = dt.datetime(2026, 10, 26, 12, 0, tzinfo=dt.UTC)
+    manual.record_observation(
+        pool="devin",
+        used_pct=8.0,
+        window="daily",
+        measured_at=now - dt.timedelta(hours=2, minutes=1),
+        reason="daily console reading",
+        ttl_s=manual.MAX_TTL_S,
+        now=now,
+    )
+
+    payload = manual.list_payload(pool="devin", now=now)
+    assert payload["latest_valid"] == []
+    assert payload["entries"][0]["status"] == "expired"
+
+
+def test_noncredit_default_manual_ttl_remains_fifteen_minutes():
+    now = dt.datetime(2026, 10, 26, 12, 0, tzinfo=dt.UTC)
+    entry = manual.record_observation(
+        pool="devin",
+        used_pct=8.0,
+        window="daily",
+        measured_at=now,
+        reason="daily console reading",
+        now=now,
+    )
+
+    assert manual.parse_timestamp(entry["expires_at"]) == now + dt.timedelta(minutes=15)
+
+
 def test_reset_boundary_shortens_effect_before_ttl():
     now = dt.datetime(2026, 9, 22, 6, 0, tzinfo=dt.UTC)
     entry = manual.record_observation(

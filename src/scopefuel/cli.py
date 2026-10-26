@@ -310,7 +310,12 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--measured-at", required=True, metavar="TIMESTAMP|now", help="실제로 관측한 시각"
     )
     manual_set.add_argument("--reason", required=True, help="측정 장애 또는 정정 사유")
-    manual_set.add_argument("--ttl", default="15m", metavar="DURATION", help="효력 기간, 최대 2h")
+    manual_set.add_argument(
+        "--ttl",
+        default=None,
+        metavar="DURATION",
+        help="효력 기간, 최대 2h (credit window 최대 24h)",
+    )
 
     manual_list = manual_sub.add_parser("list", help="append-only 수동 관측 이력 보기")
     manual_list.add_argument("--pool", choices=manual_pool_choices, help="provider pool 필터")
@@ -1109,7 +1114,12 @@ def _manual_command(args: argparse.Namespace) -> int:
     now = dt.datetime.now(dt.UTC)
     try:
         if args.manual_command == "set":
-            ttl_s = manual.parse_duration(args.ttl)
+            default_ttl_s = (
+                manual.CREDIT_MAX_TTL_S
+                if manual.normalize_window(args.pool, args.window) == manual.CREDIT_WINDOW
+                else manual.DEFAULT_TTL_S
+            )
+            ttl_s = manual.parse_duration(args.ttl) if args.ttl is not None else default_ttl_s
             resets_in_s = manual.parse_duration(args.resets_in) if args.resets_in else None
             resets_at = manual.parse_timestamp(args.resets_at, now=now) if args.resets_at else None
             measured_at = manual.parse_timestamp(args.measured_at, now=now)

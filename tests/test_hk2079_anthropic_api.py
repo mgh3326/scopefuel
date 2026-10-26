@@ -59,7 +59,7 @@ def _record_credit(
     total: float = 200.0,
     expires_on: str = CREDIT_EXPIRES,
     measured_at: dt.datetime = NOW,
-    ttl_s: float = 900.0,
+    ttl_s: float = 24 * 3600.0,
 ) -> dict:
     return manual.record_observation(
         pool="anthropic-api",
@@ -105,29 +105,28 @@ def _snapshot_view() -> launch.CatalogView:
     )
 
 
-def _set_manual_credit_cli(*, remaining: str = "150", total: str = "200", ttl: str = "15m") -> int:
-    return cli.main(
-        [
-            "manual",
-            "set",
-            "--pool",
-            "anthropic-api",
-            "--window",
-            "credit",
-            "--remaining",
-            remaining,
-            "--total",
-            total,
-            "--expires-on",
-            CREDIT_EXPIRES,
-            "--measured-at",
-            "now",
-            "--reason",
-            "Anthropic console credit balance",
-            "--ttl",
-            ttl,
-        ]
-    )
+def _set_manual_credit_cli(*, remaining: str = "150", total: str = "200", ttl: str | None = None) -> int:
+    args = [
+        "manual",
+        "set",
+        "--pool",
+        "anthropic-api",
+        "--window",
+        "credit",
+        "--remaining",
+        remaining,
+        "--total",
+        total,
+        "--expires-on",
+        CREDIT_EXPIRES,
+        "--measured-at",
+        "now",
+        "--reason",
+        "Anthropic console credit balance",
+    ]
+    if ttl is not None:
+        args.extend(["--ttl", ttl])
+    return cli.main(args)
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +272,196 @@ def test_credit_manual_set_cli_accepts_remaining_total_and_expiry(capsys):
     (entry,) = payload["latest_valid"]
     assert entry["credit"]["remaining_usd"] == 150.0
     assert entry["credit"]["expires_on"] == CREDIT_EXPIRES
+    validity = manual.parse_timestamp(entry["expires_at"]) - manual.parse_timestamp(entry["entered_at"])
+    assert validity == dt.timedelta(hours=24)
 
 
 def test_credit_display_names_the_balance_and_days_left():
-    result = _credit_result()
-    text = manual.credit_display(result.manual, now=NOW)
+    entry = _record_credit()
+    text = manual.credit_display({"latest_valid": [entry]}, now=NOW)
     assert text is not None
     assert "$150.00/$200.00" in text
     assert "30일 남음" in text
     assert CREDIT_EXPIRES in text
+    assert f"valid_until={entry['expires_at']}" in text
+    assert "(in 24h)" in text
+
+
+def test_credit_ttl_accepts_twelve_hours_but_rejects_over_twenty_four(capsys):
+    assert _set_manual_credit_cli(ttl="12h") == 0
+    (entry,) = manual.load_store()["history"]
+    assert manual.parse_timestamp(entry["expires_at"]) == manual.parse_timestamp(
+        entry["measured_at"]
+    ) + dt.timedelta(hours=12)
+
+    capsys.readouterr()
+    assert _set_manual_credit_cli(ttl="30h") == 2
+    assert "24h 이하" in capsys.readouterr().err
+
+
+def test_credit_ttl_help_names_both_limits(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["manual", "set", "--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "2h" in help_text
+    assert "24h" in help_text
+
+
+def test_credit_expiring_today_is_refused_at_record_time():
+    """Mutant: drop the credit expires_on cap -> today's balance is accepted."""
+
+    with pytest.raises(manual.ManualError, match="만료"):
+        _record_credit(expires_on=TODAY.isoformat())
+
+
+def test_credit_expiry_is_midnight_utc_and_stale_at_that_boundary():
+    expires_on = TODAY + dt.timedelta(days=1)
+    entry = _record_credit(expires_on=expires_on.isoformat())
+    expiry_start = dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC)
+    assert manual.parse_timestamp(entry["expires_at"]) == expiry_start
+
+    resolution = manual.resolve_result(
+        manual.manual_only_result("anthropic-api"), now=expiry_start, store=manual.load_store()
+    )
+    assert resolution.applied is False
+    assert "credit" in (resolution.failure_reason or "")
+
+    result = gate_check(
+        [resolution.result],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm="pi-sonnet55@high",
+        today=expires_on,
+        now=expiry_start,
+    )
+    assert result.ok is False
+    assert result.unmeasurable is True
+
+
+def test_legacy_credit_overrun_is_clamped_on_read_without_rewriting_store():
+    expiry_start = dt.datetime.combine(TODAY, dt.time.min, tzinfo=dt.UTC)
+    measured_at = expiry_start - dt.timedelta(hours=1)
+    manual.record_observation(
+        pool="anthropic-api",
+        window="credit",
+        remaining_usd=150,
+        total_usd=200,
+        credit_expires_on=TODAY.isoformat(),
+        measured_at=measured_at,
+        reason="legacy credit fixture",
+        ttl_s=manual.CREDIT_MAX_TTL_S,
+        now=measured_at,
+    )
+
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    legacy = store["history"][-1]
+    legacy.pop("credit_ttl_policy")
+    legacy["expires_at"] = manual._iso(measured_at + dt.timedelta(hours=2))
+    path.write_text(json.dumps(store))
+    original = path.read_bytes()
+
+    loaded = manual.load_store()
+    assert loaded["history"][-1]["expires_at"] == legacy["expires_at"]
+    before_expiry = measured_at + dt.timedelta(minutes=30)
+    payload = manual.list_payload(pool="anthropic-api", now=before_expiry)
+    (view,) = payload["entries"]
+    assert view["status"] == "active"
+    assert view["expires_at"] == manual._iso(expiry_start)
+    assert view["legacy_clamped"] is True
+    list_line = manual.format_list(payload)
+    assert f"valid_until={manual._iso(expiry_start)} (in 30m)" in list_line
+    assert "legacy-clamped=true" in list_line
+    display = manual.credit_display(payload, now=before_expiry)
+    assert display is not None
+    assert "legacy-clamped" in display
+    assert path.read_bytes() == original
+
+    resolution = manual.resolve_result(
+        manual.manual_only_result("anthropic-api"),
+        now=expiry_start,
+        store=manual.load_store(),
+    )
+    assert resolution.applied is False
+    result = gate_check(
+        [resolution.result],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm="pi-sonnet55@high",
+        today=TODAY,
+        now=expiry_start,
+    )
+    assert result.ok is False
+    assert result.unmeasurable is True
+    assert path.read_bytes() == original
+
+
+def test_hand_edited_credit_expiry_beyond_credit_bounds_is_rejected():
+    """Mutant: let _validate_store accept any expiry -> this hand edit passes."""
+
+    _record_credit()
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(hours=24, seconds=1)
+    entry["expires_at"] = too_late.isoformat()
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError, match="expiry 불일치"):
+        manual.load_store()
+
+
+def test_legacy_credit_expiry_beyond_old_two_hour_bound_is_rejected():
+    _record_credit()
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    entry.pop("credit_ttl_policy")
+    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(hours=2, seconds=1)
+    entry["expires_at"] = manual._iso(too_late)
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError, match="expiry 불일치"):
+        manual.load_store()
+
+
+def test_hand_edited_credit_expiry_beyond_expires_on_is_rejected():
+    """Mutant: omit the new credit date bound -> this hand edit passes."""
+
+    expires_on = TODAY + dt.timedelta(days=1)
+    measured_at = dt.datetime.combine(TODAY, dt.time(0, 2), tzinfo=dt.UTC)
+    _record_credit(expires_on=expires_on.isoformat(), measured_at=measured_at)
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    beyond_midnight = dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC) + dt.timedelta(seconds=30)
+    entry["expires_at"] = manual._iso(beyond_midnight)
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError, match="expiry 불일치"):
+        manual.load_store()
+
+
+def test_hand_edited_noncredit_expiry_beyond_two_hours_is_rejected():
+    """Mutant: let _validate_store accept any expiry -> this hand edit passes."""
+
+    manual.record_observation(
+        pool="devin",
+        used_pct=8,
+        window="daily",
+        measured_at=NOW,
+        reason="daily console reading",
+        ttl_s=manual.MAX_TTL_S,
+        now=NOW,
+    )
+    path = manual.manual_path()
+    store = json.loads(path.read_text())
+    entry = store["history"][-1]
+    too_late = manual.parse_timestamp(entry["measured_at"]) + dt.timedelta(seconds=manual.MAX_TTL_S + 1)
+    entry["expires_at"] = too_late.isoformat()
+    path.write_text(json.dumps(store))
+    with pytest.raises(manual.ManualError, match="expiry 불일치"):
+        manual.load_store()
 
 
 def test_credit_window_rejects_inconsistent_shapes():
@@ -312,10 +492,12 @@ def test_credit_window_rejects_inconsistent_shapes():
 
 
 def test_credit_expiry_in_the_past_fails_closed():
-    past = (TODAY - dt.timedelta(days=1)).isoformat()
-    _record_credit(expires_on=past)
+    expires_on = TODAY + dt.timedelta(days=1)
+    entry = _record_credit(expires_on=expires_on.isoformat())
+    expiry_start = dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC)
+    assert manual.parse_timestamp(entry["expires_at"]) == expiry_start
     resolution = manual.resolve_result(
-        manual.manual_only_result("anthropic-api"), now=NOW, store=manual.load_store()
+        manual.manual_only_result("anthropic-api"), now=expiry_start, store=manual.load_store()
     )
     assert resolution.applied is False
 
@@ -395,6 +577,42 @@ def test_gate_admits_with_the_marker_when_credit_is_fresh_and_positive(profile, 
     assert result.provider_id == "anthropic-api"
     assert result.e6_arm == _marker(profile, rung)
     assert result.used_pct == pytest.approx(25.0)
+
+
+def test_three_hour_old_credit_observation_still_admits_pi_sonnet55():
+    """Mutant: reapply the 2h TTL to credit -> this admission goes RED."""
+
+    credit = _credit_result(measured_at=NOW - dt.timedelta(hours=3))
+    result = gate_check(
+        [credit],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm="pi-sonnet55@high",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True, result.reason
+    assert result.provider_id == "anthropic-api"
+
+
+def test_twenty_five_hour_old_credit_observation_fails_closed_as_unmeasurable():
+    _record_credit(measured_at=NOW - dt.timedelta(hours=25))
+    resolution = manual.resolve_result(
+        manual.manual_only_result("anthropic-api"), now=NOW, store=manual.load_store()
+    )
+    assert resolution.applied is False
+    result = gate_check(
+        [resolution.result],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm="pi-sonnet55@high",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert result.unmeasurable is True
 
 
 @pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
@@ -524,6 +742,7 @@ def test_gate_cli_refuses_without_the_marker(monkeypatch, capsys):
 def test_gate_cli_allow_line_shows_pool_credit_and_days_left(monkeypatch, capsys, tmp_path):
     assert _set_manual_credit_cli() == 0
     capsys.readouterr()
+    stored_entry = manual.load_store()["history"][-1]
     monkeypatch.setattr(cli, "registry", lambda: {"claude": _claude_result})
     monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
     record_path = tmp_path / "gate.json"
@@ -546,6 +765,8 @@ def test_gate_cli_allow_line_shows_pool_credit_and_days_left(monkeypatch, capsys
     assert "pool=anthropic-api" in captured.out
     assert "$150.00/$200.00" in captured.out
     assert "30일 남음" in captured.out
+    assert f"valid_until={stored_entry['expires_at']}" in captured.out
+    assert "(in " in captured.out
     record = json.loads(record_path.read_text())
     assert record["provider_id"] == "anthropic-api"
     assert record["e6_arm"] == "pi-sonnet55@high"
