@@ -5819,11 +5819,11 @@ def _evaluate(
             urgency_hours=urgency_hours,
             budget=budget,
         )
-        if effective_class == "spend" and (free_swe2_bucket or not pace_waste_eligible):
-            score -= SCORE_WASTE_WEIGHT * waste_term
-            waste_term = 0.0
         throughput_window = _select_throughput_window(states, constraint)
         brake, brake_window = _brake_factor(states)
+        if effective_class == "spend" and (free_swe2_bucket or not pace_waste_eligible):
+            score -= SCORE_WASTE_WEIGHT * waste_term * brake
+            waste_term = 0.0
 
         # ROB-1188 fix 4: 리셋까지 아주 짧게(기본 1h) 남았고 잔여가 유의미한 임계(기본 5%)
         # 이상이면 "확실히 소멸"이 "며칠 단위 의도(boost)"보다 시급하다 — boost 를 역전.

@@ -310,3 +310,87 @@ def test_recommend_unknown_pace_does_not_get_waste_boost():
     candidate = evaluation.included[0]
     assert "pace-unknown window=7d" in candidate.windows_display
     assert candidate.waste_term == 0
+
+
+def test_recommend_swe2_free_bucket_is_pace_exempt_not_excluded():
+    """The gate's SWE-2 free-bucket exemption (hk 2087 rule 5) holds at recommend level too."""
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["devin-swe2"]]
+    # This rung's bucket would exhaust long before reset if it were judged as
+    # a spend-pool window: elapsed 24h, burn 3.33%/h, time_to_exhaust 6h < 144h.
+    free_bucket = _bucket("7d", 80, 144, scope=Scope("model", "swe-2-high"))
+    evaluation = recommend._evaluate(
+        [_provider("devin", free_bucket)],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+
+    assert [candidate.profile.name for candidate in evaluation.included] == ["devin-swe2"]
+    candidate = evaluation.included[0]
+    assert "pace=exempt (SWE-2 free bucket)" in candidate.windows_display
+    assert candidate.waste_term == 0
+    assert not any(item.kind == "pace_exhaustion" for item in evaluation.excluded)
+
+
+def test_recommend_waste_removal_subtracts_the_braked_share():
+    """Removing WASTE subtracts SCORE_WASTE_WEIGHT*waste*brake, not the unbraked share."""
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["grok-hi"]]
+    # The 5h window sits under the brake knee and reports no reset (pace
+    # unknown) → the row is not pace_waste_eligible, so its WASTE share is
+    # removed. The 7d budget window is on pace and carries a nonzero waste
+    # term (90 remaining, burn 10/24%/h → waste 30).
+    evaluation = recommend._evaluate(
+        [_provider("grok", _bucket("5h", 80, None), _bucket("7d", 10, 144))],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+
+    assert len(evaluation.included) == 1
+    candidate = evaluation.included[0]
+    assert candidate.brake == pytest.approx(0.4)
+    assert candidate.waste_term == 0
+    expected = (
+        candidate.capacity_term + recommend.SCORE_THRU_WEIGHT * candidate.throughput_term
+    ) * candidate.brake
+    assert candidate.score == pytest.approx(expected)
+
+
+def test_recommend_waste_removal_is_unchanged_when_brake_is_one():
+    """A spend row with no short window keeps today's exact score (brake 1)."""
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["grok-hi"]]
+    # 7d at elapsed 8h is inside the first 5% of its window → pace unknown →
+    # WASTE removal path; waste term is 79 and the brake is 1 (no ≤6h window).
+    evaluation = recommend._evaluate(
+        [_provider("grok", _bucket("7d", 1, 160))],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+
+    assert len(evaluation.included) == 1
+    candidate = evaluation.included[0]
+    assert candidate.brake == pytest.approx(1.0)
+    assert candidate.waste_term == 0
+    expected = (
+        candidate.capacity_term + recommend.SCORE_THRU_WEIGHT * candidate.throughput_term
+    ) * candidate.brake
+    assert candidate.score == pytest.approx(expected)
