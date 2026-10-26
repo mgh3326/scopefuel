@@ -41,9 +41,7 @@ def _provider(pool: str, *buckets: Bucket, pool_class: str = "spend") -> Provide
 def _load_pace_base(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     repo = pathlib.Path(__file__).resolve().parents[1]
-    if subprocess.run(
-        ["git", "cat-file", "-e", PACE_BASE_COMMIT], cwd=repo, capture_output=True
-    ).returncode:
+    if subprocess.run(["git", "cat-file", "-e", PACE_BASE_COMMIT], cwd=repo, capture_output=True).returncode:
         subprocess.run(
             ["git", "fetch", "--depth=1", "origin", PACE_BASE_COMMIT],
             cwd=repo,
