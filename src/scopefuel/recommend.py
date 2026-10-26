@@ -3037,8 +3037,7 @@ def _format_pace_warnings(
     inflight_tag: str | None = None,
 ) -> str:
     lines = [
-        _pace_warning_line(provider_id, verdict, inflight_tag=inflight_tag)
-        for verdict in headroom.warnings
+        _pace_warning_line(provider_id, verdict, inflight_tag=inflight_tag) for verdict in headroom.warnings
     ]
     lines.extend(f"pace-unknown window={verdict.window}" for verdict in headroom.unknowns)
     return "\n".join(lines)

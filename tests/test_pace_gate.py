@@ -129,9 +129,7 @@ def test_consult_only_over_pace_is_admitted_with_operator_request():
     assert "pace-warning pool=claude window=7d" in result.reason
 
 
-@pytest.mark.parametrize(
-    ("window", "used"), [("7d", 99.0), ("7d", 100.0), ("5h", 100.0), ("1d", 100.0)]
-)
+@pytest.mark.parametrize(("window", "used"), [("7d", 99.0), ("7d", 100.0), ("5h", 100.0), ("1d", 100.0)])
 def test_real_exhaustion_cutoff_still_refuses(window, used):
     result = recommend.gate_check(
         [_provider("claude", _bucket(window, used, 4 if window == "5h" else 144))],
