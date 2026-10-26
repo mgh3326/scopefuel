@@ -2505,6 +2505,27 @@ class _PaceWindowVerdict:
         )
 
 
+@dataclass(frozen=True)
+class _PaceHeadroom:
+    rank: float | None
+    warnings: tuple[_PaceWindowVerdict, ...]
+    unknowns: tuple[_PaceWindowVerdict, ...]
+
+
+def _pace_headroom(verdicts: list[_PaceWindowVerdict]) -> _PaceHeadroom:
+    """Return warning windows and their tightest TTE/reset ranking ratio."""
+    warnings = tuple(verdict for verdict in verdicts if verdict.exhausts_before_reset)
+    unknowns = tuple(verdict for verdict in verdicts if verdict.unknown)
+    ratios = [
+        verdict.time_to_exhaust / verdict.hours_to_reset
+        for verdict in warnings
+        if verdict.time_to_exhaust is not None
+        and verdict.hours_to_reset is not None
+        and verdict.hours_to_reset > 0
+    ]
+    return _PaceHeadroom(min(ratios) if ratios else None, warnings, unknowns)
+
+
 @dataclass
 class _Candidate:
     profile: Profile
@@ -2532,6 +2553,7 @@ class _Candidate:
     throughput_term: float = 0.0
     score: float = 0.0
     imminent_exhaustion: bool = False
+    pace_headroom: float | None = None
     blended_price: float | None = None
     value_ratio: float | None = None
     value_sort_skipped: bool = False
@@ -2986,16 +3008,14 @@ def _format_pace_verdicts(verdicts: list[_PaceWindowVerdict]) -> str:
     )
 
 
-def _pace_exhaustion_reason(
+def _pace_warning_line(
     provider_id: str,
     verdict: _PaceWindowVerdict,
     *,
     inflight_tag: str | None = None,
-    other_verdicts: list[_PaceWindowVerdict] | None = None,
 ) -> str:
-    """Stable one-line pace refusal with enough data to audit the comparison."""
     parts = [
-        "pace_exhaustion",
+        "pace-warning",
         f"pool={provider_id}",
         f"window={verdict.window}",
         f"remaining={_pace_number(verdict.remaining_pct)}%",
@@ -3007,11 +3027,39 @@ def _pace_exhaustion_reason(
     ]
     if inflight_tag:
         parts.append(inflight_tag)
-    elif inflight_tag == "":
-        parts.append("inflight=0")
-    unknown = [item.window for item in (other_verdicts or []) if item.unknown]
-    parts.extend(f"pace-unknown window={window}" for window in unknown)
     return " ".join(parts)
+
+
+def _format_pace_warnings(
+    provider_id: str,
+    headroom: _PaceHeadroom,
+    *,
+    inflight_tag: str | None = None,
+) -> str:
+    lines = [
+        _pace_warning_line(provider_id, verdict, inflight_tag=inflight_tag)
+        for verdict in headroom.warnings
+    ]
+    lines.extend(f"pace-unknown window={verdict.window}" for verdict in headroom.unknowns)
+    return "\n".join(lines)
+
+
+def _format_recommend_pace(
+    provider_id: str,
+    verdicts: list[_PaceWindowVerdict],
+    headroom: _PaceHeadroom,
+) -> str:
+    if not headroom.warnings:
+        return _format_pace_verdicts(verdicts)
+    warning_ids = {id(verdict) for verdict in headroom.warnings}
+    return " · ".join(
+        _pace_warning_line(provider_id, verdict)
+        if id(verdict) in warning_ids
+        else f"pace-unknown window={verdict.window}"
+        if verdict.unknown
+        else f"pace=within-limit window={verdict.window}"
+        for verdict in verdicts
+    )
 
 
 def _constraint_sort_key(state: _WindowState) -> tuple[int, float, float, str]:
@@ -4594,40 +4642,20 @@ def gate_check(
         pace_suffix = ""
         if effective_class == "spend":
             pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
-            pace_exhaustion = next(
-                (verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None
-            )
-            if pace_exhaustion is not None:
-                pace_reason = _pace_exhaustion_reason(
+            pace_headroom = _pace_headroom(pace_verdicts)
+            if pace_headroom.warnings:
+                pace_suffix = "\n" + _format_pace_warnings(
                     provider_id,
-                    pace_exhaustion,
+                    pace_headroom,
                     inflight_tag=_pace_inflight_tag(in_flight),
-                    other_verdicts=pace_verdicts,
                 )
-                if pace_override_ref is None:
-                    return GateResult(
-                        ok=False,
-                        profile=profile_name,
-                        provider_id=provider_id,
-                        grade=None,
-                        reason=pace_reason,
-                        used_pct=100.0 - pace_exhaustion.remaining_pct,
-                        pool_class=effective_class,
-                        missing_windows=missing,
-                        unknown_plan=unknown_plan,
-                        inflight=in_flight.tag if in_flight is not None else None,
-                        inflight_warning=in_flight.warning if in_flight is not None else None,
-                        **audit,
-                    )
-                pace_suffix = f"pace_exhaustion overridden {pace_reason}"
-                pace_suffix += f" pace_override_ref={pace_override_ref}"
             else:
                 pace_suffix = _format_pace_verdicts(pace_verdicts)
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
         reason += _exhaust_suffix(cutoff_status, notify_status)
         reason += _missing_windows_tag(missing, "측정된 창으로 판정")
         if pace_suffix:
-            reason += f" {pace_suffix}"
+            reason += pace_suffix if pace_suffix.startswith("\n") else f" {pace_suffix}"
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -4942,40 +4970,12 @@ def gate_check(
     pace_suffix = ""
     if effective_class == "spend":
         pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
-        pace_exhaustion = next((verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None)
-        if pace_exhaustion is not None:
-            if pace_override_ref is None:
-                alts = alternatives()
-                reason = _pace_exhaustion_reason(
-                    provider_id,
-                    pace_exhaustion,
-                    inflight_tag=_pace_inflight_tag(in_flight),
-                    other_verdicts=pace_verdicts,
-                )
-                return GateResult(
-                    ok=False,
-                    profile=profile_name,
-                    provider_id=provider_id,
-                    grade=grade,
-                    reason=reason,
-                    used_pct=100.0 - pace_exhaustion.remaining_pct,
-                    pool_class=effective_class,
-                    alternatives=alts,
-                    missing_windows=missing,
-                    unknown_plan=unknown_plan,
-                    inflight=in_flight.tag if in_flight is not None else None,
-                    inflight_warning=in_flight.warning if in_flight is not None else None,
-                    **audit,
-                )
-            pace_suffix = (
-                "pace_exhaustion overridden "
-                + _pace_exhaustion_reason(
-                    provider_id,
-                    pace_exhaustion,
-                    inflight_tag=_pace_inflight_tag(in_flight),
-                    other_verdicts=pace_verdicts,
-                )
-                + f" pace_override_ref={pace_override_ref}"
+        pace_headroom = _pace_headroom(pace_verdicts)
+        if pace_headroom.warnings:
+            pace_suffix = "\n" + _format_pace_warnings(
+                provider_id,
+                pace_headroom,
+                inflight_tag=_pace_inflight_tag(in_flight),
             )
         else:
             pace_suffix = _format_pace_verdicts(pace_verdicts)
@@ -4996,7 +4996,7 @@ def gate_check(
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if pace_suffix:
-            reason += f" {pace_suffix}"
+            reason += pace_suffix if pace_suffix.startswith("\n") else f" {pace_suffix}"
         if operator_request is not None:
             tag = _operator_request_audit(
                 operator_request, audit_requested_by or "unknown", escalation_override
@@ -5028,7 +5028,7 @@ def gate_check(
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
     if pace_suffix:
-        reason += f" {pace_suffix}"
+        reason += pace_suffix if pace_suffix.startswith("\n") else f" {pace_suffix}"
     if operator_request is not None:
         reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     reason += _e6_arm_suffix(e6_admitted)
@@ -5151,14 +5151,17 @@ def _recommend_rank_key(
     value_order: dict[int, int],
     intra_pool_rank: dict[int, int],
     slot: int,
-) -> tuple[int, int, int, int, float, int, int, int, int, int]:
+) -> tuple[int, float, int, int, int, int, float, int, int, int, int, int]:
     """The one total order every included ``--recommend`` candidate sorts by.
 
-    #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
-    comparator — the round-2 comparator could express cyclic preferences
-    (boost>one-up, one-up>missing, missing>boost) which are unreachable in a
-    total order. Field precedence is fixed: unmeasured-last first, then the
-    usual quota and boost dimensions in main's order — imminent exhaustion,
+    Pace headroom is the first dimension: rows without an exhausting window
+    keep today's order ahead of all over-pace rows; over-pace rows sort by the
+    largest minimum TTE/reset ratio. Unknown windows have no headroom and stay
+    in pace. After that, #1318-2 round 3 (director-1 decision C) keeps one
+    tuple key, no pairwise comparator — the round-2 comparator could express
+    cyclic preferences (boost>one-up, one-up>missing, missing>boost) which are
+    unreachable in a total order. Field precedence continues with unmeasured-last,
+    then the usual quota and boost dimensions in main's order — imminent exhaustion,
     boost presence and value, continuous score — then the #1340 (dr-1340-1)
     paid-within-pool dimension, then the value-order slot, intra-pool rank —
     then exact before one-up as the last tie-break, then the caller's stable
@@ -5179,6 +5182,8 @@ def _recommend_rank_key(
     the same cost-first policy direction as the in-pool rule.
     """
     return (
+        1 if candidate.pace_headroom is not None else 0,
+        -(candidate.pace_headroom if candidate.pace_headroom is not None else 0.0),
         0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
         0 if candidate.imminent_exhaustion else 1,
         0 if candidate.boost is not None else 1,
@@ -5765,29 +5770,12 @@ def _evaluate(
         pace_note = ""
         free_swe2_bucket = model_bucket is not None
         pace_waste_eligible = False
+        pace_headroom_rank = None
         if effective_class == "spend" and not free_swe2_bucket:
             pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
-            pace_exhaustion = next(
-                (verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None
-            )
-            if pace_exhaustion is not None:
-                excluded.append(
-                    _Excluded(
-                        profile,
-                        _pace_exhaustion_reason(
-                            provider_id,
-                            pace_exhaustion,
-                            other_verdicts=pace_verdicts,
-                        ),
-                        provider_id=provider_id,
-                        kind="pace_exhaustion",
-                        placed_grade=placed_grade,
-                        one_up=one_up,
-                        borrowed=borrowed_row,
-                    )
-                )
-                continue
-            pace_note = _format_pace_verdicts(pace_verdicts)
+            pace_headroom = _pace_headroom(pace_verdicts)
+            pace_headroom_rank = pace_headroom.rank
+            pace_note = _format_recommend_pace(provider_id, pace_verdicts, pace_headroom)
             # Unknown windows cannot refuse by themselves, but an unknown pool
             # is not established to be inside the pace limit for WASTE scoring.
             pace_waste_eligible = bool(pace_verdicts) and all(
@@ -5870,6 +5858,7 @@ def _evaluate(
                 throughput_term=throughput_term,
                 score=score,
                 imminent_exhaustion=imminent_exhaustion,
+                pace_headroom=pace_headroom_rank,
                 placed_grade=placed_grade,
                 one_up=one_up,
                 borrowed=borrowed_row,
