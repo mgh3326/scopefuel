@@ -609,7 +609,12 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
     )
     gate_parser = subparsers.add_parser(
         "gate",
-        help="profile 하나의 스폰 가능 여부 판정 (exit 0=가능/3=차단/4=측정불가/5=역할 거부/6=구독 해지)",
+        help=(
+            "profile 하나의 스폰 가능 여부 판정. spend 풀은 어느 창이든 소진 예상이 reset보다 빠르면 거부 "
+            "(첫 5%% 창과 pace-unknown은 제외); non-spend와 SWE-2 free 창은 면제. "
+            "필요하면 --pace-override REF로만 pace 거부를 해제합니다 "
+            "(exit 0=가능/3=차단/4=측정불가/5=역할 거부/6=구독 해지)"
+        ),
     )
     gate_parser.add_argument(
         "-m", "--profile", required=True, choices=all_profiles, help="herdr-spawn profile 이름"
@@ -634,6 +639,15 @@ def build_parser(available: list[str]) -> argparse.ArgumentParser:
             "escalation/consult_only 프로필 전용 운영자 명시 요청 참조 (hk:doc/<key> 또는 "
             "hk:task/<정수>만 허용). fable 같은 consult_only 프로필은 이 REF 없이는 거부된다. "
             "감사 가능한 주장을 기록하는 경로이며 운영자 신원·동의를 증명하지 않는다"
+        ),
+    )
+    gate_parser.add_argument(
+        "--pace-override",
+        metavar="REF",
+        help=(
+            "pace_exhaustion만 해제하는 별도 필수 REF (hk:doc/<key> 또는 hk:task/<정수>). "
+            "spend 풀의 어느 창이든 소진 예상이 reset보다 빠르면 거부; 첫 5%% 창, 계산 불가 창, "
+            "non-spend 풀과 SWE-2 free 창은 pace-unknown 또는 면제입니다"
         ),
     )
     gate_parser.add_argument(
@@ -1240,7 +1254,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             bench_scores=bench_scores,
             model_prices=model_prices,
             grade_table=grade_table,
-            free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
+            free_rate_limit=free_window.display_value(free_limit) if free_limit is not None else None,
             swe2_result=swe2_result,
             area=area,
             area_exceptions=area_exceptions,
@@ -1262,7 +1276,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
                 explain=bool(getattr(args, "explain", False)),
                 hide_excluded=bool(getattr(args, "hide_excluded", False)),
                 grade_table=grade_table,
-                free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
+                free_rate_limit=free_window.display_value(free_limit) if free_limit is not None else None,
                 swe2_result=swe2_result,
                 area=area,
                 area_exceptions=area_exceptions,
@@ -1302,6 +1316,7 @@ def _gate_record(
             "alternatives": list(result.alternatives),
             "escalation_override": result.escalation_override,
             "operator_request_ref": result.operator_request_ref,
+            **({"pace_override_ref": result.pace_override_ref} if result.pace_override_ref else {}),
             "requested_by": result.requested_by,
             "ref_resolution": result.ref_resolution,
             "role_denied": result.role_denied,
@@ -1347,12 +1362,16 @@ def _gate_record(
 
 
 def _gate_args(args: argparse.Namespace) -> dict:
-    return {
+    options = {
         "operator_request": args.operator_request,
         "requested_by": args.requested_by,
         "purpose": args.purpose,
         "role": args.role,
     }
+    pace_override_ref = getattr(args, "pace_override", None)
+    if pace_override_ref is not None:
+        options["pace_override_ref"] = pace_override_ref
+    return options
 
 
 def _e6_arm_marker() -> str | None:
@@ -1675,22 +1694,19 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             observed_age_s=remote_used.age_s,
         )
     free_limit = None
-    if result.ok and free_window.is_free_profile(args.profile):
+    if free_window.is_free_profile(args.profile):
         free_limit = free_window.active_record(now=now)
     if free_limit is not None:
-        # Preserve the observed usage fields while applying this independent
-        # provider refusal. Existing gate refusals keep their original reason,
-        # output, and exit code; this only replaces a base admission.
+        # This host-local observation is advisory: the free SWE-2 attempt is
+        # still admitted and can be retried on a recommended fallback if the
+        # provider rejects it. Preserve any independent quota refusal.
         result = replace(
             result,
-            ok=False,
-            reason=free_window.reason(free_limit),
-            unmeasurable=False,
-            alternatives=(),
-            role_denied=False,
-            unsubscribed=False,
-            e6_arm=None,
+            reason=f"{result.reason} — {free_window.display_value(free_limit)}",
         )
+    pace_override = getattr(args, "pace_override", None)
+    if pace_override is not None and result.pace_override_ref is None:
+        result = replace(result, pace_override_ref=pace_override)
     # #742 — 구독 해지 거부는 전용 exit 6: 쿼타 차단(3)·측정불가(4)·역할 거부(5)와
     # 다른 rc 로 "reset 을 기다리면 풀리는" quota 답과 섞이지 않는다.
     exit_code = (
@@ -1747,6 +1763,8 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
             first_line += f" {recommend.e6_arm_tag(result.e6_arm)}"
         if result.stale_accepted:
             first_line += " stale_accepted=true"
+        if result.pace_override_ref is not None:
+            first_line += f" pace_override_ref={result.pace_override_ref}"
         if result.operator_request_ref is not None:
             first_line += (
                 f" escalation_override={'true' if result.escalation_override else 'false'}"

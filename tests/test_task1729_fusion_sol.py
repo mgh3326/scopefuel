@@ -124,7 +124,7 @@ def _recommend_output(providers, names, free_limit=None):
         today=NOW.date(),
         now=NOW,
         grade_table=_table_for_profiles(names),
-        free_rate_limit=free_window.reason(free_limit) if free_limit is not None else None,
+        free_rate_limit=free_window.display_value(free_limit) if free_limit is not None else None,
     )
     return payload, json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
@@ -285,7 +285,7 @@ def test_fast_model_ids_do_not_resolve_to_supported_profiles(fast_id):
         )
 
 
-def test_sol61_observation_holds_all_free_rungs_without_entering_swe2_scope(monkeypatch, tmp_path):
+def test_sol61_observation_notes_all_free_rungs_without_entering_swe2_scope(monkeypatch, tmp_path):
     _isolate_free_window(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
     _install_cli_stubs(monkeypatch)
@@ -303,18 +303,17 @@ def test_sol61_observation_holds_all_free_rungs_without_entering_swe2_scope(monk
     assert not (set(PROFILES) & SWE2_MODEL_SCOPE_PROFILES)
 
     for name in PROFILES:
-        rc, _out, err = _capture_cli(["gate", "-m", name])
-        assert rc == 3, (name, err)
-        assert "free_rate_limited" in err, (name, err)
+        rc, out, err = _capture_cli(["gate", "-m", name])
+        assert rc == 0, (name, err)
+        assert "last observed free_rate_limited" in out, (name, out)
 
     for free_profile in sorted(FREE_PROFILES):
-        rc, _out, err = _capture_cli(["gate", "-m", free_profile])
-        assert rc == 3, (free_profile, err)
-        assert "free_rate_limited" in err, (free_profile, err)
-        assert "rung devin-fusion-sol61" in err, (free_profile, err)
+        rc, out, err = _capture_cli(["gate", "-m", free_profile])
+        assert rc == 0, (free_profile, err)
+        assert "last observed free_rate_limited" in out, (free_profile, out)
 
 
-def test_live_hold_refuses_sol61_in_gate_and_excludes_recommend_rows_with_codex_pool(monkeypatch, tmp_path):
+def test_live_observation_admits_sol61_and_notes_recommend_rows(monkeypatch, tmp_path):
     _isolate_free_window(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
     _install_cli_stubs(monkeypatch)
@@ -322,19 +321,20 @@ def test_live_hold_refuses_sol61_in_gate_and_excludes_recommend_rows_with_codex_
     _observe_sol61_hold()
 
     for name in PROFILES:
-        rc, _out, err = _capture_cli(["gate", "-m", name])
-        assert rc == 3, (name, err)
-        assert "free_rate_limited" in err, (name, err)
+        rc, out, err = _capture_cli(["gate", "-m", name])
+        assert rc == 0, (name, err)
+        assert "last observed free_rate_limited" in out, (name, out)
 
     record = free_window.active_record(now=NOW)
     assert record is not None
     payload, _encoded = _recommend_output(providers, PROFILES, record)
     rows = {row["profile"]: row for row in payload["rows"]}
     assert set(rows) == set(PROFILES)
-    for row in rows.values():
-        assert row["kind"] == "free_rate_limited"
+    ranked = [row for row in payload["rows"] if row["kind"] == "candidate"]
+    assert len(ranked) == len(PROFILES)
+    for row in ranked:
         assert row["provider"] == "codex"
-        assert row["reason"] == free_window.reason(record)
+        assert free_window.display_value(record) in row["windows"]
 
 
 def test_no_or_expired_hold_keeps_sol61_gate_and_recommend_output_unchanged(monkeypatch, tmp_path):
@@ -367,7 +367,7 @@ def test_no_or_expired_hold_keeps_sol61_gate_and_recommend_output_unchanged(monk
     assert expired_recommend == baseline_recommend
 
 
-def test_base_codex_refusal_keeps_its_reason_and_rc_during_live_hold(monkeypatch, tmp_path):
+def test_base_codex_refusal_keeps_rc_and_adds_free_observation_note(monkeypatch, tmp_path):
     _isolate_free_window(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.dt, "datetime", FrozenDateTime)
     _install_cli_stubs(monkeypatch)
@@ -375,14 +375,14 @@ def test_base_codex_refusal_keeps_its_reason_and_rc_during_live_hold(monkeypatch
     providers[0].buckets[0] = Bucket("week", "7d", 100.0, RESET_7D, Scope("account"), "week")
     monkeypatch.setattr(cli, "collect", lambda *args, **kwargs: providers)
 
-    baseline_gate = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
+    _capture_cli(["gate", "-m", "devin-fusion-sol61"])
     _baseline_payload, baseline_recommend = _recommend_output(providers, PROFILES)
     _observe_sol61_hold()
 
     held_gate = _capture_cli(["gate", "-m", "devin-fusion-sol61"])
-    assert held_gate == baseline_gate
     assert held_gate[0] == 3
-    assert "free_rate_limited" not in held_gate[2]
+    assert "100% 사용" in held_gate[2]
+    assert "last observed free_rate_limited" in held_gate[2]
 
     record = free_window.active_record(now=NOW)
     assert record is not None

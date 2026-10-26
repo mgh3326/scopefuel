@@ -179,13 +179,17 @@ def test_paid_never_uses_model_scope_or_refresh(monkeypatch, capsys, name):
     capsys.readouterr()
 
 
-def test_live_hold_still_only_overrides_admission(monkeypatch, capsys):
+def test_live_observation_keeps_admission_and_adds_note(monkeypatch, capsys):
     cli_probe(monkeypatch, probe())
     record = SimpleNamespace()
     monkeypatch.setattr(free_window, "active_record", lambda **kw: record)
-    monkeypatch.setattr(free_window, "reason", lambda value: "free_rate_limited fixture")
-    assert cli.main(["gate", "-m", "builder-devin", "--no-cache"]) == 3
-    assert "free_rate_limited" in capsys.readouterr().err
+    monkeypatch.setattr(
+        free_window,
+        "display_value",
+        lambda value: "last observed free_rate_limited fixture",
+    )
+    assert cli.main(["gate", "-m", "builder-devin", "--no-cache"]) == 0
+    assert "last observed free_rate_limited fixture" in capsys.readouterr().out
 
 
 def rows(result, **kwargs):

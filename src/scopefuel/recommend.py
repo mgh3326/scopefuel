@@ -38,6 +38,7 @@ from .model import (
     _parse_reset,
     _window_seconds,
     account_tag,
+    pace_for,
 )
 from .policy import (
     get_active_override,
@@ -72,6 +73,9 @@ PRESERVE_EXCLUDE_PCT = 90.0
 SPEND_EXCLUDE_PCT = 99.0
 # spend 풀이 리셋까지 이 시간 이내이면 정렬 최상위 + 🔥 (fallback — pace 계산 불가 시에만).
 RESET_URGENCY_HOURS = 12.0
+# Early-window averages are too noisy to decide whether a spend pool will
+# exhaust before reset. Keep this threshold named for help text and audit.
+PACE_EARLY_WINDOW_FRACTION = 0.05
 
 # ROB-1191 ② continuous score component weights (explainable fixed constants).
 # total = capacity_term + WASTE_WEIGHT * waste_term + THRU_WEIGHT * throughput_term
@@ -2478,6 +2482,29 @@ class _WindowState:
         return _WINDOW_LABEL.get(self.window, self.window)
 
 
+@dataclass(frozen=True)
+class _PaceWindowVerdict:
+    """Shared gate/recommend pace calculation for one reported quota window."""
+
+    window: str
+    remaining_pct: float
+    elapsed_h: float | None
+    hours_to_reset: float | None
+    burn_rate: float | None
+    time_to_exhaust: float | None
+    allowed_daily_budget: float | None
+    unknown: bool
+
+    @property
+    def exhausts_before_reset(self) -> bool:
+        return (
+            not self.unknown
+            and self.time_to_exhaust is not None
+            and self.hours_to_reset is not None
+            and self.time_to_exhaust < self.hours_to_reset
+        )
+
+
 @dataclass
 class _Candidate:
     profile: Profile
@@ -2883,6 +2910,110 @@ def _window_states(
     return states
 
 
+def _pace_window_verdicts(
+    matches: list[tuple[float, str, str | None]],
+    now: dt.datetime,
+    *,
+    stale: bool = False,
+) -> list[_PaceWindowVerdict]:
+    """Compute the one spend-pace verdict shared by gate admission and recommend.
+
+    ``pace_for`` is the source of truth for whether a window is measurable and
+    for its allowed full-use rate. Stale observations and the first 5% of a
+    window are displayed as unknown and never trigger a refusal.
+    """
+    verdicts: list[_PaceWindowVerdict] = []
+    for used_pct, window, reset_at in matches:
+        bucket = Bucket(label=window, window=window, used_pct=used_pct, resets_at=reset_at)
+        pace = pace_for(bucket, now=now)
+        seconds = _window_seconds(window)
+        hours_to_reset = _hours_to_reset(reset_at, now)
+        elapsed_h = None
+        if seconds is not None and hours_to_reset is not None:
+            elapsed_h = seconds / 3600.0 - hours_to_reset
+        elapsed_fraction = elapsed_h / (seconds / 3600.0) if elapsed_h is not None and seconds else None
+        remaining_pct = max(0.0, 100.0 - used_pct)
+        burn_rate = used_pct / elapsed_h if elapsed_h is not None and elapsed_h > 0 else None
+        time_to_exhaust = (
+            math.inf
+            if burn_rate == 0
+            else (remaining_pct / burn_rate if burn_rate is not None and burn_rate > 0 else None)
+        )
+        allowed_daily_budget = pace.full_use_rate
+        if allowed_daily_budget is not None and pace.full_use_rate_unit == "%/h":
+            allowed_daily_budget *= 24.0
+        unknown = (
+            stale
+            or pace.ratio is None
+            or elapsed_fraction is None
+            or elapsed_fraction < PACE_EARLY_WINDOW_FRACTION
+            or hours_to_reset is None
+            or elapsed_h is None
+            or elapsed_h <= 0
+            or burn_rate is None
+            or time_to_exhaust is None
+            or allowed_daily_budget is None
+        )
+        verdicts.append(
+            _PaceWindowVerdict(
+                window=window,
+                remaining_pct=remaining_pct,
+                elapsed_h=elapsed_h,
+                hours_to_reset=hours_to_reset,
+                burn_rate=burn_rate,
+                time_to_exhaust=time_to_exhaust,
+                allowed_daily_budget=allowed_daily_budget,
+                unknown=unknown,
+            )
+        )
+    return verdicts
+
+
+def _pace_number(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if math.isinf(value):
+        return "inf"
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_pace_verdicts(verdicts: list[_PaceWindowVerdict]) -> str:
+    return " ".join(
+        f"pace-unknown window={verdict.window}"
+        if verdict.unknown
+        else f"pace=within-limit window={verdict.window}"
+        for verdict in verdicts
+    )
+
+
+def _pace_exhaustion_reason(
+    provider_id: str,
+    verdict: _PaceWindowVerdict,
+    *,
+    inflight_tag: str | None = None,
+    other_verdicts: list[_PaceWindowVerdict] | None = None,
+) -> str:
+    """Stable one-line pace refusal with enough data to audit the comparison."""
+    parts = [
+        "pace_exhaustion",
+        f"pool={provider_id}",
+        f"window={verdict.window}",
+        f"remaining={_pace_number(verdict.remaining_pct)}%",
+        f"elapsed_h={_pace_number(verdict.elapsed_h)}h",
+        f"burn_rate={_pace_number(verdict.burn_rate)}%/h",
+        f"hours_to_reset={_pace_number(verdict.hours_to_reset)}h",
+        f"time_to_exhaust={_pace_number(verdict.time_to_exhaust)}h",
+        f"allowed_daily_budget={_pace_number(verdict.allowed_daily_budget)}%/day",
+    ]
+    if inflight_tag:
+        parts.append(inflight_tag)
+    elif inflight_tag == "":
+        parts.append("inflight=0")
+    unknown = [item.window for item in (other_verdicts or []) if item.unknown]
+    parts.extend(f"pace-unknown window={window}" for window in unknown)
+    return " ".join(parts)
+
+
 def _constraint_sort_key(state: _WindowState) -> tuple[int, float, float, str]:
     """Smaller key = more constraining. Known TTE first; fallback by used_pct desc."""
     if state.time_to_exhaust is not None:
@@ -3260,6 +3391,8 @@ class GateResult:
     # 실제로 건너뛰었을 때만 True (대안이 없어 정상 자격으로 통과했으면 False).
     escalation_override: bool = False
     operator_request_ref: str | None = None
+    # hk 2087 — separate, shape-validated REF for a spend-pool pace override.
+    pace_override_ref: str | None = None
     requested_by: str | None = None
     # REF 해석 시도 결과. scopefuel 은 hk 저장소 클라이언트를 갖지 않으므로
     # 주장된 REF 는 항상 "unverified" 로만 기록한다 — verified 를 주장하지 않는다.
@@ -3916,6 +4049,17 @@ def _inflight_gate(
     return _InflightGate(reserves, n, f"inflight={n}", None, status)
 
 
+def _pace_inflight_tag(in_flight: _InflightGate | None) -> str:
+    """Expose the count already used by the gate without adding it to burn math."""
+    if in_flight is None:
+        return "inflight=0"
+    if in_flight.n is None:
+        return f"{in_flight.tag} counted=unknown"
+    if in_flight.unknown:
+        return f"{in_flight.tag} counted={in_flight.n}"
+    return in_flight.tag
+
+
 def _inflight_headroom(
     states: list[_WindowState],
     required: frozenset[str],
@@ -3953,6 +4097,7 @@ def gate_check(
     model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
     operator_request: str | None = None,
+    pace_override_ref: str | None = None,
     requested_by: str | None = None,
     purpose: str | None = None,
     role: str | None = None,
@@ -4091,6 +4236,17 @@ def gate_check(
                 "hk:doc/<key> 또는 hk:task/<정수> 만 허용"
             ),
             operator_request_ref=operator_request,
+        )
+    if pace_override_ref is not None and not _operator_request_ref_valid(pace_override_ref):
+        pace_override_ref_reason = f"pace_override_ref_invalid: {pace_override_ref!r}"
+        pace_override_ref_reason += " — hk:doc/<key> 또는 hk:task/<정수> 만 허용"
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=pace_override_ref_reason,
+            pace_override_ref=pace_override_ref,
         )
     if requested_by is not None and not _requested_by_valid(requested_by):
         return GateResult(
@@ -4254,6 +4410,8 @@ def gate_check(
     if found is None:
         # D3: Profile not in GRADE_TABLE — check quota cutoff only (no escalation logic).
         audit: dict[str, object] = {"experiment_retired": experiment_retired} if experiment_retired else {}
+        if pace_override_ref is not None:
+            audit["pace_override_ref"] = pace_override_ref
         if operator_request is not None:
             audit |= {
                 "operator_request_ref": operator_request,
@@ -4433,9 +4591,43 @@ def gate_check(
                     inflight_warning=in_flight.warning,
                     **audit,
                 )
+        pace_suffix = ""
+        if effective_class == "spend":
+            pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
+            pace_exhaustion = next(
+                (verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None
+            )
+            if pace_exhaustion is not None:
+                pace_reason = _pace_exhaustion_reason(
+                    provider_id,
+                    pace_exhaustion,
+                    inflight_tag=_pace_inflight_tag(in_flight),
+                    other_verdicts=pace_verdicts,
+                )
+                if pace_override_ref is None:
+                    return GateResult(
+                        ok=False,
+                        profile=profile_name,
+                        provider_id=provider_id,
+                        grade=None,
+                        reason=pace_reason,
+                        used_pct=100.0 - pace_exhaustion.remaining_pct,
+                        pool_class=effective_class,
+                        missing_windows=missing,
+                        unknown_plan=unknown_plan,
+                        inflight=in_flight.tag if in_flight is not None else None,
+                        inflight_warning=in_flight.warning if in_flight is not None else None,
+                        **audit,
+                    )
+                pace_suffix = f"pace_exhaustion overridden {pace_reason}"
+                pace_suffix += f" pace_override_ref={pace_override_ref}"
+            else:
+                pace_suffix = _format_pace_verdicts(pace_verdicts)
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
         reason += _exhaust_suffix(cutoff_status, notify_status)
         reason += _missing_windows_tag(missing, "측정된 창으로 판정")
+        if pace_suffix:
+            reason += f" {pace_suffix}"
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -4503,10 +4695,12 @@ def gate_check(
 
     escalation_override = False
     audit: dict[str, object] = {}
+    if pace_override_ref is not None:
+        audit["pace_override_ref"] = pace_override_ref
     if operator_request is not None:
         # 여기 도달하는 비-escalation 요청은 consult_only 정체성뿐이다 — catalog 가
         # fable 을 default-gate 행으로 되돌린 경우에도 감사 필드는 기록한다.
-        audit = {
+        audit |= {
             "operator_request_ref": operator_request,
             "requested_by": audit_requested_by or "unknown",
             "ref_resolution": "unverified",
@@ -4534,7 +4728,7 @@ def gate_check(
                 )
             escalation_override = True
         if operator_request is not None:
-            audit = {
+            audit |= {
                 "escalation_override": escalation_override,
                 "operator_request_ref": operator_request,
                 "requested_by": audit_requested_by or "unknown",
@@ -4745,6 +4939,47 @@ def gate_check(
                 **audit,
             )
 
+    pace_suffix = ""
+    if effective_class == "spend":
+        pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
+        pace_exhaustion = next((verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None)
+        if pace_exhaustion is not None:
+            if pace_override_ref is None:
+                alts = alternatives()
+                reason = _pace_exhaustion_reason(
+                    provider_id,
+                    pace_exhaustion,
+                    inflight_tag=_pace_inflight_tag(in_flight),
+                    other_verdicts=pace_verdicts,
+                )
+                return GateResult(
+                    ok=False,
+                    profile=profile_name,
+                    provider_id=provider_id,
+                    grade=grade,
+                    reason=reason,
+                    used_pct=100.0 - pace_exhaustion.remaining_pct,
+                    pool_class=effective_class,
+                    alternatives=alts,
+                    missing_windows=missing,
+                    unknown_plan=unknown_plan,
+                    inflight=in_flight.tag if in_flight is not None else None,
+                    inflight_warning=in_flight.warning if in_flight is not None else None,
+                    **audit,
+                )
+            pace_suffix = (
+                "pace_exhaustion overridden "
+                + _pace_exhaustion_reason(
+                    provider_id,
+                    pace_exhaustion,
+                    inflight_tag=_pace_inflight_tag(in_flight),
+                    other_verdicts=pace_verdicts,
+                )
+                + f" pace_override_ref={pace_override_ref}"
+            )
+        else:
+            pace_suffix = _format_pace_verdicts(pace_verdicts)
+
     inflight_allow_suffix = ""
     if in_flight is not None:
         if in_flight.status:
@@ -4760,6 +4995,8 @@ def gate_check(
         reason += _missing_windows_tag(missing, "측정된 창으로 판정")
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
+        if pace_suffix:
+            reason += f" {pace_suffix}"
         if operator_request is not None:
             tag = _operator_request_audit(
                 operator_request, audit_requested_by or "unknown", escalation_override
@@ -4790,6 +5027,8 @@ def gate_check(
     reason += _missing_windows_tag(missing, "측정된 창으로 판정")
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
+    if pace_suffix:
+        reason += f" {pace_suffix}"
     if operator_request is not None:
         reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     reason += _e6_arm_suffix(e6_admitted)
@@ -4874,6 +5113,36 @@ class _Evaluation:
     # inert borrowed listings. They are folded onto the excluded line with
     # their own reasons instead of vanishing.
     dropped: list[_Excluded]
+
+
+def _prioritize_free_fallback(evaluation: _Evaluation, free_rate_limit: str | None) -> None:
+    """Keep the try-SWE-2 row first and its best usable fallback immediately after."""
+    if not free_rate_limit or not evaluation.included:
+        return
+    free_index = next(
+        (
+            i
+            for i, candidate in enumerate(evaluation.included)
+            if candidate.profile.name in free_window.FREE_PROFILES
+        ),
+        None,
+    )
+    if free_index is None:
+        return
+    free_row = evaluation.included.pop(free_index)
+    other_index = next(
+        (
+            i
+            for i, candidate in enumerate(evaluation.included)
+            if candidate.profile.name not in free_window.FREE_PROFILES
+        ),
+        None,
+    )
+    if other_index is None:
+        evaluation.included.insert(0, free_row)
+        return
+    other_row = evaluation.included.pop(other_index)
+    evaluation.included[0:0] = [free_row, other_row]
 
 
 def _recommend_rank_key(
@@ -5493,6 +5762,40 @@ def _evaluate(
             )
             continue
 
+        pace_note = ""
+        free_swe2_bucket = model_bucket is not None
+        pace_waste_eligible = False
+        if effective_class == "spend" and not free_swe2_bucket:
+            pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
+            pace_exhaustion = next(
+                (verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None
+            )
+            if pace_exhaustion is not None:
+                excluded.append(
+                    _Excluded(
+                        profile,
+                        _pace_exhaustion_reason(
+                            provider_id,
+                            pace_exhaustion,
+                            other_verdicts=pace_verdicts,
+                        ),
+                        provider_id=provider_id,
+                        kind="pace_exhaustion",
+                        placed_grade=placed_grade,
+                        one_up=one_up,
+                        borrowed=borrowed_row,
+                    )
+                )
+                continue
+            pace_note = _format_pace_verdicts(pace_verdicts)
+            # Unknown windows cannot refuse by themselves, but an unknown pool
+            # is not established to be inside the pace limit for WASTE scoring.
+            pace_waste_eligible = bool(pace_verdicts) and all(
+                not verdict.unknown for verdict in pace_verdicts
+            )
+        elif free_swe2_bucket:
+            pace_note = "pace=exempt (SWE-2 free bucket)"
+
         used_pct = budget.used_pct
         remaining_pct = budget.remaining_pct
         reset_at = budget.reset_at
@@ -5516,6 +5819,9 @@ def _evaluate(
             urgency_hours=urgency_hours,
             budget=budget,
         )
+        if effective_class == "spend" and (free_swe2_bucket or not pace_waste_eligible):
+            score -= SCORE_WASTE_WEIGHT * waste_term
+            waste_term = 0.0
         throughput_window = _select_throughput_window(states, constraint)
         brake, brake_window = _brake_factor(states)
 
@@ -5528,23 +5834,16 @@ def _evaluate(
             and remaining_pct >= get_imminent_remaining_pct()
         )
 
-        # Apply the independent free-window hold only after the ordinary
-        # subscription, measurement, policy, and quota decisions admitted this
-        # row. Existing exclusion reasons therefore remain authoritative.
+        window_display = (
+            f"basis={swe2_model_scope_basis(swe2_rung)} free_tag={SWE2_FREE_TAG_OBSERVED}"
+            if model_bucket is not None
+            else _format_windows_display(states, constraint)
+            + (f" [{_stale_tag(result, accepted)}]" if accepted is not None else "")
+        )
+        if pace_note:
+            window_display += f" · {pace_note}"
         if free_rate_limit and profile.name in free_window.FREE_PROFILES:
-            excluded.append(
-                _Excluded(
-                    profile,
-                    free_rate_limit,
-                    provider_id=provider_id,
-                    kind="free_rate_limited",
-                    placed_grade=placed_grade,
-                    one_up=one_up,
-                    borrowed=borrowed_row,
-                )
-            )
-            continue
-
+            window_display += f" · {free_rate_limit}"
         included.append(
             _Candidate(
                 profile=profile,
@@ -5556,12 +5855,7 @@ def _evaluate(
                 throughput_window=throughput_window,
                 brake=brake,
                 brake_window=brake_window,
-                windows_display=(
-                    (f"basis={swe2_model_scope_basis(swe2_rung)} free_tag={SWE2_FREE_TAG_OBSERVED}")
-                    if model_bucket is not None
-                    else _format_windows_display(states, constraint)
-                    + (f" [{_stale_tag(result, accepted)}]" if accepted is not None else "")
-                ),
+                windows_display=window_display,
                 used_pct=used_pct,
                 remaining_pct=remaining_pct,
                 pool_class=effective_class,
@@ -5714,6 +6008,7 @@ def recommend(
     area_lines: list[str] = []
     if area is not None and area_exceptions:
         area_lines = _apply_area_exceptions(evaluation, grade, area, area_exceptions, catalog_model_ids)
+    _prioritize_free_fallback(evaluation, free_rate_limit)
 
     def _compact_bench(
         profile: Profile,
@@ -6079,6 +6374,7 @@ def recommend_dict(
     )
     if area is not None and area_exceptions:
         _apply_area_exceptions(evaluation, grade, area, area_exceptions, catalog_model_ids)
+    _prioritize_free_fallback(evaluation, free_rate_limit)
 
     def _row(
         item: _Candidate | _Excluded | _PolicyExcluded | _Unsubscribed | _EscalationEntry,

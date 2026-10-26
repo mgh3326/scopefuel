@@ -127,7 +127,10 @@ def reason(record: FreeLimitRecord) -> str:
 def display_value(record: FreeLimitRecord | None) -> str:
     if record is None:
         return "not observed"
-    return f"limited until {format_utc(record.reset_at)} via {record.source}"
+    return (
+        f"last observed free_rate_limited until {format_utc(record.reset_at)} "
+        f"(observed {format_utc(record.observed_at)} via {record.source})"
+    )
 
 
 def state_path() -> pathlib.Path:
