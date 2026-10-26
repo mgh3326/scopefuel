@@ -40,13 +40,24 @@ WINDOW_ALIASES = {
     "30d": "30d",
     "daily": "1d",
     "weekly": "7d",
+    # hk 2079: prepaid credit has no rolling limit window. The operator enters
+    # the console balance as remaining/total USD and the expiry date; used_pct
+    # is derived from those two numbers (see credit_used_pct).
+    "credit": "credit",
 }
 DEFAULT_WINDOWS = {
     "devin": "1d",
     "grok": "7d",
     "kiro": "30d",
     "upstage": "30d",
+    "anthropic-api": "credit",
 }
+# hk 2079: pools with no automatic probe. Their admission evidence is a manual
+# observation only, and a missing/stale observation fails closed exactly like
+# every other manual fallback (REQUIRED_WINDOWS coverage + TTL).
+MANUAL_ONLY_POOLS = frozenset({"anthropic-api"})
+MANUAL_ONLY_ERROR = "no automatic probe — manual observation only"
+CREDIT_WINDOW = "credit"
 # These are admission-coverage floors, not synthetic zero-valued buckets.
 # Devin requires only the weekly window: the startup banner always proves the
 # weekly remainder, while Daily exists only when /usage is readable — requiring
@@ -60,6 +71,7 @@ REQUIRED_WINDOWS = {
     "kiro": frozenset({"30d"}),
     "clinepass": frozenset({"5h", "7d", "30d"}),
     "upstage": frozenset({"30d"}),
+    "anthropic-api": frozenset({"credit"}),
 }
 # hk 1769 (b953) — codex required windows follow plan_type, which
 # providers/codex.py already stores as ``plan``. 2026-10-20 wham usage API
@@ -186,10 +198,11 @@ def _validate_store(store: dict) -> None:
                 raise ManualError(f"manual history {index} observation id 불일치")
             if not isinstance(event.get("pool"), str) or not event["pool"]:
                 raise ManualError(f"manual history {index} pool 불일치")
-            if event.get("window") not in {"5h", "1d", "7d", "30d"}:
+            if event.get("window") not in {"5h", "1d", "7d", "30d", CREDIT_WINDOW}:
                 raise ManualError(f"manual history {index} window 불일치")
             if not _is_valid_used_pct(event.get("used_pct")):
                 raise ManualError(f"manual history {index} used_pct 불일치")
+            _validate_credit(event, index)
             measured = _parse_iso(event.get("measured_at"))
             entered = _parse_iso(event.get("entered_at"))
             expires = _parse_iso(event.get("expires_at"))
@@ -391,9 +404,18 @@ def normalize_window(pool: str, window: str | None) -> str:
             raise ManualError(f"{pool} 은 --window 지정이 필요합니다")
         return inferred
     try:
-        return WINDOW_ALIASES[window]
+        normalized = WINDOW_ALIASES[window]
     except KeyError as exc:
         raise ManualError(f"지원하지 않는 window: {window}") from exc
+    # hk 2079: the credit window is the manual-only pool's window and nothing
+    # else's — a credit entry on a probed pool (or a rolling window on the
+    # credit pool) could never satisfy that pool's REQUIRED_WINDOWS.
+    if (normalized == CREDIT_WINDOW) != (pool in MANUAL_ONLY_POOLS):
+        raise ManualError(
+            f"{pool} 에는 {normalized} window 를 쓸 수 없습니다 "
+            f"(credit window 는 {', '.join(sorted(MANUAL_ONLY_POOLS))} 전용)"
+        )
+    return normalized
 
 
 def parse_used_pct(value: str) -> float:
@@ -426,6 +448,117 @@ def _parse_iso(value: object) -> dt.datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=dt.UTC)
     return parsed.astimezone(dt.UTC)
+
+
+def _parse_date(value: object) -> dt.date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def credit_used_pct(remaining_usd: float, total_usd: float) -> float:
+    """Used share of a prepaid credit balance — remaining USD against total USD.
+
+    This is the only derived number the credit window stores: the manual record
+    keeps the two USD amounts and the expiry, and ``used_pct`` follows from them
+    so the existing admission/cutoff path (which speaks percentages) needs no
+    second shape. A zero remaining balance is 100% used (fail closed).
+    """
+
+    if not math.isfinite(remaining_usd) or not math.isfinite(total_usd):
+        raise ManualError("credit 금액은 유한 숫자여야 합니다")
+    if remaining_usd < 0 or total_usd <= 0 or remaining_usd > total_usd:
+        raise ManualError("credit 은 0 이상 remaining <= total > 0 이어야 합니다")
+    return (1.0 - remaining_usd / total_usd) * 100.0
+
+
+def _credit(event: dict) -> dict | None:
+    credit = event.get("credit")
+    return credit if isinstance(credit, dict) else None
+
+
+def _validate_credit(event: dict, index: int) -> None:
+    """Validate the optional ``credit`` block (hk 2079).
+
+    A credit window must carry it and the stored used_pct must be the value the
+    USD numbers derive — a hand-edited percentage cannot disagree with the
+    balance the operator entered. Every other window must not carry one.
+    """
+
+    credit = event.get("credit")
+    # The credit window belongs to the manual-only pool and nothing else, in the
+    # reader as in the writer (normalize_window): a hand-edited store cannot move it.
+    if (event.get("window") == CREDIT_WINDOW) != (event.get("pool") in MANUAL_ONLY_POOLS):
+        raise ManualError(f"manual history {index} credit pool 불일치")
+    if event.get("window") != CREDIT_WINDOW:
+        if credit is not None:
+            raise ManualError(f"manual history {index} credit window 불일치")
+        return
+    if not isinstance(credit, dict):
+        raise ManualError(f"manual history {index} credit 구조 불일치")
+    remaining = credit.get("remaining_usd")
+    total = credit.get("total_usd")
+    expires = credit.get("expires_on")
+    if (
+        isinstance(remaining, bool)
+        or not isinstance(remaining, (int, float))
+        or isinstance(total, bool)
+        or not isinstance(total, (int, float))
+    ):
+        raise ManualError(f"manual history {index} credit 금액 불일치")
+    if _parse_date(expires) is None:
+        raise ManualError(f"manual history {index} credit 만료일 불일치")
+    expected = credit_used_pct(float(remaining), float(total))
+    if abs(float(event.get("used_pct")) - expected) > 1e-9:
+        raise ManualError(f"manual history {index} credit used_pct 불일치")
+
+
+def credit_display(summary: dict | None, *, now: dt.datetime) -> str | None:
+    """One human line for a fresh credit observation: balance and days left."""
+
+    if not summary:
+        return None
+    entries = summary.get("latest_valid")
+    if entries is None:
+        entries = summary.get("entries") or []
+    for entry in entries:
+        credit = _credit(entry)
+        if entry.get("window") != CREDIT_WINDOW or credit is None:
+            continue
+        expires = _parse_date(credit.get("expires_on"))
+        if expires is None:
+            continue
+        days = (expires - _as_utc(now).date()).days
+        left = f"{days}일 남음" if days >= 0 else f"{-days}일 지남(만료)"
+        pool = str(entry.get("pool") or "")
+        return (
+            f"{pool} credit ${float(credit['remaining_usd']):.2f}/"
+            f"${float(credit['total_usd']):.2f} · {left} (만료 {expires.isoformat()})"
+        )
+    return None
+
+
+def manual_only_result(pool: str) -> ProviderResult:
+    """The synthetic automatic result for a pool that has no probe (hk 2079).
+
+    ``resolve_result`` treats this as a retryable measurement failure so the
+    manual observation is the only admission evidence; a missing or stale
+    observation leaves the pool unmeasurable (fail closed), exactly like every
+    other manual fallback.
+    """
+
+    if pool not in MANUAL_ONLY_POOLS:
+        raise ManualError(f"{pool} 은 manual-only pool 이 아닙니다")
+    return ProviderResult(
+        id=pool,
+        error=MANUAL_ONLY_ERROR,
+        error_kind="manual_only",
+        note="자동 프로브 없음 — 운영자가 console 값을 manual 로 입력한다",
+        pool_class="spend",
+    )
 
 
 def _process_info(pid: int) -> tuple[int | None, str | None]:
@@ -500,19 +633,20 @@ def _latest_set(history: list[dict], pool: str, window: str) -> dict | None:
 def record_observation(
     *,
     pool: str,
-    used_pct: float,
+    used_pct: float | None = None,
     window: str | None,
     measured_at: dt.datetime,
     reason: str,
     ttl_s: float = DEFAULT_TTL_S,
     resets_in_s: float | None = None,
     resets_at: dt.datetime | None = None,
+    remaining_usd: float | None = None,
+    total_usd: float | None = None,
+    credit_expires_on: str | None = None,
     now: dt.datetime | None = None,
 ) -> dict:
     entered_at = _as_utc(now or dt.datetime.now(dt.UTC))
     measured_at = _as_utc(measured_at)
-    if not _is_valid_used_pct(used_pct):
-        raise ManualError("used_pct 는 0..100 유한 숫자여야 합니다")
     if not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > MAX_TTL_S:
         raise ManualError("--ttl 은 0보다 크고 2h 이하여야 합니다")
     if measured_at > entered_at + dt.timedelta(seconds=MAX_FUTURE_SKEW_S):
@@ -523,6 +657,31 @@ def record_observation(
     if len(reason) > MAX_REASON_CHARS:
         raise ManualError(f"--reason 은 {MAX_REASON_CHARS}자 이하여야 합니다")
     normalized_window = normalize_window(pool, window)
+    credit: dict | None = None
+    if normalized_window == CREDIT_WINDOW:
+        if used_pct is not None:
+            raise ManualError("credit window 는 --used 대신 --remaining/--total 을 씁니다")
+        if remaining_usd is None or total_usd is None or credit_expires_on is None:
+            raise ManualError("credit window 는 --remaining·--total·--expires-on 이 모두 필요합니다")
+        if resets_in_s is not None or resets_at is not None:
+            raise ManualError(
+                "credit window 는 --resets-in/--resets-at 을 쓰지 않습니다 (만료일은 --expires-on)"
+            )
+        expires = _parse_date(credit_expires_on)
+        if expires is None:
+            raise ManualError("--expires-on 은 YYYY-MM-DD 형식이어야 합니다")
+        used_pct = credit_used_pct(float(remaining_usd), float(total_usd))
+        credit = {
+            "remaining_usd": float(remaining_usd),
+            "total_usd": float(total_usd),
+            "expires_on": expires.isoformat(),
+        }
+    elif used_pct is None:
+        raise ManualError("--used 는 필수입니다 (credit window 는 --remaining/--total)")
+    elif any(value is not None for value in (remaining_usd, total_usd, credit_expires_on)):
+        raise ManualError("--remaining/--total/--expires-on 은 --window credit 에서만 씁니다")
+    if used_pct is None or not _is_valid_used_pct(used_pct):
+        raise ManualError("used_pct 는 0..100 유한 숫자여야 합니다")
     if resets_in_s is not None and resets_at is not None:
         raise ManualError("--resets-in 과 --resets-at 은 함께 쓸 수 없습니다")
     if resets_in_s is not None:
@@ -592,6 +751,8 @@ def record_observation(
             "local_only": True,
             "execution_context": _execution_context(),
         }
+        if credit is not None:
+            entry["credit"] = credit
         history.append(entry)
         store["latest"][f"{pool}:{normalized_window}"] = observation_id
         _save_unlocked(store)
@@ -643,6 +804,10 @@ def automatic_error_text(result: ProviderResult) -> str | None:
 
 
 def classify_automatic_failure(result: ProviderResult) -> tuple[str | None, str | None]:
+    if result.error_kind == "manual_only" or result.error == MANUAL_ONLY_ERROR:
+        # hk 2079: there is no probe to fail — the manual observation is the
+        # only measurement path, and the usual TTL/coverage rules still gate it.
+        return "manual_only", MANUAL_ONLY_ERROR
     text = automatic_error_text(result)
     if text is None:
         return None, None
@@ -718,6 +883,12 @@ def _entry_views(
         elif auto_success and measured is not None and auto_time is not None and auto_time > measured:
             status = "superseded_by_auto"
         elif expires is None or expires <= current:
+            status = "expired"
+        elif (credit := _credit(event)) is not None and (
+            (expires_on := _parse_date(credit.get("expires_on"))) is None or expires_on < current.date()
+        ):
+            # hk 2079: an expired credit balance is not admission evidence even
+            # while the manual TTL is still running.
             status = "expired"
         elif auto_fresh:
             status = "shadowed_by_fresh_auto"
@@ -834,7 +1005,7 @@ def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> t
 def _horizon(window: str) -> str:
     if window in {"5h", "1d"}:
         return "now"
-    if window == "30d":
+    if window in {"30d", CREDIT_WINDOW}:
         return "month"
     return "week"
 
@@ -888,7 +1059,10 @@ def resolve_result(
             failure_kind=failure_kind,
             failure_reason="검증된 auth 실패는 manual observation으로 숨길 수 없음",
         )
-    if failure_kind not in {"transport", "parse_error"}:
+    allowed_failures = {"transport", "parse_error"}
+    if failure_kind == "manual_only" and result.id in MANUAL_ONLY_POOLS:
+        allowed_failures.add("manual_only")
+    if failure_kind not in allowed_failures:
         summary["selection"] = "unsupported_failure"
         return Resolution(
             annotated,
@@ -917,6 +1091,7 @@ def resolve_result(
         )
 
     selected = tuple(active[key] for key in sorted(active))
+    credit = credit_display({"latest_valid": list(selected)}, now=now)
     buckets = [
         Bucket(
             label=f"manual {entry['window']}",
@@ -925,7 +1100,7 @@ def resolve_result(
             resets_at=entry.get("resets_at"),
             scope=Scope("account"),
             horizon=_horizon(entry["window"]),  # type: ignore[arg-type]
-            note=f"source={SOURCE}; {SOURCE_LABEL}",
+            note=f"source={SOURCE}; {SOURCE_LABEL}" + (f"; {credit}" if credit else ""),
         )
         for entry in selected
     ]
@@ -1039,10 +1214,18 @@ def format_list(payload: dict) -> str:
         f"replaced={payload['counts']['replaced']} local_only=true"
     ]
     for entry in payload["entries"]:
+        credit = _credit(entry)
+        credit_s = (
+            f" credit_remaining_usd={credit['remaining_usd']:g}"
+            f" credit_total_usd={credit['total_usd']:g}"
+            f" credit_expires_on={credit['expires_on']}"
+            if credit is not None
+            else ""
+        )
         lines.append(
             f"{entry['pool']} window={entry['window']} used_pct={entry['used_pct']:g} "
             f"status={entry['status']} measured_at={entry['measured_at']} "
-            f"expires_at={entry['expires_at']} source={SOURCE} "
+            f"expires_at={entry['expires_at']}{credit_s} source={SOURCE} "
             f"source_verification={SOURCE_VERIFICATION} label={SOURCE_LABEL} "
             f"id={entry['manual_observation_id']}"
         )
