@@ -317,8 +317,8 @@ def test_spend_reset_not_imminent_no_fire():
     assert "🔥" not in ranked[0]
 
 
-def test_overpace_weekly_window_refuses_recommendation_even_when_5h_is_safe():
-    """Any over-pace window refuses the row, even when the other window is safe."""
+def test_overpace_weekly_window_warns_recommendation_even_when_5h_is_safe():
+    """An over-pace weekly window warns but keeps the row, even when 5h is safe."""
     providers = [
         _result_windows_with_resets(
             "claude",
@@ -327,8 +327,8 @@ def test_overpace_weekly_window_refuses_recommendation_even_when_5h_is_safe():
     ]
     out = recommend(providers, "S+", today=TODAY, now=NOW)
     lines = [line for line in out.splitlines() if line[:1].isdigit()]
-    assert not any("opus" in line for line in lines)
-    assert "pace_exhaustion" in out
+    assert any("opus" in line for line in lines)
+    assert "pace-warning pool=claude window=7d" in out
     assert "window=7d" in out
 
 
@@ -1702,7 +1702,7 @@ def test_rob1210_imminent_exhaustion_uses_budget_window():
     assert "잔여 60%" in urgent_line
 
 
-def test_rob1210_weekly_pace_exhaustion_refuses_recommendation_row():
+def test_rob1210_weekly_overpace_warns_and_keeps_recommendation_row():
     """The weekly budget window participates in admission, not just 5h budget scoring."""
     out = recommend(
         [_result_windows_with_resets("claude", [(50.0, "5h", 0.5), (60.0, "7d", 68.0)])],
@@ -1710,8 +1710,8 @@ def test_rob1210_weekly_pace_exhaustion_refuses_recommendation_row():
         today=TODAY,
         now=NOW,
     )
-    assert not any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
-    assert "pace_exhaustion" in out and "window=7d" in out
+    assert any(line[:1].isdigit() and "opus" in line for line in out.splitlines())
+    assert "pace-warning pool=claude window=7d" in out and "window=7d" in out
 
 
 def test_rob1210_short_window_cutoff_remains_a_brake():
