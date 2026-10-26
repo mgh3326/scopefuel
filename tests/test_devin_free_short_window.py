@@ -157,6 +157,8 @@ class DevinFreeShortWindowTests(unittest.TestCase):
         self.patcher.setattr(cli.bench, "read_prices", lambda: {})
         self.patcher.setattr(cli.bench, "runtime_grade_table", lambda: recommend.GRADE_TABLE)
         self.patcher.setattr(cli, "_retired_rungs", lambda: frozenset())
+        self.patcher.setattr(cli, "_consult_only_rungs", lambda: frozenset())
+        self.patcher.setattr(cli, "_gate_policy_context", lambda *args, **kwargs: None)
         self.patcher.setattr(cli, "_shadow_gate", lambda *args, **kwargs: None)
         self.patcher.setattr(cli, "_emit_stale_build_warning", lambda: None)
 

@@ -168,10 +168,12 @@ def test_gate_launch_parity(catalog_gate, profile, effort, retired, marker, ref,
     elif not ok:
         expected = "retired" if retired else ("e6_arm_required" if gate_kind == "default" else "consult_only")
         if ref in ("HK:task/1786", "hk:task/1786 "):
+            # hk 2021: a malformed REF is refused by its shape on both sides, before any rung rule.
             assert "operator_request_ref_invalid" in gate.reason
+            assert "operator_request_ref_invalid" in reason
         else:
             assert expected in gate.reason
-        assert expected in reason
+            assert expected in reason
 
 
 def test_default_row_ref_still_not_applicable(catalog_gate):
@@ -595,3 +597,105 @@ def test_implicit_policy_context_never_invents_an_ordinary_rung(monkeypatch):
         backend="handoffkeep",
     )
     assert cli._gate_policy_context("haiku", None, None) is None
+
+
+# --- hk 2021: launch validates the operator-request REF shape on every path ---
+
+REF_REFUSAL = "operator_request_ref_invalid: {ref!r} — hk:doc/<key> 또는 hk:task/<정수> 만 허용"
+MALFORMED_REFS = [
+    "hk:task/1786\n",
+    "hk:task/1786\r",
+    "hk:task/17\t86",
+    "hk:task/17 86",
+    "hk:task/1786\x07",
+    "hk:task/1786 ",
+    "hk:task/1786\x00",
+    "hk:doc/Briefs/b953",
+    "hk:task/1x",
+    "hk:doc/" + "a" * 122,
+]
+VALID_REFS = ["hk:task/1786", "hk:doc/briefs/b953/x", "hk:doc/" + "a" * 121]
+
+
+def _kimi_fallback_view():
+    return bench.CatalogView(
+        entries=(
+            bench.CatalogEntry(
+                profile="kimi-k3", effort="", model_id="kimi-k3", pool="kimi", grade="S", score=61.0
+            ),
+            bench.CatalogEntry(
+                profile="codex-sol",
+                effort="max",
+                model_id="gpt-6.1-sol",
+                pool="codex",
+                grade="S+",
+                score=67.0,
+            ),
+        ),
+        source="server",
+        backend="handoffkeep",
+    )
+
+
+def _resolve_on(path, operator_request):
+    """R1: consult_only fable. R2: round-extension astra builder. R4: unmeasured E6 rung."""
+    if path == "R1":
+        return launch.resolve_launch("fable", operator_request=operator_request)
+    if path == "R2":
+        return launch.resolve_launch(
+            "codex-astra", role="builder", purpose="round-extension", operator_request=operator_request
+        )
+    return launch.resolve_launch(
+        "kimi-k3",
+        effort="high",
+        e6_arm="kimi-k3@high",
+        operator_request=operator_request,
+        view=_kimi_fallback_view(),
+    )
+
+
+@pytest.mark.parametrize("path", ["R1", "R4"])
+@pytest.mark.parametrize("ref", MALFORMED_REFS)
+def test_launch_refuses_a_malformed_ref_before_using_it(path, ref):
+    with pytest.raises(launch.LaunchError) as raised:
+        _resolve_on(path, ref)
+    assert str(raised.value) == REF_REFUSAL.format(ref=ref)
+
+
+@pytest.mark.parametrize("ref", MALFORMED_REFS)
+def test_round_extension_path_keeps_its_role_refusal_for_a_malformed_ref(ref):
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        _resolve_on("R2", ref)
+
+
+@pytest.mark.parametrize("ref", MALFORMED_REFS)
+def test_policy_launch_refuses_a_malformed_ref_and_renders_nothing(ref, capsys):
+    assert cli.main(["policy", "launch", "fable", "--operator-request", ref]) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {REF_REFUSAL.format(ref=ref)}\n"
+
+
+@pytest.mark.parametrize("ref", VALID_REFS)
+def test_a_valid_ref_still_resolves_on_r1_and_r4(ref):
+    assert _resolve_on("R1", ref).model_id == "claude-fable-5-1"
+    assert _resolve_on("R4", ref).operator_request_ref == ref
+
+
+def test_the_round_extension_path_still_takes_its_own_ref():
+    ref = "hk:doc/round-ext/b2051"
+    assert _resolve_on("R2", ref).round_extension_builder["ref"] == ref
+
+
+@pytest.mark.parametrize(
+    "ref", VALID_REFS + MALFORMED_REFS + ["hk:doc/round-ext/b2051", "hk:doc/Briefs/b953"]
+)
+def test_launch_and_gate_agree_on_every_ref_shape(ref):
+    accepted_by_gate = recommend._operator_request_ref_valid(ref)
+    try:
+        launch.resolve_launch("fable", operator_request=ref)
+    except launch.LaunchError:
+        accepted_by_launch = False
+    else:
+        accepted_by_launch = True
+    assert accepted_by_launch == accepted_by_gate

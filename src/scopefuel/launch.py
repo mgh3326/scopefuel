@@ -44,6 +44,7 @@ from .recommend import (
     REP_GRADES_ORDER,
     UNGRADED_TRIAL_PROFILES,
     Grade,
+    _operator_request_ref_valid,
     astra_purpose_allowed,
     barred_model_id_for_profile,
     e6_arm_carrier_grade,
@@ -717,6 +718,14 @@ def resolve_launch(
         raise LaunchError(
             f"role_restricted: {profile}: round-extension requires a round-ext document ref; "
             "builder/captain astra forbidden"
+        )
+
+    # hk 2021: a string REF is rendered into the output below, so it gets the
+    # gate's shape check. It runs after the round-extension checks above, which
+    # keep their stricter role_restricted refusal. Same validator, same text.
+    if isinstance(operator_request, str) and not _operator_request_ref_valid(operator_request):
+        raise LaunchError(
+            f"operator_request_ref_invalid: {operator_request!r} — hk:doc/<key> 또는 hk:task/<정수> 만 허용"
         )
 
     view = read_catalog(path=path) if view is None else view
