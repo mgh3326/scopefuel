@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 
-from .model import Bucket, ProviderResult, Scope, _is_valid_used_pct
+from .model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope, _is_valid_used_pct
 
 SCHEMA = "scopefuel.manual.v1"
 SOURCE = "operator"
@@ -901,7 +901,10 @@ def classify_automatic_failure(result: ProviderResult) -> tuple[str | None, str 
     # Provider-specific transport/timeout/parser classifications are stronger
     # evidence than an unfamiliar human-facing error string. This is required
     # for commandcode's probe-failure-only manual-credit fallback.
-    if result.error_kind in {"transport", "probe_timeout"}:
+    # hk 2182: a deferred (in-flight/background-refresh) round is not a
+    # measurement — it defers to the manual observation like a transport
+    # failure does, so a daemon-polled pool keeps serving its credit.
+    if result.error_kind in {"transport", "probe_timeout", PROBE_IN_PROGRESS}:
         return "transport", safe_text
     if result.error_kind == "parse_error":
         return "parse_error", safe_text

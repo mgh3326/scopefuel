@@ -706,7 +706,12 @@ def collect(
         if fetcher is None:
             return ProviderResult(id="?", error="알 수 없는 provider", error_kind="unknown")
         try:
-            return fetcher()  # type: ignore[operator]
+            # hk 2182 — a provider may publish a short-budget entry point
+            # (``fetch.detached_probe``) for callers that must never start or
+            # starve a long probe. The synchronous probe itself stays on
+            # ``fetcher()`` and is reached only by the refresh worker.
+            probe = getattr(fetcher, "detached_probe", None) or fetcher
+            return probe()  # type: ignore[operator]
         except Exception as exc:
             kind, status, retry_after = classify_error(exc)
             return ProviderResult(

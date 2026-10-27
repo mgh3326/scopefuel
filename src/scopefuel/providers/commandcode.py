@@ -22,6 +22,17 @@ from .. import cache, proctrack
 from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_COMMANDCODE_BIN") or "cmd"
+_DEFAULT_BINARY_NAME = "cmd"
+# hk 2182 (a): cmd is not on scopefuel's PATH on every host — the desk install
+# lives under ~/.hermes/node/bin. Resolution order: an explicit configured
+# path (SCOPEFUEL_COMMANDCODE_BIN or [pools.commandcode] bin in config.toml),
+# then PATH, then these known install dirs. Never a login shell.
+KNOWN_BIN_DIRS = (
+    "~/.hermes/node/bin",
+    "~/.local/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+)
 SOURCE = "cli:/usage"
 # hk 2160 r2: resolved per probe, not at import — importing this module with
 # HOME unset must not raise, and a test/host may relocate HOME after import.
@@ -81,10 +92,11 @@ _DURATION = re.compile(
 
 
 class ProbeTimeout(subprocess.TimeoutExpired):
-    def __init__(self, cmd, timeout, *, stage: str, nbytes: int) -> None:
+    def __init__(self, cmd, timeout, *, stage: str, nbytes: int, detail: str | None = None) -> None:
         super().__init__(cmd, timeout)
         self.stage = stage
         self.nbytes = nbytes
+        self.detail = detail
 
 
 def _timeout_s() -> float:
@@ -110,6 +122,59 @@ def _probe_lock_dir() -> pathlib.Path:
     return cache.cache_dir() / "probe-locks" / "commandcode"
 
 
+def _explicit_binary() -> str | None:
+    """The operator-declared cmd path, if any — env/config before any search."""
+
+    if BINARY != _DEFAULT_BINARY_NAME:
+        return BINARY
+    try:
+        from ..policy import load_config
+
+        entry = (load_config().get("pools") or {}).get("commandcode")
+        if isinstance(entry, dict):
+            raw = entry.get("bin")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+    except Exception:  # noqa: BLE001 - a broken config must not break the probe
+        pass
+    return None
+
+
+def _resolve_binary() -> tuple[str | None, list[str]]:
+    """Resolve the cmd binary; returns (path or None, every location tried).
+
+    Order: explicit configured path → PATH → KNOWN_BIN_DIRS. An explicit path
+    that does not exist is recorded and the search continues — a stale config
+    must fail loud in the error's tried list, not silently measure nothing.
+    """
+
+    tried: list[str] = []
+    if explicit := _explicit_binary():
+        candidate = pathlib.Path(os.path.expanduser(explicit))
+        tried.append(str(candidate))
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate), tried
+    tried.append(f"PATH:{_DEFAULT_BINARY_NAME}")
+    if found := shutil.which(_DEFAULT_BINARY_NAME):
+        return found, tried
+    for install_dir in KNOWN_BIN_DIRS:
+        candidate = pathlib.Path(install_dir).expanduser() / _DEFAULT_BINARY_NAME
+        tried.append(str(candidate))
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate), tried
+    return None, tried
+
+
+def _binary_missing_result(tried: list[str]) -> ProviderResult:
+    return ProviderResult(
+        id="commandcode",
+        error=f"cmd 실행 파일 없음 — 찾아본 경로: {', '.join(tried)}",
+        error_kind="transport",
+        source=SOURCE,
+        pool_class="spend",
+    )
+
+
 def _ensure_workdir(workdir: pathlib.Path) -> None:
     try:
         if not (workdir / ".git").exists():
@@ -124,7 +189,7 @@ def _ensure_workdir(workdir: pathlib.Path) -> None:
         pass
 
 
-def _probe_once() -> str:
+def _probe_once(binary: str) -> str:
     workdir = _probe_workdir().expanduser()
     workdir.mkdir(parents=True, exist_ok=True)
     _ensure_workdir(workdir)
@@ -137,13 +202,13 @@ def _probe_once() -> str:
     child_pgid: int | None = None
     try:
         if timeout_s <= 0:
-            raise ProbeTimeout([BINARY, "--no-session"], timeout_s, stage="no-output", nbytes=0)
+            raise ProbeTimeout([binary, "--no-session"], timeout_s, stage="no-output", nbytes=0)
         master_fd, slave_fd = pty.openpty()
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", PTY_ROWS, PTY_COLS, 0, 0))
         child_env = os.environ.copy()
         child_env.setdefault("TERM", "xterm-256color")
         process = subprocess.Popen(
-            [BINARY, "--no-session"],
+            [binary, "--no-session"],
             cwd=instance_dir,
             stdin=slave_fd,
             stdout=slave_fd,
@@ -184,7 +249,7 @@ def _probe_once() -> str:
                 # instance dir, so any probe could hit it).
                 if _TRUST_QUESTION.search(screen):
                     raise ProbeTimeout(
-                        [BINARY, "--no-session"], timeout_s, stage="trust-prompt", nbytes=len(output)
+                        [binary, "--no-session"], timeout_s, stage="trust-prompt", nbytes=len(output)
                     )
                 if not sent and _PROMPT.search(screen):
                     os.write(master_fd, PROBE_INPUT.encode())
@@ -207,10 +272,13 @@ def _probe_once() -> str:
         screen = _clean(output.decode("utf-8", errors="replace"))
         if time.monotonic() >= deadline and not (sent and _complete(screen)):
             raise ProbeTimeout(
-                [BINARY, "--no-session"],
+                [binary, "--no-session"],
                 timeout_s,
                 stage="unparsed" if sent else "no-prompt",
                 nbytes=len(output),
+                # hk 2182 (c): an unparsed screen fails closed naming exactly
+                # which part of the /usage panel was missing.
+                detail=_missing_detail(screen) if sent else None,
             )
         return screen
     finally:
@@ -311,6 +379,16 @@ def _complete(text: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _missing_detail(text: str) -> str | None:
+    """Why a screen fails the three-window parse — the fail-closed reason."""
+
+    try:
+        _parse_buckets(text, now=dt.datetime.now(dt.UTC))
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _segment_end(clean: str, start: int, own: str) -> int:
@@ -433,14 +511,18 @@ def parse(text: str, *, now: dt.datetime | None = None) -> ProviderResult:
 
 
 def fetch() -> ProviderResult:
-    if shutil.which(BINARY) is None:
-        return ProviderResult(
-            id="commandcode",
-            error="cmd 실행 파일 없음",
-            error_kind="transport",
-            source=SOURCE,
-            pool_class="spend",
-        )
+    """The synchronous PTY probe — run only by a caller that owns the budget.
+
+    collect() never reaches this path: ``fetch.detached_probe`` below is what
+    gate/recommend/--json/status call, so a caller that can be killed mid-run
+    (the panewire daemon's ~15s polls) never starts or holds the probe. The
+    detached ``scopefuel refresh commandcode --_worker`` path invokes this
+    directly with its own 60s budget.
+    """
+
+    binary, tried = _resolve_binary()
+    if binary is None:
+        return _binary_missing_result(tried)
     try:
         with proctrack.single_probe_lock(_probe_lock_dir()) as acquired:
             if not acquired:
@@ -451,15 +533,21 @@ def fetch() -> ProviderResult:
                     source=SOURCE,
                     pool_class="spend",
                 )
-            screen = _probe_once()
+            screen = _probe_once(binary)
     except ProbeTimeout as exc:
+        error = f"cmd /usage PTY probe timeout (stage={exc.stage}, bytes={exc.nbytes})"
+        if exc.detail:
+            error += f" — missing: {exc.detail}"
+        raw = {"source": SOURCE, "stage": exc.stage, "bytes": exc.nbytes}
+        if exc.detail:
+            raw["missing"] = exc.detail
         return ProviderResult(
             id="commandcode",
-            error=f"cmd /usage PTY probe timeout (stage={exc.stage}, bytes={exc.nbytes})",
+            error=error,
             error_kind="probe_timeout",
             source=SOURCE,
             pool_class="spend",
-            raw={"source": SOURCE, "stage": exc.stage, "bytes": exc.nbytes},
+            raw=raw,
         )
     except OSError as exc:
         return ProviderResult(
@@ -474,4 +562,57 @@ def fetch() -> ProviderResult:
     return result
 
 
+def _spawn_background_refresh() -> None:
+    """Detach ``scopefuel refresh commandcode --_worker`` — owns its own budget.
+
+    Best-effort: a spawn failure degrades to the same cached/manual serving
+    this round already produced; the next short caller tries again.
+    """
+
+    try:
+        from .. import refresh
+
+        refresh.spawn_detached("commandcode")
+    except Exception:  # noqa: BLE001 - never let a refresh spawn break a caller
+        pass
+
+
+def _deferred_fetch() -> ProviderResult:
+    """hk 2182 (b): the short-budget path — never starts or starves the probe.
+
+    A daemon-poll caller is killed long before the ~30s PTY probe could land,
+    so an inline probe only ever produces corpses: nothing is cached and the
+    lock is almost always held by the next poll. Instead this serves what is
+    already known — collect() turns the PROBE_IN_PROGRESS marker into the
+    fresh/stale snapshot, and the manual credit fallback covers a bare miss —
+    and, when no live probe owns the lock, starts at most ONE detached
+    background refresh which writes the cache when it finishes.
+    """
+
+    if proctrack.probe_in_flight(_probe_lock_dir()):
+        return ProviderResult(
+            id="commandcode",
+            error="cmd /usage 탐침이 이미 실행 중 — 이번 회차 건너뜀",
+            error_kind=PROBE_IN_PROGRESS,
+            source=SOURCE,
+            pool_class="spend",
+        )
+    binary, tried = _resolve_binary()
+    if binary is None:
+        return _binary_missing_result(tried)
+    _spawn_background_refresh()
+    return ProviderResult(
+        id="commandcode",
+        error="cmd /usage 탐침을 백그라운드에서 시작 — 이번 회차는 직전 값 사용",
+        error_kind=PROBE_IN_PROGRESS,
+        source=SOURCE,
+        pool_class="spend",
+        raw={"source": SOURCE, "background_refresh": True},
+    )
+
+
 fetch.pool_class = "spend"
+# collect() dispatches short-budget callers here instead of fetch(); the
+# synchronous probe stays reachable only through ``scopefuel refresh
+# commandcode`` (foreground or the detached --_worker it spawns).
+fetch.detached_probe = _deferred_fetch
