@@ -35,7 +35,36 @@ USAGE_TEXT = (
     "5-hour 1% · resets in 3h 52m / Weekly 1% · resets in 6d 22h"
 )
 UNPARSED_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "cmd_usage_m1b_unparsed.synthetic.txt"
+M1B_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "cmd_usage_m1b_screen.txt"
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _stubborn_stub_cmd(tmp_path: pathlib.Path) -> pathlib.Path:
+    """cmd stub reproducing the m1b fixture: an Enter read in the same chunk
+    as the typed text is swallowed — the /usage panel never renders."""
+
+    script = tmp_path / "cmd-stubborn"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time, tty\n"
+        "tty.setraw(sys.stdin.fileno())\n"  # a TUI reads keystrokes, not lines
+        "os.write(1, '❯ '.encode())\n"
+        "typed = False\n"
+        "buf = b''\n"
+        "while True:\n"
+        "    chunk = os.read(0, 4096)\n"
+        "    if not chunk:\n"
+        "        break\n"
+        "    buf += chunk\n"
+        "    if not typed and b'/usage' in buf:\n"
+        "        typed = True\n"
+        "        os.write(1, '❯ /usage   \\n'.encode())\n"  # the input-box echo
+        "    elif typed and (b'\\r' in chunk or b'\\n' in chunk):\n"
+        f"        os.write(1, {USAGE_TEXT.encode()!r} + b'\\n')\n"
+        "        time.sleep(1)\n"
+    )
+    script.chmod(0o755)
+    return script
 
 
 def _stub_cmd(tmp_path: pathlib.Path, name: str = "cmd") -> pathlib.Path:
@@ -312,6 +341,34 @@ def test_repeated_short_calls_never_stay_in_progress_forever(monkeypatch, tmp_pa
 # ---------------------------------------------------------------------------
 # (c) unparsed screens fail closed naming the missing part
 # ---------------------------------------------------------------------------
+
+
+def test_probe_writes_text_then_submits_enter_separately(monkeypatch, tmp_path):
+    """Mutant: restore the single '/usage\\r' write -> the stubborn stub never
+
+    renders the panel and this goes RED with stage=unparsed.
+    """
+
+    monkeypatch.setattr(commandcode, "BINARY", str(_stubborn_stub_cmd(tmp_path)))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    result = commandcode.fetch()
+    assert result.status == "ok"
+    assert len(result.buckets) == 3
+
+
+def test_m1b_verbatim_screen_fails_closed_naming_the_missing_panel():
+    """hk:doc fixtures/hk2182/m1b-usage-screen — '/usage' sat in the input box;
+
+    no panel ever rendered, so the parse must name the missing windows.
+    """
+
+    result = commandcode.parse(M1B_FIXTURE.read_text(), now=NOW)
+    assert result.error_kind == "parse_error"
+    assert "usage windows are missing" in result.error
+    detail = commandcode._missing_detail(M1B_FIXTURE.read_text())
+    assert detail == "one or more usage windows are missing"
 
 
 def test_m1b_synthetic_unparsed_screen_fails_closed():

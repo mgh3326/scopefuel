@@ -37,7 +37,15 @@ SOURCE = "cli:/usage"
 # hk 2160 r2: resolved per probe, not at import — importing this module with
 # HOME unset must not raise, and a test/host may relocate HOME after import.
 PROBE_WORKDIR: pathlib.Path | None = None
-PROBE_INPUT = "/usage\r"
+# hk 2182 (c): cmd's TUI never acts on an Enter written in the same os.write
+# as the command text (m1b fixture hk:doc fixtures/hk2182/m1b-usage-screen —
+# "/usage" sat in the input box for the full 30s). Write the text, wait for
+# its echo, then submit Enter separately.
+PROBE_INPUT = "/usage"
+PROBE_SUBMIT = "\r"
+# How long to wait for the "/usage" echo before submitting anyway — a TUI in
+# raw mode may not echo at all, and submission must still happen.
+ECHO_WAIT_S = 0.5
 TIMEOUT_S = 30.0
 TIMEOUT_MIN_S = 5.0
 TIMEOUT_MAX_S = 60.0
@@ -229,6 +237,9 @@ def _probe_once(binary: str) -> str:
         output = bytearray()
         deadline = time.monotonic() + timeout_s
         sent = False
+        sent_at = 0.0
+        sent_mark = 0
+        submitted = False
         panel_seen_at: float | None = None
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master_fd], [], [], 0.1)
@@ -254,7 +265,17 @@ def _probe_once(binary: str) -> str:
                 if not sent and _PROMPT.search(screen):
                     os.write(master_fd, PROBE_INPUT.encode())
                     sent = True
-                if sent:
+                    sent_at = time.monotonic()
+                    sent_mark = len(output)
+                if sent and not submitted:
+                    # Submit only once the typed text has echoed (or a slash
+                    # menu may render it as a selectable row); ECHO_WAIT_S is
+                    # the fallback for a TUI that never echoes.
+                    tail = _clean(output[sent_mark:].decode("utf-8", errors="replace"))
+                    if "/usage" in tail or time.monotonic() - sent_at >= ECHO_WAIT_S:
+                        os.write(master_fd, PROBE_SUBMIT.encode())
+                        submitted = True
+                if submitted:
                     try:
                         _parse_buckets(screen, now=dt.datetime.now(dt.UTC))
                     except ValueError:
@@ -268,9 +289,12 @@ def _probe_once(binary: str) -> str:
                 break
             if panel_seen_at is not None and time.monotonic() - panel_seen_at >= READY_SETTLE_S:
                 break
+            if sent and not submitted and time.monotonic() - sent_at >= ECHO_WAIT_S:
+                os.write(master_fd, PROBE_SUBMIT.encode())
+                submitted = True
 
         screen = _clean(output.decode("utf-8", errors="replace"))
-        if time.monotonic() >= deadline and not (sent and _complete(screen)):
+        if time.monotonic() >= deadline and not (submitted and _complete(screen)):
             raise ProbeTimeout(
                 [binary, "--no-session"],
                 timeout_s,
