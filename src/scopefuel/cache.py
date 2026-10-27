@@ -218,6 +218,20 @@ def _negative_cacheable(name: str, result: ProviderResult) -> bool:
     return bool(result.error)
 
 
+def _clear_negative(name: str) -> None:
+    """excluded/unsubscribed 로 건너뛴 pool 의 남은 부정 캐시를 지운다.
+
+    재활성화(class=spend/preserve, subscribed=true) 직후의 첫 호출이 이전
+    실패 창에 막히지 않고 다시 측정되게 하기 위해서다. 이 정리는 감사 쓰기가
+    아니다 — last_error* 는 건드리지 않는다.
+    """
+    with _exclusive_cache_lock():
+        data = _load()
+        entry = data.get(name)
+        if isinstance(entry, dict) and entry.pop("negative_until", None) is not None:
+            _save(data)
+
+
 def _bump_backoff(pools: dict, name: str, result: ProviderResult, now: float) -> None:
     """429 실패의 다음 허용 시각을 기록한다.
 
@@ -652,6 +666,11 @@ def collect(
         # --no-cache. The reason is served through the ordinary error row so
         # gate/recommend/status keep showing the pool instead of dropping it.
         if reason := _pool_skip_reason(name, policy_class, policy_note):
+            # A pool skipped in this state must not carry a negative-cache
+            # stamp from an earlier failure: re-enabling it has to probe on the
+            # next call. The skip itself writes no audit fields.
+            if isinstance(entry, dict) and "negative_until" in entry:
+                _clear_negative(name)
             results[index] = _skip_result(name, policy_class, reason)
             skipped.add(name)
             continue
