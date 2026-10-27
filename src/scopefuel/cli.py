@@ -917,7 +917,12 @@ def _emit_provider_explain(results: list[ProviderResult], names: list[str], now:
         print(kimi.explain_lockout_scan(result, now=now), file=sys.stderr)
 
 
-def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.datetime) -> str:
+def _render(
+    results: list[ProviderResult],
+    args: argparse.Namespace,
+    now: dt.datetime,
+    listed: list[ProviderResult] | None = None,
+) -> str:
     color = not args.no_color and sys.stdout.isatty()
     if args.raw:
         return json.dumps({r.id: r.raw for r in results}, indent=2, ensure_ascii=False)
@@ -925,7 +930,10 @@ def _render(results: list[ProviderResult], args: argparse.Namespace, now: dt.dat
         stale = _stale_build_verdict()
         free_short_window = free_window.display_value(free_window.active_record(now=now))
         providers = []
-        for result in results:
+        # hk 2136: ``providers`` also lists the manual-only pools (``listed``); the
+        # summary marks below still read ``results`` alone, so an unobserved pool
+        # never changes the host-level mark.
+        for result in results if listed is None else listed:
             item = result.as_dict(now=now)
             if result.id == "devin":
                 for bucket in item["buckets"]:
@@ -1627,6 +1635,18 @@ def _refresh_swe2_result(
         return result
     updated = refresh.refresh_swe2_result()
     return updated if updated is not None else result
+
+
+def _listed_with_manual_only(results: list[ProviderResult], *, now: dt.datetime) -> list[ProviderResult]:
+    """``--json`` providers list: the displayed results plus every manual-only pool (hk 2136).
+
+    The synthetic entries come from the same ``_with_manual_only_results`` the
+    gate path uses and are resolved through ``manual.apply_for_display``, so a
+    missing, stale or expired observation renders fail-closed rather than as
+    availability.
+    """
+    manual_only = _with_manual_only_results([])
+    return [*results, *manual.apply_for_display(manual_only, now=now)]
 
 
 def _with_manual_only_results(results: list[ProviderResult]) -> list[ProviderResult]:
@@ -2761,9 +2781,12 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         now = dt.datetime.now(dt.UTC)
         results = collect(fetchers, names, ttl_s=args.cache_ttl, use_cache=not args.no_cache)
+        listed = None
         if not args.raw:
             results = manual.apply_for_display(results, now=now)
-        print(_render(results, args, now), flush=True)
+            if args.json:
+                listed = _listed_with_manual_only(results, now=now)
+        print(_render(results, args, now, listed=listed), flush=True)
         if args.explain:
             _emit_provider_explain(results, names, now)
         if not args.raw and not args.json:
