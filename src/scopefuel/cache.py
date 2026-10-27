@@ -28,7 +28,7 @@ from .model import (
     _is_valid_used_pct,
     _normalize_pool_class,
 )
-from .policy import get_policy
+from .policy import get_policy, get_subscribed
 
 DEFAULT_TTL_S = 60.0
 # 창 길이에서 허용 낡음을 약 1%로 유도한 정적 TTL 표다: 5h≈18,000s → 180s,
@@ -44,6 +44,14 @@ PROVIDER_TTL_S = {
 }
 MAX_FETCH_WORKERS = 8  # 현재 provider 수 이하: 독립 HTTP/PTY fetch를 병렬화하되 무제한 spawn은 피한다.
 STALE_MAX_S = 6 * 3600.0  # 이보다 오래된 스냅샷은 폴백으로도 쓰지 않는다
+
+# hk 2114 — 실패한 프로브(파싱 실패·n/a·타임아웃·네트워크/PTY 오류)를 이 호스트에
+# 짧게 기억한다. 창 안에서는 gate·recommend·status·collect 가 fetcher 를 다시
+# 부르지 않고 마지막 정상 스냅샷(있으면 stale) 또는 실패를 그대로 서빙한다.
+# 속도 제한은 이 창이 아니라 위의 host backoff 를 그대로 쓴다.
+NEGATIVE_TTL_S = 600.0
+# PROVIDER_TTL_S 와 같은 표 스타일의 pool 별 재정의. 비어 있으면 NEGATIVE_TTL_S.
+NEGATIVE_TTL_S_BY_POOL: dict[str, float] = {}
 
 # task #576 — 429 이후 host-local backoff. Retry-After 양수는 그대로 존중하고,
 # 없거나 0이면 지수(60s → … → 15m 상한)로 늘린다. 상태는 호스트 로컬이다.
@@ -184,6 +192,32 @@ def _backoffable(name: str, result: ProviderResult) -> bool:
     return name in NETWORK_BACKOFF_POOLS and result.error_kind == "network"
 
 
+def _negative_ttl_s(name: str) -> float:
+    """pool 의 부정 캐시 TTL — 표에 없으면 NEGATIVE_TTL_S."""
+    return NEGATIVE_TTL_S_BY_POOL.get(name, NEGATIVE_TTL_S)
+
+
+def _negative_until(entry: object) -> float:
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        return float(entry.get("negative_until") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _negative_cacheable(name: str, result: ProviderResult) -> bool:
+    """부정 캐시에 남길 실패인가.
+
+    backoff 가 이미 있는 실패(429, NETWORK_BACKOFF_POOLS 의 네트워크 오류)는
+    그 창을 그대로 쓴다 — 여기서 두 번째 창을 열지 않는다. 경고만 있는 결과는
+    실패가 아니므로 종전처럼 캐시하지 않는다(#2114 이전 동작 유지).
+    """
+    if _backoffable(name, result):
+        return False
+    return bool(result.error)
+
+
 def _bump_backoff(pools: dict, name: str, result: ProviderResult, now: float) -> None:
     """429 실패의 다음 허용 시각을 기록한다.
 
@@ -227,6 +261,10 @@ def record_failure(name: str, result: ProviderResult, now: float) -> None:
     with _exclusive_cache_lock():
         data = _load()
         data[name] = _audit_failure(data.get(name), result, now)
+        if _negative_cacheable(name, result):
+            data[name]["negative_until"] = now + _negative_ttl_s(name)
+        else:
+            data[name].pop("negative_until", None)
         _save(data)
         if _backoffable(name, result):
             state = _load_backoff()
@@ -259,7 +297,9 @@ def _pool_class(fetcher: object) -> PoolClass | None:
 _VALID_POOL_CLASSES = frozenset({"preserve", "spend", "exclude"})
 
 
-def _effective_class(name: str, fetcher: object, payload_class: PoolClass | None = None) -> PoolClass:
+def _effective_class_and_note(
+    name: str, fetcher: object, payload_class: PoolClass | None = None
+) -> tuple[PoolClass, str | None]:
     explicit = _pool_class(fetcher)
     if explicit is not None:
         fallback: PoolClass = _normalize_pool_class(explicit)
@@ -267,7 +307,39 @@ def _effective_class(name: str, fetcher: object, payload_class: PoolClass | None
         fallback = payload_class  # type: ignore[assignment]
     else:
         fallback = "preserve"
-    return get_policy(name, fallback)[0]
+    return get_policy(name, fallback)
+
+
+def _effective_class(name: str, fetcher: object, payload_class: PoolClass | None = None) -> PoolClass:
+    return _effective_class_and_note(name, fetcher, payload_class)[0]
+
+
+def _pool_skip_reason(name: str, policy_class: PoolClass, policy_note: str | None) -> str | None:
+    """Never-probe reason for an excluded or unsubscribed pool (hk 2114).
+
+    The effective class and the **pool-level** subscribed flag decide. Profile
+    flags are deliberately ignored: one pool serves several profiles, so a
+    profile-level ``subscribed=true`` must not make the host probe a pool whose
+    pool-level flag says false.
+    """
+    if policy_class == "exclude":
+        reason = "class=exclude — 탐침 안 함"
+        return f"{reason} ({policy_note})" if policy_note else reason
+    subscribed, status = get_subscribed(name)
+    if not subscribed:
+        reason = "subscribed=false — 탐침 안 함"
+        return f"{reason} ({status})" if status else reason
+    return None
+
+
+def _skip_result(name: str, policy_class: PoolClass, reason: str) -> ProviderResult:
+    return ProviderResult(
+        id=name,
+        error=reason,
+        error_kind="excluded" if policy_class == "exclude" else "unsubscribed",
+        pool_class=policy_class,
+        note="탐침하지 않음",
+    )
 
 
 def _from_entry(
@@ -318,6 +390,81 @@ def _from_entry(
 
 def _failure_label(result: ProviderResult) -> str:
     return "속도 제한" if _is_rate_limited(result) else "조회 실패"
+
+
+def _failure_fallback(
+    name: str,
+    fetcher: object,
+    entry: dict,
+    result: ProviderResult,
+    now: float,
+    policy_class: PoolClass,
+    *,
+    error_at: float | None = None,
+) -> ProviderResult:
+    """실패 회차의 마지막 정상 스냅샷 폴백 — 실패 경로와 부정 캐시가 공유한다.
+
+    ``error_at`` 은 실패가 실제로 관측된 시각이다. live 실패는 ``now``,
+    부정 캐시는 기록된 ``last_error_at`` 을 넘겨 서빙 때마다 새 실패처럼
+    보이지 않게 한다.
+    """
+    age = now - float(entry.get("fetched_at") or 0)
+    stored_fp = (entry.get("result") or {}).get("account_fp")
+    has_snapshot = bool(entry.get("result"))
+    if stored_fp is not None and result.account_fp is not None and stored_fp != result.account_fp:
+        # 계정/구독 변경 의심 — 다른 계정의 스냅샷은 쓰지 않는다(자문 2558)
+        result.account_fp_match = False
+        return result
+    if has_snapshot and age <= STALE_MAX_S:
+        stale = _from_entry(entry, name, now, policy_class)
+        stale.note = f"{_failure_label(result)} → 캐시 사용 ({result.error})"
+        stale.last_error = result.error
+        if result.hint:
+            stale.last_error += f" — {result.hint}"
+        stale.last_error_at = now if error_at is None else error_at
+        stale.error_kind = result.error_kind
+        stale.http_status = result.http_status
+        stale.retry_after_s = result.retry_after_s
+        stale.account_fp_match = (
+            None
+            if stored_fp is None and result.account_fp is None
+            else stored_fp is not None and stored_fp == result.account_fp
+        )
+        return stale
+    if has_snapshot:
+        # task #614 — 정상 스냅샷이 존재하지만 6h 한도를 넘었다.
+        # 거부 사유가 "마지막 정상 값 없음"이 아니라 "너무 오래됨"이려면
+        # 나이를 결과에 남겨야 한다.
+        result.age_s = age
+    return result
+
+
+def _negative_result(
+    name: str,
+    fetcher: object,
+    entry: dict,
+    now: float,
+    policy_class: PoolClass,
+) -> ProviderResult:
+    """부정 캐시 창 안의 결과 — fetcher 를 부르지 않고 실패를 재구성한다."""
+    status = entry.get("last_http_status")
+    result = ProviderResult(
+        id=name,
+        error=entry.get("last_error") or "조회 실패",
+        error_kind=entry.get("last_error_kind"),
+        http_status=status if isinstance(status, int) else None,
+        pool_class=policy_class,
+    )
+    failed_at = entry.get("last_error_at")
+    return _failure_fallback(
+        name,
+        fetcher,
+        entry,
+        result,
+        now,
+        policy_class,
+        error_at=float(failed_at) if isinstance(failed_at, int | float) else now,
+    )
 
 
 def _backoff_result(
@@ -449,6 +596,10 @@ def _merge_results(
                 backoff_dirty = True
         for name, result in failures.items():
             data[name] = _audit_failure(data.get(name), result, now)
+            if _negative_cacheable(name, result):
+                data[name]["negative_until"] = now + _negative_ttl_s(name)
+            else:
+                data[name].pop("negative_until", None)
             if _backoffable(name, result):
                 _bump_backoff(backoff["pools"], name, result, now)
                 backoff_dirty = True
@@ -470,6 +621,8 @@ def collect(
     use_cache=False 도 파일을 읽는다 — 이번 호출에서 성공한 항목만 덮어쓰는 부분
     병합이므로 실패하거나 이번에 조회하지 않은 provider 의 기존 스냅샷은 남는다
     (#576: 예전에는 빈 dict 를 통째로 저장해 다른 provider 의 정상 값까지 사라졌다).
+    use_cache=False 는 **성공 스냅샷**만 무시한다 — 부정 캐시(NEGATIVE_TTL_S)와
+    excluded/unsubscribed 풀의 미탐침은 그대로 적용된다(hk 2114).
     """
     now = time.time() if now is None else now
     # task #578 — 측정 전에 계정 binding 을 고정한다(미등록이면 빈 dict, 동작 불변).
@@ -485,6 +638,7 @@ def collect(
     results: list[ProviderResult | None] = [None] * len(names)
     misses: list[tuple[int, str, object, dict | None, PoolClass, float]] = []
     policy_classes: dict[str, PoolClass] = {}
+    skipped: set[str] = set()
 
     for index, name in enumerate(names):
         entry = cache.get(name)
@@ -492,8 +646,15 @@ def collect(
         cached_class: PoolClass | None = None
         if isinstance(entry, dict):
             cached_class = (entry.get("result") or {}).get("pool_class")
-        policy_class = _effective_class(name, fetcher, cached_class)
+        policy_class, policy_note = _effective_class_and_note(name, fetcher, cached_class)
         policy_classes[name] = policy_class
+        # hk 2114 — excluded / unsubscribed pools are never probed, even with
+        # --no-cache. The reason is served through the ordinary error row so
+        # gate/recommend/status keep showing the pool instead of dropping it.
+        if reason := _pool_skip_reason(name, policy_class, policy_note):
+            results[index] = _skip_result(name, policy_class, reason)
+            skipped.add(name)
+            continue
         effective_ttl_s = ttl_s if ttl_s is not None else PROVIDER_TTL_S.get(name, DEFAULT_TTL_S)
         if use_cache and entry and now - float(entry.get("fetched_at") or 0) <= effective_ttl_s:
             fresh = _from_entry(entry, name, now, policy_class)
@@ -509,6 +670,13 @@ def collect(
             until = 0.0
         if until > now:
             results[index] = _backoff_result(name, fetcher, entry, state, now, until, policy_class)
+            continue
+
+        # hk 2114 — 부정 캐시 창 안에서는 fetcher 를 부르지 않는다. --no-cache
+        # 도 이 창을 건너뛰지 않는다: 스크립트 루프가 깨진 프로브를 두들기지
+        # 못하게 하는 것이 이 창의 목적이다. 창이 지나면 다시 측정한다.
+        if isinstance(entry, dict) and _negative_until(entry) > now:
+            results[index] = _negative_result(name, fetcher, entry, now, policy_class)
             continue
 
         misses.append(
@@ -582,6 +750,10 @@ def collect(
                     until,
                     policy_class,
                 ), False
+            # hk 2114 — 다른 프로세스가 그 사이 실패를 기록했을 수 있다.
+            # 부정 캐시 창은 --no-cache 도 건너뛰지 않는다(첫 스캔과 같은 뜻).
+            if isinstance(latest, dict) and _negative_until(latest) > now:
+                return _negative_result(name, fetcher, latest, now, policy_class), False
             # use_cache=False(--no-cache)는 첫 스캔과 같은 뜻으로 항상 fetch 한다 —
             # 재확인도 캐시 히트를 서빙하지 않는다(backoff 창은 위에서 여전히 막는다).
             if (
@@ -637,34 +809,9 @@ def collect(
                 results[index] = result
                 continue
             if isinstance(entry, dict):
-                age = now - float(entry.get("fetched_at") or 0)
-                stored_fp = (entry.get("result") or {}).get("account_fp")
-                if stored_fp is not None and result.account_fp is not None and stored_fp != result.account_fp:
-                    # 계정/구독 변경 의심 — 다른 계정의 스냅샷은 쓰지 않는다(자문 2558)
-                    result.account_fp_match = False
-                elif age <= STALE_MAX_S:
-                    stale = _from_entry(entry, name, now, policy_class)
-                    stale.note = f"{_failure_label(result)} → 캐시 사용 ({result.error})"
-                    stale.last_error = result.error
-                    if result.hint:
-                        stale.last_error += f" — {result.hint}"
-                    stale.last_error_at = now
-                    stale.error_kind = result.error_kind
-                    stale.http_status = result.http_status
-                    stale.retry_after_s = result.retry_after_s
-                    stale.account_fp_match = (
-                        None
-                        if stored_fp is None and result.account_fp is None
-                        else stored_fp is not None and stored_fp == result.account_fp
-                    )
-                    results[index] = stale
-                    continue
-                elif entry.get("result"):
-                    # task #614 — 정상 스냅샷이 존재하지만 6h 한도를 넘었다.
-                    # 거부 사유가 "마지막 정상 값 없음"이 아니라 "너무 오래됨"이려면
-                    # 나이를 결과에 남겨야 한다.
-                    result.age_s = age
-            results[index] = result
+                results[index] = _failure_fallback(name, _fetcher, entry, result, now, policy_class)
+            else:
+                results[index] = result
             continue
 
         if not attempted:
@@ -691,6 +838,10 @@ def collect(
     # v2 저장소에는 쓰지 않는다.
     for index, name in enumerate(names):
         current = results[index]
+        if name in skipped:
+            # hk 2114 — an excluded/unsubscribed pool stays "not probed"; a
+            # remote snapshot must not silently turn it into a measurement.
+            continue
         if current is None or not quota_share.remote_eligible(current):
             continue
         remote = quota_share.remote_result(name, fetchers.get(name), current, policy_classes[name], now=now)

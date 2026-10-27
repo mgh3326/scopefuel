@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import importlib
+import importlib.util
+import io
 import json
+import pathlib
+import subprocess
+import sys
+import tarfile
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +19,7 @@ from scopefuel.model import Bucket, ProviderResult, Scope
 
 NOW = dt.datetime(2026, 10, 26, 12, 0, tzinfo=dt.UTC)
 TODAY = NOW.date()
+PACE_BASE_COMMIT = "49a25ed181f1342f78b0c12ff5a997ffed88a529"
 
 
 def _bucket(window: str, used: float, reset_in_hours: float | None, *, scope: Scope | None = None) -> Bucket:
@@ -29,6 +38,31 @@ def _provider(pool: str, *buckets: Bucket, pool_class: str = "spend") -> Provide
     return ProviderResult(id=pool, pool_class=pool_class, buckets=list(buckets))  # type: ignore[arg-type]
 
 
+def _load_pace_base(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    if subprocess.run(["git", "cat-file", "-e", PACE_BASE_COMMIT], cwd=repo, capture_output=True).returncode:
+        subprocess.run(
+            ["git", "fetch", "--depth=1", "origin", PACE_BASE_COMMIT],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+    archive = subprocess.run(
+        ["git", "archive", PACE_BASE_COMMIT, "src"], cwd=repo, check=True, capture_output=True
+    ).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as source:
+        source.extractall(tmp_path, filter="data")
+    package = tmp_path / "src/scopefuel"
+    spec = importlib.util.spec_from_file_location(
+        "scopefuel_pace_base", package / "__init__.py", submodule_search_locations=[str(package)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return importlib.import_module("scopefuel_pace_base.recommend")
+
+
 @pytest.fixture(autouse=True)
 def isolate_gate_side_effects(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
@@ -37,7 +71,7 @@ def isolate_gate_side_effects(monkeypatch, tmp_path):
     monkeypatch.setattr(recommend, "_inflight_gate", lambda *args, **kwargs: None)
 
 
-def test_weekly_pace_exhaustion_refuses_and_reports_all_required_fields(monkeypatch):
+def test_weekly_over_pace_is_admitted_and_reports_all_required_fields(monkeypatch):
     monkeypatch.setattr(
         recommend,
         "_inflight_gate",
@@ -49,8 +83,8 @@ def test_weekly_pace_exhaustion_refuses_and_reports_all_required_fields(monkeypa
         [_provider("claude", _bucket("7d", 50, 144))], "sonnet", today=TODAY, now=NOW
     )
 
-    assert result.ok is False
-    assert result.reason.startswith("pace_exhaustion")
+    assert result.ok is True
+    assert "pace-warning pool=claude window=7d" in result.reason
     for field in (
         "pool=claude",
         "window=7d",
@@ -71,7 +105,7 @@ def test_weekly_pace_with_headroom_is_admitted():
     assert "pace=within-limit" in result.reason
 
 
-def test_any_window_over_pace_refuses_even_when_weekly_is_on_pace():
+def test_5h_only_over_pace_is_admitted_with_warning():
     result = recommend.gate_check(
         [
             _provider(
@@ -84,9 +118,96 @@ def test_any_window_over_pace_refuses_even_when_weekly_is_on_pace():
         today=TODAY,
         now=NOW,
     )
-    assert result.ok is False
-    assert "pace_exhaustion" in result.reason
+    assert result.ok is True
+    assert "pace-warning pool=grok window=5h" in result.reason
     assert "window=5h" in result.reason
+
+
+def test_consult_only_over_pace_is_admitted_with_operator_request():
+    result = recommend.gate_check(
+        [_provider("claude", _bucket("7d", 50, 144))],
+        "fable",
+        today=TODAY,
+        now=NOW,
+        operator_request="hk:task/1",
+    )
+    assert result.ok is True
+    assert result.operator_request_ref == "hk:task/1"
+    assert "pace-warning pool=claude window=7d" in result.reason
+
+
+@pytest.mark.parametrize(("window", "used"), [("7d", 99.0), ("7d", 100.0), ("5h", 100.0), ("1d", 100.0)])
+def test_real_exhaustion_cutoff_still_refuses(window, used):
+    result = recommend.gate_check(
+        [_provider("claude", _bucket(window, used, 4 if window == "5h" else 144))],
+        "sonnet",
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "pace-warning" not in result.reason
+
+
+def test_decision_equivalence_to_real_exhaustion_rule():
+    snapshots = [
+        ("in pace", "7d", 20.0, 120.0, False),
+        ("weekly over pace", "7d", 50.0, 144.0, False),
+        ("5h over pace", "5h", 50.0, 4.0, False),
+        ("99 percent cutoff", "7d", 99.0, 144.0, True),
+        ("100 percent used", "7d", 100.0, 144.0, True),
+    ]
+    for _name, window, used, reset, refuses in snapshots:
+        result = recommend.gate_check(
+            [_provider("claude", _bucket(window, used, reset))],
+            "sonnet",
+            today=TODAY,
+            now=NOW,
+        )
+        assert result.ok is not refuses
+
+
+def test_underpace_and_nonspend_outputs_match_49a25ed(tmp_path, monkeypatch):
+    base = _load_pace_base(tmp_path / "base")
+    monkeypatch.setattr(base, "_observe_exhaustion", lambda *args, **kwargs: None)
+    monkeypatch.setattr(base, "_inflight_gate", lambda *args, **kwargs: None)
+
+    def snapshot(module):
+        model = importlib.import_module(f"{module.__package__}.model")
+
+        def item(pool, used, reset, pool_class):
+            bucket = model.Bucket(
+                label="7d",
+                window="7d",
+                used_pct=used,
+                resets_at=(NOW + dt.timedelta(hours=reset)).isoformat(),
+                scope=model.Scope("account"),
+                horizon="week",
+            )
+            return model.ProviderResult(id=pool, pool_class=pool_class, buckets=[bucket])
+
+        return [item("claude", 20, 120, "spend"), item("codex", 80, 144, "preserve")]
+
+    for profile in ("sonnet", "codex-luna"):
+        current_result = recommend.gate_check(snapshot(recommend), profile, today=TODAY, now=NOW)
+        base_result = base.gate_check(snapshot(base), profile, today=TODAY, now=NOW)
+        assert asdict(current_result) == asdict(base_result)
+
+    outputs = []
+    for module in (recommend, base):
+        profiles = {profile.name: profile for rows in module.GRADE_TABLE.values() for profile in rows}
+        table = {grade: [] for grade in module.GRADE_TABLE}
+        table["A"] = [profiles["sonnet"], profiles["codex-luna"]]
+        providers = snapshot(module)
+        outputs.append(
+            (
+                module.recommend(providers, "A", today=TODAY, now=NOW, grade_table=table),
+                json.dumps(
+                    module.recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table),
+                    ensure_ascii=False,
+                ),
+            )
+        )
+    assert outputs[0] == outputs[1]
 
 
 def test_non_spend_pool_and_swe2_free_bucket_are_exempt():
@@ -121,7 +242,7 @@ def test_pace_override_requires_valid_ref_and_records_valid_ref():
     )
     assert admitted.ok is True
     assert admitted.pace_override_ref == "hk:task/625"
-    assert "pace_exhaustion overridden" in admitted.reason
+    assert "pace-warning pool=claude window=7d" in admitted.reason
     assert malformed.ok is False
     assert "pace_override_ref_invalid" in malformed.reason
 
@@ -138,9 +259,9 @@ def test_pace_override_does_not_satisfy_existing_consult_only_rung_rule():
     assert "--operator-request" in result.reason
 
 
-def test_consult_only_spend_pool_uses_pace_gate_and_keeps_both_refs():
+def test_consult_only_spend_pool_records_both_refs_without_pace_override():
     provider = [_provider("claude", _bucket("7d", 50, 144))]
-    refused = recommend.gate_check(
+    admitted = recommend.gate_check(
         provider,
         "fable",
         today=TODAY,
@@ -156,10 +277,11 @@ def test_consult_only_spend_pool_uses_pace_gate_and_keeps_both_refs():
         pace_override_ref="hk:task/2",
     )
 
-    assert refused.ok is False
-    assert refused.reason.startswith("pace_exhaustion pool=claude")
+    assert admitted.ok is True
+    assert "pace-warning pool=claude window=7d" in admitted.reason
+    assert admitted.operator_request_ref == "hk:task/1"
     assert overridden.ok is True
-    assert "pace_exhaustion overridden" in overridden.reason
+    assert "pace-warning pool=claude window=7d" in overridden.reason
     assert overridden.operator_request_ref == "hk:task/1"
     assert overridden.pace_override_ref == "hk:task/2"
 
@@ -185,6 +307,10 @@ def test_cli_option_and_gate_record_carry_the_pace_override_ref(monkeypatch, tmp
     monkeypatch.setattr(cli, "_emit_stale_build_warning", lambda: None)
     record_path = tmp_path / "gate.json"
 
+    admitted_rc = cli.main(["gate", "-m", "sonnet", "--no-cache"])
+    assert admitted_rc == 0
+    assert "pace-warning pool=claude window=7d" in capsys.readouterr().out
+
     rc = cli.main(
         [
             "gate",
@@ -208,11 +334,22 @@ def test_gate_help_states_pace_rule_and_exemptions(capsys):
     with pytest.raises(SystemExit) as result:
         cli.main(["gate", "--help"])
     assert result.value.code == 0
-    help_text = capsys.readouterr().out
+    help_text = " ".join(capsys.readouterr().out.split())
     assert "--pace-override REF" in help_text
     assert "첫 5%" in help_text
     assert "non-spend" in help_text
     assert "SWE-2 free" in help_text
+    assert "감사" in help_text
+    assert "real exhaustion refuses" in help_text
+
+
+def test_recommend_help_states_pace_ranks_and_warns(capsys):
+    parser = cli.build_parser([])
+    with pytest.raises(SystemExit) as result:
+        parser.parse_args(["--help"])
+    assert result.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "Pace ranks and warns; only real exhaustion refuses" in help_text
 
 
 @pytest.mark.parametrize(
@@ -235,7 +372,7 @@ def test_uncomputable_or_early_window_is_admitted_and_named_pace_unknown(
     assert "pace-unknown window=7d" in result.reason
 
 
-def test_operator_snapshot_claude_is_refused_and_codex_is_admitted():
+def test_operator_snapshot_claude_over_pace_is_admitted_and_codex_is_admitted():
     claude = recommend.gate_check(
         [_provider("claude", _bucket("7d", 69, 127.2))], "sonnet", today=TODAY, now=NOW
     )
@@ -245,8 +382,8 @@ def test_operator_snapshot_claude_is_refused_and_codex_is_admitted():
         today=TODAY,
         now=NOW,
     )
-    assert claude.ok is False
-    assert "pace_exhaustion" in claude.reason
+    assert claude.ok is True
+    assert "pace-warning pool=claude window=7d" in claude.reason
     assert codex.ok is True
 
 
@@ -254,25 +391,73 @@ def test_manual_window_observation_uses_the_same_pace_admission():
     manual = _provider("claude", _bucket("7d", 50, 144))
     manual.source = "manual"
     result = recommend.gate_check([manual], "sonnet", today=TODAY, now=NOW)
-    assert result.ok is False
-    assert "pace_exhaustion" in result.reason
+    assert result.ok is True
+    assert "pace-warning pool=claude window=7d" in result.reason
 
 
-def test_recommend_marks_any_window_refusal_and_never_scores_it_as_waste():
+def test_recommend_lists_over_pace_rows_with_warnings_and_headroom_order():
     profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
     table = {grade: [] for grade in recommend.GRADE_TABLE}
-    table["A+"] = [profiles["grok-hi"], profiles["sonnet"]]
+    table["A"] = [profiles["sonnet"], profiles["grok-hi"], profiles["kimi-k3-low"]]
     providers = [
-        _provider("grok", _bucket("5h", 50, 4), _bucket("7d", 20, 120)),
-        _provider("claude", _bucket("7d", 20, 120), pool_class="preserve"),
+        _provider("claude", _bucket("7d", 20, 120)),
+        _provider("grok", _bucket("7d", 50, 144)),
+        _provider("kimi", _bucket("7d", 80, 144)),
     ]
-    data = recommend.recommend_dict(providers, "A+", today=TODAY, now=NOW, grade_table=table)
+    data = recommend.recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
+    assert [row["profile"] for row in data["rows"]] == ["sonnet", "grok-hi", "kimi-k3-low"]
+    assert all(row["kind"] == "candidate" for row in data["rows"])
     grok = next(row for row in data["rows"] if row["profile"] == "grok-hi")
-    sonnet = next(row for row in data["rows"] if row["profile"] == "sonnet")
-    assert grok["kind"] == "pace_exhaustion"
-    assert "window=5h" in grok["reason"]
-    assert "score" not in grok
-    assert sonnet["kind"] == "candidate"
+    kimi = next(row for row in data["rows"] if row["profile"] == "kimi-k3-low")
+    assert "pace-warning pool=grok window=7d" in grok["windows"]
+    assert "pace-warning pool=kimi window=7d" in kimi["windows"]
+
+
+def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_headroom():
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["C"] = [profiles["sonnet"], profiles["kimi-k3-low"]]
+    providers = [
+        _provider("claude", _bucket("7d", 50, 144)),
+        _provider("kimi", _bucket("7d", 70, 144)),
+        _provider("anthropic-api", _bucket("7d", 25, 144)),
+    ]
+
+    data = recommend.recommend_dict(providers, "C", today=TODAY, now=NOW, grade_table=table)
+    rows = [row for row in data["rows"] if row["kind"] == "candidate"]
+    names = [row["profile"] for row in rows]
+    credit = next(row for row in rows if row["profile"] == "pi-sonnet55")
+
+    assert names.index("sonnet") < names.index("kimi-k3-low") < names.index("pi-sonnet55")
+    assert (
+        "pace-warning pool=claude window=7d"
+        in next(row for row in rows if row["profile"] == "sonnet")["windows"]
+    )
+    assert (
+        "pace-warning pool=kimi window=7d"
+        in next(row for row in rows if row["profile"] == "kimi-k3-low")["windows"]
+    )
+    assert "pace-warning pool=anthropic-api window=7d" in credit["windows"]
+
+
+def test_swe2_free_bucket_stays_listed_and_exempt_from_pace_and_waste():
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["devin-swe2"]]
+    evaluation = recommend._evaluate(
+        [_provider("devin", _bucket("7d", 80, 144, scope=Scope("model", "swe-2-high")))],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+    assert len(evaluation.included) == 1
+    candidate = evaluation.included[0]
+    assert "pace=exempt (SWE-2 free bucket)" in candidate.windows_display
+    assert candidate.waste_term == 0
 
 
 def test_recommend_marks_pace_unknown_in_candidate_windows():
@@ -310,3 +495,87 @@ def test_recommend_unknown_pace_does_not_get_waste_boost():
     candidate = evaluation.included[0]
     assert "pace-unknown window=7d" in candidate.windows_display
     assert candidate.waste_term == 0
+
+
+def test_recommend_swe2_free_bucket_is_pace_exempt_not_excluded():
+    """The gate's SWE-2 free-bucket exemption (hk 2087 rule 5) holds at recommend level too."""
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["devin-swe2"]]
+    # This rung's bucket would exhaust long before reset if it were judged as
+    # a spend-pool window: elapsed 24h, burn 3.33%/h, time_to_exhaust 6h < 144h.
+    free_bucket = _bucket("7d", 80, 144, scope=Scope("model", "swe-2-high"))
+    evaluation = recommend._evaluate(
+        [_provider("devin", free_bucket)],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+
+    assert [candidate.profile.name for candidate in evaluation.included] == ["devin-swe2"]
+    candidate = evaluation.included[0]
+    assert "pace=exempt (SWE-2 free bucket)" in candidate.windows_display
+    assert candidate.waste_term == 0
+    assert not any(item.kind == "pace_exhaustion" for item in evaluation.excluded)
+
+
+def test_recommend_waste_removal_subtracts_the_braked_share():
+    """Removing WASTE subtracts SCORE_WASTE_WEIGHT*waste*brake, not the unbraked share."""
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["grok-hi"]]
+    # The 5h window sits under the brake knee and reports no reset (pace
+    # unknown) → the row is not pace_waste_eligible, so its WASTE share is
+    # removed. The 7d budget window is on pace and carries a nonzero waste
+    # term (90 remaining, burn 10/24%/h → waste 30).
+    evaluation = recommend._evaluate(
+        [_provider("grok", _bucket("5h", 80, None), _bucket("7d", 10, 144))],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+
+    assert len(evaluation.included) == 1
+    candidate = evaluation.included[0]
+    assert candidate.brake == pytest.approx(0.4)
+    assert candidate.waste_term == 0
+    expected = (
+        candidate.capacity_term + recommend.SCORE_THRU_WEIGHT * candidate.throughput_term
+    ) * candidate.brake
+    assert candidate.score == pytest.approx(expected)
+
+
+def test_recommend_waste_removal_is_unchanged_when_brake_is_one():
+    """A spend row with no short window keeps today's exact score (brake 1)."""
+    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    table = {grade: [] for grade in recommend.GRADE_TABLE}
+    table["A+"] = [profiles["grok-hi"]]
+    # 7d at elapsed 8h is inside the first 5% of its window → pace unknown →
+    # WASTE removal path; waste term is 79 and the brake is 1 (no ≤6h window).
+    evaluation = recommend._evaluate(
+        [_provider("grok", _bucket("7d", 1, 160))],
+        "A+",
+        TODAY,
+        NOW,
+        urgency_hours=24,
+        bench_scores=None,
+        normalized_prices={},
+        table=table,
+    )
+
+    assert len(evaluation.included) == 1
+    candidate = evaluation.included[0]
+    assert candidate.brake == pytest.approx(1.0)
+    assert candidate.waste_term == 0
+    expected = (
+        candidate.capacity_term + recommend.SCORE_THRU_WEIGHT * candidate.throughput_term
+    ) * candidate.brake
+    assert candidate.score == pytest.approx(expected)

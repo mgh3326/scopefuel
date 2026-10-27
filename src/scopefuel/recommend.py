@@ -2655,6 +2655,27 @@ class _PaceWindowVerdict:
         )
 
 
+@dataclass(frozen=True)
+class _PaceHeadroom:
+    rank: float | None
+    warnings: tuple[_PaceWindowVerdict, ...]
+    unknowns: tuple[_PaceWindowVerdict, ...]
+
+
+def _pace_headroom(verdicts: list[_PaceWindowVerdict]) -> _PaceHeadroom:
+    """Return warning windows and their tightest TTE/reset ranking ratio."""
+    warnings = tuple(verdict for verdict in verdicts if verdict.exhausts_before_reset)
+    unknowns = tuple(verdict for verdict in verdicts if verdict.unknown)
+    ratios = [
+        verdict.time_to_exhaust / verdict.hours_to_reset
+        for verdict in warnings
+        if verdict.time_to_exhaust is not None
+        and verdict.hours_to_reset is not None
+        and verdict.hours_to_reset > 0
+    ]
+    return _PaceHeadroom(min(ratios) if ratios else None, warnings, unknowns)
+
+
 @dataclass
 class _Candidate:
     profile: Profile
@@ -2682,6 +2703,7 @@ class _Candidate:
     throughput_term: float = 0.0
     score: float = 0.0
     imminent_exhaustion: bool = False
+    pace_headroom: float | None = None
     blended_price: float | None = None
     value_ratio: float | None = None
     value_sort_skipped: bool = False
@@ -3139,16 +3161,14 @@ def _format_pace_verdicts(verdicts: list[_PaceWindowVerdict]) -> str:
     )
 
 
-def _pace_exhaustion_reason(
+def _pace_warning_line(
     provider_id: str,
     verdict: _PaceWindowVerdict,
     *,
     inflight_tag: str | None = None,
-    other_verdicts: list[_PaceWindowVerdict] | None = None,
 ) -> str:
-    """Stable one-line pace refusal with enough data to audit the comparison."""
     parts = [
-        "pace_exhaustion",
+        "pace-warning",
         f"pool={provider_id}",
         f"window={verdict.window}",
         f"remaining={_pace_number(verdict.remaining_pct)}%",
@@ -3160,11 +3180,38 @@ def _pace_exhaustion_reason(
     ]
     if inflight_tag:
         parts.append(inflight_tag)
-    elif inflight_tag == "":
-        parts.append("inflight=0")
-    unknown = [item.window for item in (other_verdicts or []) if item.unknown]
-    parts.extend(f"pace-unknown window={window}" for window in unknown)
     return " ".join(parts)
+
+
+def _format_pace_warnings(
+    provider_id: str,
+    headroom: _PaceHeadroom,
+    *,
+    inflight_tag: str | None = None,
+) -> str:
+    lines = [
+        _pace_warning_line(provider_id, verdict, inflight_tag=inflight_tag) for verdict in headroom.warnings
+    ]
+    lines.extend(f"pace-unknown window={verdict.window}" for verdict in headroom.unknowns)
+    return "\n".join(lines)
+
+
+def _format_recommend_pace(
+    provider_id: str,
+    verdicts: list[_PaceWindowVerdict],
+    headroom: _PaceHeadroom,
+) -> str:
+    if not headroom.warnings:
+        return _format_pace_verdicts(verdicts)
+    warning_ids = {id(verdict) for verdict in headroom.warnings}
+    return " · ".join(
+        _pace_warning_line(provider_id, verdict)
+        if id(verdict) in warning_ids
+        else f"pace-unknown window={verdict.window}"
+        if verdict.unknown
+        else f"pace=within-limit window={verdict.window}"
+        for verdict in verdicts
+    )
 
 
 def _constraint_sort_key(state: _WindowState) -> tuple[int, float, float, str]:
@@ -4239,6 +4286,57 @@ def _inflight_headroom(
     return None
 
 
+def _policy_exclude_gate_result(
+    *,
+    profile_name: str,
+    provider_id: str,
+    grade: Grade | None,
+    rung_suffix: str,
+    result: ProviderResult | None,
+    alternatives: Callable[[], tuple[str, ...]],
+    missing: tuple[str, ...],
+    audit: dict[str, object],
+    today: dt.date,
+) -> GateResult | None:
+    """Excluded pool refusal, decided before any measurement check (hk 2114).
+
+    collect() never probes an excluded pool, so the gate must not turn the
+    "not probed" row into "unmeasurable": the pool's own policy reason is the
+    answer, exactly as it was when a measurement happened to exist.
+
+    ``alternatives`` is lazy: building it runs the whole recommend evaluation
+    (and observes exhaustion), which must not happen for a pool that is not
+    excluded — that would send the exhaustion notice before the gate's own
+    observation and turn the first gate's reason into "already notified".
+    """
+    fallback: PoolClass = (
+        result.pool_class
+        if result is not None and result.pool_class in ("preserve", "spend", "exclude")
+        else "preserve"
+    )
+    effective_class = get_policy(provider_id, fallback, today=today)[0]
+    if effective_class != "exclude":
+        return None
+    override = get_active_override(provider_id, today=today)
+    reason_parts = [f"정책 제외 ({provider_id}"]
+    if override is not None and override.until:
+        reason_parts.append(f"until {override.until.isoformat()}")
+    if override is not None and override.note:
+        reason_parts.append(override.note)
+    return GateResult(
+        ok=False,
+        profile=profile_name,
+        provider_id=provider_id,
+        grade=grade,
+        reason=", ".join(reason_parts) + ")" + rung_suffix,
+        used_pct=None,
+        pool_class=effective_class,
+        alternatives=alternatives(),
+        missing_windows=missing,
+        **audit,
+    )
+
+
 def gate_check(
     providers: list[ProviderResult],
     profile_name: str,
@@ -4670,6 +4768,21 @@ def gate_check(
                 missing_windows=missing,
                 **audit,
             )
+        # hk 2114 — same rule as the graded path: an excluded pool is never
+        # probed, so its policy reason is decided before measurability.
+        excluded = _policy_exclude_gate_result(
+            profile_name=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            rung_suffix="",
+            result=result,
+            alternatives=lambda: (),
+            missing=missing,
+            audit=audit,
+            today=today,
+        )
+        if excluded is not None:
+            return excluded
         if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
             return GateResult(
                 ok=False,
@@ -4718,27 +4831,6 @@ def gate_check(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-        # Consultation and retired experiments retain fable's fail-closed
-        # exclude check. Ordinary D3 profiles keep their previous quota behavior.
-        if consult_only and effective_class == "exclude":
-            override = get_active_override(provider_id, today=today)
-            reason_parts = [f"정책 제외 ({provider_id}"]
-            if override is not None and override.until:
-                reason_parts.append(f"until {override.until.isoformat()}")
-            if override is not None and override.note:
-                reason_parts.append(override.note)
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=None,
-                reason=", ".join(reason_parts) + ")",
-                used_pct=used_pct,
-                pool_class=effective_class,
-                missing_windows=missing,
-                unknown_plan=unknown_plan,
-                **audit,
-            )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
         notify_status = _observe_exhaustion(
@@ -4797,40 +4889,20 @@ def gate_check(
         pace_suffix = ""
         if effective_class == "spend":
             pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
-            pace_exhaustion = next(
-                (verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None
-            )
-            if pace_exhaustion is not None:
-                pace_reason = _pace_exhaustion_reason(
+            pace_headroom = _pace_headroom(pace_verdicts)
+            if pace_headroom.warnings:
+                pace_suffix = "\n" + _format_pace_warnings(
                     provider_id,
-                    pace_exhaustion,
+                    pace_headroom,
                     inflight_tag=_pace_inflight_tag(in_flight),
-                    other_verdicts=pace_verdicts,
                 )
-                if pace_override_ref is None:
-                    return GateResult(
-                        ok=False,
-                        profile=profile_name,
-                        provider_id=provider_id,
-                        grade=None,
-                        reason=pace_reason,
-                        used_pct=100.0 - pace_exhaustion.remaining_pct,
-                        pool_class=effective_class,
-                        missing_windows=missing,
-                        unknown_plan=unknown_plan,
-                        inflight=in_flight.tag if in_flight is not None else None,
-                        inflight_warning=in_flight.warning if in_flight is not None else None,
-                        **audit,
-                    )
-                pace_suffix = f"pace_exhaustion overridden {pace_reason}"
-                pace_suffix += f" pace_override_ref={pace_override_ref}"
             else:
                 pace_suffix = _format_pace_verdicts(pace_verdicts)
         reason = f"{profile_name} pool={provider_id} 사용 {used_pct:g}% class={effective_class}"
         reason += _exhaust_suffix(cutoff_status, notify_status)
         reason += _missing_windows_tag(missing, "측정된 창으로 판정")
         if pace_suffix:
-            reason += f" {pace_suffix}"
+            reason += pace_suffix if pace_suffix.startswith("\n") else f" {pace_suffix}"
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if operator_request is not None:
@@ -5000,6 +5072,22 @@ def gate_check(
             **audit,
         )
 
+    # hk 2114 — exclude precedes every measurement check: an excluded pool is
+    # not probed at all, so "no measurement" must not replace the policy reason.
+    excluded = _policy_exclude_gate_result(
+        profile_name=profile_name,
+        provider_id=provider_id,
+        grade=grade,
+        rung_suffix=rung_suffix,
+        result=result,
+        alternatives=alternatives,
+        missing=missing,
+        audit=audit,
+        today=today,
+    )
+    if excluded is not None:
+        return excluded
+
     if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
         alts = alternatives()
         return GateResult(
@@ -5057,28 +5145,6 @@ def gate_check(
         result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
     )
     effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-    override = get_active_override(provider_id, today=today)
-
-    if effective_class == "exclude":
-        alts = alternatives()
-        reason_parts = [f"정책 제외 ({provider_id}"]
-        if override is not None and override.until:
-            reason_parts.append(f"until {override.until.isoformat()}")
-        if override is not None and override.note:
-            reason_parts.append(override.note)
-        return GateResult(
-            ok=False,
-            profile=profile_name,
-            provider_id=provider_id,
-            grade=grade,
-            reason=", ".join(reason_parts) + ")" + rung_suffix,
-            used_pct=used_pct,
-            pool_class=effective_class,
-            alternatives=alts,
-            missing_windows=missing,
-            unknown_plan=unknown_plan,
-            **audit,
-        )
 
     cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
@@ -5145,40 +5211,12 @@ def gate_check(
     pace_suffix = ""
     if effective_class == "spend":
         pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
-        pace_exhaustion = next((verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None)
-        if pace_exhaustion is not None:
-            if pace_override_ref is None:
-                alts = alternatives()
-                reason = _pace_exhaustion_reason(
-                    provider_id,
-                    pace_exhaustion,
-                    inflight_tag=_pace_inflight_tag(in_flight),
-                    other_verdicts=pace_verdicts,
-                )
-                return GateResult(
-                    ok=False,
-                    profile=profile_name,
-                    provider_id=provider_id,
-                    grade=grade,
-                    reason=reason,
-                    used_pct=100.0 - pace_exhaustion.remaining_pct,
-                    pool_class=effective_class,
-                    alternatives=alts,
-                    missing_windows=missing,
-                    unknown_plan=unknown_plan,
-                    inflight=in_flight.tag if in_flight is not None else None,
-                    inflight_warning=in_flight.warning if in_flight is not None else None,
-                    **audit,
-                )
-            pace_suffix = (
-                "pace_exhaustion overridden "
-                + _pace_exhaustion_reason(
-                    provider_id,
-                    pace_exhaustion,
-                    inflight_tag=_pace_inflight_tag(in_flight),
-                    other_verdicts=pace_verdicts,
-                )
-                + f" pace_override_ref={pace_override_ref}"
+        pace_headroom = _pace_headroom(pace_verdicts)
+        if pace_headroom.warnings:
+            pace_suffix = "\n" + _format_pace_warnings(
+                provider_id,
+                pace_headroom,
+                inflight_tag=_pace_inflight_tag(in_flight),
             )
         else:
             pace_suffix = _format_pace_verdicts(pace_verdicts)
@@ -5199,7 +5237,7 @@ def gate_check(
         if accepted is not None:
             reason += f" [{_stale_tag(result, accepted)}]"
         if pace_suffix:
-            reason += f" {pace_suffix}"
+            reason += pace_suffix if pace_suffix.startswith("\n") else f" {pace_suffix}"
         if operator_request is not None:
             tag = _operator_request_audit(
                 operator_request, audit_requested_by or "unknown", escalation_override
@@ -5231,7 +5269,7 @@ def gate_check(
     if accepted is not None:
         reason += f" [{_stale_tag(result, accepted)}]"
     if pace_suffix:
-        reason += f" {pace_suffix}"
+        reason += pace_suffix if pace_suffix.startswith("\n") else f" {pace_suffix}"
     if operator_request is not None:
         reason += f" [{_operator_request_audit(operator_request, audit_requested_by or 'unknown', False)}]"
     reason += _e6_arm_suffix(e6_admitted)
@@ -5354,20 +5392,24 @@ def _recommend_rank_key(
     value_order: dict[int, int],
     intra_pool_rank: dict[int, int],
     slot: int,
-) -> tuple[int, int, int, int, int, float, int, int, int, int, int]:
+) -> tuple[int, int, float, int, int, int, int, float, int, int, int, int, int]:
     """The one total order every included ``--recommend`` candidate sorts by.
 
     hk 2079 (operator r1026prio): the anthropic-api credit row is a parallel
     option, never a promotion over the standard lanes. The leading key keeps
     every credit row after every non-credit row (SWE-2 free and the
     subscription quota alike), so it can never rank above an eligible
-    subscription row for the same seat; the remaining keys are unchanged, so
-    the standard lanes keep their existing order byte for byte.
+    subscription row for the same seat.
+
+    hk 2099 (operator r1026pacesoft): pace headroom comes next: rows without an
+    exhausting window keep today's order ahead of all over-pace rows; over-pace
+    rows sort by the largest minimum TTE/reset ratio. Unknown windows have no
+    headroom and stay in pace.
 
     #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
     comparator — the round-2 comparator could express cyclic preferences
     (boost>one-up, one-up>missing, missing>boost) which are unreachable in a
-    total order. Field precedence is fixed: unmeasured-last first, then the
+    total order. Field precedence continues with unmeasured-last, then the
     usual quota and boost dimensions in main's order — imminent exhaustion,
     boost presence and value, continuous score — then the #1340 (dr-1340-1)
     paid-within-pool dimension, then the value-order slot, intra-pool rank —
@@ -5390,6 +5432,8 @@ def _recommend_rank_key(
     """
     return (
         0 if not is_credit_row(candidate.profile) else 1,
+        1 if candidate.pace_headroom is not None else 0,
+        -(candidate.pace_headroom if candidate.pace_headroom is not None else 0.0),
         0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
         0 if candidate.imminent_exhaustion else 1,
         0 if candidate.boost is not None else 1,
@@ -5864,6 +5908,31 @@ def _evaluate(
             if profile.name in SWE2_MODEL_SCOPE_PROFILES and swe2_result is not None
             else by_id.get(provider_id)
         )
+        # hk 2114 — an excluded pool is never probed, so its policy reason is
+        # decided before any measurement/billing check. Otherwise the skip row
+        # would be folded as "unmeasurable" instead of the policy exclusion.
+        fallback_class: PoolClass = (
+            result.pool_class
+            if result is not None and result.pool_class in ("preserve", "spend", "exclude")
+            else "preserve"
+        )
+        effective_class, _policy_note = get_policy(provider_id, fallback_class, today=today)
+        if effective_class == "exclude":
+            override = get_active_override(provider_id, today=today)
+            policy_excluded.append(
+                _PolicyExcluded(
+                    profile=profile,
+                    provider_id=provider_id,
+                    provider_label=provider_label,
+                    until=override.until if override is not None else None,
+                    note=override.note if override is not None else None,
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                    borrowed=borrowed_row,
+                )
+            )
+            continue
+
         billing = _fusion_billing_gate(profile.name, provider_id, result, now, memo=billing_memo)
         if billing is not None:
             if billing.result is None:
@@ -5973,22 +6042,6 @@ def _evaluate(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-        override = get_active_override(provider_id, today=today)
-
-        if effective_class == "exclude":
-            policy_excluded.append(
-                _PolicyExcluded(
-                    profile=profile,
-                    provider_id=provider_id,
-                    provider_label=provider_label,
-                    until=override.until if override is not None else None,
-                    note=override.note if override is not None else None,
-                    placed_grade=placed_grade,
-                    one_up=one_up,
-                    borrowed=borrowed_row,
-                )
-            )
-            continue
 
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
@@ -6013,29 +6066,12 @@ def _evaluate(
         pace_note = ""
         free_swe2_bucket = model_bucket is not None
         pace_waste_eligible = False
+        pace_headroom_rank = None
         if effective_class == "spend" and not free_swe2_bucket:
             pace_verdicts = _pace_window_verdicts(matches, now, stale=result.stale)
-            pace_exhaustion = next(
-                (verdict for verdict in pace_verdicts if verdict.exhausts_before_reset), None
-            )
-            if pace_exhaustion is not None:
-                excluded.append(
-                    _Excluded(
-                        profile,
-                        _pace_exhaustion_reason(
-                            provider_id,
-                            pace_exhaustion,
-                            other_verdicts=pace_verdicts,
-                        ),
-                        provider_id=provider_id,
-                        kind="pace_exhaustion",
-                        placed_grade=placed_grade,
-                        one_up=one_up,
-                        borrowed=borrowed_row,
-                    )
-                )
-                continue
-            pace_note = _format_pace_verdicts(pace_verdicts)
+            pace_headroom = _pace_headroom(pace_verdicts)
+            pace_headroom_rank = pace_headroom.rank
+            pace_note = _format_recommend_pace(provider_id, pace_verdicts, pace_headroom)
             # Unknown windows cannot refuse by themselves, but an unknown pool
             # is not established to be inside the pace limit for WASTE scoring.
             pace_waste_eligible = bool(pace_verdicts) and all(
@@ -6067,11 +6103,11 @@ def _evaluate(
             urgency_hours=urgency_hours,
             budget=budget,
         )
-        if effective_class == "spend" and (free_swe2_bucket or not pace_waste_eligible):
-            score -= SCORE_WASTE_WEIGHT * waste_term
-            waste_term = 0.0
         throughput_window = _select_throughput_window(states, constraint)
         brake, brake_window = _brake_factor(states)
+        if effective_class == "spend" and (free_swe2_bucket or not pace_waste_eligible):
+            score -= SCORE_WASTE_WEIGHT * waste_term * brake
+            waste_term = 0.0
 
         # ROB-1188 fix 4: 리셋까지 아주 짧게(기본 1h) 남았고 잔여가 유의미한 임계(기본 5%)
         # 이상이면 "확실히 소멸"이 "며칠 단위 의도(boost)"보다 시급하다 — boost 를 역전.
@@ -6120,6 +6156,7 @@ def _evaluate(
                 throughput_term=throughput_term,
                 score=score,
                 imminent_exhaustion=imminent_exhaustion,
+                pace_headroom=pace_headroom_rank,
                 placed_grade=placed_grade,
                 one_up=one_up,
                 borrowed=borrowed_row,
