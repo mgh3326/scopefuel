@@ -39,7 +39,7 @@ _PROMPT = re.compile(r"❯|›|Shift\+Tab")
 _TRUST_QUESTION = re.compile(r"Do you trust the contents of this directory\?", re.I)
 _LIMIT_TEXT = re.compile(
     r"\b(?:usage|rate|request)\s+limit(?:\s+(?:reached|exceeded))?\b|"
-    r"\blimit\s+(?:reached|exceeded|exhausted)\b|\bquota\s+(?:exceeded|exhausted)\b",
+    r"\blimit\s+(?:reached|exceeded|exhausted)\b|\bquota\s+exhausted\b",
     re.I,
 )
 _LIMIT_WINDOW = {
@@ -49,19 +49,17 @@ _LIMIT_WINDOW = {
 }
 _MONTHLY = re.compile(
     r"(?:(?P<used>\d+(?:\.\d+)?)\s*%\s*used\b|"
-    r"(?P<limit>(?:(?:usage|rate|request)\s+)?limit)[\s\S]{0,120}?)"
+    r"(?P<limit>usage|rate|request)\s+limit[\s\S]{0,120}?)"
     r"[\s\S]{0,180}?"
     r"(?P<days>\d+(?:\.\d+)?)\s*days?\s+to\s+renew",
     re.I,
 )
 _FIVE_HOUR = re.compile(
-    r"\b5[- ]?hour\b[\s\S]{0,100}?(?:(?P<used>\d+(?:\.\d+)?)\s*%|"
-    r"(?P<limit>(?:(?:usage|rate|request)\s+)?limit))",
+    r"\b5[- ]?hour\b[\s\S]{0,100}?(?:(?P<used>\d+(?:\.\d+)?)\s*%|(?P<limit>usage|rate|request)\s+limit)",
     re.I,
 )
 _WEEKLY = re.compile(
-    r"\bweekly\b[\s\S]{0,100}?(?:(?P<used>\d+(?:\.\d+)?)\s*%|"
-    r"(?P<limit>(?:(?:usage|rate|request)\s+)?limit))",
+    r"\bweekly\b[\s\S]{0,100}?(?:(?P<used>\d+(?:\.\d+)?)\s*%|(?P<limit>usage|rate|request)\s+limit)",
     re.I,
 )
 _RESET_IN = re.compile(r"\bresets?\s+in\s+(?P<duration>[^|/·\r\n]+)", re.I)
