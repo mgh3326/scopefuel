@@ -1583,6 +1583,29 @@ def _pi_credit_rung(profile: str, model: str, rung: str) -> Profile:
     return _e6_arm_profile(profile, f"{model} (pi {rung})", rung, PI_CREDIT_PLACEMENT_NOTE)
 
 
+# hk 2141 (operator r1027cmdcode, plan GOAT per r1027cmdgoat): the Command
+# Code credit is spent through cmd, where ``--effort`` takes the model's own
+# levels — a real ``cmd -m deepseek/deepseek-v4.1-flash`` run on 2026-10-27
+# answered ``Supported: off, low, high, max``. The rungs are the catalog
+# vocabulary intersection low/high/max (off is not exposed, medium/xhigh are
+# not supported). Same model id as devin-ds41 but a different harness, so the
+# rows inherit no grade from the devin rows — the same worker/tester-only rule
+# as the pi credit lanes, and small first reps on a paid credit.
+CMD_CREDIT_MODELS: dict[str, str] = {
+    "cmd-dsflash41": "DeepSeek V4.1 Flash",
+}
+CMD_EFFORT_RUNGS: tuple[str, ...] = ("low", "high", "max")
+CMD_CREDIT_PLACEMENT_NOTE = (
+    "AA 미측정 (cmd harness — commandcode credit · worker/tester 전용 · "
+    "builder 배치 금지, reps 필요 · devin-ds41 동일 모델·상이 하네스 — 급 비상속 · "
+    "첫 reps 소액, 유료 credit)"
+)
+
+
+def _cmd_credit_rung(profile: str, model: str, rung: str) -> Profile:
+    return _e6_arm_profile(profile, f"{model} (cmd {rung})", rung, CMD_CREDIT_PLACEMENT_NOTE)
+
+
 # #920: sonnet@max left the E6 table — the Sonnet 5.5 refresh places it at S
 # (estimated, one step below the vendor TB4 70.6 raw-S+ read).
 E6_ARM_RUNGS: tuple[Profile, ...] = (
@@ -1681,6 +1704,33 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         for profile, model in PI_CREDIT_MODELS.items()
         for rung in PI_THINKING_RUNGS
     ),
+    # hk 2141: the commandcode credit rungs — one unmeasured row per effort the
+    # model accepts through cmd (off not exposed; medium/xhigh unsupported).
+    *(
+        _cmd_credit_rung(profile, model, rung)
+        for profile, model in CMD_CREDIT_MODELS.items()
+        for rung in CMD_EFFORT_RUNGS
+    ),
+    # hk 2110 (operator r1027terra, b953): wrk adds codex-terra61 for
+    # gpt-6.1-terra — a NEW model with no measurement anywhere. One rung per
+    # effort the CLI accepts, all at the shared C carrier. Nothing is
+    # inherited: no grade, placement, benchmark score or AA number from the
+    # barred gpt-5.6-terra rows (the 2026-10-12 noterra decision keeps those,
+    # and their history, untouched) or from sol — the row attaches no
+    # benchmark at all (no AA mapping, the #1284 no-AA shape). Unlike the pi
+    # credit rungs these are NOT worker/tester-only: the pair experiment needs
+    # terra as a builder, so the builder seat is admitted with the marker.
+    # Every rung is silent in recommend and refused e6_arm_required without
+    # SCOPEFUEL_E6_ARM=codex-terra61@<rung>.
+    *(
+        _e6_arm_profile(
+            "codex-terra61",
+            f"GPT-6.1 Terra ({rung})",
+            rung,
+            "gpt-6.1-terra AA 미측정 — 신규 모델, 측정 이력 없음 (hk 2110 · operator r1027terra)",
+        )
+        for rung in ("low", "medium", "high", "xhigh", "max")
+    ),
 )
 
 E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
@@ -1689,37 +1739,77 @@ E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
 # hk 2079: the credit rows have no builder placement until reps exist. The E6
 # marker opens a rung for the worker and tester seats only; any other seat
 # (builder, captain, reviewer, or none named) is refused even with the marker.
-E6_WORKER_TESTER_ONLY_PROFILES: frozenset[str] = frozenset(PI_CREDIT_MODELS)
+E6_WORKER_TESTER_ONLY_PROFILES: frozenset[str] = frozenset(PI_CREDIT_MODELS) | frozenset(CMD_CREDIT_MODELS)
 E6_WORKER_TESTER_SEATS: frozenset[str] = frozenset({"worker", "tester"})
 E6_WORKER_TESTER_ONLY_REASON = (
     "worker/tester 전용 — 미측정 E6 런그는 builder 배치 금지 (reps 필요, devin-fusion/grok 과 같은 규칙)"
 )
 
 
+def worker_tester_rungs(profile: str) -> tuple[str, ...]:
+    """The registered E6 rungs of a worker/tester-only credit profile, in order."""
+
+    return tuple(row.launcher_effort or "" for row in E6_ARM_RUNGS if row.name == profile)
+
+
 def credit_effort_required_reason(profile: str) -> str:
     """The one refusal line a bare credit-profile spelling gets, in gate and launch alike.
 
-    pi's thinking level is the effort, so the profile name alone names no rung and
-    no sibling row stands in for it: the request must carry ``--effort <rung>``.
+    The credit launcher's level is the effort, so the profile name alone names no
+    rung and no sibling row stands in for it: the request must carry
+    ``--effort <rung>``.
     """
 
     return (
         f"effort_required: {profile} needs an explicit --effort "
-        f"({'|'.join(PI_THINKING_RUNGS)}); a bare spelling names no rung"
+        f"({'|'.join(worker_tester_rungs(profile))}); a bare spelling names no rung"
     )
+
+
+def e6_registered_rungs(profile: str) -> tuple[str, ...]:
+    """The E6 rungs registered for a profile, in E6_ARM_RUNGS order."""
+
+    canonical = PROFILE_ALIASES.get(profile, profile)
+    return tuple(row.launcher_effort or "" for row in E6_ARM_RUNGS if row.name == canonical)
+
+
+def e6_only_profile(profile: str, grade_table: dict[str, list[Profile]] | None = None) -> bool:
+    """Whether a profile exists only as unmeasured E6 rungs (hk 2110).
+
+    It has registered E6 rungs and no placement row in the grade table — so a
+    bare spelling names no rung at all and no measured sibling can stand in:
+    the request must carry the rung's own marker. The pi credit profiles are
+    the first shape (hk 2079); codex-terra61 joins them — same E6-only rule,
+    without the worker/tester-only seat restriction.
+
+    Once the canon places the profile as an ordinary row (a real measurement)
+    the table carries it and the answer becomes False — the restriction is
+    "unmeasured", never the profile name.
+    """
+
+    canonical = PROFILE_ALIASES.get(profile, profile)
+    if not any(key[0] == canonical for key in E6_ARM_KEYS):
+        return False
+    table = GRADE_TABLE if grade_table is None else grade_table
+    return _find_profile(canonical, grade_table=table) is None
 
 
 def is_e6_unmeasured_key(profile: str, effort: str | None) -> bool:
     """Whether a catalog (profile, effort) key is an unmeasured E6 measurement key.
 
-    A registered E6 rung is one. So is *any* effort key of a credit profile (hk
-    2079): those profiles exist only as unmeasured E6 rows, so a canon row for
-    one at an effort-less or unregistered key is the same measurement row under
-    another spelling — it never becomes a placement unless the canon moves it
-    above its carrier grade (a real measurement).
+    A registered E6 rung is one. So is *any* effort key of a profile that
+    exists only as unmeasured E6 rows (hk 2079's credit profiles, hk 2110's
+    codex-terra61): a canon row for one at an effort-less or unregistered key
+    is the same measurement row under another spelling — it never becomes a
+    placement unless the canon moves it above its carrier grade (a real
+    measurement).
     """
 
-    return (profile, effort or "") in E6_ARM_KEYS or profile in E6_WORKER_TESTER_ONLY_PROFILES
+    return (
+        (profile, effort or "") in E6_ARM_KEYS
+        or profile in E6_WORKER_TESTER_ONLY_PROFILES
+        or e6_only_profile(profile)
+    )
 
 
 def e6_worker_tester_seat_denied(profile: str, role: str | None) -> bool:
@@ -1736,26 +1826,33 @@ def is_credit_row(profile: Profile) -> bool:
     return profile.name in E6_WORKER_TESTER_ONLY_PROFILES
 
 
-def credit_row_offered(profile: Profile, available: bool) -> bool:
+def credit_row_offered(profile: Profile, providers: list[ProviderResult]) -> bool:
     """Whether ``--recommend`` lists this credit row at its C carrier grade.
 
     Only each profile's default rung is offered, so the list carries one
     parallel option per model instead of every thinking level; the other rungs
-    stay on the folded E6-unmeasured line, like every other E6 rung.
+    stay on the folded E6-unmeasured line, like every other E6 rung. The offer
+    follows the row's OWN pool (hk 2141): a fresh anthropic-api balance never
+    offers a commandcode row.
     """
 
-    return available and is_credit_row(profile) and profile.launcher_effort == e6_bare_rung(profile.name)
+    return (
+        is_credit_row(profile)
+        and profile.launcher_effort == e6_bare_rung(profile.name)
+        and credit_row_available(providers, profile_pool(profile.name)[0])
+    )
 
 
-def credit_row_available(providers: list[ProviderResult]) -> bool:
-    """Whether the anthropic-api manual credit is usable for recommendation.
+def credit_row_available(providers: list[ProviderResult], pool: str = "anthropic-api") -> bool:
+    """Whether one manual-credit pool is usable for recommendation.
 
-    The credit rows are only offered while the pool carries a fresh manual
-    observation with credit left. A missing or stale observation leaves the
-    rows folded as unmeasured, the same fail-closed rule the gate applies.
+    The credit rows are only offered while their own pool carries a fresh
+    manual observation with credit left. A missing or stale observation
+    leaves the rows folded as unmeasured, the same fail-closed rule the gate
+    applies.
     """
 
-    result = next((item for item in providers if item.id == "anthropic-api"), None)
+    result = next((item for item in providers if item.id == pool), None)
     if result is None or result.error:
         return False
     return any(_is_valid_used_pct(bucket.used_pct) and bucket.used_pct < 100.0 for bucket in result.buckets)
@@ -2377,6 +2474,14 @@ _PI_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
     "pi-opus55": ("anthropic-api", None),
 }
 
+# hk 2141 (operator r1027cmdcode): the cmd Command Code profiles get the same
+# explicit-map rule — a cmd- spelling that is not registered here inherits no
+# route. They bill the Command Code credit, a manual-only pool with no probe;
+# its balance is an operator manual observation, never a cmd account read.
+_CMD_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
+    "cmd-dsflash41": ("commandcode", None),
+}
+
 
 def _profile_label(profile: Profile) -> str:
     if profile.launcher_effort:
@@ -2499,6 +2604,8 @@ def profile_pool(profile: str) -> tuple[str, str | None]:
         return _OC_PROFILE_POOLS.get(profile, ("", None))
     if profile.startswith("pi-"):
         return _PI_PROFILE_POOLS.get(profile, ("", None))
+    if profile.startswith("cmd-"):
+        return _CMD_PROFILE_POOLS.get(profile, ("", None))
     if profile in ("grok", "grok-hi", "grok-med", "grok45", "grok45-med", "grok46", "grok46-med"):
         return "grok", None
     # ROB-1252: cc-qwen38/cc-glm run the Claude Code CLI harness itself against
@@ -2539,6 +2646,10 @@ PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
     "pi-haiku55": "anthropic",
     "pi-sonnet55": "anthropic",
     "pi-opus55": "anthropic",
+    # hk 2110: the codex quota pool serves OpenAI models — codex-terra61 is
+    # gpt-6.1-terra, family "openai" for tester separation. The default would
+    # report the pool id ("codex"), which is an account lane, not the vendor.
+    "codex-terra61": "openai",
 }
 
 
@@ -4586,9 +4697,17 @@ def gate_check(
     )
     # hk 2079: a consult_only gate on an unmeasured credit row is still an
     # unmeasured row — it keeps the E6 marker and the worker/tester seat rule.
+    # hk 2110: the same holds for an E6-only profile — a consult_only
+    # codex-terra61 rung keeps its marker rule too; without this the consult
+    # spelling lifted the marker for every E6-only profile but the credit
+    # ones (tester r2 found the bypass).
     e6_row = (
         None
-        if (consult_only and canonical_profile not in E6_WORKER_TESTER_ONLY_PROFILES)
+        if (
+            consult_only
+            and canonical_profile not in E6_WORKER_TESTER_ONLY_PROFILES
+            and not e6_only_profile(canonical_profile, grade_table=table)
+        )
         or (rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung))
         else e6_arm_rung_for(canonical_profile, rung)
     )
@@ -4686,17 +4805,25 @@ def gate_check(
             ),
         )
     if (
-        canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
+        (
+            canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
+            or e6_only_profile(canonical_profile, grade_table=table)
+        )
         and e6_admitted is None
+        and not consult_only
         and (rung_row is None or rung_row[0] == e6_arm_carrier_grade(canonical_profile, rung))
     ):
-        # hk 2079: the credit profiles exist only as unmeasured E6 rows. A request
-        # is admitted either through the E6 marker on a registered rung, or when
-        # the canon placed the requested rung's own row above its carrier grade (a
-        # real measurement). A rung the canon has no placement for does not fall
-        # back to the profile's default placement here — that would let a measured
-        # sibling graduate it — and a carrier-grade row is unmeasured whatever its
-        # key. Both are refused, never admitted on the balance alone.
+        # hk 2079 + hk 2110: the credit profiles exist only as unmeasured E6
+        # rows — and a worker/tester-only rung never borrows a measured sibling
+        # placement even when the canon carries one — while codex-terra61 is
+        # E6-only until the canon places it. A request is admitted either
+        # through the E6 marker on a registered rung, or when the canon placed
+        # the requested rung's own row above its carrier grade (a real
+        # measurement). A rung the canon has no placement for does not fall
+        # back to the profile's default placement here — that would let a
+        # measured sibling graduate it — and a carrier-grade row is unmeasured
+        # whatever its key. Both are refused, never admitted on the balance
+        # alone.
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -4705,7 +4832,7 @@ def gate_check(
             reason=(
                 f"e6_arm_required: {canonical_profile} 은 미측정 E6 측정 런그뿐이다 (#594) — "
                 f"SCOPEFUEL_E6_ARM={canonical_profile}@<rung> 표식이 등록된 런그 "
-                f"({', '.join(PI_THINKING_RUNGS)}) 하나를 가리켜야 연다"
+                f"({', '.join(e6_registered_rungs(canonical_profile))}) 하나를 가리켜야 연다"
             ),
         )
     if found is None:
@@ -5734,7 +5861,6 @@ def _evaluate(
     # the SWE-2 free and subscription lanes. Every other credit row (and all of
     # them without a usable balance) folds as E6 unmeasured like every other
     # carrier row, so no canon row goes unaccounted (hk 1862).
-    credit_available = credit_row_available(providers)
     # Only the E6-unmeasured fold is replaced by the offering: a credit row the
     # canon dropped for another reason (consult_only, barred) stays dropped.
     dropped.extend(
@@ -5744,7 +5870,7 @@ def _evaluate(
         and not (
             item.kind == "e6_unmeasured"
             and item.profile.gate == "default"
-            and credit_row_offered(item.profile, credit_available)
+            and credit_row_offered(item.profile, providers)
         )
     )
     folded_keys = {(item.profile.name, normalize_effort(item.profile.launcher_effort)) for item in dropped}
@@ -5759,7 +5885,7 @@ def _evaluate(
             continue
         if canon_keys is not None and key not in canon_keys:
             continue
-        if credit_row_offered(rung_row, credit_available):
+        if credit_row_offered(rung_row, providers):
             continue
         dropped.append(_Excluded(rung_row, E6_UNMEASURED_REASON, kind="e6_unmeasured", placed_grade=grade))
         folded_keys.add(key)
@@ -5825,7 +5951,7 @@ def _evaluate(
         entries += [
             (row, grade)
             for row in E6_ARM_RUNGS
-            if credit_row_offered(row, credit_available)
+            if credit_row_offered(row, providers)
             and (row.name, normalize_effort(row.launcher_effort)) not in table_keys
             and (row.name, normalize_effort(row.launcher_effort)) not in folded_keys
             and (canon_keys is None or (row.name, normalize_effort(row.launcher_effort)) in canon_keys)
@@ -5856,7 +5982,7 @@ def _evaluate(
         if (
             rung_key in E6_ARM_KEYS
             and placed_grade == e6_arm_carrier_grade(profile.name, profile.launcher_effort)
-            and not credit_row_offered(profile, credit_available)
+            and not credit_row_offered(profile, providers)
         ):
             excluded.append(
                 _Excluded(

@@ -1406,13 +1406,16 @@ def test_a_one_row_catalog_against_a_full_cache_is_still_rejected(catalog_server
 
     view = bench.read_catalog()
     assert view.source == "cache"
-    # The cache holds the seed, which carries the three E6-only pi profiles the
-    # bundled placement snapshot does not — so the dropped set is "cached".
-    assert view.detail == "server catalog rejected: 1 row, missing 41 cached profiles"
+    # The cache holds the seed, which carries the E6-only pi, cmd, and terra61
+    # profiles the bundled placement snapshot does not — so the dropped set is
+    # "cached".
+    assert view.detail == "server catalog rejected: 1 row, missing 43 cached profiles"
     # hk 1885: 68 = the 67 pre-1885 rows + the sonnet@low C row (the profile
     # count of "missing 38" is unchanged — sonnet was already a profile).
     # hk 2079: 83 = those 68 + the 15 pi credit E6 rows (3 profiles x 5 rungs).
-    assert _cached_catalog_count() == 83
+    # hk 2110: 88 = those 83 + the 5 codex-terra61 E6 rows (1 profile).
+    # hk 2141: 91 = those 88 + the 3 cmd-dsflash41 credit E6 rows.
+    assert _cached_catalog_count() == 91
 
 
 def test_no_cache_keeps_the_bundle_floor(catalog_server):
