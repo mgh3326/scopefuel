@@ -17,6 +17,7 @@ Every probe test uses stub binaries — the real cmd is never run.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import os
 import pathlib
@@ -39,26 +40,39 @@ M1B_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "cmd_usage_m1b_screen
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _stubborn_stub_cmd(tmp_path: pathlib.Path) -> pathlib.Path:
+def _stubborn_stub_cmd(tmp_path: pathlib.Path, log: pathlib.Path | None = None) -> pathlib.Path:
     """cmd stub reproducing the m1b fixture: an Enter read in the same chunk
-    as the typed text is swallowed — the /usage panel never renders."""
+    as the typed text is swallowed — the /usage panel never renders.
+
+    N8 (verdict finding): the stub sleeps before its first read, so a caller that
+    writes "/usage" and "\\r" back-to-back has both bytes queued and the stub
+    reads them as ONE chunk (m1b's merged write) instead of racing a reader
+    that was already blocked. Every chunk it reads is logged, so a test can
+    assert the Enter never shares the text's read.
+    """
 
     script = tmp_path / "cmd-stubborn"
+    chunk_log = log or tmp_path / "cmd-stubborn-chunks.log"
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import os, sys, time, tty\n"
         "tty.setraw(sys.stdin.fileno())\n"  # a TUI reads keystrokes, not lines
         "os.write(1, '❯ '.encode())\n"
+        # A TUI takes a moment to start reading keys; anything written in
+        # that window is one read, exactly like m1b's merged "/usage\\r".
+        "time.sleep(0.25)\n"
+        f"log = open({str(chunk_log)!r}, 'ab', buffering=0)\n"
         "typed = False\n"
-        "buf = b''\n"
         "while True:\n"
         "    chunk = os.read(0, 4096)\n"
         "    if not chunk:\n"
         "        break\n"
-        "    buf += chunk\n"
-        "    if not typed and b'/usage' in buf:\n"
+        "    log.write(chunk.replace(b'\\r', b'<CR>').replace(b'\\n', b'<LF>') + b'\\n')\n"
+        "    if not typed and b'/usage' in chunk:\n"
         "        typed = True\n"
         "        os.write(1, '❯ /usage   \\n'.encode())\n"  # the input-box echo
+        "        if b'\\r' in chunk or b'\\n' in chunk:\n"
+        "            break\n"  # merged text+Enter: the TUI swallows it
         "    elif typed and (b'\\r' in chunk or b'\\n' in chunk):\n"
         f"        os.write(1, {USAGE_TEXT.encode()!r} + b'\\n')\n"
         "        time.sleep(1)\n"
@@ -191,6 +205,29 @@ def test_missing_binary_error_names_the_paths_tried(monkeypatch, tmp_path):
     assert "PATH:cmd" in result.error
 
 
+def test_known_dir_cmd_must_be_executable(monkeypatch, tmp_path):
+    """N4 (verdict finding): a non-executable cmd in a known dir is skipped.
+
+    A mutant that only checks existence would pick the dead file here.
+    """
+
+    home = tmp_path / "home"
+    hermes = home / ".hermes" / "node" / "bin"
+    hermes.mkdir(parents=True)
+    dead = hermes / "cmd"
+    dead.write_text("#!/bin/sh\n")
+    dead.chmod(0o644)
+    executable = _stub_cmd(home / ".local" / "bin")
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.setattr(commandcode, "BINARY", "cmd")
+    binary, tried = commandcode._resolve_binary()
+    assert binary == str(executable)
+    assert str(dead) in tried
+
+
 # ---------------------------------------------------------------------------
 # (b) deferred fetch, single background refresh, lock ownership
 # ---------------------------------------------------------------------------
@@ -207,7 +244,26 @@ def test_short_budget_fetch_serves_at_once_and_spawns_one_refresh(monkeypatch, t
     monkeypatch.setattr(commandcode, "BINARY", str(_stub_cmd(tmp_path)))
     result = commandcode._deferred_fetch()
     assert result.error_kind == PROBE_IN_PROGRESS
+    assert result.raw["background_refresh"] is True
     assert spawned == [1]
+
+
+def test_background_refresh_spawn_failure_still_serves_the_round(monkeypatch, tmp_path):
+    """N19 (verdict finding): a refresh spawn that raises is swallowed — the round
+
+    still serves cached/manual instead of failing. A mutant that catches only
+    one exception type lets this RuntimeError escape -> RED.
+    """
+
+    monkeypatch.setattr(commandcode, "BINARY", str(_stub_cmd(tmp_path)))
+
+    def explode(*_args):
+        raise RuntimeError("spawn exploded")
+
+    monkeypatch.setattr(refresh, "spawn_detached", explode)
+    result = commandcode._deferred_fetch()
+    assert result.error_kind == PROBE_IN_PROGRESS
+    assert result.raw["background_refresh"] is True
 
 
 def test_held_probe_lock_means_in_flight_and_no_second_spawn(monkeypatch, tmp_path):
@@ -266,7 +322,7 @@ def test_collect_without_cache_still_offers_manual_fallback(monkeypatch, tmp_pat
 
 
 def test_lock_records_the_holder_pid_and_survives_fd_inheritance(tmp_path):
-    """N10 (verdict r2): the production pid write inside single_probe_lock —
+    """N10 (verdict finding): the production pid write inside single_probe_lock —
 
     an owner that is SIGKILLed while a forked child pins the lock's inode
     must be reclaimed via its recorded pid. Mutant: drop the os.write of
@@ -274,6 +330,7 @@ def test_lock_records_the_holder_pid_and_survives_fd_inheritance(tmp_path):
     """
 
     lock_dir = tmp_path / "locks"
+    grandchild_pid = tmp_path / "grandchild.pid"
     code = (
         "import os, subprocess, sys, time\n"
         f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
@@ -282,7 +339,9 @@ def test_lock_records_the_holder_pid_and_survives_fd_inheritance(tmp_path):
         "    assert acquired\n"
         # A child that inherits the lock fd keeps the inode pinned after the
         # owner dies — the exact daemon-corpse shape from the incident.
-        "    subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'], close_fds=False)\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'], "
+        "close_fds=False)\n"
+        f"    open({str(grandchild_pid)!r}, 'w').write(str(child.pid))\n"
         "    sys.stdout.write(f'{os.getpid()}\\n'); sys.stdout.flush()\n"
         "    time.sleep(60)\n"
     )
@@ -303,6 +362,10 @@ def test_lock_records_the_holder_pid_and_survives_fd_inheritance(tmp_path):
         if owner.poll() is None:
             owner.kill()
             owner.wait(timeout=5)
+        # The fd-inheriting grandchild would otherwise outlive the test.
+        if grandchild_pid.exists():
+            with contextlib.suppress(ProcessLookupError, ValueError):
+                os.kill(int(grandchild_pid.read_text()), signal.SIGKILL)
 
 
 def test_killed_lock_owner_leaves_no_held_lock(tmp_path):
@@ -402,7 +465,7 @@ def test_reclaim_loses_to_a_competing_replacer(monkeypatch, tmp_path):
 
 
 def test_spawn_detached_starts_the_worker_in_its_own_session(monkeypatch, tmp_path):
-    """N3 (verdict r2): spawn_detached mechanics — a worker that shares the
+    """N3 (verdict finding): spawn_detached mechanics — a worker that shares the
 
     caller's session dies with it. Mutant: start_new_session=False -> RED.
     """
@@ -479,16 +542,26 @@ def test_repeated_short_calls_never_stay_in_progress_forever(monkeypatch, tmp_pa
 def test_probe_writes_text_then_submits_enter_separately(monkeypatch, tmp_path):
     """Mutant: restore the single '/usage\\r' write -> the stubborn stub never
 
-    renders the panel and this goes RED with stage=unparsed.
+    renders the panel and this goes RED with stage=unparsed. N8 (verdict finding):
+    the stub reads only after its start-up pause, so the two writes land as
+    one chunk whenever the Enter does not wait for the echo; the chunk log
+    then shows "/usage<CR>" in the text's read (or no panel at all).
     """
 
-    monkeypatch.setattr(commandcode, "BINARY", str(_stubborn_stub_cmd(tmp_path)))
+    chunk_log = tmp_path / "chunks.log"
+    monkeypatch.setattr(commandcode, "BINARY", str(_stubborn_stub_cmd(tmp_path, log=chunk_log)))
     monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
     monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
     monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "5")
     result = commandcode.fetch()
     assert result.status == "ok"
     assert len(result.buckets) == 3
+    chunks = chunk_log.read_bytes().splitlines()
+    # The Enter must be a later read than the text: the probe waited for the
+    # echo. A caller that submits immediately puts both in the first chunk.
+    assert chunks[0] == b"/usage"
+    assert b"<CR>" in chunks[1]
 
 
 def test_m1b_verbatim_screen_fails_closed_naming_the_missing_panel():
