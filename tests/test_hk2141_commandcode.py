@@ -126,9 +126,12 @@ def test_cmd_rows_have_their_own_map_and_stay_out_of_the_pi_map():
     assert not set(CMD_PROFILES) & set(recommend._PI_PROFILE_POOLS)
 
 
-def test_commandcode_has_no_automatic_probe():
-    assert "commandcode" not in providers.BUILTIN
-    assert "commandcode" not in providers.registry()
+def test_commandcode_has_an_automatic_probe_registration():
+    # hk 2160: cmd's /usage PTY probe is the automatic path; the manual credit
+    # stays only as the fallback where the screen cannot be read.
+    assert "commandcode" in providers.BUILTIN
+    assert "commandcode" in providers.registry()
+    assert providers.BUILTIN["commandcode"].pool_class == "spend"
     synthetic = manual.manual_only_result("commandcode")
     assert synthetic.id == "commandcode"
     assert synthetic.error_kind == "manual_only"

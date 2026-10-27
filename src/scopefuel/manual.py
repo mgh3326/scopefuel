@@ -56,15 +56,11 @@ DEFAULT_WINDOWS = {
     "anthropic-api": "credit",
     "commandcode": "credit",
 }
-# hk 2079: pools with no automatic probe. Their admission evidence is a manual
-# observation only, and a missing/stale observation fails closed exactly like
-# every other manual fallback (REQUIRED_WINDOWS coverage + TTL).
-# hk 2141: commandcode joins the set — the Command Code GOAT credit (operator
-# r1027cmdcode, r1027cmdgoat) is metered through the cmd CLI only, has no usage
-# API, and the operator records the /usage credit balance (remaining, total
-# and expiry — no amount or period is hardcoded) like the Anthropic credit.
+# hk 2079: pools whose credit observations can be supplied manually. Most have
+# no automatic probe; commandcode keeps this path only as a fallback when its
+# /usage PTY probe cannot be read.
 MANUAL_ONLY_POOLS = frozenset({"anthropic-api", "commandcode"})
-MANUAL_ONLY_ERROR = "no automatic probe — manual observation only"
+MANUAL_ONLY_ERROR = "no automatic observation — manual observation only"
 CREDIT_WINDOW = "credit"
 # These are admission-coverage floors, not synthetic zero-valued buckets.
 # Devin requires only the weekly window: the startup banner always proves the
@@ -79,6 +75,12 @@ REQUIRED_WINDOWS = {
     "kiro": frozenset({"30d"}),
     "clinepass": frozenset({"5h", "7d", "30d"}),
     "upstage": frozenset({"30d"}),
+    "anthropic-api": frozenset({"credit"}),
+    "commandcode": frozenset({"5h", "7d", "30d"}),
+}
+# Manual fallback coverage is separate from automatic probe coverage: the
+# operator records a credit balance and expiry when cmd /usage cannot be read.
+MANUAL_FALLBACK_WINDOWS = {
     "anthropic-api": frozenset({"credit"}),
     "commandcode": frozenset({"credit"}),
 }
@@ -601,12 +603,10 @@ def _format_remaining_validity(seconds: float) -> str:
 
 
 def manual_only_result(pool: str) -> ProviderResult:
-    """The synthetic automatic result for a pool that has no probe (hk 2079).
+    """Synthetic failure for a manual-credit pool with no usable probe result (hk 2079).
 
-    ``resolve_result`` treats this as a retryable measurement failure so the
-    manual observation is the only admission evidence; a missing or stale
-    observation leaves the pool unmeasurable (fail closed), exactly like every
-    other manual fallback.
+    ``resolve_result`` treats this as a missing measurement so a manual credit
+    entry can serve as fallback; missing or stale credit still fails closed.
     """
 
     if pool not in MANUAL_ONLY_POOLS:
@@ -615,7 +615,7 @@ def manual_only_result(pool: str) -> ProviderResult:
         id=pool,
         error=MANUAL_ONLY_ERROR,
         error_kind="manual_only",
-        note="자동 프로브 없음 — 운영자가 console 값을 manual 로 입력한다",
+        note="자동 관측 없음 — valid manual credit fallback needed",
         pool_class="spend",
     )
 
@@ -898,6 +898,13 @@ def classify_automatic_failure(result: ProviderResult) -> tuple[str | None, str 
         evidence = f"{evidence} {' '.join(result.hint.split())[:200]}"
     if _AUTH_FAILURE.search(evidence):
         return "auth", safe_text
+    # Provider-specific transport/timeout/parser classifications are stronger
+    # evidence than an unfamiliar human-facing error string. This is required
+    # for commandcode's probe-failure-only manual-credit fallback.
+    if result.error_kind in {"transport", "probe_timeout"}:
+        return "transport", safe_text
+    if result.error_kind == "parse_error":
+        return "parse_error", safe_text
     if _RATE_OR_TRANSPORT.search(evidence):
         return "transport", safe_text
     if _PARSE_FAILURE.search(evidence):
@@ -1062,6 +1069,12 @@ def required_windows_for(result: ProviderResult | None) -> frozenset[str]:
     """
     if result is None:
         return frozenset()
+    if (
+        result.id in MANUAL_FALLBACK_WINDOWS
+        and isinstance(result.manual, dict)
+        and result.manual.get("selection") == "manual_fallback"
+    ):
+        return MANUAL_FALLBACK_WINDOWS[result.id]
     if result.id == "codex":
         plan = normalize_codex_plan(result.plan)
         if plan in CODEX_PLAN_REQUIRED_WINDOWS:
@@ -1086,7 +1099,13 @@ def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> t
     confirmed = [
         float(bucket.used_pct)
         for bucket in result.buckets
-        if bucket.scope.kind == "account" and _is_valid_used_pct(bucket.used_pct)
+        if bucket.scope.kind == "account"
+        and _is_valid_used_pct(bucket.used_pct)
+        and not (
+            result.id == "commandcode"
+            and _parse_iso(bucket.resets_at) is not None
+            and _parse_iso(bucket.resets_at) <= _as_utc(now)
+        )
     ]
     over = [used for used in confirmed if used >= cutoff]
     return (max(over), cutoff) if over else None
@@ -1181,7 +1200,7 @@ def resolve_result(
         )
 
     active = {entry["window"]: entry for entry in summary["latest_valid"]}
-    required = required_windows_for(result)
+    required = MANUAL_FALLBACK_WINDOWS.get(result.id, required_windows_for(result))
     missing = sorted(required - active.keys())
     summary["required_windows"] = sorted(required)
     summary["covered_windows"] = sorted(active)
