@@ -52,6 +52,8 @@ from .recommend import (
     e6_arm_carrier_grade,
     e6_arm_matches,
     e6_arm_rung_for,
+    e6_only_profile,
+    e6_registered_rungs,
     e6_worker_tester_seat_denied,
     is_barred_model_id,
     is_e6_unmeasured_key,
@@ -132,6 +134,10 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     # hk 2141: the cmd Command Code profile. The id is the model cmd's
     # ``--model`` flag receives; wrk passes the rung as ``--effort``.
     "cmd-dsflash41": "deepseek/deepseek-v4.1-flash",
+    # hk 2110: gpt-6.1-terra — the codex-terra61 E6 rungs all launch the same
+    # model id. There is no AA mapping (the model is unmeasured), so the id
+    # lives here and ``_snapshot_model_id`` picks it up for the catalog rows.
+    "codex-terra61": "gpt-6.1-terra",
 }
 
 # The rung a profile starts on when the caller pins no effort.  Only profiles
@@ -168,6 +174,11 @@ DEFAULT_LAUNCH_EFFORTS: dict[str, str] = {
     # ``--recommend`` offers: a bare cmd spelling names no rung and is refused
     # by gate and launch (recommend.credit_effort_required_reason).
     "cmd-dsflash41": "high",
+    # hk 2110: the codex launcher takes --effort for codex-terra61, so the
+    # profile belongs in the flag table (a bare request is refused
+    # e6_arm_required before this default could ever launch a rung — the value
+    # is the flag registration, not an admissible default).
+    "codex-terra61": "max",
 }
 
 
@@ -766,6 +777,18 @@ def resolve_launch(
         # a launcher default, and never the canon's best-graded sibling. The same line
         # the gate prints.
         raise LaunchError(credit_effort_required_reason(canonical))
+    if (
+        requested is None
+        and marker is not None
+        and marker.profile == canonical
+        and e6_only_profile(canonical)
+    ):
+        # hk 2110: an E6-only profile has no placement default to name a rung —
+        # the marker is the only way a bare ``policy launch codex-terra61`` can
+        # name one at all (the same asymmetry the gate has). On a placed
+        # profile the ambient marker must NOT re-point a bare request onto its
+        # rung: the default placement still answers (leaked-env safety).
+        requested = marker.effort
     experiment_effort = requested or (marker.effort if marker and marker.profile == canonical else None)
     experiment_row = next(
         (entry for entry in view.entries if entry.key == (canonical, experiment_effort) and entry.retired_at),
@@ -814,21 +837,28 @@ def resolve_launch(
         # unmeasured xhigh rung and the canon's own retirement stopped refusing.
         # hk 2079: the credit profiles are the exception — a consult_only gate on
         # an unmeasured credit row does not lift the marker and seat rules.
+        # hk 2110 generalizes: the exception applies only to profiles that also
+        # have placements — an E6-only profile's unmeasured row stays refused
+        # under any gate spelling.
         rows = [
             row
             for row in rows
-            if (row.gate == GATE_CONSULT_ONLY and canonical not in E6_WORKER_TESTER_ONLY_PROFILES)
+            if (row.gate == GATE_CONSULT_ONLY and not e6_only_profile(canonical))
             or not _unmeasured_e6_row(row)
         ]
 
     from_snapshot = False
     if not rows:
         mentioned = any(entry.profile == canonical for entry in view.entries)
-        if mentioned and canonical in E6_WORKER_TESTER_ONLY_PROFILES:
-            # hk 2079: a profile that exists only as unmeasured E6 rows has no
-            # placement to fall back on — name the marker it needs.
+        if mentioned and e6_only_profile(canonical):
+            # hk 2079 + hk 2110: a profile that exists only as unmeasured E6
+            # rows has no placement to fall back on — name the marker it needs.
             raise LaunchError(
                 f"e6_arm_required: {canonical}@{requested} requires SCOPEFUEL_E6_ARM={canonical}@{requested}"
+                if requested is not None
+                else f"e6_arm_required: {canonical} 은 미측정 E6 측정 런그뿐이다 (#594) — "
+                f"SCOPEFUEL_E6_ARM={canonical}@<rung> 표식이 등록된 런그 "
+                f"({', '.join(e6_registered_rungs(canonical))}) 하나를 가리켜야 연다"
             )
         if mentioned:
             # The catalog carries this profile and every rung of it is retired —
@@ -893,10 +923,11 @@ def resolve_launch(
     if not matched:
         if _retired_rung(view, canonical, resolved_effort):
             raise LaunchError(f"profile '{profile}' rung '{resolved_effort}' is retired in the catalog")
-        if canonical in E6_WORKER_TESTER_ONLY_PROFILES:
-            # hk 2079: a credit profile has no default placement for an unknown or
-            # unmeasured rung to fall back on — borrowing a measured sibling row
-            # would graduate it. The rung needs its own row or the E6 marker.
+        if e6_only_profile(canonical):
+            # hk 2079 + hk 2110: an E6-only profile has no default placement for
+            # an unknown or unmeasured rung to fall back on — borrowing a
+            # measured sibling row would graduate it. The rung needs its own
+            # row or the E6 marker.
             raise LaunchError(
                 f"e6_arm_required: {canonical}@{resolved_effort} requires "
                 f"SCOPEFUEL_E6_ARM={canonical}@{resolved_effort}"

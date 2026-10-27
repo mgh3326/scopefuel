@@ -444,23 +444,21 @@ def _drop_aplus_opus_low_payload(payload):
 
 
 def _drop_pi_credit_folds(text, payload):
-    """The current output minus the folded E6-unmeasured entries of the credit rows.
+    """The current output minus the folded E6-unmeasured entries of the E6-only rows.
 
-    hk 2079 adds the pi anthropic-api profiles as E6 rows, and hk 2141 the
-    cmd-dsflash41 commandcode rows; every E6 carrier row rides the folded
-    excluded line at C (hk 1862's accounting). The pre-1990 base has no such
-    rows, so the only intended difference on these providers (none carries an
-    anthropic-api or commandcode pool) is those fold entries: they are removed
-    from the current output and the fold count corrected. Ranked rows are not
-    touched, so a credit row leaking in as a candidate still fails the
-    comparison.
+    hk 2079 adds the pi anthropic-api profiles as E6 rows, and every E6 carrier
+    row rides the folded excluded line at C (hk 1862's accounting). hk 2110 adds
+    the codex-terra61 rungs the same way, and hk 2141 adds cmd-dsflash41. The
+    pre-1990 base has no such rows, so those fold entries are removed from the
+    current output and the fold count corrected. Ranked rows are not touched,
+    so a row leaking in as a candidate still fails the comparison.
     """
     lines = []
     for line in text.split("\n"):
         fold = re.match(r"^✗ 제외 \((\d+)\): (.*)$", line)
         if fold:
             items = fold.group(2).split(" · ")
-            kept = [item for item in items if not item.startswith(("pi-", "cmd-"))]
+            kept = [item for item in items if not item.startswith(("pi-", "cmd-", "codex-terra61"))]
             if len(kept) != len(items):
                 assert kept, text
                 count = int(fold.group(1)) - (len(items) - len(kept))
@@ -469,7 +467,9 @@ def _drop_pi_credit_folds(text, payload):
     payload = {
         **payload,
         "excluded": [
-            entry for entry in payload["excluded"] if not entry["profile"].startswith(("pi-", "cmd-"))
+            entry
+            for entry in payload["excluded"]
+            if not entry["profile"].startswith(("pi-", "cmd-", "codex-terra61"))
         ],
     }
     return "\n".join(lines), payload
