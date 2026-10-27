@@ -129,6 +129,9 @@ LAUNCH_MODEL_IDS: dict[str, str] = {
     "pi-haiku55": "anthropic/claude-haiku-5-5",
     "pi-sonnet55": "anthropic/claude-sonnet-5-5",
     "pi-opus55": "anthropic/claude-opus-5-5",
+    # hk 2141: the cmd Command Code profile. The id is the model cmd's
+    # ``--model`` flag receives; wrk passes the rung as ``--effort``.
+    "cmd-dsflash41": "deepseek/deepseek-v4.1-flash",
 }
 
 # The rung a profile starts on when the caller pins no effort.  Only profiles
@@ -159,6 +162,12 @@ DEFAULT_LAUNCH_EFFORTS: dict[str, str] = {
     "pi-haiku55": "low",
     "pi-sonnet55": "high",
     "pi-opus55": "high",
+    # hk 2141: cmd's ``--effort`` takes the model's own levels (the
+    # deepseek-v4.1-flash run answered "Supported: off, low, high, max"), so
+    # this profile takes the flag. The value is only the one rung
+    # ``--recommend`` offers: a bare cmd spelling names no rung and is refused
+    # by gate and launch (recommend.credit_effort_required_reason).
+    "cmd-dsflash41": "high",
 }
 
 

@@ -54,11 +54,16 @@ DEFAULT_WINDOWS = {
     "kiro": "30d",
     "upstage": "30d",
     "anthropic-api": "credit",
+    "commandcode": "credit",
 }
 # hk 2079: pools with no automatic probe. Their admission evidence is a manual
 # observation only, and a missing/stale observation fails closed exactly like
 # every other manual fallback (REQUIRED_WINDOWS coverage + TTL).
-MANUAL_ONLY_POOLS = frozenset({"anthropic-api"})
+# hk 2141: commandcode joins the set — the Command Code GOAT credit (operator
+# r1027cmdcode, r1027cmdgoat) is metered through the cmd CLI only, has no usage
+# API, and the operator records the /usage credit balance (remaining, total
+# and expiry — no amount or period is hardcoded) like the Anthropic credit.
+MANUAL_ONLY_POOLS = frozenset({"anthropic-api", "commandcode"})
 MANUAL_ONLY_ERROR = "no automatic probe — manual observation only"
 CREDIT_WINDOW = "credit"
 # These are admission-coverage floors, not synthetic zero-valued buckets.
@@ -75,6 +80,7 @@ REQUIRED_WINDOWS = {
     "clinepass": frozenset({"5h", "7d", "30d"}),
     "upstage": frozenset({"30d"}),
     "anthropic-api": frozenset({"credit"}),
+    "commandcode": frozenset({"credit"}),
 }
 # hk 1769 (b953) — codex required windows follow plan_type, which
 # providers/codex.py already stores as ``plan``. 2026-10-20 wham usage API
@@ -1104,6 +1110,23 @@ def resolve_result(
     store = load_store() if store is None else store
     summary = _summary_for_pool(store, result.id, now=now, auto_result=result)
     annotated = replace(result, manual=summary) if summary is not None else result
+    if result.id == "commandcode":
+        # hk 2141: a live observed cmd usage/rate limit maps the pool to
+        # exhausted until the reset the observation names — the manual credit
+        # cannot override it (the desk records the balance, the pane recorded
+        # the refusal). Same fail-closed direction as a missing observation.
+        from . import commandcode_limit
+
+        limit_record = commandcode_limit.active_record(now=_as_utc(now))
+        if limit_record is not None:
+            if summary is not None:
+                summary["selection"] = "observed_limit"
+            return Resolution(
+                annotated,
+                False,
+                summary,
+                failure_reason=commandcode_limit.reason(limit_record),
+            )
     if summary is None:
         return Resolution(annotated, False, None, failure_reason="manual observation 없음")
     if result.status == "ok" and not result.stale and _has_usable_automatic_bucket(result):
