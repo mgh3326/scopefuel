@@ -4,15 +4,72 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: filter
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          GH_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$GH_EVENT" = workflow_dispatch ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GH_EVENT" = pull_request ]; then
+            git diff --name-only "$GH_BASE_SHA" "$GH_HEAD_SHA" > changed-paths.txt
+          elif [ -n "$GH_BASE_SHA" ] && [ "$GH_BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --name-only "$GH_BASE_SHA" "$GH_HEAD_SHA" > changed-paths.txt
+          else
+            git ls-files > changed-paths.txt
+          fi
+          docs_only=true
+          while IFS= read -r path; do
+            case "$path" in
+              .github/*) docs_only=false; break ;;
+              *.md|docs/*) ;;
+              *) docs_only=false; break ;;
+            esac
+          done < changed-paths.txt
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   test:
     runs-on: ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.13"
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.13", "3.14"]
+        exclude:
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.14"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -24,3 +81,26 @@ jobs:
         run: uvx ruff format --check .
       - name: Test
         run: uv run --python ${{ matrix.python }} --group dev pytest
+
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [changes, test]
+    if: always()
+    steps:
+      - name: Check required jobs
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          if [ "$CHANGES_RESULT" != success ]; then
+            echo "changes job did not succeed: $CHANGES_RESULT"
+            exit 1
+          fi
+          if [ "$DOCS_ONLY" = true ] && [ "$TEST_RESULT" = skipped ]; then
+            exit 0
+          fi
+          if [ "$TEST_RESULT" != success ]; then
+            echo "test job did not succeed: $TEST_RESULT"
+            exit 1
+          fi
