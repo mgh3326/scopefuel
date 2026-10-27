@@ -265,6 +265,46 @@ def test_collect_without_cache_still_offers_manual_fallback(monkeypatch, tmp_pat
     assert spawned == [1]
 
 
+def test_lock_records_the_holder_pid_and_survives_fd_inheritance(tmp_path):
+    """N10 (verdict r2): the production pid write inside single_probe_lock —
+
+    an owner that is SIGKILLed while a forked child pins the lock's inode
+    must be reclaimed via its recorded pid. Mutant: drop the os.write of
+    os.getpid() -> the owner record is empty, the reclaim never fires -> RED.
+    """
+
+    lock_dir = tmp_path / "locks"
+    code = (
+        "import os, subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
+        "from scopefuel import proctrack\n"
+        f"with proctrack.single_probe_lock({str(lock_dir)!r}) as acquired:\n"
+        "    assert acquired\n"
+        # A child that inherits the lock fd keeps the inode pinned after the
+        # owner dies — the exact daemon-corpse shape from the incident.
+        "    subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'], close_fds=False)\n"
+        "    sys.stdout.write(f'{os.getpid()}\\n'); sys.stdout.flush()\n"
+        "    time.sleep(60)\n"
+    )
+    owner = subprocess.Popen(  # noqa: S603 - fixed argv, test helper
+        [sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+    )
+    try:
+        assert owner.stdout is not None
+        owner_pid = int(owner.stdout.readline().strip())
+        assert proctrack._read_lock_owner(lock_dir / ".probe.lock") == owner_pid
+        os.kill(owner_pid, signal.SIGKILL)
+        owner.wait(timeout=5)
+        assert proctrack.probe_in_flight(lock_dir) is False
+        with proctrack.single_probe_lock(lock_dir) as acquired:
+            assert acquired is True
+            assert proctrack._read_lock_owner(lock_dir / ".probe.lock") == os.getpid()
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=5)
+
+
 def test_killed_lock_owner_leaves_no_held_lock(tmp_path):
     """Mutant: the lock is kept after its owner dies -> acquire goes RED."""
 
@@ -359,6 +399,35 @@ def test_reclaim_loses_to_a_competing_replacer(monkeypatch, tmp_path):
     finally:
         holder.kill()
         holder.wait(timeout=5)
+
+
+def test_spawn_detached_starts_the_worker_in_its_own_session(monkeypatch, tmp_path):
+    """N3 (verdict r2): spawn_detached mechanics — a worker that shares the
+
+    caller's session dies with it. Mutant: start_new_session=False -> RED.
+    """
+
+    calls = []
+
+    class _Popen:
+        def __init__(self, argv, **kwargs):
+            calls.append({"argv": argv, **kwargs})
+
+    monkeypatch.setattr(refresh.subprocess, "Popen", _Popen)
+    assert refresh.spawn_detached("commandcode") is True
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["argv"] == [
+        sys.executable,
+        "-m",
+        "scopefuel.cli",
+        "refresh",
+        "commandcode",
+        "--_worker",
+    ]
+    assert call["start_new_session"] is True
+    assert call["close_fds"] is True
+    assert call["stdin"] is refresh.subprocess.DEVNULL
 
 
 def test_background_refresh_worker_writes_the_cache(monkeypatch, tmp_path):
