@@ -23,7 +23,9 @@ from ..model import PROBE_IN_PROGRESS, Bucket, ProviderResult, Scope
 
 BINARY = os.environ.get("SCOPEFUEL_COMMANDCODE_BIN") or "cmd"
 SOURCE = "cli:/usage"
-PROBE_WORKDIR = pathlib.Path.home() / ".local" / "share" / "scopefuel" / "commandcode-probe-workdir"
+# hk 2160 r2: resolved per probe, not at import — importing this module with
+# HOME unset must not raise, and a test/host may relocate HOME after import.
+PROBE_WORKDIR: pathlib.Path | None = None
 PROBE_INPUT = "/usage\r"
 TIMEOUT_S = 30.0
 TIMEOUT_MIN_S = 5.0
@@ -47,21 +49,14 @@ _LIMIT_WINDOW = {
     "5h": re.compile(r"\b(?:5[- ]?hour|five[- ]?hour|5h)\b", re.I),
     "7d": re.compile(r"\b(?:weekly|week)\b", re.I),
 }
-_MONTHLY = re.compile(
-    r"(?:(?P<used>\d+(?:\.\d+)?)\s*%\s*used\b|"
-    r"(?P<limit>(?:(?:usage|rate|request)\s+)?limit)[\s\S]{0,120}?)"
-    r"[\s\S]{0,180}?"
-    r"(?P<days>\d+(?:\.\d+)?)\s*days?\s+to\s+renew",
-    re.I,
-)
-_FIVE_HOUR = re.compile(
-    r"\b5[- ]?hour\b[\s\S]{0,100}?(?:(?P<used>\d+(?:\.\d+)?)\s*%|"
-    r"(?P<limit>(?:(?:usage|rate|request)\s+)?limit))",
-    re.I,
-)
-_WEEKLY = re.compile(
-    r"\bweekly\b[\s\S]{0,100}?(?:(?P<used>\d+(?:\.\d+)?)\s*%|"
-    r"(?P<limit>(?:(?:usage|rate|request)\s+)?limit))",
+_FIVE_HOUR_LABEL = re.compile(r"\b5[- ]?hour\b", re.I)
+_WEEKLY_LABEL = re.compile(r"\bweekly\b", re.I)
+_DAYS_TO_RENEW = re.compile(r"(?P<days>\d+(?:\.\d+)?)\s*days?\s+to\s+renew", re.I)
+# A window's own value (percent or limit wording) is searched only inside its
+# own segment — up to the next window label — so a row missing its percentage
+# fails closed instead of borrowing the next window's number.
+_VALUE = re.compile(
+    r"(?:(?P<used>\d+(?:\.\d+)?)\s*%|(?P<limit>(?:(?:usage|rate|request)\s+)?limit\b))",
     re.I,
 )
 _RESET_IN = re.compile(r"\bresets?\s+in\s+(?P<duration>[^|/·\r\n]+)", re.I)
@@ -91,6 +86,12 @@ def _timeout_s() -> float:
     return max(min(configured, remaining), 0.0)
 
 
+def _probe_workdir() -> pathlib.Path:
+    if PROBE_WORKDIR is not None:
+        return PROBE_WORKDIR
+    return pathlib.Path.home() / ".local" / "share" / "scopefuel" / "commandcode-probe-workdir"
+
+
 def _probe_lock_dir() -> pathlib.Path:
     return cache.cache_dir() / "probe-locks" / "commandcode"
 
@@ -110,7 +111,7 @@ def _ensure_workdir(workdir: pathlib.Path) -> None:
 
 
 def _probe_once() -> str:
-    workdir = pathlib.Path(PROBE_WORKDIR).expanduser()
+    workdir = _probe_workdir().expanduser()
     workdir.mkdir(parents=True, exist_ok=True)
     _ensure_workdir(workdir)
     proctrack.kill_stale_probe_leftovers(workdir)
@@ -163,13 +164,17 @@ def _probe_once() -> str:
                     break
                 output.extend(chunk)
                 screen = _clean(output.decode("utf-8", errors="replace"))
-                if not sent and _PROMPT.search(screen):
-                    os.write(master_fd, PROBE_INPUT.encode())
-                    sent = True
-                elif not sent and _TRUST_QUESTION.search(screen):
+                # The trust dialog's selection marker matches _PROMPT, so the
+                # question must be checked first: PROBE_INPUT is never written
+                # while the dialog is on screen (each probe runs in a fresh
+                # instance dir, so any probe could hit it).
+                if _TRUST_QUESTION.search(screen):
                     raise ProbeTimeout(
                         [BINARY, "--no-session"], timeout_s, stage="trust-prompt", nbytes=len(output)
                     )
+                if not sent and _PROMPT.search(screen):
+                    os.write(master_fd, PROBE_INPUT.encode())
+                    sent = True
                 if sent:
                     try:
                         _parse_buckets(screen, now=dt.datetime.now(dt.UTC))
@@ -305,26 +310,39 @@ def _complete(text: str) -> bool:
 
 def _parse_buckets(text: str, *, now: dt.datetime) -> list[Bucket]:
     clean = _clean(text)
-    monthly = _MONTHLY.search(clean)
-    five_hour = _FIVE_HOUR.search(clean)
-    weekly = _WEEKLY.search(clean)
-    if monthly is None or five_hour is None or weekly is None:
+    five_hour = _FIVE_HOUR_LABEL.search(clean)
+    weekly = _WEEKLY_LABEL.search(clean)
+    if five_hour is None or weekly is None:
         raise ValueError("one or more usage windows are missing")
 
-    monthly_reset = _reset_for_duration(f"{monthly['days']} days", now=now)
+    # The monthly row is everything before the earliest short-window label;
+    # a value is searched inside each window's own segment only (hk 2160 r2).
+    monthly_segment = clean[: min(five_hour.start(), weekly.start())]
+    renew = _DAYS_TO_RENEW.search(monthly_segment)
+    if renew is None:
+        raise ValueError("the monthly usage window is missing")
+
     five_segment = _segment_after(clean, five_hour.start(), "7d")
     weekly_segment = _segment_after(clean, weekly.start())
     five_reset_match = _RESET_IN.search(five_segment)
     weekly_reset_match = _RESET_IN.search(weekly_segment)
     if five_reset_match is None or weekly_reset_match is None:
         raise ValueError("a short-window reset is missing")
+
+    monthly_reset = _reset_for_duration(f"{renew['days']} days", now=now)
     five_reset = _reset_for_duration(five_reset_match["duration"], now=now)
     weekly_reset = _reset_for_duration(weekly_reset_match["duration"], now=now)
 
+    monthly_value = _VALUE.search(monthly_segment)
+    five_value = _VALUE.search(five_segment)
+    weekly_value = _VALUE.search(weekly_segment)
+    if monthly_value is None or five_value is None or weekly_value is None:
+        raise ValueError("a usage window has no percentage of its own")
+
     values = {
-        "30d": _percent(monthly["used"] or "100"),
-        "5h": _percent(five_hour["used"] or "100"),
-        "7d": _percent(weekly["used"] or "100"),
+        "30d": _percent(monthly_value["used"] or "100"),
+        "5h": _percent(five_value["used"] or "100"),
+        "7d": _percent(weekly_value["used"] or "100"),
     }
     resets = {"30d": monthly_reset, "5h": five_reset, "7d": weekly_reset}
     if _LIMIT_TEXT.search(clean):

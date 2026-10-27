@@ -15,6 +15,7 @@ Each test docstring names the mutant it kills where the brief lists one.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import pathlib
 
 import pytest
@@ -143,6 +144,63 @@ def test_limit_wording_maps_to_its_named_window_and_unmapped_wording_fails_close
     assert bad.error_kind == "parse_error"
 
 
+def test_five_hour_limit_wording_with_no_number_is_exhausted():
+    """Mutant: default the missing percent to 0 -> this goes RED (5h must be 100)."""
+
+    text = USAGE_TEXT.replace("5-hour 1%", "5-hour usage limit reached")
+    result = commandcode.parse(text, now=NOW)
+    buckets = {bucket.window: bucket for bucket in result.buckets}
+    assert buckets["5h"].used_pct == 100
+    assert buckets["30d"].used_pct == 0
+    assert buckets["7d"].used_pct == 1
+
+
+@pytest.mark.parametrize(
+    ("prior", "current"),
+    [
+        ("5-hour 1%", "5-hour"),
+        ("Weekly 1%", "Weekly"),
+        ("0% used", "used"),
+    ],
+)
+def test_a_window_without_its_own_value_fails_closed(prior, current):
+    """A row that lost its percentage must not borrow the next window's."""
+
+    result = commandcode.parse(USAGE_TEXT.replace(prior, current), now=NOW)
+    assert result.error_kind == "parse_error"
+
+
+@pytest.mark.parametrize("window", ["30d", "5h", "7d"])
+def test_a_percentage_over_100_is_a_parse_error(window):
+    """Mutant: drop the 0..100 range check -> this goes RED."""
+
+    prior = {"30d": "0% used", "5h": "5-hour 1%", "7d": "Weekly 1%"}[window]
+    current = {"30d": "150% used", "5h": "5-hour 150%", "7d": "Weekly 150%"}[window]
+    result = commandcode.parse(USAGE_TEXT.replace(prior, current), now=NOW)
+    assert result.error_kind == "parse_error"
+
+
+def test_limit_wording_outside_a_window_row_maps_to_one_window_or_fails():
+    """Limit text away from every window row still resolves — or fails closed.
+
+    Mutant: drop the distance mapping -> the first case goes RED (7d must be
+    100). Mutant: accept ambiguity -> the tie goes RED (must be parse_error).
+    """
+
+    nearest = commandcode.parse(f"{USAGE_TEXT} · quota exhausted", now=NOW)
+    buckets = {bucket.window: bucket for bucket in nearest.buckets}
+    assert buckets["7d"].used_pct == 100
+    assert buckets["5h"].used_pct == 1
+
+    # "quota exhausted" sits exactly midway: dist(5h label end) == dist(7d
+    # label start) == 44, so no single window owns it and the parse fails.
+    pre = "5-hour 1% " + "x" * 40
+    post = "x" * 29 + " Weekly 1% · resets in 6d 22h"
+    tied = "Monthly 0% used · 31 days to renew · " + pre + "quota exhausted" + post
+    result = commandcode.parse(tied, now=NOW)
+    assert result.error_kind == "parse_error"
+
+
 # ---------------------------------------------------------------------------
 # 2. manual credit fallback — only after the probe cannot be read
 # ---------------------------------------------------------------------------
@@ -236,6 +294,72 @@ def test_probe_uses_stub_cmd_and_reads_usage_without_a_model_prompt(monkeypatch,
     result = commandcode.fetch()
     assert result.status == "ok"
     assert len(result.buckets) == 3
+
+
+def test_trust_dialog_never_gets_probe_input(monkeypatch, tmp_path):
+    """B1: the trust dialog's selection marker matches _PROMPT, so the probe
+
+    must end as stage=trust-prompt with ZERO bytes typed into the stub.
+    Mutant: check _PROMPT before _TRUST_QUESTION -> /usage is typed into the
+    dialog and the stub counts the bytes -> this goes RED.
+    """
+
+    count_file = tmp_path / "stdin-bytes"
+    script = tmp_path / "cmd-trust-stub"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, select, signal, sys\n"
+        f"count_path = {str(count_file)!r}\n"
+        "count = 0\n"
+        "def dump(*_args):\n"
+        "    open(count_path, 'w').write(str(count))\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, dump)\n"
+        "print('Do you trust the contents of this directory? ❯ 1. Yes', flush=True)\n"
+        "while True:\n"
+        "    readable, _, _ = select.select([sys.stdin], [], [], 0.1)\n"
+        "    if readable:\n"
+        "        chunk = os.read(0, 4096)\n"
+        "        if not chunk:\n"
+        "            dump()\n"
+        "        count += len(chunk)\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(commandcode, "BINARY", str(script))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    result = commandcode.fetch()
+    assert result.error_kind == "probe_timeout"
+    assert result.raw["stage"] == "trust-prompt"
+    assert count_file.read_text() == "0"
+
+
+def test_probe_workdir_resolves_home_lazily(monkeypatch, tmp_path):
+    """M1: Path.home() is called per probe, never at import — a relocated
+
+    HOME after import is honoured, and the import itself needs no HOME.
+    """
+
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", None)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert commandcode._probe_workdir() == (
+        tmp_path / "home" / ".local" / "share" / "scopefuel" / "commandcode-probe-workdir"
+    )
+
+
+def test_importing_the_provider_without_home_does_not_raise():
+    """M1: `env -u HOME` must import cleanly — nothing resolves HOME at import."""
+
+    import subprocess
+    import sys
+
+    env = {key: value for key, value in os.environ.items() if key != "HOME"}
+    subprocess.run(
+        [sys.executable, "-c", "import scopefuel.providers.commandcode"],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
 
 
 def test_probe_failure_uses_hk2114_negative_cache(monkeypatch, tmp_path):
