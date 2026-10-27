@@ -4592,9 +4592,17 @@ def gate_check(
     )
     # hk 2079: a consult_only gate on an unmeasured credit row is still an
     # unmeasured row — it keeps the E6 marker and the worker/tester seat rule.
+    # hk 2110: the same holds for an E6-only profile — a consult_only
+    # codex-terra61 rung keeps its marker rule too; without this the consult
+    # spelling lifted the marker for every E6-only profile but the credit
+    # ones (tester r2 found the bypass).
     e6_row = (
         None
-        if (consult_only and canonical_profile not in E6_WORKER_TESTER_ONLY_PROFILES)
+        if (
+            consult_only
+            and canonical_profile not in E6_WORKER_TESTER_ONLY_PROFILES
+            and not e6_only_profile(canonical_profile, grade_table=table)
+        )
         or (rung_row is not None and rung_row[0] != e6_arm_carrier_grade(canonical_profile, rung))
         else e6_arm_rung_for(canonical_profile, rung)
     )

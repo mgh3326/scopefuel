@@ -308,6 +308,89 @@ def test_the_marker_is_normalized_like_an_effort_spelling(monkeypatch, capsys, t
     assert "[E6 arm, unmeasured C: codex-terra61@max]" in out.splitlines()[0]
 
 
+# --- consult_only still keeps the marker rule (tester r2) ---------------------
+
+
+def _terra61_consult_only_view(rung: str = "max") -> launch.CatalogView:
+    """A served canon whose only change is one terra61 row gated consult_only."""
+    entries = tuple(
+        replace(entry, gate="consult_only") if entry.key == (PROFILE, rung) else entry
+        for entry in bench.catalog_snapshot()
+    )
+    return launch.CatalogView(entries=entries, source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+
+
+@pytest.mark.parametrize("rung", RUNGS)
+@pytest.mark.parametrize("role", [None, "builder", "worker", "tester"])
+def test_a_consult_only_terra61_rung_keeps_the_marker_rule(rung, role):
+    """tester r2: a canon consult_only flag must not lift the E6 marker — the
+    same rule hk 2079 pins for the credit rows. Without the marker every seat
+    is refused e6_arm_required; the consult spelling is not a bypass."""
+    result = gate_check(
+        [_provider()],
+        PROFILE,
+        role=role,
+        effort=rung,
+        operator_request="hk:task/2110",
+        consult_only_rungs=frozenset({(PROFILE, rung)}),
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is False
+    assert "e6_arm_required" in result.reason
+    assert f"{PROFILE}@{rung}" in result.reason
+
+
+@pytest.mark.parametrize("rung", RUNGS)
+def test_a_consult_only_terra61_rung_admits_a_marked_builder(rung):
+    """With the exact marker the consult gate opens for the builder seat —
+    terra61 is not worker/tester-only (unlike the pi credit rows)."""
+    result = gate_check(
+        [_provider()],
+        PROFILE,
+        role="builder",
+        effort=rung,
+        e6_arm=f"{PROFILE}@{rung}",
+        operator_request="hk:task/2110",
+        consult_only_rungs=frozenset({(PROFILE, rung)}),
+        today=TODAY,
+        now=NOW,
+    )
+    # consult admission reports no candidate placement (the fable quota path) —
+    # the asserted part is that the marker, not the consult spelling, opened it.
+    assert result.ok is True, result.reason
+    assert result.e6_arm == f"{PROFILE}@{rung}"
+
+
+def test_gate_cli_consult_only_terra61_rung_refuses_without_the_marker(monkeypatch, capsys, tmp_path):
+    """The tester r2 repro, verbatim: canon flips codex-terra61@max to
+    consult_only, an operator ref is given, the marker is absent — the gate
+    must refuse e6_arm_required, not admit on the consult spelling."""
+    view = _terra61_consult_only_view("max")
+    monkeypatch.setattr(bench, "read_catalog", lambda **kwargs: view)
+    monkeypatch.setattr(bench, "runtime_grade_table", lambda **kwargs: bench._catalog_grade_table(view))
+    monkeypatch.delenv(E6_ARM_MARKER_ENV, raising=False)
+    rc, out, err, record = _gate_cli(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [
+            "gate",
+            "-m",
+            "codex-terra61",
+            "--effort",
+            "max",
+            "--operator-request",
+            "hk:task/2110",
+            "--role",
+            "builder",
+        ],
+    )
+    assert rc == 3, out + err
+    assert "e6_arm_required" in err
+    assert record["ok"] is False
+
+
 def test_a_retired_terra61_rung_is_not_revived_by_the_marker():
     result = gate_check(
         [_provider()],
