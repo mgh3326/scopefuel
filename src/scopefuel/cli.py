@@ -155,7 +155,12 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
     parser.add_argument(
         "--horizon", choices=["now", "week", "both"], default="both", help="--brief 에 표시할 지평"
     )
-    parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="성공 캐시를 무시하고 강제 조회 — 실패 캐시(NEGATIVE_TTL_S)와 "
+        "excluded/unsubscribed 풀의 미탐침은 무시하지 않는다",
+    )
     parser.add_argument(
         "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
     )
@@ -709,7 +714,12 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         metavar="PATH",
         help="gate 판정 감사 레코드를 JSON으로 저장할 경로",
     )
-    gate_parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 강제 조회")
+    gate_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="성공 캐시를 무시하고 강제 조회 — 실패 캐시(NEGATIVE_TTL_S)와 "
+        "excluded/unsubscribed 풀의 미탐침은 무시하지 않는다",
+    )
     gate_parser.add_argument(
         "--cache-ttl", type=float, default=None, help="캐시 TTL(초; 지정 시 전 provider 공통)"
     )
@@ -2774,7 +2784,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if MARK_RANK[overall_usage_mark(results, now=now)] >= threshold:
             return 2
-    return 1 if any(r.error for r in results) else 0
+    # hk 2114 — an excluded/unsubscribed pool is shown with its "not probed"
+    # reason, but it is not a measurement failure: it must not make the status
+    # command exit 1 on a healthy host.
+    skipped_kinds = {"excluded", "unsubscribed"}
+    return 1 if any(r.error and r.error_kind not in skipped_kinds for r in results) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover
