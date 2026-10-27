@@ -56,11 +56,15 @@ DEFAULT_WINDOWS = {
     "anthropic-api": "credit",
     "commandcode": "credit",
 }
-# hk 2079: pools whose credit observations can be supplied manually. Most have
-# no automatic probe; commandcode keeps this path only as a fallback when its
-# /usage PTY probe cannot be read.
+# hk 2079: pools with no automatic probe. Their admission evidence is a manual
+# observation only, and a missing/stale observation fails closed exactly like
+# every other manual fallback (REQUIRED_WINDOWS coverage + TTL).
+# hk 2141: commandcode joins the set — the Command Code GOAT credit (operator
+# r1027cmdcode, r1027cmdgoat) is metered through the cmd CLI only, has no usage
+# API, and the operator records the /usage credit balance (remaining, total
+# and expiry — no amount or period is hardcoded) like the Anthropic credit.
 MANUAL_ONLY_POOLS = frozenset({"anthropic-api", "commandcode"})
-MANUAL_ONLY_ERROR = "no automatic observation — manual observation only"
+MANUAL_ONLY_ERROR = "no automatic probe — manual observation only"
 CREDIT_WINDOW = "credit"
 # These are admission-coverage floors, not synthetic zero-valued buckets.
 # Devin requires only the weekly window: the startup banner always proves the
@@ -75,12 +79,6 @@ REQUIRED_WINDOWS = {
     "kiro": frozenset({"30d"}),
     "clinepass": frozenset({"5h", "7d", "30d"}),
     "upstage": frozenset({"30d"}),
-    "anthropic-api": frozenset({"credit"}),
-    "commandcode": frozenset({"5h", "7d", "30d"}),
-}
-# Manual fallback coverage is separate from automatic probe coverage: the
-# operator records a credit balance and expiry when cmd /usage cannot be read.
-MANUAL_FALLBACK_WINDOWS = {
     "anthropic-api": frozenset({"credit"}),
     "commandcode": frozenset({"credit"}),
 }
@@ -450,17 +448,13 @@ def normalize_window(pool: str, window: str | None) -> str:
         normalized = WINDOW_ALIASES[window]
     except KeyError as exc:
         raise ManualError(f"지원하지 않는 window: {window}") from exc
-    # Credit entries are restricted to pools with an explicit manual-credit
-    # fallback; all other pools accept only their rolling windows.
-    if normalized == CREDIT_WINDOW and pool not in MANUAL_ONLY_POOLS:
+    # hk 2079: the credit window is the manual-only pool's window and nothing
+    # else's — a credit entry on a probed pool (or a rolling window on the
+    # credit pool) could never satisfy that pool's REQUIRED_WINDOWS.
+    if (normalized == CREDIT_WINDOW) != (pool in MANUAL_ONLY_POOLS):
         raise ManualError(
             f"{pool} 에는 {normalized} window 를 쓸 수 없습니다 "
-            f"(credit fallback 은 {', '.join(sorted(MANUAL_ONLY_POOLS))} 전용)"
-        )
-    if normalized != CREDIT_WINDOW and pool in MANUAL_ONLY_POOLS:
-        raise ManualError(
-            f"{pool} 에는 {normalized} window 를 쓸 수 없습니다 "
-            f"(credit fallback pool 은 rolling window 관측을 받지 않음)"
+            f"(credit window 는 {', '.join(sorted(MANUAL_ONLY_POOLS))} 전용)"
         )
     return normalized
 
@@ -536,7 +530,7 @@ def _validate_credit(event: dict, index: int) -> None:
     """
 
     credit = event.get("credit")
-    # The credit window belongs to a manual-credit fallback pool and nothing else, in the
+    # The credit window belongs to the manual-only pool and nothing else, in the
     # reader as in the writer (normalize_window): a hand-edited store cannot move it.
     if (event.get("window") == CREDIT_WINDOW) != (event.get("pool") in MANUAL_ONLY_POOLS):
         raise ManualError(f"manual history {index} credit pool 불일치")
@@ -607,10 +601,12 @@ def _format_remaining_validity(seconds: float) -> str:
 
 
 def manual_only_result(pool: str) -> ProviderResult:
-    """Synthetic failure for a manual-credit pool with no usable probe result (hk 2079).
+    """The synthetic automatic result for a pool that has no probe (hk 2079).
 
-    ``resolve_result`` treats this as a missing measurement so a manual credit
-    entry can serve as fallback; missing or stale credit still fails closed.
+    ``resolve_result`` treats this as a retryable measurement failure so the
+    manual observation is the only admission evidence; a missing or stale
+    observation leaves the pool unmeasurable (fail closed), exactly like every
+    other manual fallback.
     """
 
     if pool not in MANUAL_ONLY_POOLS:
@@ -619,7 +615,7 @@ def manual_only_result(pool: str) -> ProviderResult:
         id=pool,
         error=MANUAL_ONLY_ERROR,
         error_kind="manual_only",
-        note="자동 관측 없음 — valid manual credit fallback needed",
+        note="자동 프로브 없음 — 운영자가 console 값을 manual 로 입력한다",
         pool_class="spend",
     )
 
@@ -902,13 +898,6 @@ def classify_automatic_failure(result: ProviderResult) -> tuple[str | None, str 
         evidence = f"{evidence} {' '.join(result.hint.split())[:200]}"
     if _AUTH_FAILURE.search(evidence):
         return "auth", safe_text
-    # Provider-specific transport/timeout/parser classifications are stronger
-    # evidence than an unfamiliar human-facing error string. This is required
-    # for commandcode's probe-failure-only manual-credit fallback.
-    if result.error_kind in {"transport", "probe_timeout"}:
-        return "transport", safe_text
-    if result.error_kind == "parse_error":
-        return "parse_error", safe_text
     if _RATE_OR_TRANSPORT.search(evidence):
         return "transport", safe_text
     if _PARSE_FAILURE.search(evidence):
@@ -1073,12 +1062,6 @@ def required_windows_for(result: ProviderResult | None) -> frozenset[str]:
     """
     if result is None:
         return frozenset()
-    if (
-        result.id in MANUAL_FALLBACK_WINDOWS
-        and isinstance(result.manual, dict)
-        and result.manual.get("selection") == "manual_fallback"
-    ):
-        return MANUAL_FALLBACK_WINDOWS[result.id]
     if result.id == "codex":
         plan = normalize_codex_plan(result.plan)
         if plan in CODEX_PLAN_REQUIRED_WINDOWS:
@@ -1104,11 +1087,6 @@ def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> t
         float(bucket.used_pct)
         for bucket in result.buckets
         if bucket.scope.kind == "account" and _is_valid_used_pct(bucket.used_pct)
-        and not (
-            result.id == "commandcode"
-            and _parse_iso(bucket.resets_at) is not None
-            and _parse_iso(bucket.resets_at) <= _as_utc(now)
-        )
     ]
     over = [used for used in confirmed if used >= cutoff]
     return (max(over), cutoff) if over else None
@@ -1132,6 +1110,23 @@ def resolve_result(
     store = load_store() if store is None else store
     summary = _summary_for_pool(store, result.id, now=now, auto_result=result)
     annotated = replace(result, manual=summary) if summary is not None else result
+    if result.id == "commandcode":
+        # hk 2141: a live observed cmd usage/rate limit maps the pool to
+        # exhausted until the reset the observation names — the manual credit
+        # cannot override it (the desk records the balance, the pane recorded
+        # the refusal). Same fail-closed direction as a missing observation.
+        from . import commandcode_limit
+
+        limit_record = commandcode_limit.active_record(now=_as_utc(now))
+        if limit_record is not None:
+            if summary is not None:
+                summary["selection"] = "observed_limit"
+            return Resolution(
+                annotated,
+                False,
+                summary,
+                failure_reason=commandcode_limit.reason(limit_record),
+            )
     if summary is None:
         return Resolution(annotated, False, None, failure_reason="manual observation 없음")
     if result.status == "ok" and not result.stale and _has_usable_automatic_bucket(result):
@@ -1186,7 +1181,7 @@ def resolve_result(
         )
 
     active = {entry["window"]: entry for entry in summary["latest_valid"]}
-    required = MANUAL_FALLBACK_WINDOWS.get(result.id, required_windows_for(result))
+    required = required_windows_for(result)
     missing = sorted(required - active.keys())
     summary["required_windows"] = sorted(required)
     summary["covered_windows"] = sorted(active)

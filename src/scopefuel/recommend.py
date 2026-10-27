@@ -1802,16 +1802,7 @@ def credit_row_available(providers: list[ProviderResult], pool: str = "anthropic
     result = next((item for item in providers if item.id == pool), None)
     if result is None or result.error:
         return False
-    from .manual import required_windows_for
-
-    required = required_windows_for(result)
-    windows = {bucket.window: bucket for bucket in result.buckets}
-    return bool(required) and all(
-        window in windows
-        and _is_valid_used_pct(windows[window].used_pct)
-        and windows[window].used_pct < 100.0
-        for window in required
-    )
+    return any(_is_valid_used_pct(bucket.used_pct) and bucket.used_pct < 100.0 for bucket in result.buckets)
 
 
 def e6_arm_carrier_grade(profile: str, effort: str | None) -> Grade:
@@ -2432,8 +2423,8 @@ _PI_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
 
 # hk 2141 (operator r1027cmdcode): the cmd Command Code profiles get the same
 # explicit-map rule — a cmd- spelling that is not registered here inherits no
-# route. The commandcode pool is read through cmd's /usage screen, with manual
-# credit accepted only as fallback when that screen cannot be read.
+# route. They bill the Command Code credit, a manual-only pool with no probe;
+# its balance is an operator manual observation, never a cmd account read.
 _CMD_PROFILE_POOLS: dict[str, tuple[str, str | None]] = {
     "cmd-dsflash41": ("commandcode", None),
 }

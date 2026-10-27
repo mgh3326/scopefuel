@@ -1219,7 +1219,6 @@ def test_hand_edited_credit_store_is_rejected(edit):
 
 @pytest.mark.parametrize("pool", sorted(providers.BUILTIN))
 def test_used_is_still_required_for_every_probed_pool(pool, capsys):
-    window = "credit" if pool == "commandcode" else "7d"
     rc = cli.main(
         [
             "manual",
@@ -1227,7 +1226,7 @@ def test_used_is_still_required_for_every_probed_pool(pool, capsys):
             "--pool",
             pool,
             "--window",
-            window,
+            "7d",
             "--measured-at",
             "now",
             "--reason",
@@ -1236,11 +1235,7 @@ def test_used_is_still_required_for_every_probed_pool(pool, capsys):
     )
     captured = capsys.readouterr()
     assert rc == 2
-    if pool == "commandcode":
-        assert "--remaining" in captured.err
-        assert "--expires-on" in captured.err
-    else:
-        assert "--used" in captured.err
+    assert "--used" in captured.err
 
 
 # ---------------------------------------------------------------------------
