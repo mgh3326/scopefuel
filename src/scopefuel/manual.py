@@ -31,8 +31,9 @@ SOURCE_VERIFICATION = "unverified"
 SOURCE_LABEL = "자기신고 · 미검증"
 DEFAULT_TTL_S = 15 * 60.0
 MAX_TTL_S = 2 * 3600.0
-CREDIT_MAX_TTL_S = 24 * 3600.0
-CREDIT_TTL_POLICY = "credit-24h-v1"
+CREDIT_V1_MAX_TTL_S = 24 * 3600.0
+CREDIT_V1_TTL_POLICY = "credit-24h-v1"
+CREDIT_V2_TTL_POLICY = "credit-until-expiry-v2"
 MAX_FUTURE_SKEW_S = 300.0
 MAX_REASON_CHARS = 1000
 
@@ -227,25 +228,38 @@ def _validate_store(store: dict) -> None:
                 raise ManualError(f"manual history {index} future measurement 불일치")
             credit_policy = event.get("credit_ttl_policy")
             if event["window"] == CREDIT_WINDOW:
-                if credit_policy is not None and credit_policy != CREDIT_TTL_POLICY:
+                if credit_policy is not None and credit_policy not in (
+                    CREDIT_V1_TTL_POLICY,
+                    CREDIT_V2_TTL_POLICY,
+                ):
                     raise ManualError(f"manual history {index} credit TTL policy 불일치")
                 # Pre-hk-2106 events had the general two-hour cap. Keep those
                 # append-only records readable when their only new-policy
                 # overrun is expires_on midnight; clamp their read view below.
-                ttl_limit_s = CREDIT_MAX_TTL_S if credit_policy == CREDIT_TTL_POLICY else MAX_TTL_S
+                if credit_policy == CREDIT_V2_TTL_POLICY:
+                    credit = event["credit"]
+                    expires_on = _parse_date(credit["expires_on"])
+                    assert expires_on is not None
+                    expiry_bounds = [dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC)]
+                else:
+                    ttl_limit_s = CREDIT_V1_MAX_TTL_S if credit_policy == CREDIT_V1_TTL_POLICY else MAX_TTL_S
+                    expiry_bounds = [
+                        measured + dt.timedelta(seconds=ttl_limit_s),
+                        entered + dt.timedelta(seconds=ttl_limit_s),
+                    ]
+                    if credit_policy == CREDIT_V1_TTL_POLICY:
+                        credit = event["credit"]
+                        expires_on = _parse_date(credit["expires_on"])
+                        assert expires_on is not None
+                        expiry_bounds.append(dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC))
             else:
                 if "credit_ttl_policy" in event:
                     raise ManualError(f"manual history {index} credit TTL policy 불일치")
                 ttl_limit_s = MAX_TTL_S
-            expiry_bounds = [
-                measured + dt.timedelta(seconds=ttl_limit_s),
-                entered + dt.timedelta(seconds=ttl_limit_s),
-            ]
-            if event["window"] == CREDIT_WINDOW and credit_policy == CREDIT_TTL_POLICY:
-                credit = event["credit"]
-                expires_on = _parse_date(credit["expires_on"])
-                assert expires_on is not None
-                expiry_bounds.append(dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC))
+                expiry_bounds = [
+                    measured + dt.timedelta(seconds=ttl_limit_s),
+                    entered + dt.timedelta(seconds=ttl_limit_s),
+                ]
             if expires > min(expiry_bounds):
                 raise ManualError(f"manual history {index} expiry 불일치")
             if not isinstance(event.get("reason"), str) or not event["reason"].strip():
@@ -694,13 +708,15 @@ def record_observation(
     if len(reason) > MAX_REASON_CHARS:
         raise ManualError(f"--reason 은 {MAX_REASON_CHARS}자 이하여야 합니다")
     normalized_window = normalize_window(pool, window)
-    ttl_limit_s = CREDIT_MAX_TTL_S if normalized_window == CREDIT_WINDOW else MAX_TTL_S
-    if ttl_s is None:
-        ttl_s = CREDIT_MAX_TTL_S if normalized_window == CREDIT_WINDOW else DEFAULT_TTL_S
-    if not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > ttl_limit_s:
-        if normalized_window == CREDIT_WINDOW:
-            raise ManualError("--ttl 은 0보다 크고 credit window 는 24h 이하, 그 외는 2h 이하여야 합니다")
-        raise ManualError("--ttl 은 0보다 크고 2h 이하여야 합니다")
+    is_credit = normalized_window == CREDIT_WINDOW
+    if is_credit:
+        if ttl_s is not None and (not math.isfinite(ttl_s) or ttl_s <= 0):
+            raise ManualError("credit window --ttl 은 0보다 큰 유한값이어야 합니다")
+    else:
+        if ttl_s is None:
+            ttl_s = DEFAULT_TTL_S
+        if not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > MAX_TTL_S:
+            raise ManualError("--ttl 은 0보다 크고 2h 이하여야 합니다")
     credit: dict | None = None
     credit_expiry_start: dt.datetime | None = None
     if normalized_window == CREDIT_WINDOW:
@@ -734,12 +750,20 @@ def record_observation(
         raise ManualError("--resets-in 과 --resets-at 은 함께 쓸 수 없습니다")
     if resets_in_s is not None:
         resets_at = measured_at + dt.timedelta(seconds=resets_in_s)
-    expires_at = min(
-        measured_at + dt.timedelta(seconds=ttl_s),
-        entered_at + dt.timedelta(seconds=ttl_limit_s),
-    )
     if credit_expiry_start is not None:
-        expires_at = min(expires_at, credit_expiry_start)
+        if ttl_s is None:
+            expires_at = credit_expiry_start
+        else:
+            until_expiry_s = max(0.0, (credit_expiry_start - measured_at).total_seconds())
+            expires_at = (
+                credit_expiry_start if ttl_s >= until_expiry_s else measured_at + dt.timedelta(seconds=ttl_s)
+            )
+    else:
+        assert ttl_s is not None
+        expires_at = min(
+            measured_at + dt.timedelta(seconds=ttl_s),
+            entered_at + dt.timedelta(seconds=MAX_TTL_S),
+        )
     if resets_at is not None:
         expires_at = min(expires_at, _as_utc(resets_at))
 
@@ -803,7 +827,7 @@ def record_observation(
         }
         if credit is not None:
             entry["credit"] = credit
-            entry["credit_ttl_policy"] = CREDIT_TTL_POLICY
+            entry["credit_ttl_policy"] = CREDIT_V2_TTL_POLICY
         history.append(entry)
         store["latest"][f"{pool}:{normalized_window}"] = observation_id
         _save_unlocked(store)
