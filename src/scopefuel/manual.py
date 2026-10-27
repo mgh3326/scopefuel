@@ -1103,7 +1103,8 @@ def confirmed_automatic_cutoff(result: ProviderResult, *, now: dt.datetime) -> t
     confirmed = [
         float(bucket.used_pct)
         for bucket in result.buckets
-        if bucket.scope.kind == "account" and _is_valid_used_pct(bucket.used_pct)
+        if bucket.scope.kind == "account"
+        and _is_valid_used_pct(bucket.used_pct)
         and not (
             result.id == "commandcode"
             and _parse_iso(bucket.resets_at) is not None
