@@ -4286,6 +4286,57 @@ def _inflight_headroom(
     return None
 
 
+def _policy_exclude_gate_result(
+    *,
+    profile_name: str,
+    provider_id: str,
+    grade: Grade | None,
+    rung_suffix: str,
+    result: ProviderResult | None,
+    alternatives: Callable[[], tuple[str, ...]],
+    missing: tuple[str, ...],
+    audit: dict[str, object],
+    today: dt.date,
+) -> GateResult | None:
+    """Excluded pool refusal, decided before any measurement check (hk 2114).
+
+    collect() never probes an excluded pool, so the gate must not turn the
+    "not probed" row into "unmeasurable": the pool's own policy reason is the
+    answer, exactly as it was when a measurement happened to exist.
+
+    ``alternatives`` is lazy: building it runs the whole recommend evaluation
+    (and observes exhaustion), which must not happen for a pool that is not
+    excluded — that would send the exhaustion notice before the gate's own
+    observation and turn the first gate's reason into "already notified".
+    """
+    fallback: PoolClass = (
+        result.pool_class
+        if result is not None and result.pool_class in ("preserve", "spend", "exclude")
+        else "preserve"
+    )
+    effective_class = get_policy(provider_id, fallback, today=today)[0]
+    if effective_class != "exclude":
+        return None
+    override = get_active_override(provider_id, today=today)
+    reason_parts = [f"정책 제외 ({provider_id}"]
+    if override is not None and override.until:
+        reason_parts.append(f"until {override.until.isoformat()}")
+    if override is not None and override.note:
+        reason_parts.append(override.note)
+    return GateResult(
+        ok=False,
+        profile=profile_name,
+        provider_id=provider_id,
+        grade=grade,
+        reason=", ".join(reason_parts) + ")" + rung_suffix,
+        used_pct=None,
+        pool_class=effective_class,
+        alternatives=alternatives(),
+        missing_windows=missing,
+        **audit,
+    )
+
+
 def gate_check(
     providers: list[ProviderResult],
     profile_name: str,
@@ -4717,6 +4768,21 @@ def gate_check(
                 missing_windows=missing,
                 **audit,
             )
+        # hk 2114 — same rule as the graded path: an excluded pool is never
+        # probed, so its policy reason is decided before measurability.
+        excluded = _policy_exclude_gate_result(
+            profile_name=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            rung_suffix="",
+            result=result,
+            alternatives=lambda: (),
+            missing=missing,
+            audit=audit,
+            today=today,
+        )
+        if excluded is not None:
+            return excluded
         if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
             return GateResult(
                 ok=False,
@@ -4765,27 +4831,6 @@ def gate_check(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-        # Consultation and retired experiments retain fable's fail-closed
-        # exclude check. Ordinary D3 profiles keep their previous quota behavior.
-        if consult_only and effective_class == "exclude":
-            override = get_active_override(provider_id, today=today)
-            reason_parts = [f"정책 제외 ({provider_id}"]
-            if override is not None and override.until:
-                reason_parts.append(f"until {override.until.isoformat()}")
-            if override is not None and override.note:
-                reason_parts.append(override.note)
-            return GateResult(
-                ok=False,
-                profile=profile_name,
-                provider_id=provider_id,
-                grade=None,
-                reason=", ".join(reason_parts) + ")",
-                used_pct=used_pct,
-                pool_class=effective_class,
-                missing_windows=missing,
-                unknown_plan=unknown_plan,
-                **audit,
-            )
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
         notify_status = _observe_exhaustion(
@@ -5027,6 +5072,22 @@ def gate_check(
             **audit,
         )
 
+    # hk 2114 — exclude precedes every measurement check: an excluded pool is
+    # not probed at all, so "no measurement" must not replace the policy reason.
+    excluded = _policy_exclude_gate_result(
+        profile_name=profile_name,
+        provider_id=provider_id,
+        grade=grade,
+        rung_suffix=rung_suffix,
+        result=result,
+        alternatives=alternatives,
+        missing=missing,
+        audit=audit,
+        today=today,
+    )
+    if excluded is not None:
+        return excluded
+
     if result is None or result.error or result.warning or (result.status != "ok" and accepted is None):
         alts = alternatives()
         return GateResult(
@@ -5084,28 +5145,6 @@ def gate_check(
         result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
     )
     effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-    override = get_active_override(provider_id, today=today)
-
-    if effective_class == "exclude":
-        alts = alternatives()
-        reason_parts = [f"정책 제외 ({provider_id}"]
-        if override is not None and override.until:
-            reason_parts.append(f"until {override.until.isoformat()}")
-        if override is not None and override.note:
-            reason_parts.append(override.note)
-        return GateResult(
-            ok=False,
-            profile=profile_name,
-            provider_id=provider_id,
-            grade=grade,
-            reason=", ".join(reason_parts) + ")" + rung_suffix,
-            used_pct=used_pct,
-            pool_class=effective_class,
-            alternatives=alts,
-            missing_windows=missing,
-            unknown_plan=unknown_plan,
-            **audit,
-        )
 
     cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
     over = _any_window_over_cutoff(states, cutoff)
@@ -5869,6 +5908,31 @@ def _evaluate(
             if profile.name in SWE2_MODEL_SCOPE_PROFILES and swe2_result is not None
             else by_id.get(provider_id)
         )
+        # hk 2114 — an excluded pool is never probed, so its policy reason is
+        # decided before any measurement/billing check. Otherwise the skip row
+        # would be folded as "unmeasurable" instead of the policy exclusion.
+        fallback_class: PoolClass = (
+            result.pool_class
+            if result is not None and result.pool_class in ("preserve", "spend", "exclude")
+            else "preserve"
+        )
+        effective_class, _policy_note = get_policy(provider_id, fallback_class, today=today)
+        if effective_class == "exclude":
+            override = get_active_override(provider_id, today=today)
+            policy_excluded.append(
+                _PolicyExcluded(
+                    profile=profile,
+                    provider_id=provider_id,
+                    provider_label=provider_label,
+                    until=override.until if override is not None else None,
+                    note=override.note if override is not None else None,
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                    borrowed=borrowed_row,
+                )
+            )
+            continue
+
         billing = _fusion_billing_gate(profile.name, provider_id, result, now, memo=billing_memo)
         if billing is not None:
             if billing.result is None:
@@ -5978,22 +6042,6 @@ def _evaluate(
             result.pool_class if result.pool_class in ("preserve", "spend") else "preserve"
         )
         effective_class = get_policy(provider_id, fallback_class, today=today)[0]
-        override = get_active_override(provider_id, today=today)
-
-        if effective_class == "exclude":
-            policy_excluded.append(
-                _PolicyExcluded(
-                    profile=profile,
-                    provider_id=provider_id,
-                    provider_label=provider_label,
-                    until=override.until if override is not None else None,
-                    note=override.note if override is not None else None,
-                    placed_grade=placed_grade,
-                    one_up=one_up,
-                    borrowed=borrowed_row,
-                )
-            )
-            continue
 
         cutoff, cutoff_status = _pool_cutoff(provider_id, effective_class)
         over = _any_window_over_cutoff(states, cutoff)
