@@ -952,9 +952,9 @@ def _render(
         stale = _stale_build_verdict()
         free_short_window = free_window.display_value(free_window.active_record(now=now))
         providers = []
-        # hk 2141 (following hk 2136): ``providers`` also lists the manual-only
-        # pools (``listed``); the summary marks below still read ``results``
-        # alone, so an unobserved pool never changes the host-level mark.
+        # hk 2136: ``providers`` also lists the manual-only pools (``listed``); the
+        # summary marks below still read ``results`` alone, so an unobserved pool
+        # never changes the host-level mark.
         for result in results if listed is None else listed:
             item = result.as_dict(now=now)
             if result.id == "devin":
@@ -1660,14 +1660,13 @@ def _refresh_swe2_result(
 
 
 def _listed_with_manual_only(results: list[ProviderResult], *, now: dt.datetime) -> list[ProviderResult]:
-    """``--json`` providers list: the displayed results plus every manual-only pool.
+    """``--json`` providers list: the displayed results plus every manual-only pool (hk 2136).
 
     The synthetic entries come from the same ``_with_manual_only_results`` the
     gate path uses and are resolved through ``manual.apply_for_display``, so a
     missing, stale or expired observation renders fail-closed rather than as
     availability.
     """
-
     manual_only = _with_manual_only_results([])
     return [*results, *manual.apply_for_display(manual_only, now=now)]
 
