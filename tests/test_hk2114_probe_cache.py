@@ -1,11 +1,17 @@
 """hk 2114 — never probe an excluded/unsubscribed pool, and briefly cache failures.
 
-The three invariants this file pins, stated as mutants:
+The invariants this file pins, stated as mutants:
 
 - probe an excluded or unsubscribed pool again -> the zero-calls cases go RED;
 - drop the negative cache -> the not-called-within-TTL cases go RED;
 - never expire the negative cache -> the called-again-after-TTL cases go RED;
-- send rate limits to the negative cache -> the backoff case goes RED.
+- send rate limits to the negative cache -> the backoff case goes RED;
+- make --no-cache bypass the negative cache -> the no-cache case goes RED;
+- run the gate exclude check after the measurement check -> the rc 3 cases go RED;
+- remove the refresh worker skip -> the refresh zero-call case goes RED;
+- drop the skip's negative-stamp cleanup -> the re-enable case goes RED;
+- remove the SWE-2 guard's excluded-devin early return -> the stale excluded
+  fixture goes RED; call refresh_swe2_result twice -> the "once" case goes RED.
 
 Every case uses temp HOME/XDG/SCOPEFUEL_CACHE from the suite fixtures and stub
 fetchers only; no real provider is reached.
@@ -173,11 +179,17 @@ def test_refresh_swe2_guard_returns_early_for_excluded_devin(monkeypatch):
 
     monkeypatch.setattr(cli.refresh, "refresh_swe2_result", fake_refresh)
     policy.set_policy("devin", "exclude", until=dt.date(2099, 1, 1))
+    # Stale and past the provider TTL: without the get_policy early return this
+    # result would take the "refresh a stale observation" branch. A fresh-looking
+    # skip result would short-circuit at the next guard and leave the early
+    # return unpinned (round-2 tester B1).
     skipped = ProviderResult(
         id="devin",
         error="class=exclude — 탐침 안 함",
         error_kind="excluded",
         pool_class="exclude",
+        stale=True,
+        age_s=cache.PROVIDER_TTL_S.get("devin", cache.DEFAULT_TTL_S) + 1.0,
     )
 
     out = cli._refresh_swe2_result(skipped, needed=True, now=dt.datetime.now(dt.UTC))
