@@ -540,6 +540,7 @@ def test_clinepass_is_appended_after_existing_builtin_providers():
         "kimi",
         "devin",
         "upstage",
+        "commandcode",
     ]
 
 
