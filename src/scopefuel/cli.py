@@ -102,10 +102,28 @@ def _manual_money_arg(value: str) -> float:
     return parsed
 
 
+def _policy_pool_names(available: list[str], manual_pools: frozenset[str]) -> list[str]:
+    """Every pool name a pool policy may name — the ``policy set`` choices and
+    the ``policy list`` known-pool table draw from this one source (hk 2103).
+
+    The probe pools (``available``), the manual-only pools, and every pool the
+    catalog names — a manual-only pool like ``anthropic-api`` has no fetcher,
+    so it reaches this list only through the catalog and ``manual_pools``.
+    """
+
+    names = set(available) | set(manual_pools)
+    names.update(entry.pool for entry in bench.catalog_snapshot() if entry.pool)
+    return sorted(names)
+
+
 def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset()) -> argparse.ArgumentParser:
     # hk 2079: a manual-only pool has no probe, so it is not in ``available``
     # (the probe list) but its manual observations still need a valid pool name.
     manual_pool_choices = sorted(set(available) | set(manual_pools))
+    # hk 2103: policy set takes the same vocabulary the pool table knows —
+    # every pool the catalog names, manual-only ones included — so a
+    # manual-only pool can be configured. Unknown names are still refused.
+    policy_pool_choices = _policy_pool_names(available, manual_pools)
     parser = argparse.ArgumentParser(
         prog="scopefuel",
         description="AI 코딩 플랜의 남은 여유를 스코프(계정/모델/그룹)와 지평(지금/이번주)으로 구분해 조회",
@@ -180,7 +198,7 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
     policy_sub.add_parser("list", help="정책 목록 보기")
 
     set_parser = policy_sub.add_parser("set", help="pool 정책 설정")
-    set_parser.add_argument("pool", choices=available, help="provider pool 이름")
+    set_parser.add_argument("pool", choices=policy_pool_choices, help="provider pool 이름")
     set_parser.add_argument(
         "pool_class",
         nargs="?",
@@ -938,6 +956,13 @@ def _policy_command(
 ) -> int:
     today = dt.datetime.now(dt.UTC).date()
     known_classes = {name: getattr(fetcher, "pool_class", "preserve") for name, fetcher in fetchers.items()}
+    # hk 2103: list the same pools ``policy set`` accepts — manual-only pools
+    # (spend by construction) and every pool the catalog names, even ones with
+    # no configured policy yet.
+    for pool in manual.MANUAL_ONLY_POOLS:
+        known_classes.setdefault(pool, manual.manual_only_result(pool).pool_class)
+    for pool in _policy_pool_names(list(fetchers), manual.MANUAL_ONLY_POOLS):
+        known_classes.setdefault(pool, "preserve")
 
     if args.policy_command == "list":
         for row in list_policy_rows(known_classes, today=today):
