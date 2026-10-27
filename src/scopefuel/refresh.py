@@ -129,6 +129,13 @@ def run_worker(fetchers: dict[str, object], pool: str, *, swe2: bool = False) ->
         print(f"refresh: unknown pool: {pool}", file=sys.stderr)
         return 2
 
+    fetcher = fetchers[pool]
+    # hk 2114 — refresh is another registry-fetcher caller, so it must honour
+    # the same never-probe rule as collect/gate/recommend/status.
+    if reason := cache._pool_skip_reason(pool, cache._effective_class(pool, fetcher), None):
+        print(f"refresh: pool={pool} {reason} — skipped")
+        return 0
+
     with pool_lock(pool) as acquired:
         if not acquired:
             print(f"refresh: pool={pool} already in progress; skipped")
@@ -142,7 +149,6 @@ def run_worker(fetchers: dict[str, object], pool: str, *, swe2: bool = False) ->
             if remaining > 0:
                 print(f"refresh: pool={pool} backoff 중 — {remaining:.0f}s 뒤 허용, 네트워크 호출 생략")
                 return SWE2_RC_BACKOFF if swe2 else 0
-            fetcher = fetchers[pool]
             v2_identities = _v2_capture(pool, now)
             started_at = now
             result = _fetch(fetcher, pool)
