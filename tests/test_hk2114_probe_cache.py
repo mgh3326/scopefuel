@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from scopefuel import cache, cli, policy
+from scopefuel import cache, cli, policy, refresh
 from scopefuel.model import Bucket, ProviderResult, Scope
 
 
@@ -67,6 +67,20 @@ def _registry(**extra: object) -> dict[str, object]:
 
 
 # --------------------------------------------------------------- never probe
+
+
+@pytest.mark.parametrize("state", ["exclude", "unsubscribed"])
+def test_refresh_worker_honours_the_same_skip(monkeypatch, capsys, state):
+    """refresh is another registry-fetcher caller; it must not bypass the skip."""
+    kimi = _Counter(_ok("kimi"))
+    if state == "exclude":
+        policy.set_policy("kimi", "exclude", until=dt.date(2099, 1, 1))
+    else:
+        policy.set_subscribed("kimi", False)
+
+    assert refresh.run_worker({"kimi": kimi}, "kimi") == 0
+    assert kimi.calls == 0
+    assert "skipped" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("state", ["exclude", "unsubscribed"])
@@ -145,6 +159,115 @@ def test_status_shows_the_skip_reason_without_failing_the_exit_code(monkeypatch,
     out = capsys.readouterr()
     assert kimi.calls == 0
     assert "탐침 안 함" in out.out
+
+
+# --------------------------------------------------------------- SWE-2 guard
+
+
+def test_refresh_swe2_guard_returns_early_for_excluded_devin(monkeypatch):
+    calls: list[int] = []
+
+    def fake_refresh():
+        calls.append(1)
+        return _ok("devin")
+
+    monkeypatch.setattr(cli.refresh, "refresh_swe2_result", fake_refresh)
+    policy.set_policy("devin", "exclude", until=dt.date(2099, 1, 1))
+    skipped = ProviderResult(
+        id="devin",
+        error="class=exclude — 탐침 안 함",
+        error_kind="excluded",
+        pool_class="exclude",
+    )
+
+    out = cli._refresh_swe2_result(skipped, needed=True, now=dt.datetime.now(dt.UTC))
+
+    assert out is skipped
+    assert calls == []  # the old early return is unchanged
+
+
+@pytest.mark.parametrize(
+    "stale,age",
+    [(True, 1.0), (False, cache.PROVIDER_TTL_S.get("devin", cache.DEFAULT_TTL_S) + 1.0)],
+)
+def test_refresh_swe2_guard_refreshes_a_stale_or_expired_subscribed_devin_once(monkeypatch, stale, age):
+    calls: list[int] = []
+    fresh = _ok("devin")
+
+    def fake_refresh():
+        calls.append(1)
+        return fresh
+
+    monkeypatch.setattr(cli.refresh, "refresh_swe2_result", fake_refresh)
+    observed = ProviderResult(id="devin", stale=stale, age_s=age, pool_class="spend")
+
+    out = cli._refresh_swe2_result(observed, needed=True, now=dt.datetime.now(dt.UTC))
+
+    assert out is fresh
+    assert calls == [1]  # exactly one refresh, not suppressed or duplicated
+
+
+def test_refresh_swe2_guard_leaves_a_fresh_subscribed_devin_alone(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(cli.refresh, "refresh_swe2_result", lambda: calls.append(1) or _ok("devin"))
+    fresh = ProviderResult(id="devin", stale=False, age_s=10.0, pool_class="spend")
+
+    out = cli._refresh_swe2_result(fresh, needed=True, now=dt.datetime.now(dt.UTC))
+
+    assert out is fresh
+    assert calls == []
+
+
+# --------------------------------------------------------------- skip cleanup
+
+
+@pytest.mark.parametrize("state", ["exclude", "unsubscribed"])
+def test_skipped_pool_clears_negative_cache_and_reprobes_after_reenable(state):
+    calls: list[int] = []
+
+    def bad():
+        calls.append(1)
+        return ProviderResult(id="stub", error="n/a (parse failed)", error_kind="parse_error")
+
+    fetchers = {"stub": bad}
+    cache.collect(fetchers, ["stub"], now=1000.0)
+    entry = cache._load()["stub"]
+    assert entry["negative_until"] == 1600.0
+    assert entry["last_error_at"] == 1000.0
+
+    if state == "exclude":
+        policy.set_policy("stub", "exclude", until=dt.date(2099, 1, 1))
+    else:
+        policy.set_subscribed("stub", False)
+
+    skipped = cache.collect(fetchers, ["stub"], now=1010.0)[0]
+    assert len(calls) == 1
+    assert skipped.error_kind in ("excluded", "unsubscribed")
+    entry = cache._load()["stub"]
+    assert "negative_until" not in entry  # no negative-cache entry survives the skip
+    assert entry["last_error_at"] == 1000.0  # the skip wrote no audit fields
+
+    if state == "exclude":
+        policy.clear_policy("stub")
+    else:
+        policy.set_subscribed("stub", True)
+
+    cache.collect(fetchers, ["stub"], now=1020.0)
+    assert len(calls) == 2  # re-enabled: the next call probes again
+
+
+def test_pool_skipped_from_the_start_has_no_cache_entry():
+    calls: list[int] = []
+
+    def bad():
+        calls.append(1)
+        return ProviderResult(id="stub", error="n/a", error_kind="parse_error")
+
+    policy.set_policy("stub", "exclude", until=dt.date(2099, 1, 1))
+    cache.collect({"stub": bad}, ["stub"], now=1000.0)
+
+    assert calls == []
+    assert "stub" not in cache._load()
 
 
 # --------------------------------------------------------------- negative cache
