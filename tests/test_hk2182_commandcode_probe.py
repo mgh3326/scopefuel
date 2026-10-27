@@ -161,6 +161,23 @@ def test_config_bin_wins_over_path(monkeypatch, tmp_path, isolated_cache):
     assert binary == str(configured)
 
 
+def test_path_cmd_wins_over_known_install_dirs(monkeypatch, tmp_path):
+    """S1 (verdict r1): PATH before known dirs — a mutant reordering them
+
+    must go RED. Both locations hold a cmd; the PATH one must win.
+    """
+
+    home = tmp_path / "home"
+    _stub_cmd(home / ".hermes" / "node" / "bin")
+    path_dir = tmp_path / "path-bin"
+    on_path = _stub_cmd(path_dir)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(path_dir))
+    monkeypatch.setattr(commandcode, "BINARY", "cmd")
+    binary, _tried = commandcode._resolve_binary()
+    assert binary == str(on_path)
+
+
 def test_missing_binary_error_names_the_paths_tried(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     empty = tmp_path / "empty-path"
@@ -283,6 +300,23 @@ def test_dead_owner_pid_is_reclaimed(tmp_path):
         holder.wait(timeout=5)
 
 
+def test_unlabelled_lock_holder_counts_as_in_flight(tmp_path):
+    """S4 (verdict r1): a held lock with no readable owner stays in-flight —
+
+    an unknown holder is assumed live, never reclaimed.
+    """
+
+    lock_dir = tmp_path / "locks"
+    holder = _lock_helper(lock_dir, owner="''")  # writes a blank owner line
+    try:
+        assert proctrack.probe_in_flight(lock_dir) is True
+        with proctrack.single_probe_lock(lock_dir) as acquired:
+            assert acquired is False
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+
+
 def test_live_owner_lock_is_never_reclaimed(tmp_path):
     """Mutant: reclaim regardless of owner liveness -> this goes RED."""
 
@@ -290,6 +324,36 @@ def test_live_owner_lock_is_never_reclaimed(tmp_path):
     holder = _lock_helper(lock_dir, owner="os.getpid()")
     try:
         assert proctrack.probe_in_flight(lock_dir) is True
+        with proctrack.single_probe_lock(lock_dir) as acquired:
+            assert acquired is False
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+
+
+def test_reclaim_loses_to_a_competing_replacer(monkeypatch, tmp_path):
+    """S5 (verdict r1): two reclaimers each lock their own replacement file —
+
+    the inode check must make the loser report a miss, not hold the lock.
+    A mutant deleting the check acquires on a stale inode -> RED.
+    """
+
+    lock_dir = tmp_path / "locks"
+    holder = _lock_helper(lock_dir, owner=str(_dead_pid()))
+    try:
+        real_try = proctrack._try_lock_fd
+        raced = {"done": False}
+
+        def competing(path):
+            fd = real_try(path)
+            if fd is not None and not raced["done"]:
+                raced["done"] = True
+                rival = pathlib.Path(path).with_name(".probe.lock.rival")
+                rival.write_text("")
+                os.replace(rival, path)  # a second reclaimer wins the publish
+            return fd
+
+        monkeypatch.setattr(proctrack, "_try_lock_fd", competing)
         with proctrack.single_probe_lock(lock_dir) as acquired:
             assert acquired is False
     finally:
@@ -369,6 +433,44 @@ def test_m1b_verbatim_screen_fails_closed_naming_the_missing_panel():
     assert "usage windows are missing" in result.error
     detail = commandcode._missing_detail(M1B_FIXTURE.read_text())
     assert detail == "one or more usage windows are missing"
+
+
+def test_probe_input_carries_no_enter_and_submit_is_the_carriage_return():
+    """S3 (verdict r1): '/usage\\r' back in PROBE_INPUT reintroduces the merged
+
+    write on TUIs that coalesce — pin the two-write contract itself.
+    """
+
+    assert "\r" not in commandcode.PROBE_INPUT
+    assert "\n" not in commandcode.PROBE_INPUT
+    assert commandcode.PROBE_SUBMIT == "\r"
+
+
+def test_unparsed_screen_end_to_end_names_the_missing_part(monkeypatch, tmp_path):
+    """S2 (verdict r1): the real _probe_once must wire _missing_detail into
+
+    the timeout — a silent stub that never renders the panel yields
+    stage=unparsed with the missing part named.
+    """
+
+    script = tmp_path / "cmd-silent"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time, tty\n"
+        "tty.setraw(sys.stdin.fileno())\n"
+        "os.write(1, '❯ '.encode())\n"
+        "time.sleep(60)\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(commandcode, "BINARY", str(script))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "5")
+    result = commandcode.fetch()
+    assert result.error_kind == "probe_timeout"
+    assert "stage=unparsed" in result.error
+    assert "missing:" in result.error
+    assert result.raw["missing"] == "one or more usage windows are missing"
 
 
 def test_m1b_synthetic_unparsed_screen_fails_closed():
