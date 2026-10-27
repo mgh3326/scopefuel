@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from ..model import PoolClass, ProviderResult, _normalize_pool_class
-from . import agy, claude, clinepass, codex, devin, grok, kimi, kiro, upstage
+from . import agy, claude, clinepass, codex, commandcode, devin, grok, kimi, kiro, upstage
 
 
 class Fetcher(Protocol):
@@ -46,6 +46,7 @@ def _with_class(fn: object, pool_class: PoolClass) -> Fetcher:
 
 BUILTIN: dict[str, Fetcher] = {
     "claude": _with_class(claude.fetch, "spend"),
+    "commandcode": _with_class(commandcode.fetch, "spend"),
     "codex": _with_class(codex.fetch, "spend"),
     "agy": _with_class(agy.fetch, "spend"),
     "kiro": _with_class(kiro.fetch, "spend"),

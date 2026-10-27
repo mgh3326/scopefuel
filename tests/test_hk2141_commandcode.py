@@ -1,13 +1,10 @@
-"""hk 2141: the commandcode credit pool and its cmd-dsflash41 E6 rungs.
+"""hk 2141: the commandcode /usage pool and its cmd-dsflash41 E6 rungs.
 
-The operator's Command Code credit (cmd 1.88.0, plan GOAT per r1027cmdcode /
-r1027cmdgoat — no amount or period is hardcoded anywhere) is spent through
-cmd. It is a separate pool with no usage API and no probe: its balance is a
-manual observation the operator or desk enters (the ``/usage`` credit balance
-plus an expiry), and nothing is ever fetched or scraped from the cmd
-account. The cmd rungs (one per effort the model accepts) are unmeasured E6
-catalog rows: marker-gated, worker/tester only, and they inherit no grade from
-devin-ds41 — same model, different harness.
+The GOAT usage screen provides monthly, 5-hour, and weekly percentages with
+their own reset times. A PTY probe reads only cmd's /usage UI; failures use
+hk 2114's negative cache and a valid manual credit observation remains a
+fallback. The cmd rungs are unmeasured E6 rows, marker-gated and worker/tester
+only, with no grade inherited from devin-ds41.
 
 Each test docstring names the mutant it kills where the brief lists one.
 """
@@ -20,8 +17,9 @@ import pathlib
 
 import pytest
 
-from scopefuel import bench, cli, commandcode_limit, launch, manual, providers, recommend
+from scopefuel import bench, cache, cli, launch, manual, providers, recommend
 from scopefuel.model import Bucket, ProviderResult, Scope
+from scopefuel.providers import commandcode
 from scopefuel.recommend import (
     E6_ARM_ANNOTATION,
     E6_ARM_KEYS,
@@ -45,6 +43,12 @@ CMD_RUNGS = ("low", "high", "max")
 CMD_DEFAULT_RUNG = {"cmd-dsflash41": "high"}
 CMD_ROWS = [(profile, rung) for profile in sorted(CMD_PROFILES) for rung in CMD_RUNGS]
 CREDIT_EXPIRES = (TODAY + dt.timedelta(days=30)).isoformat()
+USAGE_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "cmd_usage_goat.txt"
+LIMIT_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "cmd_usage_limit.placeholder.txt"
+USAGE_TEXT = (
+    "GOAT Plan · active / 0% used / 95 requests this month · 31 days to renew / "
+    "5-hour 1% · resets in 3h 52m / Weekly 1% · resets in 6d 22h"
+)
 
 
 def _marker(profile: str, rung: str) -> str:
@@ -74,12 +78,9 @@ def _record_credit(
 
 
 def _credit_result(*, now: dt.datetime = NOW, **kwargs) -> ProviderResult:
-    _record_credit(**kwargs)
-    resolution = manual.resolve_result(
-        manual.manual_only_result("commandcode"), now=now, store=manual.load_store()
-    )
-    assert resolution.applied, resolution.failure_reason
-    return resolution.result
+    # Gate/catalog cases use a valid automatic observation; manual fallback
+    # behavior is covered separately below.
+    return commandcode.parse(USAGE_TEXT, now=now)
 
 
 def _claude_result(used: float = 10.0) -> ProviderResult:
@@ -126,9 +127,10 @@ def test_cmd_rows_have_their_own_map_and_stay_out_of_the_pi_map():
     assert not set(CMD_PROFILES) & set(recommend._PI_PROFILE_POOLS)
 
 
-def test_commandcode_has_no_automatic_probe():
-    assert "commandcode" not in providers.BUILTIN
-    assert "commandcode" not in providers.registry()
+def test_commandcode_has_an_automatic_probe_registration():
+    assert "commandcode" in providers.BUILTIN
+    assert "commandcode" in providers.registry()
+    assert providers.BUILTIN["commandcode"].pool_class == "spend"
     synthetic = manual.manual_only_result("commandcode")
     assert synthetic.id == "commandcode"
     assert synthetic.error_kind == "manual_only"
@@ -208,37 +210,147 @@ def test_launch_spelling_takes_the_effort_flag(profile, rung):
 
 
 # ---------------------------------------------------------------------------
-# 3. the manual credit shape — fail closed without a valid observation
+# 3. /usage windows, passive limit mapping, and manual fallback
 # ---------------------------------------------------------------------------
 
 
-def test_credit_observation_derives_used_pct_and_carries_the_expiry():
-    entry = _record_credit(remaining=0.75, total=1.0)
-    assert entry["window"] == "credit"
-    assert entry["used_pct"] == pytest.approx(25.0)
-    assert entry["credit"] == {
-        "remaining_usd": 0.75,
-        "total_usd": 1.0,
-        "expires_on": CREDIT_EXPIRES,
-    }
-    assert entry["resets_at"] is None
+def test_desk_usage_fixture_parses_all_three_percentages_and_resets():
+    assert USAGE_FIXTURE.read_text().strip() == USAGE_TEXT
+    result = commandcode.parse(USAGE_FIXTURE.read_text(), now=NOW)
+    assert result.status == "ok"
+    buckets = {bucket.window: bucket for bucket in result.buckets}
+    assert set(buckets) == {"30d", "5h", "7d"}
+    assert buckets["30d"].used_pct == 0
+    assert buckets["30d"].resets_at == (NOW + dt.timedelta(days=31)).isoformat().replace("+00:00", "Z")
+    assert buckets["5h"].used_pct == 1
+    assert buckets["5h"].resets_at == (NOW + dt.timedelta(hours=3, minutes=52)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert buckets["7d"].used_pct == 1
+    assert buckets["7d"].resets_at == (NOW + dt.timedelta(days=6, hours=22)).isoformat().replace(
+        "+00:00", "Z"
+    )
 
 
-def test_a_noncredit_window_on_commandcode_is_refused():
-    """The credit window is the manual-only pool's window and nothing else's."""
+@pytest.mark.parametrize("window", ["30d", "5h", "7d"])
+def test_any_window_at_100_is_exhausted_and_uses_that_windows_reset(window):
+    prior = {"30d": "0% used", "5h": "5-hour 1%", "7d": "Weekly 1%"}[window]
+    current = {"30d": "100% used", "5h": "5-hour 100%", "7d": "Weekly 100%"}[window]
+    result = commandcode.parse(USAGE_TEXT.replace(prior, current), now=NOW)
+    bucket = next(bucket for bucket in result.buckets if bucket.window == window)
+    assert bucket.used_pct == 100
+    assert bucket.resets_at
+    gate = gate_check(
+        [result],
+        "cmd-dsflash41",
+        role="worker",
+        effort="high",
+        e6_arm=_marker("cmd-dsflash41", "high"),
+        today=TODAY,
+        now=NOW,
+    )
+    assert gate.ok is False
 
-    with pytest.raises(manual.ManualError, match="credit"):
-        manual.record_observation(
-            pool="commandcode",
-            window="7d",
-            used_pct=25.0,
-            measured_at=NOW,
-            reason="wrong window",
-            now=NOW,
-        )
+
+def test_credit_recommendation_requires_every_commandcode_window():
+    healthy = commandcode.parse(USAGE_TEXT, now=NOW)
+    assert recommend.credit_row_available([healthy], "commandcode")
+    exhausted = commandcode.parse(USAGE_TEXT.replace("Weekly 1%", "Weekly 100%"), now=NOW)
+    assert not recommend.credit_row_available([exhausted], "commandcode")
 
 
-def test_missing_manual_value_refuses_admission():
+def test_limit_wording_maps_to_its_named_window_and_unmapped_wording_fails_closed():
+    fixture = LIMIT_FIXTURE.read_text()
+    assert "PLACEHOLDER" in fixture
+    text = "\n".join(line for line in fixture.splitlines() if not line.startswith("#"))
+    result = commandcode.parse(text, now=NOW)
+    buckets = {bucket.window: bucket for bucket in result.buckets}
+    assert buckets["7d"].used_pct == 100
+    assert buckets["7d"].resets_at == (NOW + dt.timedelta(days=6, hours=22)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    bad = commandcode.parse(USAGE_TEXT.replace("Weekly 1%", "usage limit reached"), now=NOW)
+    assert bad.error_kind == "parse_error"
+
+
+def test_manual_credit_fallback_is_used_only_after_probe_failure():
+    _record_credit(remaining=0.75, total=1.0)
+    failed = ProviderResult(
+        id="commandcode", error="cmd unavailable", error_kind="transport", pool_class="spend"
+    )
+    resolution = manual.resolve_result(failed, now=NOW, store=manual.load_store())
+    assert resolution.applied
+    assert resolution.result.manual["selection"] == "manual_fallback"
+    assert resolution.result.buckets[0].used_pct == pytest.approx(25.0)
+    assert manual.required_windows_for(resolution.result) == frozenset({"credit"})
+
+
+def test_stale_100_percent_observation_holds_until_its_named_reset_only():
+    _record_credit(remaining=0.75, total=1.0)
+    limited_text = USAGE_TEXT.replace("Weekly 1%", "Weekly 100%")
+    active_limit = commandcode.parse(limited_text, now=NOW)
+    active_limit.stale = True
+    active_limit.error = "cmd probe failed"
+    active_limit.error_kind = "transport"
+    blocked = manual.resolve_result(active_limit, now=NOW, store=manual.load_store())
+    assert blocked.applied is False
+
+    expired_limit = commandcode.parse(limited_text, now=NOW)
+    expired_limit.stale = True
+    expired_limit.error = "cmd probe failed"
+    expired_limit.error_kind = "transport"
+    for bucket in expired_limit.buckets:
+        bucket.resets_at = (NOW - dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    reopened = manual.resolve_result(expired_limit, now=NOW, store=manual.load_store())
+    assert reopened.applied is True
+
+
+def test_manual_credit_fallback_rejects_missing_stale_expired_and_exhausted():
+    failed = ProviderResult(
+        id="commandcode", error="cmd unavailable", error_kind="transport", pool_class="spend"
+    )
+    cases = (
+        (None, NOW),
+        ({"measured_at": NOW - dt.timedelta(hours=2), "ttl_s": 900.0}, NOW),
+        ({"remaining": 0.0}, NOW),
+        (
+            {"expires_on": (TODAY + dt.timedelta(days=1)).isoformat()},
+            dt.datetime.combine(TODAY + dt.timedelta(days=1), dt.time.min, tzinfo=dt.UTC)
+            + dt.timedelta(seconds=1),
+        ),
+    )
+    for kwargs, resolve_now in cases:
+        manual.clear_pool("commandcode", now=NOW)
+        if kwargs is not None:
+            _record_credit(**kwargs)
+        resolution = manual.resolve_result(failed, now=resolve_now, store=manual.load_store())
+        if kwargs == {"remaining": 0.0}:
+            assert resolution.applied is True
+            denied = gate_check(
+                [resolution.result],
+                "cmd-dsflash41",
+                role="worker",
+                effort="high",
+                e6_arm=_marker("cmd-dsflash41", "high"),
+                today=TODAY,
+                now=resolve_now,
+            )
+            assert denied.ok is False
+        else:
+            assert resolution.applied is False, kwargs
+            assert resolution.result.status == "error"
+
+
+def test_commandcode_has_automatic_three_window_coverage():
+    assert "commandcode" in providers.BUILTIN
+    assert "commandcode" in providers.registry()
+    assert providers.BUILTIN["commandcode"].pool_class == "spend"
+    assert manual.required_windows_for(commandcode.parse(USAGE_TEXT, now=NOW)) == frozenset(
+        {"5h", "7d", "30d"}
+    )
+
+
+def test_missing_observation_refuses_admission():
     """Mutant: read a missing observation as available -> this goes RED."""
 
     resolution = manual.resolve_result(
@@ -276,46 +388,6 @@ def test_stale_manual_value_refuses_admission():
         e6_arm=_marker("cmd-dsflash41", "high"),
         today=TODAY,
         now=NOW,
-    )
-    assert result.ok is False
-    assert result.unmeasurable is True
-
-
-def test_zero_remaining_balance_is_not_admitted():
-    """Mutant: read a 100%-used observation as available -> this goes RED."""
-
-    result = gate_check(
-        [_credit_result(remaining=0.0)],
-        "cmd-dsflash41",
-        role="worker",
-        effort="high",
-        e6_arm=_marker("cmd-dsflash41", "high"),
-        today=TODAY,
-        now=NOW,
-    )
-    assert result.ok is False
-
-
-def test_credit_expired_at_midnight_utc_fails_closed():
-    """Mutant: read an expired observation as available -> this goes RED."""
-
-    expires_on = TODAY + dt.timedelta(days=1)
-    _record_credit(expires_on=expires_on.isoformat())
-    expiry_start = dt.datetime.combine(expires_on, dt.time.min, tzinfo=dt.UTC)
-    resolution = manual.resolve_result(
-        manual.manual_only_result("commandcode"),
-        now=expiry_start + dt.timedelta(seconds=1),
-        store=manual.load_store(),
-    )
-    assert resolution.applied is False
-    result = gate_check(
-        [resolution.result],
-        "cmd-dsflash41",
-        role="worker",
-        effort="high",
-        e6_arm=_marker("cmd-dsflash41", "high"),
-        today=expires_on,
-        now=expiry_start + dt.timedelta(seconds=1),
     )
     assert result.ok is False
     assert result.unmeasurable is True
@@ -430,138 +502,57 @@ def test_gate_reason_names_commandcode_not_devin(profile):
 
 
 # ---------------------------------------------------------------------------
-# 5. the observed-limit hook — pool exhausted until the named reset
+# 5. probe failure/cache behavior and --json listing
 # ---------------------------------------------------------------------------
 
 
-def _observe_limit(*, reset: dt.datetime | None = None, observed: dt.datetime = NOW) -> None:
-    reset = reset or NOW + dt.timedelta(hours=6)
-    saved = commandcode_limit.record_observation(
-        reset=reset.isoformat(),
-        observed=observed.isoformat(),
-        rung="cmd-dsflash41",
-        source="job:2141-test",
+def test_probe_uses_stub_cmd_and_reads_usage_without_a_model_prompt(monkeypatch, tmp_path):
+    script = tmp_path / "cmd-stub"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time\n"
+        "print('❯ ', end='', flush=True)\n"
+        "line = sys.stdin.readline()\n"
+        "assert line.strip() == '/usage', line\n"
+        f"print({USAGE_TEXT!r}, flush=True)\n"
+        "time.sleep(1)\n"
     )
-    assert saved is True
+    script.chmod(0o755)
+    monkeypatch.setattr(commandcode, "BINARY", str(script))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    result = commandcode.fetch()
+    assert result.status == "ok"
+    assert len(result.buckets) == 3
 
 
-def test_observe_commandcode_limit_records_and_blocks_the_pool():
-    """A live observed cmd limit maps the pool to exhausted until its reset."""
+def test_probe_failure_uses_hk2114_negative_cache(monkeypatch, tmp_path):
+    calls = []
 
-    _observe_limit()
-    # Even a fresh, positive credit observation cannot override the refusal
-    # the pane already recorded.
-    resolution = manual.resolve_result(
-        manual.manual_only_result("commandcode"), now=NOW, store=manual.load_store()
-    )
-    assert resolution.applied is False
-    assert "commandcode" in (resolution.failure_reason or "")
-    assert "rate_limited" in (resolution.failure_reason or "")
+    def fail():
+        calls.append(1)
+        return ProviderResult(
+            id="commandcode", error="stub failed", error_kind="transport", pool_class="spend"
+        )
 
-    _record_credit()
-    resolution = manual.resolve_result(
-        manual.manual_only_result("commandcode"), now=NOW, store=manual.load_store()
-    )
-    assert resolution.applied is False
-    result = gate_check(
-        [resolution.result],
-        "cmd-dsflash41",
-        role="worker",
-        effort="high",
-        e6_arm=_marker("cmd-dsflash41", "high"),
-        today=TODAY,
-        now=NOW,
-    )
-    assert result.ok is False
-    assert result.unmeasurable is True
+    fetchers = {"commandcode": fail}
+    first = cache.collect(fetchers, ["commandcode"], use_cache=False, now=1000.0)
+    second = cache.collect(fetchers, ["commandcode"], use_cache=False, now=1001.0)
+    assert len(calls) == 1
+    assert first[0].status == second[0].status == "error"
 
 
-def test_the_pool_reads_free_again_after_the_named_reset():
-    _observe_limit(reset=NOW + dt.timedelta(hours=6))
-    _record_credit()
-    after_reset = NOW + dt.timedelta(hours=6, seconds=1)
-    resolution = manual.resolve_result(
-        manual.manual_only_result("commandcode"), now=after_reset, store=manual.load_store()
-    )
-    assert resolution.applied is True, resolution.failure_reason
-
-
-def test_limit_observation_uses_the_named_reset_without_a_fixed_horizon():
-    """A reset beyond an assumed plan period is preserved exactly as entered."""
-
-    named_reset = NOW + dt.timedelta(days=45)
-    _observe_limit(reset=named_reset)
-    record = commandcode_limit.active_record(now=NOW)
-    assert record is not None
-    assert record.reset_at == named_reset
-    assert commandcode_limit.active_record(now=named_reset - dt.timedelta(seconds=1)) is not None
-    assert commandcode_limit.active_record(now=named_reset) is None
-
-
-def test_clear_hold_reopens_the_pool():
-    _observe_limit()
-    removed = commandcode_limit.clear_hold(now=NOW)
-    assert removed is not None
-    _record_credit()
-    resolution = manual.resolve_result(
-        manual.manual_only_result("commandcode"), now=NOW, store=manual.load_store()
-    )
-    assert resolution.applied is True, resolution.failure_reason
-
-
-def test_observe_cli_records_and_clears(capsys):
-    rc = cli.main(
-        [
-            "observe",
-            "commandcode-limit",
-            "--reset",
-            (NOW + dt.timedelta(hours=6)).isoformat(),
-            "--observed",
-            NOW.isoformat(),
-            "--rung",
-            "cmd-dsflash41",
-            "--source",
-            "job:2141-test",
-        ]
-    )
-    assert rc == 0
-    assert "recorded" in capsys.readouterr().out
-    assert commandcode_limit.active_record(now=NOW) is not None
-
-    rc = cli.main(["observe", "commandcode-limit", "--clear"])
-    assert rc == 0
-    assert "cleared" in capsys.readouterr().out
-    assert commandcode_limit.active_record(now=NOW) is None
-
-
-def test_observe_cli_rejects_an_unknown_rung(capsys):
-    """Fail closed: an observation for a profile we do not launch is refused."""
-
-    rc = cli.main(
-        [
-            "observe",
-            "commandcode-limit",
-            "--reset",
-            (NOW + dt.timedelta(hours=6)).isoformat(),
-            "--observed",
-            NOW.isoformat(),
-            "--rung",
-            "cmd-dsflash42",
-            "--source",
-            "job:2141-test",
-        ]
-    )
-    assert rc == 2
-    assert commandcode_limit.active_record(now=NOW) is None
-
-
-def test_observe_limit_wording_fixture_is_a_placeholder():
-    """Pins the fixture state: real cmd limit wording is still unknown (PR body)."""
-
-    text = (
-        pathlib.Path(__file__).parent / "fixtures" / "commandcode_limit_screen.placeholder.txt"
-    ).read_text()
-    assert "PLACEHOLDER" in text
+@pytest.mark.parametrize("state", ["exclude", "unsubscribed"])
+def test_excluded_or_unsubscribed_commandcode_is_never_probed(monkeypatch, state):
+    calls = []
+    if state == "exclude":
+        monkeypatch.setattr(cache, "get_policy", lambda *args, **kwargs: ("exclude", None))
+    else:
+        monkeypatch.setattr(cache, "get_subscribed", lambda _name: (False, "test unsubscribed"))
+    results = cache.collect({"commandcode": lambda: calls.append(1)}, ["commandcode"], use_cache=False)
+    assert calls == []
+    assert results[0].error_kind in {"excluded", "unsubscribed"}
 
 
 # ---------------------------------------------------------------------------
@@ -625,18 +616,6 @@ def test_json_commandcode_shows_a_valid_credit_observation(capsys, monkeypatch):
 
 def test_json_commandcode_stale_observation_fails_closed(capsys, monkeypatch):
     _record_credit(measured_at=NOW - dt.timedelta(hours=2), ttl_s=900.0)
-    _stub_registry(monkeypatch)
-    rc, payload = _json_payload(capsys, [])
-
-    assert rc == 0
-    entry = _entry(payload, "commandcode")
-    assert entry["status"] == "error"
-    _no_usage_shown(entry)
-
-
-def test_json_commandcode_observed_limit_fails_closed(capsys, monkeypatch):
-    _record_credit()
-    _observe_limit()
     _stub_registry(monkeypatch)
     rc, payload = _json_payload(capsys, [])
 

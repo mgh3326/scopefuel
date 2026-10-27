@@ -20,7 +20,6 @@ from dataclasses import replace
 from . import (
     areas,
     bench,
-    commandcode_limit,
     free_window,
     grades,
     herdr,
@@ -104,8 +103,8 @@ def _manual_money_arg(value: str) -> float:
 
 
 def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset()) -> argparse.ArgumentParser:
-    # hk 2079: a manual-only pool has no probe, so it is not in ``available``
-    # (the probe list) but its manual observations still need a valid pool name.
+    # Manual-credit fallback pools remain valid observation targets even when
+    # they are not in the active provider registry.
     manual_pool_choices = sorted(set(available) | set(manual_pools))
     parser = argparse.ArgumentParser(
         prog="scopefuel",
@@ -760,28 +759,6 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         metavar="KEY",
         help="--clear 대상 identity key (기본: 캐시된 account fingerprint 또는 host/user fallback)",
     )
-    # hk 2141: a cmd screen/exit text naming a usage or rate limit maps the
-    # commandcode pool to exhausted until the reset it names. Same passive
-    # shape as devin-free-limit — the observer writes only what it already saw.
-    observe_cmd = observe_sub.add_parser(
-        "commandcode-limit", help="cmd Command Code usage/rate limit reset 기록/해제"
-    )
-    observe_cmd.add_argument("--reset", help="timezone-aware ISO-8601 reset time")
-    observe_cmd.add_argument("--observed", help="timezone-aware ISO-8601 observation time")
-    observe_cmd.add_argument("--rung", help="observed cmd profile UID")
-    observe_cmd.add_argument("--source", help="job:<job>")
-    observe_cmd.add_argument("--unparsed", action="store_true", help="reset message was not parseable")
-    observe_cmd.add_argument(
-        "--clear",
-        action="store_true",
-        help="기록 대신 live hold 를 제거 (reset/observed/rung/source 와 병용 불가)",
-    )
-    observe_cmd.add_argument(
-        "--account-key",
-        metavar="KEY",
-        help="--clear 대상 identity key (기본: host/user fallback)",
-    )
-
     refresh_parser = subparsers.add_parser("refresh", help="한 pool만 이벤트 기반으로 캐시 갱신")
     refresh_parser.add_argument("pool", choices=REFRESH_POOLS, help="갱신할 provider pool")
     refresh_parser.add_argument("--background", action="store_true", help="즉시 반환하고 백그라운드 갱신")
@@ -952,7 +929,7 @@ def _render(
         stale = _stale_build_verdict()
         free_short_window = free_window.display_value(free_window.active_record(now=now))
         providers = []
-        # hk 2136: ``providers`` also lists the manual-only pools (``listed``); the
+        # hk 2136: ``providers`` also lists manual-credit fallback pools (``listed``); the
         # summary marks below still read ``results`` alone, so an unobserved pool
         # never changes the host-level mark.
         for result in results if listed is None else listed:
@@ -1660,7 +1637,7 @@ def _refresh_swe2_result(
 
 
 def _listed_with_manual_only(results: list[ProviderResult], *, now: dt.datetime) -> list[ProviderResult]:
-    """``--json`` providers list: the displayed results plus every manual-only pool (hk 2136).
+    """``--json`` providers list: displayed results plus manual-credit pools (hk 2136).
 
     The synthetic entries come from the same ``_with_manual_only_results`` the
     gate path uses and are resolved through ``manual.apply_for_display``, so a
@@ -1672,12 +1649,11 @@ def _listed_with_manual_only(results: list[ProviderResult], *, now: dt.datetime)
 
 
 def _with_manual_only_results(results: list[ProviderResult]) -> list[ProviderResult]:
-    """Append the synthetic result for every manual-only pool (hk 2079).
+    """Append a synthetic result for missing manual-credit pools (hk 2079).
 
-    A manual-only pool has no fetcher, so ``collect`` never returns it. The
-    synthetic result is what routes the pool through the ordinary manual
-    fallback (TTL + REQUIRED_WINDOWS coverage), so a missing or stale manual
-    observation still fails closed instead of silently vanishing.
+    Probed pools already returned by ``collect`` take precedence. A synthetic
+    result lets the ordinary manual fallback (TTL + coverage) handle an
+    unregistered or manual-only pool without silently treating it as usable.
     """
 
     present = {item.id for item in results}
@@ -2694,14 +2670,10 @@ def main(argv: list[str] | None = None) -> int:
     if arguments and arguments[0] == "observe":
         parser = build_parser([])
         args = parser.parse_args(arguments)
-        if args.observe_command == "devin-free-limit":
-            store = free_window
-            label = "Devin free short-window limit"
-        elif args.observe_command == "commandcode-limit":
-            store = commandcode_limit
-            label = "cmd Command Code limit"
-        else:
+        if args.observe_command != "devin-free-limit":
             parser.error("unsupported observe command")
+        store = free_window
+        label = "Devin free short-window limit"
         if args.account_key is not None and not args.clear:
             parser.error("--account-key requires --clear")
         if args.clear:
