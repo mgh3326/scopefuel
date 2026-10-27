@@ -25,7 +25,10 @@ CREDIT_EXPIRES = (TODAY + dt.timedelta(days=30)).isoformat()
 # Pools that gate can name in ``pool=`` but that --json does not list.  oc-omni
 # (a grade-table row) bills ``omniroute``, which has no registered fetcher and
 # no manual route, so gate can never answer it ok and --json has no entry for
-# it.  Pinned here so a new unlisted pool still fails the drift test below.
+# it.  The operator retired omniroute on 2026-09-26 (config profiles.oc-omni
+# subscribed=false, "omniroute 미사용"), so it is not live.  Pinned here so a
+# new unlisted pool still fails the drift test below; remove this exception
+# together with oc-omni.
 UNLISTED_GATE_POOLS = frozenset({"omniroute"})
 
 
