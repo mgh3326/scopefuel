@@ -20,6 +20,7 @@ from dataclasses import replace
 from . import (
     areas,
     bench,
+    commandcode_limit,
     free_window,
     grades,
     herdr,
@@ -758,6 +759,27 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--account-key",
         metavar="KEY",
         help="--clear 대상 identity key (기본: 캐시된 account fingerprint 또는 host/user fallback)",
+    )
+    # hk 2141: a cmd screen/exit text naming a usage or rate limit maps the
+    # commandcode pool to exhausted until the reset it names. Same passive
+    # shape as devin-free-limit — the observer writes only what it already saw.
+    observe_cmd = observe_sub.add_parser(
+        "commandcode-limit", help="cmd Command Code usage/rate limit reset 기록/해제"
+    )
+    observe_cmd.add_argument("--reset", help="timezone-aware ISO-8601 reset time")
+    observe_cmd.add_argument("--observed", help="timezone-aware ISO-8601 observation time")
+    observe_cmd.add_argument("--rung", help="observed cmd profile UID")
+    observe_cmd.add_argument("--source", help="job:<job>")
+    observe_cmd.add_argument("--unparsed", action="store_true", help="reset message was not parseable")
+    observe_cmd.add_argument(
+        "--clear",
+        action="store_true",
+        help="기록 대신 live hold 를 제거 (reset/observed/rung/source 와 병용 불가)",
+    )
+    observe_cmd.add_argument(
+        "--account-key",
+        metavar="KEY",
+        help="--clear 대상 identity key (기본: host/user fallback)",
     )
 
     refresh_parser = subparsers.add_parser("refresh", help="한 pool만 이벤트 기반으로 캐시 갱신")
@@ -2672,7 +2694,13 @@ def main(argv: list[str] | None = None) -> int:
     if arguments and arguments[0] == "observe":
         parser = build_parser([])
         args = parser.parse_args(arguments)
-        if args.observe_command != "devin-free-limit":
+        if args.observe_command == "devin-free-limit":
+            store = free_window
+            label = "Devin free short-window limit"
+        elif args.observe_command == "commandcode-limit":
+            store = commandcode_limit
+            label = "cmd Command Code limit"
+        else:
             parser.error("unsupported observe command")
         if args.account_key is not None and not args.clear:
             parser.error("--account-key requires --clear")
@@ -2683,20 +2711,20 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 parser.error("--clear cannot be combined with observation fields")
             try:
-                removed = free_window.clear_hold(account_key=args.account_key)
+                removed = store.clear_hold(account_key=args.account_key)
             except (OSError, ValueError) as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2
             if removed is None:
-                print("no live Devin free short-window limit to clear")
+                print(f"no live {label} to clear")
             else:
-                print(f"cleared {free_window.reason(removed)}")
+                print(f"cleared {store.reason(removed)}")
             return 0
         missing = [field for field in ("reset", "observed", "rung", "source") if getattr(args, field) is None]
         if missing:
             parser.error("required: " + ", ".join(f"--{field}" for field in missing))
         try:
-            saved = free_window.record_observation(
+            saved = store.record_observation(
                 reset=args.reset,
                 observed=args.observed,
                 rung=args.rung,
@@ -2707,9 +2735,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         if saved:
-            print("recorded Devin free short-window limit")
+            print(f"recorded {label}")
         else:
-            print("expired or older Devin free short-window observation ignored")
+            print(f"expired or older {label} observation ignored")
         return 0
 
     fetchers = registry()

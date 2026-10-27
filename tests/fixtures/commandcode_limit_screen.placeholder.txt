@@ -1,0 +1,15 @@
+PLACEHOLDER — hk 2141 (operator r1027cmdcode)
+
+The Command Code (cmd v1.88.0) usage/rate-limit wording is not known yet.
+
+`cmd --help` documents `/usage` (credits, plan, and usage metrics) but names no
+limit text, and no desk capture has provided the screen or exit text a limited
+run prints. Per the hk 2141 brief the wording may only come from `cmd --help`
+or a capture the desk provides — a limit must never be triggered on purpose.
+
+Until a capture lands, `scopefuel observe commandcode-limit` accepts only
+typed values (--reset/--observed/--rung/--source) exactly like
+`observe devin-free-limit`, and tests exercise the store through those typed
+values — never a real cmd run. When the wording arrives, the observer parser
+(wrk side, hk 2140) consumes the captured text; this file is replaced by that
+capture.

@@ -449,6 +449,7 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
         # hk 2079: the pi anthropic-api credit rows are E6 carrier rows, so
         # their unmeasured entries ride that folded line at C too.
         # hk 2110: the codex-terra61 E6 rungs ride the same folded line.
+        # hk 2141: cmd-dsflash41 commandcode rows fold the same way.
         def _strip_fusion(text: str) -> str:
             out = []
             for line in text.splitlines():
@@ -462,6 +463,7 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
                     for e in entries
                     if "devin-fusion-sol61" not in e
                     and not e.startswith("pi-")
+                    and not e.startswith("cmd-")
                     and not e.startswith("codex-terra61")
                 ]
                 if entries:
