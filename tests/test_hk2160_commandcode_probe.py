@@ -170,6 +170,38 @@ def test_a_window_without_its_own_value_fails_closed(prior, current):
     assert result.error_kind == "parse_error"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # (a) weekly without a value must not borrow a trailing unrelated %
+        USAGE_TEXT.replace("Weekly 1%", "Weekly") + " / Context 37% used",
+        # (b) weekly before 5-hour, weekly's own value missing
+        "GOAT Plan · 0% used · 31 days to renew / Weekly · resets in 6d 22h / 5-hour 1% · resets in 3h 52m",
+        # (c) 5-hour last, its value missing, a later number on screen
+        "GOAT Plan · 0% used · 31 days to renew / Weekly 2% · resets in 6d 22h / "
+        "5-hour · resets in 3h 52m / Context 9%",
+    ],
+)
+def test_a_row_without_its_own_value_never_borrows_a_later_number(text):
+    """Mutant: weekly segment back to end of screen, or reset bound dropped -> RED."""
+
+    result = commandcode.parse(text, now=NOW)
+    assert result.error_kind == "parse_error"
+
+
+def test_windows_out_of_fixture_order_still_parse():
+    """Row order does not matter: bounds follow labels, not fixture order."""
+
+    text = (
+        "GOAT Plan · 0% used · 31 days to renew / Weekly 2% · resets in 6d 22h / 5-hour 1% · resets in 3h 52m"
+    )
+    result = commandcode.parse(text, now=NOW)
+    assert result.status == "ok"
+    buckets = {bucket.window: bucket for bucket in result.buckets}
+    assert buckets["5h"].used_pct == 1
+    assert buckets["7d"].used_pct == 2
+
+
 @pytest.mark.parametrize("window", ["30d", "5h", "7d"])
 def test_a_percentage_over_100_is_a_parse_error(window):
     """Mutant: drop the 0..100 range check -> this goes RED."""

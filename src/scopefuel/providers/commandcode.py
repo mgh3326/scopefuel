@@ -52,9 +52,23 @@ _LIMIT_WINDOW = {
 _FIVE_HOUR_LABEL = re.compile(r"\b5[- ]?hour\b", re.I)
 _WEEKLY_LABEL = re.compile(r"\bweekly\b", re.I)
 _DAYS_TO_RENEW = re.compile(r"(?P<days>\d+(?:\.\d+)?)\s*days?\s+to\s+renew", re.I)
+# Strict row labels for segment bounds — bare "5h"/"week" spellings would
+# truncate a row at the next row's "resets in 5h"/"resets in 1 week".
+_BOUNDARY_LABEL = {
+    "30d": re.compile(r"\b(?:monthly|this month|month)\b", re.I),
+    "5h": _FIVE_HOUR_LABEL,
+    "7d": _WEEKLY_LABEL,
+}
+# The end of a completed window row (its reset phrase) — the left bound for
+# the monthly row's value when the monthly row is not first on screen.
+_RESET_BOUNDARY = re.compile(
+    r"\bresets?\s+in\s+[^|/·\r\n]+|\d+(?:\.\d+)?\s*days?\s+to\s+renew",
+    re.I,
+)
 # A window's own value (percent or limit wording) is searched only inside its
-# own segment — up to the next window label — so a row missing its percentage
-# fails closed instead of borrowing the next window's number.
+# own segment — up to the nearest following window label of either kind — and
+# before that window's own reset marker, so a row missing its percentage
+# fails closed instead of borrowing a later number.
 _VALUE = re.compile(
     r"(?:(?P<used>\d+(?:\.\d+)?)\s*%|(?P<limit>(?:(?:usage|rate|request)\s+)?limit\b))",
     re.I,
@@ -291,15 +305,6 @@ def _percent(value: str) -> float:
     return parsed
 
 
-def _segment_after(text: str, start: int, next_window: str | None = None) -> str:
-    end = len(text)
-    if next_window is not None:
-        match = _LIMIT_WINDOW[next_window].search(text, start + 1)
-        if match is not None:
-            end = match.start()
-    return text[start:end]
-
-
 def _complete(text: str) -> bool:
     try:
         _parse_buckets(text, now=dt.datetime.now(dt.UTC))
@@ -308,36 +313,60 @@ def _complete(text: str) -> bool:
         return False
 
 
+def _segment_end(clean: str, start: int, own: str) -> int:
+    """The next window-label boundary after ``start`` — order independent."""
+
+    ends = [
+        hit.start()
+        for window, pattern in _BOUNDARY_LABEL.items()
+        if window != own
+        for hit in pattern.finditer(clean)
+        if hit.start() > start
+    ]
+    return min(ends, default=len(clean))
+
+
+def _short_window(clean: str, label: re.Match[str], own: str) -> tuple[re.Match[str], re.Match[str]]:
+    """A short window's reset and its own value within its bounded segment.
+
+    The segment ends at the nearest following window label of either kind;
+    the value must come before that window's own "resets in" marker.
+    """
+
+    segment = clean[label.start() : _segment_end(clean, label.start(), own)]
+    reset = _RESET_IN.search(segment)
+    if reset is None:
+        raise ValueError("a short-window reset is missing")
+    value = _VALUE.search(segment, 0, reset.start())
+    if value is None:
+        raise ValueError("a usage window has no percentage of its own")
+    return reset, value
+
+
 def _parse_buckets(text: str, *, now: dt.datetime) -> list[Bucket]:
     clean = _clean(text)
     five_hour = _FIVE_HOUR_LABEL.search(clean)
     weekly = _WEEKLY_LABEL.search(clean)
-    if five_hour is None or weekly is None:
+    renew = _DAYS_TO_RENEW.search(clean)
+    if five_hour is None or weekly is None or renew is None:
         raise ValueError("one or more usage windows are missing")
 
-    # The monthly row is everything before the earliest short-window label;
-    # a value is searched inside each window's own segment only (hk 2160 r2).
-    monthly_segment = clean[: min(five_hour.start(), weekly.start())]
-    renew = _DAYS_TO_RENEW.search(monthly_segment)
-    if renew is None:
-        raise ValueError("the monthly usage window is missing")
-
-    five_segment = _segment_after(clean, five_hour.start(), "7d")
-    weekly_segment = _segment_after(clean, weekly.start())
-    five_reset_match = _RESET_IN.search(five_segment)
-    weekly_reset_match = _RESET_IN.search(weekly_segment)
-    if five_reset_match is None or weekly_reset_match is None:
-        raise ValueError("a short-window reset is missing")
-
+    # The monthly row's value must precede its own "days to renew", and its
+    # left bound is the end of the previous completed row (its reset phrase)
+    # — a monthly row that is not first cannot borrow an earlier number.
+    monthly_left = max(
+        (hit.end() for hit in _RESET_BOUNDARY.finditer(clean) if hit.end() <= renew.start()),
+        default=0,
+    )
+    monthly_value = _VALUE.search(clean, monthly_left, renew.start())
+    if monthly_value is None:
+        raise ValueError("the monthly usage window has no percentage of its own")
     monthly_reset = _reset_for_duration(f"{renew['days']} days", now=now)
+
+    five_reset_match, five_value = _short_window(clean, five_hour, "5h")
+    weekly_reset_match, weekly_value = _short_window(clean, weekly, "7d")
     five_reset = _reset_for_duration(five_reset_match["duration"], now=now)
     weekly_reset = _reset_for_duration(weekly_reset_match["duration"], now=now)
-
-    monthly_value = _VALUE.search(monthly_segment)
-    five_value = _VALUE.search(five_segment)
-    weekly_value = _VALUE.search(weekly_segment)
-    if monthly_value is None or five_value is None or weekly_value is None:
-        raise ValueError("a usage window has no percentage of its own")
 
     values = {
         "30d": _percent(monthly_value["used"] or "100"),
