@@ -99,7 +99,7 @@ def test_json_lists_anthropic_api_with_no_observation_fail_closed(capsys, monkey
     rc, payload = _json_payload(capsys, [])
 
     assert rc == 0
-    assert [item["id"] for item in payload["providers"]] == ["claude", "anthropic-api"]
+    assert [item["id"] for item in payload["providers"]] == ["claude", "anthropic-api", "commandcode"]
     entry = _entry(payload)
     assert entry["status"] == "error"
     assert entry["error_kind"] == "manual_only"
