@@ -60,12 +60,21 @@ NEW_RUNGS: dict[tuple[str, str], tuple[str, str, str, str]] = {
     ("haiku", "xhigh"): ("claude", "claude-haiku-5-5", "xhigh 31.5", "C"),
     ("haiku", "max"): ("claude", "claude-haiku-5-5", "max 39.2", "C"),
     ("sonnet", "max"): ("claude", "claude-sonnet-5-5", "max 70.6", "A+"),
+    # hk 2110 (operator r1027terra): gpt-6.1-terra, one rung per CLI effort —
+    # unmeasured, no AA mapping, builder-seat admissible (NOT worker/tester-only).
+    ("codex-terra61", "low"): ("codex", "gpt-6.1-terra", "gpt-6.1-terra AA 미측정", "C"),
+    ("codex-terra61", "medium"): ("codex", "gpt-6.1-terra", "gpt-6.1-terra AA 미측정", "C"),
+    ("codex-terra61", "high"): ("codex", "gpt-6.1-terra", "gpt-6.1-terra AA 미측정", "C"),
+    ("codex-terra61", "xhigh"): ("codex", "gpt-6.1-terra", "gpt-6.1-terra AA 미측정", "C"),
+    ("codex-terra61", "max"): ("codex", "gpt-6.1-terra", "gpt-6.1-terra AA 미측정", "C"),
 }
 CARRIER = {key: spec[3] for key, spec in NEW_RUNGS.items()}
 # #1284: rungs whose model has no AA measurement at all — the row must say so
-# rather than carry an AA mapping it does not have. Empty since #1296 (the two
-# no-AA devin rungs graduated to ordinary placements); kept for the next arm.
-NO_AA_RUNGS: frozenset[tuple[str, str]] = frozenset()
+# rather than carry an AA mapping it does not have. hk 2110: gpt-6.1-terra is
+# a new unmeasured model — no AA-agent or AA-model mapping exists for it.
+NO_AA_RUNGS: frozenset[tuple[str, str]] = frozenset(
+    ("codex-terra61", rung) for rung in ("low", "medium", "high", "xhigh", "max")
+)
 # The rungs the E6 arms use that the catalog already placed — no new row may
 # appear for these, or the existing spelling's resolution would change.
 EXISTING_RUNGS: dict[tuple[str, str], str] = {
@@ -343,7 +352,11 @@ def test_a_canon_carrying_the_e6_rows_does_not_recommend_them():
         return bench.CatalogEntry(
             profile=profile,
             effort=effort,
-            model_id={"sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}.get(profile, "gpt-6.1-sol"),
+            model_id={
+                "sonnet": "claude-sonnet-5-5",
+                "haiku": "claude-haiku-5-5",
+                "codex-terra61": "gpt-6.1-terra",
+            }.get(profile, "gpt-6.1-sol"),
             pool="claude" if profile in ("sonnet", "haiku") else "codex",
             grade=grade,
             benchmark_annotation=E6_ARM_ANNOTATION,
