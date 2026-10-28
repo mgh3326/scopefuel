@@ -275,6 +275,63 @@ def test_the_hottest_triggering_primary_names_the_reason():
     assert promoted["promotion"] == "promoted: codex 7d pace 1.50x"
 
 
+def test_promoted_alt_ranks_above_a_preserve_class_trigger():
+    """Tester r1 B1: a preserve-class primary has no pace headroom.
+
+    Mutant: rely on the pace-headroom dimension only -> the measured primary
+    rows outrank the promoted unmeasured alt (RED).
+    """
+
+    providers = _healthy()
+    providers[1] = _codex_weekly(75.0)  # codex is preserve-class at 1.5x
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
+    names = _names(payload)
+    assert names.index("pi-sonnet55") < names.index("codex-luna")
+    assert (
+        next(row for row in _candidates(payload) if row["profile"] == "pi-sonnet55")["promotion"]
+        == "promoted: codex 7d pace 1.50x"
+    )
+
+
+def test_promoted_alt_ranks_above_an_early_window_trigger():
+    """Tester r1 B1: the first 5% of the weekly window has no pace verdict."""
+
+    providers = _healthy()
+    providers[0] = _provider("claude", _bucket("7d", 5.0, 166.0))  # 4.2x, pace unknown
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
+    names = _names(payload)
+    assert names.index("pi-sonnet55") < names.index("sonnet")
+    assert (
+        next(row for row in _candidates(payload) if row["profile"] == "pi-sonnet55")["promotion"]
+        == "promoted: claude 7d pace 4.20x"
+    )
+
+
+def test_promoted_alt_ranks_above_a_trigger_below_1x_threshold():
+    """Tester r1 B1: a configured threshold under 1.0x has no pace warning."""
+
+    assert cli.main(["policy", "setting", "altlane_pace_multiple", "0.8"]) == 0
+    providers = _healthy()
+    providers[0] = _weekly(45.0)  # 0.9x, above 0.8
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
+    names = _names(payload)
+    assert names.index("pi-sonnet55") < names.index("sonnet")
+    assert (
+        next(row for row in _candidates(payload) if row["profile"] == "pi-sonnet55")["promotion"]
+        == "promoted: claude 7d pace 0.90x"
+    )
+
+
+def test_the_gate_alternatives_put_the_promoted_alt_above_a_preserve_trigger():
+    providers = _healthy()
+    providers[0] = _provider("claude", _bucket("7d", 100.0, 84.0))  # sonnet refused
+    providers[1] = _codex_weekly(75.0)  # codex preserve, hot
+    result = gate_check(providers, "sonnet", role="worker", today=TODAY, now=NOW)
+    assert result.ok is False
+    assert result.alternatives
+    assert result.alternatives.index("pi-sonnet55") < result.alternatives.index("codex-luna")
+
+
 def test_promotion_never_lifts_a_rung_above_its_placed_grade():
     """Mutant: promote above the placed grade -> this goes RED."""
 
@@ -360,6 +417,11 @@ def test_a_malformed_setting_falls_back_to_the_default():
     policy.config_path().write_text('[settings]\naltlane_pace_multiple = "nope"\n')
     assert policy.get_altlane_pace_multiple() == pytest.approx(1.2)
     policy.config_path().write_text("[settings]\naltlane_pace_multiple = -1\n")
+    assert policy.get_altlane_pace_multiple() == pytest.approx(1.2)
+    # A hand-edited nan/inf must not silently disable the rule.
+    policy.config_path().write_text("[settings]\naltlane_pace_multiple = nan\n")
+    assert policy.get_altlane_pace_multiple() == pytest.approx(1.2)
+    policy.config_path().write_text("[settings]\naltlane_pace_multiple = inf\n")
     assert policy.get_altlane_pace_multiple() == pytest.approx(1.2)
 
 
@@ -459,7 +521,7 @@ def test_the_cmd_row_is_not_offered_where_the_host_has_no_cmd_measurement():
     payload = recommend_dict(providers, "A+", today=TODAY, now=NOW)
     promoted = next(row for row in _candidates(payload) if row["profile"] == "cmd-dsflash41")
     assert promoted.get("promotion") == "promoted: claude 7d pace 1.50x"
-    assert "desktop-only until hk 2180" in (
+    assert "[local] cmd_dsflash41" in (
         next(p for p in GRADE_TABLE["A+"] if p.name == "cmd-dsflash41").placement_note or ""
     )
 

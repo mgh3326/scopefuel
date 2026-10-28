@@ -1608,7 +1608,7 @@ CMD_CREDIT_BASIS = "inherited from devin ds41"
 CMD_CREDIT_PLACEMENT_NOTE = (
     "AA 미측정 (cmd harness — commandcode credit · worker/tester 전용 · "
     "builder 배치 금지, reps 필요 · devin-ds41 동일 모델·상이 하네스 — 급 비상속 · "
-    "첫 reps 소액, 유료 credit · desktop-only until hk 2180)"
+    "첫 reps 소액, 유료 credit · host-gated by [local] cmd_dsflash41 (wrk hk 2180))"
 )
 
 # The alternative lanes the altlanes rule promotes (operator desk
@@ -6742,6 +6742,27 @@ def _evaluate(
             candidate, bench_scores, value_order, intra_pool_rank, slot_of[id(candidate)]
         )
     )
+    # hk 2185 (tester r1 B1): the sort key alone cannot guarantee "above the
+    # triggering primary" — a promoted row only joins the healthy tier, and the
+    # primary carries a pace headroom only for an effective spend class, outside
+    # the window's first 5%, non-stale, and when its weekly verdict warns. A
+    # preserve-class primary, an early window, or a threshold below 1.0x leaves
+    # the hot primary in the healthy tier, where its measured rows outrank the
+    # unmeasured alt. So the guarantee is a final placement: move every promoted
+    # row to just above the highest-ranked row of the triggering pool(s).
+    promoted = [candidate for candidate in included if candidate.promoted]
+    if promoted and promotions:
+        triggering = set(promotions)
+        trigger_positions = [
+            index
+            for index, candidate in enumerate(included)
+            if not candidate.promoted and resolved_pool(candidate.profile)[0] in triggering
+        ]
+        if trigger_positions:
+            insert_at = min(trigger_positions)
+            rest = [candidate for candidate in included if not candidate.promoted]
+            index = sum(1 for candidate in included[:insert_at] if not candidate.promoted)
+            included[:] = rest[:index] + promoted + rest[index:]
     return _Evaluation(
         grade=grade,
         included=included,

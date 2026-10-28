@@ -427,8 +427,8 @@ scopefuel이 이미 표에 출력하는 per-bucket pace 값 그대로입니다(�
   올리지 않습니다. 그 급에서 reps에 FAIL(`completed=0`) 또는 BOUNCE(blockers 기록)가
   있는 alt는 승격하지 않습니다. 승격은 **모든 자격 필터 뒤의 순위 단계**라,
   pool 측정 불가·cutoff·policy exclude·구독 해지·host 제약으로 빠진 행은 절대
-  승격으로 다시 나타나지 않습니다 — cmd-dsflash41은 hk 2180 전까지 desktop-only이며,
-  그 host 필터는 승격 뒤에도 그대로 적용됩니다.
+  승격으로 다시 나타나지 않습니다 — cmd-dsflash41은 host 별 `[local] cmd_dsflash41`
+  플래그(wrk hk 2180)로만 열리며, 그 host 필터는 승격 뒤에도 그대로 적용됩니다.
 - **배치**: pi-*·cmd-dsflash41의 급은 canon 카탈로그 행과 **정확히 같습니다**
   (2026-10-28 desk push, ref `desk op-1028-grades`; basis "inherited from claude
   harness … / devin ds41 …"). cmd-dsflash41은 `@high`(A+)만 배치됩니다 —

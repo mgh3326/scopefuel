@@ -1061,7 +1061,11 @@ def get_reset_urgency_hours() -> float:
 
 
 def _positive_setting(name: str, default: float) -> float:
-    """``[settings]`` 의 양수 float 설정 하나를 읽는다. 미설정/무효/0 이하는 default 로 폴백."""
+    """``[settings]`` 의 양수 float 설정 하나를 읽는다.
+
+    미설정/무효/0 이하/비유한(nan·inf) 값은 default 로 폴백한다. A hand-edited
+    ``nan`` must not silently disable a rule (``ratio >= nan`` is always False).
+    """
     config = load_config()
     settings = config.get("settings")
     if not isinstance(settings, dict):
@@ -1073,7 +1077,7 @@ def _positive_setting(name: str, default: float) -> float:
         parsed = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         return default
     return parsed
 

@@ -1845,10 +1845,19 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
     assert actual == expected
     medium = next(p for p in GRADE_TABLE["A"] if p.name == "devin-swe2-medium")
     assert medium.benchmark is None
+    # The unscored C row of each profile: the low rung where the profile has one
+    # (codex-luna, sonnet), the alt-lane canon rung otherwise (hk 2185), and the
+    # effort-less row for the rest.
+    c_effort = {
+        "codex-luna": "low",
+        "sonnet": "low",
+        "pi-haiku55": "medium",
+        "pi-sonnet55": "low",
+    }
     snapshot = {
         entry.profile: entry
         for entry in launch.snapshot_entries()
-        if entry.profile in expected and entry.grade == "C" and entry.score is None
+        if entry.profile in expected and entry.effort == c_effort.get(entry.profile, "")
     }
     assert set(snapshot) == expected
     assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())

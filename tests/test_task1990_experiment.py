@@ -461,8 +461,10 @@ def _drop_altlanes_text(text: str) -> str:
         line = lines[index]
         index += 1
         if line[:1].isdigit():
-            token = line.split(". ", 1)[1].split()[0]
-            if token in ALTLANE_PROFILES:
+            tokens = line.split(". ", 1)[1].split()
+            while tokens and tokens[0].startswith("🔥"):
+                tokens.pop(0)
+            if tokens and tokens[0] in ALTLANE_PROFILES:
                 continue
             kept.append(line)
             continue
