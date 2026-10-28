@@ -432,11 +432,14 @@ def test_gate_admits_with_the_marker_and_a_worker_or_tester_seat(profile, rung, 
 
 
 @pytest.mark.parametrize(("profile", "rung"), CMD_ROWS)
-def test_gate_refuses_the_builder_role_for_the_marker(profile, rung):
-    """Mutant: drop the worker/tester seat rule -> this goes RED."""
+def test_gate_builder_seat_on_the_placed_cmd_rung(profile, rung):
+    """op-1028-seattask: cmd-dsflash41@high is a placed default rung, so the
+    builder seat is admitted (a stale marker in the env changes nothing); a call
+    that names no seat is still refused."""
 
+    credit = _credit_result()
     result = gate_check(
-        [_credit_result()],
+        [credit],
         profile,
         role="builder",
         effort=rung,
@@ -444,9 +447,9 @@ def test_gate_refuses_the_builder_role_for_the_marker(profile, rung):
         today=TODAY,
         now=NOW,
     )
-    assert result.ok is False
-    assert result.role_denied is True
-    assert "role_restricted" in result.reason
+    assert result.ok is True, result.reason
+    refused = gate_check([credit], profile, role=None, effort=rung, today=TODAY, now=NOW)
+    assert refused.ok is False and refused.role_denied is True
 
 
 @pytest.mark.parametrize("role", [None, "captain", "reviewer", "orch"])

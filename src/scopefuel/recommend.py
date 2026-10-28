@@ -1581,8 +1581,8 @@ PI_CREDIT_BASIS = "inherited from claude harness"
 # grok lanes), and no MCP — pi has none, so a task that needs an MCP must not be
 # placed on these rows. First reps are small (the credit is paid).
 PI_CREDIT_PLACEMENT_NOTE = (
-    "AA 미측정 (pi harness — anthropic-api credit · worker/tester 전용 · "
-    "builder 배치 금지, reps 필요 · MCP 필요 작업 배치 금지: pi 는 MCP 없음 · "
+    "AA 미측정 (pi harness — anthropic-api credit · builder 는 배치된 default 런그만 "
+    "(op-1028-seattask) · MCP 필요 작업 배치 금지: pi 는 MCP 없음 · "
     "첫 reps 소액, 유료 credit)"
 )
 
@@ -1606,8 +1606,8 @@ CMD_CREDIT_MODELS: dict[str, str] = {
 CMD_EFFORT_RUNGS: tuple[str, ...] = ("low", "high", "max")
 CMD_CREDIT_BASIS = "inherited from devin ds41"
 CMD_CREDIT_PLACEMENT_NOTE = (
-    "AA 미측정 (cmd harness — commandcode credit · worker/tester 전용 · "
-    "builder 배치 금지, reps 필요 · devin-ds41 동일 모델·상이 하네스 — 급 비상속 · "
+    "AA 미측정 (cmd harness — commandcode 구독 · builder 는 배치된 default 런그만 "
+    "(op-1028-seattask) · devin-ds41 동일 모델·상이 하네스 — 급 비상속 · "
     "첫 reps 소액, 유료 credit · host-gated by [local] cmd_dsflash41 (wrk hk 2180))"
 )
 
@@ -1950,6 +1950,33 @@ def e6_worker_tester_seat_denied(profile: str, role: str | None) -> bool:
 
     return profile in E6_WORKER_TESTER_ONLY_PROFILES and (role or "").strip().casefold() not in (
         E6_WORKER_TESTER_SEATS
+    )
+
+
+# Operator decision op-1028-seattask (2026-10-28, via operator-desk): a PLACED
+# credit rung (an ordinary canon row with an inherited grade) may take the
+# builder seat as well; the canon grade per rung still bounds what it builds
+# (wrk checks the task's requested grade). The E6 marker carrier rungs keep the
+# worker/tester-only rule above, and a call that names no seat is still refused.
+CREDIT_PLACED_SEATS: frozenset[str] = E6_WORKER_TESTER_SEATS | frozenset({"builder"})
+CREDIT_PLACED_SEAT_REASON = "placed credit rung — worker/tester/builder seats only"
+
+
+def credit_builder_seat_denied(profile: str, role: str | None, row: object | None) -> bool:
+    """Whether a credit lane's builder seat lands on a rung that is not a placed default."""
+
+    return (
+        profile in E6_WORKER_TESTER_ONLY_PROFILES
+        and (role or "").strip().casefold() == "builder"
+        and (row is None or getattr(row, "gate", None) != "default")
+    )
+
+
+def credit_placed_seat_denied(profile: str, role: str | None) -> bool:
+    """Whether a placed credit rung is asked for on a seat it may not take."""
+
+    return profile in E6_WORKER_TESTER_ONLY_PROFILES and (role or "").strip().casefold() not in (
+        CREDIT_PLACED_SEATS
     )
 
 
@@ -5061,19 +5088,33 @@ def gate_check(
                 f"(배치된 런그: {'|'.join(worker_tester_rungs(canonical_profile))})"
             ),
         )
-    # hk 2185: the credit lanes are ordinary placements now, but they are still
-    # worker/tester only until reps exist — the builder seat is refused before
-    # any quota judgement, exactly as it was under the E6 marker (hk 2079).
-    if e6_worker_tester_seat_denied(canonical_profile, role):
+    # op-1028-seattask: a credit lane takes the worker, tester or builder seat,
+    # refused before any quota judgement on any other seat (or none named).
+    if credit_placed_seat_denied(canonical_profile, role):
         return GateResult(
             ok=False,
             profile=profile_name,
             provider_id=provider_id,
             grade=None,
-            reason=f"role_restricted: {canonical_profile} — {E6_WORKER_TESTER_ONLY_REASON}",
+            reason=f"role_restricted: {canonical_profile} — {CREDIT_PLACED_SEAT_REASON}",
             role_denied=True,
         )
     rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
+    # The builder seat opens only on a placed default-gate rung: consult_only,
+    # escalation and unplaced rungs stay worker/tester only (hk 2079 rule).
+    if credit_builder_seat_denied(canonical_profile, role, rung_row[1] if rung_row else None) or (
+        (role or "").strip().casefold() == "builder"
+        and canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
+        and (canonical_profile, normalize_effort(rung) or "") in consult_only_rungs
+    ):
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=f"role_restricted: {canonical_profile}@{rung} — {E6_WORKER_TESTER_ONLY_REASON}",
+            role_denied=True,
+        )
     # #716: --effort 는 명령 단위의 명시적 런그 지명이다 — 배치 행을 가리키면
     # 그 런그를 배치로 판정한다(escalation 대안 거부 생략). 표식으로만 골라진
     # 런그는 해당하지 않는다 — ambient env 는 새어 나간 문맥을 넓히지 못한다.
