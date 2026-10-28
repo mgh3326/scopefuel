@@ -55,6 +55,9 @@ from .recommend import (
     e6_only_profile,
     e6_registered_rungs,
     e6_worker_tester_seat_denied,
+    credit_placed_seat_denied,
+    credit_builder_seat_denied,
+    CREDIT_PLACED_SEAT_REASON,
     is_barred_model_id,
     is_e6_unmeasured_key,
     normalize_effort,
@@ -972,9 +975,18 @@ def resolve_launch(
     # exist — any other seat is refused even with the E6 marker. hk 2185: the
     # rows are ordinary inherited placements now, so the same seat rule applies
     # without a marker (a placement is not a measurement).
-    if e6_worker_tester_seat_denied(canonical, role):
-        seat_label = opened_arm or f"{canonical}@{resolved_effort}"
-        raise LaunchError(f"role_restricted: {seat_label} — {E6_WORKER_TESTER_ONLY_REASON}")
+    # op-1028-seattask: a placed rung may also take the builder seat; an E6
+    # marker carrier keeps the worker/tester-only rule.
+    if opened_arm is not None and e6_worker_tester_seat_denied(canonical, role):
+        raise LaunchError(f"role_restricted: {opened_arm} — {E6_WORKER_TESTER_ONLY_REASON}")
+    if opened_arm is None and credit_placed_seat_denied(canonical, role):
+        raise LaunchError(
+            f"role_restricted: {canonical}@{resolved_effort} — {CREDIT_PLACED_SEAT_REASON}"
+        )
+    if opened_arm is None and credit_builder_seat_denied(canonical, role, row):
+        raise LaunchError(
+            f"role_restricted: {canonical}@{resolved_effort} — {E6_WORKER_TESTER_ONLY_REASON}"
+        )
 
     # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라
     # 카탈로그·snapshot·arm 어떤 경로로도 동일하게 닫히고 --operator-request 가
