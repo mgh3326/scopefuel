@@ -564,6 +564,38 @@ def test_probe_writes_text_then_submits_enter_separately(monkeypatch, tmp_path):
     assert b"<CR>" in chunks[1]
 
 
+def test_silent_tui_gets_the_enter_from_the_echo_wait_fallback(monkeypatch, tmp_path):
+    """N22 (verdict r2): a TUI that never echoes the typed text goes quiet —
+
+    the idle-branch fallback is then the only path that ever writes the
+    Enter. Mutant: drop that fallback -> the probe times out -> RED.
+    """
+
+    script = tmp_path / "cmd-silent-tui"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time, tty\n"
+        "tty.setraw(sys.stdin.fileno())\n"
+        "os.write(1, '❯ '.encode())\n"  # the prompt only — no input echo
+        "while True:\n"
+        "    chunk = os.read(0, 4096)\n"
+        "    if not chunk:\n"
+        "        break\n"
+        "    if b'\\r' in chunk or b'\\n' in chunk:\n"
+        f"        os.write(1, {USAGE_TEXT.encode()!r} + b'\\n')\n"
+        "        time.sleep(1)\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(commandcode, "BINARY", str(script))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "5")
+    result = commandcode.fetch()
+    assert result.status == "ok"
+    assert len(result.buckets) == 3
+
+
 def test_m1b_verbatim_screen_fails_closed_naming_the_missing_panel():
     """hk:doc fixtures/hk2182/m1b-usage-screen — '/usage' sat in the input box;
 
