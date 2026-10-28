@@ -228,27 +228,38 @@ def test_an_unknown_weekly_pool_cannot_jump_swe2_free_or_the_block():
     above SWE-2 free.
     """
 
-    kiro = _provider("kiro", _bucket("30d", 85.0, 24.0 * 27))  # 30d credits only
+    # Reset ~12d out keeps kiro's own pace-warning out of the picture; a
+    # near-full window (tester r3 B4) demotes it to last and the mutant
+    # would survive.
+    unknown_pools = [
+        _provider("kiro", _bucket("30d", 85.0, 24.0 * 12)),  # 30d credits only
+        _provider(
+            "agy",
+            _bucket("7d", 85.0, 109.0, scope=Scope("group", "gemini")),
+            _bucket("7d", 85.0, 109.0, scope=Scope("group", "3p")),
+        ),
+    ]
     devin = ProviderResult(
         id="devin",
         pool_class="preserve",
         buckets=[_bucket("7d", 20.0, 109.0), *_swe2_free_buckets()],
     )
-    providers = [
-        _weekly("claude", 90.0),  # 1.8x hot
-        _weekly("codex", 10.0, pool_class="preserve"),
-        devin,
-        _weekly("grok", 25.0),
-        _credit("anthropic-api"),
-        _credit("commandcode"),
-        kiro,
-    ]
-    payload = recommend_dict(providers, "C", today=TODAY, now=NOW, swe2_result=devin)
-    rows = _candidates(payload)
-    assert rows[0]["profile"].startswith("devin-swe2")
-    kiro_rows = [i for i, row in enumerate(rows) if row["provider"] == "kiro"]
-    first_promoted = next(i for i, row in enumerate(rows) if row.get("promotion"))
-    assert all(i > first_promoted for i in kiro_rows)
+    for unknown in unknown_pools:
+        providers = [
+            _weekly("claude", 90.0),  # 1.8x hot
+            _weekly("codex", 10.0, pool_class="preserve"),
+            devin,
+            _weekly("grok", 25.0),
+            _credit("anthropic-api"),
+            _credit("commandcode"),
+            unknown,
+        ]
+        payload = recommend_dict(providers, "C", today=TODAY, now=NOW, swe2_result=devin)
+        rows = _candidates(payload)
+        assert rows[0]["profile"].startswith("devin-swe2"), unknown.id
+        unknown_rows = [i for i, row in enumerate(rows) if row["provider"] == unknown.id]
+        first_promoted = next(i for i, row in enumerate(rows) if row.get("promotion"))
+        assert all(i > first_promoted for i in unknown_rows), unknown.id
 
 
 def test_a_group_scoped_pool_never_decides_by_bucket_order():
