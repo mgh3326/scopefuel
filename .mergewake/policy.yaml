@@ -1,0 +1,13 @@
+version: 1
+enabled: false
+required_checks:
+  - 'ci-ok'
+blocking:
+  - paths: ['src/scopefuel/providers/**', 'src/scopefuel/spec.py', 'src/scopefuel/http.py', 'src/scopefuel/quota_share.py', 'src/scopefuel/inflight.py']
+    reason: Provider credentials and authenticated quota sharing can expose tokens before a revert.
+  - paths: ['src/scopefuel/stale_build.py', 'pyproject.toml']
+    reason: Self-update and package entry points can replace installed executables before a revert.
+  - paths: ['.github/workflows/**']
+    reason: Workflow changes can execute privileged automation before a revert.
+  - paths: ['.mergewake/**']
+    reason: Policy changes can authorize irreversible automation before a revert.
