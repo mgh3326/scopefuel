@@ -600,11 +600,7 @@ def test_a_recorded_failure_blocks_promotion_for_that_grade():
     # carries effort None and blocks the profile's whole grade.
     blocked = frozenset({("pi-sonnet55", "high", "A")})
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW, promotion_blocks=blocked)
-    row = next(
-        row
-        for row in _candidates(payload)
-        if row["launch"] == "pi-sonnet55 --effort high"
-    )
+    row = next(row for row in _candidates(payload) if row["launch"] == "pi-sonnet55 --effort high")
     assert "promotion" not in row
     # A different grade is unaffected.
     other = recommend_dict(providers, "A+", today=TODAY, now=NOW, promotion_blocks=blocked)
@@ -654,9 +650,7 @@ def test_the_cli_reads_failures_from_the_reps_store(monkeypatch):
         Rep("pi-opus55", "S+", 1, 0),  # clean pass — no block
     ]
     monkeypatch.setattr(bench, "read_reps", lambda **kwargs: reps)
-    assert cli._promotion_blocks() == frozenset(
-        {("pi-sonnet55", "high", "A"), ("pi-haiku55", None, "C")}
-    )
+    assert cli._promotion_blocks() == frozenset({("pi-sonnet55", "high", "A"), ("pi-haiku55", None, "C")})
 
 
 # ---------------------------------------------------------------------------
@@ -675,11 +669,7 @@ def test_an_ineligible_alt_is_never_promoted_into_view():
     assert "pi-sonnet55" not in _names(payload)
     # An alt row whose own pool IS measured still promotes — the fold is per
     # pool, so only the anthropic-api rows stay out.
-    assert not any(
-        row.get("promotion")
-        for row in _candidates(payload)
-        if row["provider"] == "anthropic-api"
-    )
+    assert not any(row.get("promotion") for row in _candidates(payload) if row["provider"] == "anthropic-api")
 
 
 def test_an_alt_with_an_unsubscribed_or_excluded_pool_is_not_promoted():

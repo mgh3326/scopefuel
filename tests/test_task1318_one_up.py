@@ -237,11 +237,7 @@ def test_recommend_a_lists_the_aplus_rep_rows_tagged_one_up():
         # Match on the parsed line label, not a substring — hk 2205's canon
         # one-up rows carry inherited-basis annotations that name their source
         # profiles (cmd-dsflash41's "inherited from devin ds41 devin-ds41@high").
-        lines = [
-            line
-            for line in out.splitlines()
-            if line[:1].isdigit() and _line_label(line) == label
-        ]
+        lines = [line for line in out.splitlines() if line[:1].isdigit() and _line_label(line) == label]
         # exactly one listing, always tagged — never an untagged copy at A
         assert len(lines) == 1 and "[one-up A+]" in lines[0], (label, out)
         assert label in ranked
@@ -277,13 +273,10 @@ def test_s_and_splus_have_no_one_up_rows():
     for grade in ("S", "A+"):
         out = recommend(_pool_providers(), grade, today=TODAY, now=NOW)
         one_up_labels = {
-            _line_label(line)
-            for line in out.splitlines()
-            if line[:1].isdigit() and "[one-up" in line
+            _line_label(line) for line in out.splitlines() if line[:1].isdigit() and "[one-up" in line
         }
         assert one_up_labels and all(
-            label.split(" --effort")[0].split(" (effort")[0]
-            in recommend_mod.ALTLANE_PROFILES
+            label.split(" --effort")[0].split(" (effort")[0] in recommend_mod.ALTLANE_PROFILES
             for label in one_up_labels
         ), (grade, one_up_labels)
 
@@ -326,14 +319,9 @@ def test_every_bundled_row_lists_only_at_its_placement_or_one_below():
                 rep_measured_labels.add((label, below))
             # hk 2205 (8097): a canon-placed alt-lane rung with an inherited
             # basis also takes the one-up slot at the grade below.
-            if (
-                profile.name in recommend_mod.ALTLANE_PROFILES
-                and (profile.name, profile.launcher_effort)
-                in {
-                    (name, effort)
-                    for name, effort, _g, _gate, _r in recommend_mod.ALTLANE_CANON_ROWS
-                }
-            ):
+            if profile.name in recommend_mod.ALTLANE_PROFILES and (profile.name, profile.launcher_effort) in {
+                (name, effort) for name, effort, _g, _gate, _r in recommend_mod.ALTLANE_CANON_ROWS
+            }:
                 if below is not None:
                     allowed.add(below)
                 rep_measured_labels.add((label, below))

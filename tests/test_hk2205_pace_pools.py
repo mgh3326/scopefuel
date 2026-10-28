@@ -151,9 +151,7 @@ def test_devin_at_214x_yields_and_grok_at_118x_does_not():
     """AC1 — Mutant: exempt devin from the rule -> this goes RED."""
 
     # devin 75% used with 59h elapsed of 168h -> 2.14x; grok 59% at half window -> 1.18x.
-    providers = _healthy(
-        _weekly("devin", 75.0, reset_in_hours=109.0), _weekly("grok", 59.0)
-    )
+    providers = _healthy(_weekly("devin", 75.0, reset_in_hours=109.0), _weekly("grok", 59.0))
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
     names = _names(payload)
     promoted = {row["profile"]: row["promotion"] for row in _candidates(payload) if row.get("promotion")}
@@ -161,9 +159,7 @@ def test_devin_at_214x_yields_and_grok_at_118x_does_not():
     assert all(reason == "promoted: devin 7d pace 2.14x" for reason in promoted.values())
     # devin's own paid rows are the yielding set — never promoted.
     assert "devin-ds41" in names and "devin-ds41" not in promoted
-    assert names.index("devin-ds41") > max(
-        names.index(name) for name in promoted if name in names
-    )
+    assert names.index("devin-ds41") > max(names.index(name) for name in promoted if name in names)
     # grok stays in order — not triggered — but its rows ARE under-used, so
     # they promote above the yielding devin rows.
     assert "grok-hi" in promoted
@@ -191,9 +187,7 @@ def test_swe2_free_stays_first_when_its_pool_yields():
     assert free_rows and max(free_rows) < first_promoted
     # The yielding pool's paid rows still land after every promoted row.
     paid_devin = [i for i, row in enumerate(rows) if row["profile"] == "devin-ds41"]
-    assert paid_devin and min(paid_devin) > max(
-        i for i, row in enumerate(rows) if row.get("promotion")
-    )
+    assert paid_devin and min(paid_devin) > max(i for i, row in enumerate(rows) if row.get("promotion"))
 
 
 def test_every_healthy_pool_keeps_the_pre_change_order(tmp_path):
@@ -280,13 +274,9 @@ def test_a_verify_reps_blockers_do_not_block_the_lane(monkeypatch):
     providers = _healthy()
     providers[0] = _weekly("claude", 75.0)
     providers[1] = _weekly("codex", 80.0, reset_in_hours=140.0, pool_class="preserve")  # ~2.8x
-    payload = recommend_dict(
-        providers, "A", today=TODAY, now=NOW, promotion_blocks=cli._promotion_blocks
-    )
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW, promotion_blocks=cli._promotion_blocks)
     names = _names(payload)
-    row = next(
-        row for row in _candidates(payload) if row["launch"] == "pi-sonnet55 --effort high"
-    )
+    row = next(row for row in _candidates(payload) if row["launch"] == "pi-sonnet55 --effort high")
     assert row["promotion"].startswith("promoted:")
     assert names.index("pi-sonnet55") < names.index("sonnet")
     assert names.index("pi-sonnet55") < names.index("codex-luna")
@@ -310,17 +300,13 @@ def test_an_impl_bounce_or_any_failed_rep_blocks(monkeypatch):
     )
     providers = _healthy()
     providers[0] = _weekly("claude", 75.0)
-    payload = recommend_dict(
-        providers, "A", today=TODAY, now=NOW, promotion_blocks=cli._promotion_blocks
-    )
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW, promotion_blocks=cli._promotion_blocks)
     high = next(row for row in _candidates(payload) if row["launch"] == "pi-sonnet55 --effort high")
     assert "promotion" not in high
     one_up = next(row for row in _candidates(payload) if row["profile"] == "cmd-dsflash41")
     assert "promotion" not in one_up
     # A sibling rung of the same profile with no failure still promotes.
-    xhigh = next(
-        row for row in _candidates(payload) if row["launch"] == "pi-sonnet55 --effort xhigh"
-    )
+    xhigh = next(row for row in _candidates(payload) if row["launch"] == "pi-sonnet55 --effort xhigh")
     assert xhigh.get("promotion")
 
 
@@ -364,9 +350,7 @@ def test_a_per_pool_threshold_override_needs_no_code_edit():
     policy.config_path().write_text("[pools.devin]\naltlane_pace_multiple = 3.0\n")
     assert policy.get_altlane_pace_multiple("devin") == pytest.approx(3.0)
     assert policy.get_altlane_pace_multiple("claude") == pytest.approx(1.2)
-    providers = _healthy(
-        _weekly("devin", 75.0, reset_in_hours=109.0)
-    )  # 2.14x — under the 3.0 override
+    providers = _healthy(_weekly("devin", 75.0, reset_in_hours=109.0))  # 2.14x — under the 3.0 override
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
     assert not any(row.get("promotion") for row in _candidates(payload))
     # The same pool at ~3.0x still yields under its own override.

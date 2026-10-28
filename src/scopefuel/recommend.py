@@ -6786,9 +6786,7 @@ def _evaluate(
             # one above (hk 2205 defect 2 — promotion never lifts a row above
             # its own placement, so a placed A+ one-up row may promote at A).
             placed_covers = candidate.placed_grade == grade or (
-                candidate.one_up
-                and upper_grade is not None
-                and candidate.placed_grade == upper_grade
+                candidate.one_up and upper_grade is not None and candidate.placed_grade == upper_grade
             )
             under_used = (
                 candidate.profile.name in ALTLANE_PROFILES

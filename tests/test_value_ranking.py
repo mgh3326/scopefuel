@@ -486,9 +486,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
                     # #1340: the paid-within-pool dimension — "paid" sinks
                     # below "free"/"unknown" at equal quota/boost standing.
                     item[0].billing == "paid",
-                    next(
-                        index for index, candidate in enumerate(physical) if candidate.name == item[0].name
-                    ),
+                    next(index for index, candidate in enumerate(physical) if candidate.name == item[0].name),
                 ),
             )
         ]
