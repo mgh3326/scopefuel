@@ -36,6 +36,7 @@ from .recommend import (
     ASTRA_FORBIDDEN_SEATS,
     ASTRA_ROLE_PROFILES,
     BARRED_MODEL_DECISION_REF,
+    CREDIT_PLACED_SEAT_REASON,
     E6_ARM_RUNGS,
     E6_WORKER_TESTER_ONLY_PROFILES,
     E6_WORKER_TESTER_ONLY_REASON,
@@ -48,16 +49,15 @@ from .recommend import (
     _operator_request_ref_valid,
     astra_purpose_allowed,
     barred_model_id_for_profile,
+    credit_builder_seat_denied,
     credit_effort_required_reason,
+    credit_placed_seat_denied,
     e6_arm_carrier_grade,
     e6_arm_matches,
     e6_arm_rung_for,
     e6_only_profile,
     e6_registered_rungs,
     e6_worker_tester_seat_denied,
-    credit_placed_seat_denied,
-    credit_builder_seat_denied,
-    CREDIT_PLACED_SEAT_REASON,
     is_barred_model_id,
     is_e6_unmeasured_key,
     normalize_effort,
@@ -980,13 +980,9 @@ def resolve_launch(
     if opened_arm is not None and e6_worker_tester_seat_denied(canonical, role):
         raise LaunchError(f"role_restricted: {opened_arm} — {E6_WORKER_TESTER_ONLY_REASON}")
     if opened_arm is None and credit_placed_seat_denied(canonical, role):
-        raise LaunchError(
-            f"role_restricted: {canonical}@{resolved_effort} — {CREDIT_PLACED_SEAT_REASON}"
-        )
+        raise LaunchError(f"role_restricted: {canonical}@{resolved_effort} — {CREDIT_PLACED_SEAT_REASON}")
     if opened_arm is None and credit_builder_seat_denied(canonical, role, row):
-        raise LaunchError(
-            f"role_restricted: {canonical}@{resolved_effort} — {E6_WORKER_TESTER_ONLY_REASON}"
-        )
+        raise LaunchError(f"role_restricted: {canonical}@{resolved_effort} — {E6_WORKER_TESTER_ONLY_REASON}")
 
     # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라
     # 카탈로그·snapshot·arm 어떤 경로로도 동일하게 닫히고 --operator-request 가
