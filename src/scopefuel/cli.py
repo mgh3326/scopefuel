@@ -1348,30 +1348,44 @@ def _inflight_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _promotion_blocks() -> frozenset[tuple[str, str]]:
-    """(profile, grade) keys with a recorded FAIL or BOUNCE at that grade.
+# hk 2205 (comment 8097 defect 1): a rep counts as a BOUNCE only when the
+# lane's OWN impl/fix work was sent back — a verify or reviewer rep's
+# ``blockers_found`` is that tester succeeding at its job, never a mark
+# against the lane. The rep roles that can bounce a lane's own work.
+_PROMOTION_BOUNCE_ROLES: frozenset[str] = frozenset({"impl", "fix"})
 
-    hk 2185 (altlanes2 limit b): an alt lane with a recorded failure or BOUNCE
-    at a grade is not promoted for that grade. The evidence is the reps store —
-    a FAIL is ``completed=0`` (cap exhausted without completing) and a BOUNCE
-    is a recorded blocker (``blockers_found > 0``), the tester's "send it back"
-    verdict. A read failure fails OPEN for ranking only: the promotion is a
-    preference, never a quota claim, so an unreachable reps store must not
-    break ``--recommend``.
+
+def _promotion_blocks() -> frozenset[tuple[str, str | None, str]]:
+    """(profile, effort, grade) keys with a recorded FAIL or BOUNCE at that grade.
+
+    hk 2185 (altlanes2 limit b): a lane with a recorded failure or BOUNCE at a
+    grade is not promoted for that grade. The evidence is the reps store — a
+    FAIL is ``completed=0`` (cap exhausted without completing, for ANY role)
+    and a BOUNCE is a recorded blocker (``blockers_found > 0``) on the lane's
+    own impl/fix work only — a verify/reviewer rep's blockers are its success,
+    not the lane's failure (hk 2205 defect 1). Blocks key by ``profile@rung``:
+    a rep carrying an effort blocks that rung; a rep naming none blocks the
+    profile's whole grade (``effort=None`` key). A read failure fails OPEN for
+    ranking only: the promotion is a preference, never a quota claim, so an
+    unreachable reps store must not break ``--recommend``.
     """
 
     try:
         reps = bench.read_reps()
     except Exception:  # noqa: BLE001 — ranking-only evidence, never a gate
         return frozenset()
-    blocked: set[tuple[str, str]] = set()
+    blocked: set[tuple[str, str | None, str]] = set()
     for rep in reps:
-        if not rep.grade or rep.profile not in recommend.ALTLANE_PROFILES:
+        if not rep.grade:
             continue
         failed = rep.completed == 0
-        bounced = rep.blockers_found is not None and rep.blockers_found > 0
+        bounced = (
+            rep.blockers_found is not None
+            and rep.blockers_found > 0
+            and (rep.role or "").strip().casefold() in _PROMOTION_BOUNCE_ROLES
+        )
         if failed or bounced:
-            blocked.add((rep.profile, rep.grade))
+            blocked.add((rep.profile, rep.effort, rep.grade))
     return frozenset(blocked)
 
 

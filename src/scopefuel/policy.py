@@ -1087,7 +1087,7 @@ def get_imminent_reset_hours() -> float:
     return _positive_setting("imminent_reset_hours", DEFAULT_IMMINENT_RESET_HOURS)
 
 
-def get_altlane_pace_multiple() -> float:
+def get_altlane_pace_multiple(pool: str | None = None) -> float:
     """``[settings] altlane_pace_multiple`` — alt lane 승격을 여는 주간 pace 배수(기본 1.2x).
 
     hk 2185: the value is compared against the weekly (7d) pace multiple
@@ -1095,8 +1095,24 @@ def get_altlane_pace_multiple() -> float:
     "the pool is on track to use 1.2x its even weekly pace". Unset, invalid,
     boolean or non-positive values fall back to the shipped default — a
     malformed tuning key must never disable the rule silently.
+
+    hk 2205: the same key under ``[pools.<pool>]`` is an optional per-pool
+    override (``[pools.devin] altlane_pace_multiple = 2.0``), read with the
+    same validation as every other pool key — an invalid override falls back
+    to the settings value, never disables the rule.
     """
 
+    if pool is not None:
+        entry = _pools_table(load_config()).get(pool)
+        if isinstance(entry, dict):
+            raw = entry.get("altlane_pace_multiple")
+            if raw is not None and not isinstance(raw, bool):
+                try:
+                    parsed = float(raw)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    parsed = float("nan")
+                if math.isfinite(parsed) and parsed > 0:
+                    return parsed
     return _positive_setting("altlane_pace_multiple", DEFAULT_ALTLANE_PACE_MULTIPLE)
 
 

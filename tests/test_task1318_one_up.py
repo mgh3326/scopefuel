@@ -234,7 +234,10 @@ def test_recommend_a_lists_the_aplus_rep_rows_tagged_one_up():
     out = recommend(_pool_providers(), "A", today=TODAY, now=NOW)
     ranked = _ranked(out)
     for label in ("devin-ds41", "devin-swe2 (effort high)", "devin-swe2-max (effort max)"):
-        lines = [line for line in out.splitlines() if line[:1].isdigit() and label in line]
+        # Match on the parsed line label, not a substring — hk 2205's canon
+        # one-up rows carry inherited-basis annotations that name their source
+        # profiles (cmd-dsflash41's "inherited from devin ds41 devin-ds41@high").
+        lines = [line for line in out.splitlines() if line[:1].isdigit() and _line_label(line) == label]
         # exactly one listing, always tagged — never an untagged copy at A
         assert len(lines) == 1 and "[one-up A+]" in lines[0], (label, out)
         assert label in ranked
@@ -262,10 +265,20 @@ def test_recommend_b_lists_the_a_sonnet_row_tagged_borrowed():
 
 
 def test_s_and_splus_have_no_one_up_rows():
-    """AC2: nothing is rep-measured at S+ (no one-up at S) and nothing sits above S+."""
-    for grade in ("S+", "S", "A+"):
+    """AC2: nothing sits above S+ (no one-up at S+), and nothing rep-measured
+    sits at S or S+ — so the only one-up rows at S and A+ are hk 2205's
+    canon-placed alt-lane rungs with an inherited basis."""
+    out = recommend(_pool_providers(), "S+", today=TODAY, now=NOW)
+    assert "[one-up" not in out, out
+    for grade in ("S", "A+"):
         out = recommend(_pool_providers(), grade, today=TODAY, now=NOW)
-        assert "[one-up" not in out, (grade, out)
+        one_up_labels = {
+            _line_label(line) for line in out.splitlines() if line[:1].isdigit() and "[one-up" in line
+        }
+        assert one_up_labels and all(
+            label.split(" --effort")[0].split(" (effort")[0] in recommend_mod.ALTLANE_PROFILES
+            for label in one_up_labels
+        ), (grade, one_up_labels)
 
 
 # ── every-row invariants (AC3 / AC7a / AC7b) ─────────────────────────────────
@@ -301,6 +314,14 @@ def test_every_bundled_row_lists_only_at_its_placement_or_one_below():
             allowed = allowed_at.setdefault(label, set())
             allowed.add(grade)
             if (grade, label) in pinned:
+                if below is not None:
+                    allowed.add(below)
+                rep_measured_labels.add((label, below))
+            # hk 2205 (8097): a canon-placed alt-lane rung with an inherited
+            # basis also takes the one-up slot at the grade below.
+            if profile.name in recommend_mod.ALTLANE_PROFILES and (profile.name, profile.launcher_effort) in {
+                (name, effort) for name, effort, _g, _gate, _r in recommend_mod.ALTLANE_CANON_ROWS
+            }:
                 if below is not None:
                     allowed.add(below)
                 rep_measured_labels.add((label, below))

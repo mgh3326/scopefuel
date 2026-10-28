@@ -1024,13 +1024,18 @@ def test_credit_rows_are_not_listed_without_a_usable_balance():
 
 
 def test_credit_rows_are_listed_only_at_their_placed_grade():
-    """hk 2185: each rung is listed at the grade it inherits, never another."""
+    """hk 2185: each rung is listed at the grade it inherits, never another —
+    plus hk 2205's canon one-up listing exactly one grade below, tagged."""
 
     credit = _credit_result()
-    for grade in ("S+", "S", "A+", "A", "B", "C"):
+    order = ("S+", "S", "A+", "A", "B", "C")
+    for index, grade in enumerate(order):
         out = recommend_text([_claude_result(), credit], grade, today=TODAY, now=NOW)
         listed = set(_ranked_names(out)) & set(PI_PROFILES)
         expected = {p for p, r in PI_ROWS if CANON[(p, r)] == (grade, "default")}
+        if index > 0:
+            upper = order[index - 1]
+            expected |= {p for p, r in PI_ROWS if CANON[(p, r)] == (upper, "default")}
         assert listed == expected, (grade, listed, expected)
 
 
@@ -1235,10 +1240,11 @@ def test_recommend_does_not_restore_a_consult_only_credit_row():
         for r in payload["excluded"]
     )
     # The canon's own consult_only rungs (sonnet@medium, haiku@xhigh/max) never
-    # become candidates either.
+    # become candidates either. hk 2205: pi-sonnet55@high (canon A) is allowed —
+    # it lists at B as a canon one-up row.
     assert not {
         r["profile"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
-    } - {"pi-haiku55"}
+    } - {"pi-sonnet55"}
 
 
 @pytest.mark.parametrize(
@@ -1658,6 +1664,12 @@ def test_the_credit_rows_are_accounted_once_each_on_the_c_surface():
     """Every C-placed pi rung is accounted for exactly once on the C surface."""
 
     c_rows = sorted((p, r) for p, r in PI_ROWS if _placed_grade(p, r) == "C")
+    # hk 2205: the canon B-placed default rung (pi-haiku55@high) also surfaces
+    # at C — as a one-up listing one grade below its own placement.
+    b_one_up = sorted(
+        (p, r) for p, r in PI_ROWS if _placed_grade(p, r) == "B" and _placed_gate(p, r) == "default"
+    )
+    c_rows = sorted([*c_rows, *b_one_up])
     c_candidates = {(p, r) for p, r in c_rows if _placed_gate(p, r) == "default"}
     for credit_state in ("missing", "fresh"):
         providers_ = [_claude_result()]
