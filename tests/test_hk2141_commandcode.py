@@ -1,13 +1,18 @@
-"""hk 2141: the commandcode credit pool and its cmd-dsflash41 E6 rungs.
+"""hk 2141: the commandcode credit pool and its cmd-dsflash41 rungs.
 
 The operator's Command Code credit (cmd 1.88.0, plan GOAT per r1027cmdcode /
 r1027cmdgoat — no amount or period is hardcoded anywhere) is spent through
 cmd. It is a separate pool with no usage API and no probe: its balance is a
 manual observation the operator or desk enters (the ``/usage`` credit balance
 plus an expiry), and nothing is ever fetched or scraped from the cmd
-account. The cmd rungs (one per effort the model accepts) are unmeasured E6
-catalog rows: marker-gated, worker/tester only, and they inherit no grade from
-devin-ds41 — same model, different harness.
+account.
+
+hk 2185 (operator desk op-1028-grades FINAL) supersedes the original E6
+contract: the cmd rungs are ordinary per-effort PLACEMENTS now, each
+inheriting the devin DeepSeek V4.1 Flash rung's grade per effort (high =
+devin-ds41, max = devin-ds41-max, each lower effort one step down). They keep
+the worker/tester-only seat rule and the closed rung vocabulary, and the E6
+marker is inert for them.
 
 Each test docstring names the mutant it kills where the brief lists one.
 """
@@ -23,9 +28,10 @@ import pytest
 from scopefuel import bench, cli, commandcode_limit, launch, manual, providers, recommend
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
-    E6_ARM_ANNOTATION,
+    ALTLANE_CANON_ROWS,
     E6_ARM_KEYS,
     GRADE_TABLE,
+    altlane_annotation,
     e6_arm_rung_for,
     gate_check,
     profile_pool,
@@ -43,8 +49,29 @@ CMD_PROFILES: dict[str, str] = {
 # vocabulary intersection, off not exposed.
 CMD_RUNGS = ("low", "high", "max")
 CMD_DEFAULT_RUNG = {"cmd-dsflash41": "high"}
-CMD_ROWS = [(profile, rung) for profile in sorted(CMD_PROFILES) for rung in CMD_RUNGS]
+# hk 2185: the canon places cmd-dsflash41@high only. @max as a copy of
+# devin-ds41-max (C) would sit below @high (A+) and break the canon's effort
+# monotonicity, and @low has no source rung — both are deliberately unplaced.
+CMD_CANON = {(profile, rung): (grade, gate) for profile, rung, grade, gate, _r in ALTLANE_CANON_ROWS}
+CMD_ROWS = [
+    (profile, rung) for profile in sorted(CMD_PROFILES) for rung in CMD_RUNGS if (profile, rung) in CMD_CANON
+]
+CMD_UNPLACED = [("cmd-dsflash41", rung) for rung in CMD_RUNGS if ("cmd-dsflash41", rung) not in CMD_CANON]
 CREDIT_EXPIRES = (TODAY + dt.timedelta(days=30)).isoformat()
+
+
+def _snapshot_view() -> launch.CatalogView:
+    return launch.CatalogView(
+        entries=bench.catalog_snapshot(), source=bench.CATALOG_SOURCE_SNAPSHOT, age_s=None
+    )
+
+
+def _placed_grade(profile: str, rung: str) -> str | None:
+    for grade, rows in GRADE_TABLE.items():
+        for row in rows:
+            if row.name == profile and row.launcher_effort == rung:
+                return grade
+    return None
 
 
 def _marker(profile: str, rung: str) -> str:
@@ -107,10 +134,14 @@ def test_pool_is_commandcode_not_devin():
     """Mutant: route cmd-dsflash41 to the devin pool (devin-ds41's pool) -> RED."""
 
     assert profile_pool("cmd-dsflash41") == ("commandcode", None)
-    assert provider_family("cmd-dsflash41") == "commandcode"
+    # hk 2185 (op-1028-grades FINAL): cmd-dsflash41 is DeepSeek FAMILY, the same
+    # family value devin-ds41 carries — a cmd tester for a devin builder is
+    # refused as same-family.
+    assert provider_family("cmd-dsflash41") == "devin"
     # Control: the same model on the devin harness stays on the devin pool.
     assert profile_pool("devin-ds41") == ("devin", None)
     assert provider_family("devin-ds41") == "devin"
+    assert provider_family("cmd-dsflash41") == provider_family("devin-ds41")
 
 
 def test_unregistered_cmd_spelling_does_not_inherit_the_route():
@@ -144,60 +175,69 @@ def test_commandcode_has_an_automatic_probe_registration():
 
 
 @pytest.mark.parametrize(("profile", "rung"), CMD_ROWS)
-def test_catalog_row_is_the_unmeasured_c_carrier(profile, rung):
-    """Mutant: copy the devin-ds41 grade into the cmd rows -> this goes RED."""
+def test_catalog_row_is_the_inherited_placement(profile, rung):
+    """Mutant: hand-copy a grade instead of inheriting it -> this goes RED."""
 
     rows = [entry for entry in bench.catalog_snapshot() if entry.key == (profile, rung)]
     assert len(rows) == 1
     (row,) = rows
-    assert row.grade == "C"
+    assert row.grade == _placed_grade(profile, rung) == CMD_CANON[(profile, rung)][0]
     assert row.score is None
     assert row.pool == "commandcode"
     assert row.model_id == CMD_PROFILES[profile]
-    assert row.gate == "default"
+    assert row.gate == CMD_CANON[(profile, rung)][1]
     assert row.benchmark_source is None
-    assert row.benchmark_annotation.startswith(E6_ARM_ANNOTATION)
-    # The placement exclusion is recorded in the catalog notes.
-    assert "worker/tester" in row.benchmark_annotation
-    assert "cmd" in row.benchmark_annotation
+    # hk 2185: the canon annotation, verbatim.
+    assert row.benchmark_annotation == altlane_annotation(profile, rung)
+    assert row.benchmark_annotation.startswith("inherited from devin ds41")
 
 
-def test_no_grade_inheritance_from_the_devin_ds41_rows():
-    """Mutant: copy the devin-ds41 grade into the cmd rows -> this goes RED."""
+def test_cmd_high_inherits_devin_ds41_and_the_other_rungs_are_unplaced():
+    """hk 2185: high = devin-ds41 (A+); @low/@max stay unplaced (canon decision)."""
 
-    # Control: the devin-ds41 rows really do sit above C, so "C" is not a default.
-    devin_grades = {
-        grade
-        for grade, profiles in GRADE_TABLE.items()
-        for placed in profiles
-        if placed.name in {"devin-ds41", "devin-ds41-max"}
-    }
-    assert devin_grades - {"C"}
-    # The cmd profile is not a placement at any grade.
-    assert all(placed.name not in CMD_PROFILES for profiles in GRADE_TABLE.values() for placed in profiles)
-    # And every catalog row for it is the C carrier, whatever devin-ds41 says.
-    rows = [entry for entry in bench.catalog_snapshot() if entry.profile in CMD_PROFILES]
-    assert len(rows) == len(CMD_ROWS)
-    assert {entry.grade for entry in rows} == {"C"}
-    assert {entry.score for entry in rows} == {None}
+    assert _placed_grade("cmd-dsflash41", "high") == recommend.source_placement_grade("devin-ds41", "")
+    assert _placed_grade("cmd-dsflash41", "high") == "A+"
+    assert _placed_grade("cmd-dsflash41", "low") is None
+    assert _placed_grade("cmd-dsflash41", "max") is None
+    # No catalog row for the unplaced rungs either.
+    keys = {(entry.profile, entry.effort) for entry in bench.catalog_snapshot()}
+    assert ("cmd-dsflash41", "high") in keys
+    assert ("cmd-dsflash41", "low") not in keys
+    assert ("cmd-dsflash41", "max") not in keys
+
+
+def test_cmd_ladder_is_monotone_so_a_seed_can_never_400():
+    """A canon push refuses a non-monotonic ladder — the bundle must never carry one."""
+
+    order = recommend.REP_GRADES_ORDER
+    ladder = [
+        (rung, _placed_grade("cmd-dsflash41", rung))
+        for rung in CMD_RUNGS
+        if _placed_grade("cmd-dsflash41", rung) is not None
+    ]
+    ranks = [order.index(grade) for _rung, grade in ladder]
+    assert ranks == sorted(ranks), ladder
 
 
 @pytest.mark.parametrize(("profile", "rung"), CMD_ROWS)
-def test_cmd_rows_are_in_the_e6_arm_table(profile, rung):
-    assert (profile, rung) in E6_ARM_KEYS
-    row = e6_arm_rung_for(profile, rung)
-    assert row is not None
-    assert row.benchmark is None
-    assert row.launcher_effort == rung
+def test_cmd_rows_are_ordinary_placements_not_e6_arms(profile, rung):
+    """hk 2185: a placed rung is an ordinary row — no marker, no carrier fold."""
+
+    assert (profile, rung) not in E6_ARM_KEYS
+    assert e6_arm_rung_for(profile, rung) is None
+    assert recommend.is_e6_unmeasured_key(profile, rung) is False
+    assert recommend.e6_only_profile(profile) is False
 
 
 def test_unsupported_efforts_are_not_rungs():
-    """The model answered ``Supported: off, low, high, max`` — medium/xhigh are not rows."""
+    """The model answered ``Supported: off, low, high, max`` — medium/xhigh are not rungs."""
 
     for rung in ("medium", "xhigh", "ultra"):
         for profile in CMD_PROFILES:
             assert (profile, rung) not in E6_ARM_KEYS
             assert e6_arm_rung_for(profile, rung) is None
+    # low/max are supported efforts but deliberately unplaced (hk 2185).
+    assert recommend.worker_tester_rungs("cmd-dsflash41") == ("high",)
 
 
 @pytest.mark.parametrize(("profile", "rung"), CMD_ROWS)
@@ -208,6 +248,17 @@ def test_launch_spelling_takes_the_effort_flag(profile, rung):
     assert launch.launch_spelling(profile, rung) == f"{profile} --effort {rung}"
     assert launch.DEFAULT_LAUNCH_EFFORTS[profile] == CMD_DEFAULT_RUNG[profile]
     assert launch.LAUNCH_MODEL_IDS[profile] == CMD_PROFILES[profile]
+
+
+@pytest.mark.parametrize(("profile", "rung"), CMD_UNPLACED)
+def test_launch_and_gate_refuse_an_unplaced_rung(profile, rung):
+    """@low/@max name no placement anywhere — the gate says not_placed."""
+
+    result = gate_check([_credit_result()], profile, role="worker", effort=rung, today=TODAY, now=NOW)
+    assert result.ok is False
+    assert "not_placed" in result.reason
+    with pytest.raises(launch.LaunchError, match="not placed at effort"):
+        launch.resolve_launch(profile, effort=rung, role="worker", view=_snapshot_view())
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +381,9 @@ def test_credit_expired_at_midnight_utc_fails_closed():
 
 
 @pytest.mark.parametrize(("profile", "rung"), CMD_ROWS)
-def test_gate_refuses_a_rung_without_the_marker_as_unmeasured(profile, rung):
+def test_gate_admits_a_placed_rung_without_the_marker(profile, rung):
+    """hk 2185: a placed rung needs no E6 marker — the marker is inert for cmd."""
+
     result = gate_check(
         [_credit_result()],
         profile,
@@ -339,10 +392,9 @@ def test_gate_refuses_a_rung_without_the_marker_as_unmeasured(profile, rung):
         today=TODAY,
         now=NOW,
     )
-    assert result.ok is False
-    assert result.unmeasurable is False
-    assert "e6_arm_required" in result.reason
-    assert "SCOPEFUEL_E6_ARM" in result.reason
+    assert result.ok is True, result.reason
+    assert result.e6_arm is None
+    assert result.grade == CMD_CANON[(profile, rung)][0]
 
 
 @pytest.mark.parametrize(("profile", "with_marker"), [(p, m) for p in CMD_PROFILES for m in (True, False)])
@@ -363,7 +415,7 @@ def test_gate_refuses_the_bare_spelling_even_with_a_marker(profile, with_marker)
 
 @pytest.mark.parametrize(
     ("profile", "rung", "role"),
-    [(p, r, s) for p in CMD_PROFILES for r in CMD_RUNGS for s in ("worker", "tester")],
+    [(p, r, s) for p in CMD_PROFILES for r in ("high",) for s in ("worker", "tester")],
 )
 def test_gate_admits_with_the_marker_and_a_worker_or_tester_seat(profile, rung, role):
     result = gate_check(
@@ -696,14 +748,16 @@ def test_gate_cli_refuses_when_the_manual_value_is_missing(monkeypatch, capsys):
     assert rc == 4
 
 
-def test_gate_cli_refuses_without_the_marker(monkeypatch, capsys):
+def test_gate_cli_admits_without_the_marker(monkeypatch, capsys):
+    """hk 2185: the E6 marker is inert for a placed cmd rung."""
+
     monkeypatch.delenv("SCOPEFUEL_E6_ARM", raising=False)
     monkeypatch.setattr(cli, "collect", lambda *a, **k: [])
     _record_credit()
     rc = cli.main(["gate", "-m", "cmd-dsflash41", "--role", "worker", "--effort", "high"])
     captured = capsys.readouterr()
-    assert rc == 3
-    assert "SCOPEFUEL_E6_ARM" in captured.out + captured.err
+    assert rc == 0, captured.out + captured.err
+    assert "pool=commandcode" in captured.out
 
 
 def test_gate_cli_allow_line_shows_pool_commandcode(monkeypatch, capsys, tmp_path):

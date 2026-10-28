@@ -20,6 +20,7 @@ import json
 import pathlib
 from collections import Counter
 
+from scopefuel import recommend as recommend_mod
 from scopefuel.recommend import (
     DEVIN_SWE2_MEDIUM_GRADE_ANNOTATION,
     GRADE_TABLE,
@@ -94,7 +95,17 @@ def test_no_other_grade_table_row_changed():
     def key(row: dict) -> tuple:
         return (row["grade"], row["name"], row["launcher_effort"])
 
-    assert {key(row) for row in added} == {
+    # hk 2185 (operator desk op-1028-grades FINAL): the alt-lane inherited
+    # placements — pi-* per effort from the claude harness, cmd-dsflash41 per
+    # effort from the devin ds41 rungs.
+    altlanes = {
+        (grade, profile.name, profile.launcher_effort)
+        for grade, profiles in GRADE_TABLE.items()
+        for profile in profiles
+        if profile.name in recommend_mod.ALTLANE_PROFILES
+    }
+    assert altlanes  # the new rows really are in the table
+    assert {key(row) for row in added} == altlanes | {
         ("A", "devin-swe2-medium", None),
         ("A+", "sonnet", "xhigh"),
         ("C", "sonnet", "medium"),

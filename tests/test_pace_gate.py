@@ -414,9 +414,19 @@ def test_recommend_lists_over_pace_rows_with_warnings_and_headroom_order():
 
 
 def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_headroom():
-    profiles = {profile.name: profile for rows in recommend.GRADE_TABLE.values() for profile in rows}
+    profiles = {
+        (profile.name, profile.launcher_effort): profile
+        for rows in recommend.GRADE_TABLE.values()
+        for profile in rows
+    }
     table = {grade: [] for grade in recommend.GRADE_TABLE}
-    table["C"] = [profiles["sonnet"], profiles["kimi-k3-low"]]
+    # hk 2185: the credit rows are ordinary placements now, so the fixture names
+    # the one it wants (pi-haiku55@medium is the canon's default-gated C rung).
+    table["C"] = [
+        profiles[("sonnet", "high")],
+        profiles[("kimi-k3-low", None)],
+        profiles[("pi-haiku55", "medium")],
+    ]
     providers = [
         _provider("claude", _bucket("7d", 50, 144)),
         _provider("kimi", _bucket("7d", 70, 144)),
@@ -426,9 +436,15 @@ def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_hea
     data = recommend.recommend_dict(providers, "C", today=TODAY, now=NOW, grade_table=table)
     rows = [row for row in data["rows"] if row["kind"] == "candidate"]
     names = [row["profile"] for row in rows]
-    credit = next(row for row in rows if row["profile"] == "pi-sonnet55")
+    credit = next(row for row in rows if row["profile"] == "pi-haiku55")
 
-    assert names.index("sonnet") < names.index("kimi-k3-low") < names.index("pi-sonnet55")
+    # hk 2185 (altlanes) supersedes hk 2079's "credit always last" here: claude
+    # and kimi are over pace (their 7d multiples clear 1.2x), so the eligible
+    # credit row is promoted above the triggering primaries, and the reason names
+    # the multiple. The standard rows keep their headroom order among themselves.
+    assert names.index("sonnet") < names.index("kimi-k3-low")
+    assert names.index("pi-haiku55") < names.index("sonnet")
+    assert credit["promotion"].startswith("promoted: claude 7d pace ")
     assert (
         "pace-warning pool=claude window=7d"
         in next(row for row in rows if row["profile"] == "sonnet")["windows"]
@@ -438,6 +454,22 @@ def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_hea
         in next(row for row in rows if row["profile"] == "kimi-k3-low")["windows"]
     )
     assert "pace-warning pool=anthropic-api window=7d" in credit["windows"]
+
+    # Control: with healthy primaries there is no promotion — the credit row
+    # stays after the standard lanes (today's order).
+    healthy = [
+        _provider("claude", _bucket("7d", 10, 144)),
+        _provider("kimi", _bucket("7d", 10, 144)),
+        _provider("anthropic-api", _bucket("7d", 25, 144)),
+    ]
+    healthy_rows = [
+        row
+        for row in recommend.recommend_dict(healthy, "C", today=TODAY, now=NOW, grade_table=table)["rows"]
+        if row["kind"] == "candidate"
+    ]
+    healthy_names = [row["profile"] for row in healthy_rows]
+    assert healthy_names.index("kimi-k3-low") < healthy_names.index("pi-haiku55")
+    assert "promotion" not in next(row for row in healthy_rows if row["profile"] == "pi-haiku55")
 
 
 def test_swe2_free_bucket_stays_listed_and_exempt_from_pace_and_waste():

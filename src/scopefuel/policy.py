@@ -40,6 +40,17 @@ NEAR_EXPIRY_DAYS = 3
 DEFAULT_RESET_URGENCY_HOURS = 12.0
 DEFAULT_IMMINENT_RESET_HOURS = 1.0
 DEFAULT_IMMINENT_REMAINING_PCT = 5.0
+# hk 2185 (operator desk op-1028-altlanes/altlanes3): the weekly (7d) pace
+# multiple at which a primary pool (claude or codex) promotes the alternative
+# lanes above itself. The multiple is the per-bucket pace field scopefuel
+# already prints (``pace_for(...).ratio``, rendered ``1.73x``) — no new
+# computation. A config key, not a code constant, so desk can tune the
+# threshold with no code change; the shipped default is 1.2x.
+DEFAULT_ALTLANE_PACE_MULTIPLE = 1.2
+# ``[settings]`` keys this build reads and the operator may set. Kept small on
+# purpose: an unknown name must be refused rather than written into a key
+# nothing reads.
+SETTING_KEYS: frozenset[str] = frozenset({"altlane_pace_multiple"})
 
 
 def config_path() -> pathlib.Path:
@@ -1050,7 +1061,11 @@ def get_reset_urgency_hours() -> float:
 
 
 def _positive_setting(name: str, default: float) -> float:
-    """``[settings]`` 의 양수 float 설정 하나를 읽는다. 미설정/무효/0 이하는 default 로 폴백."""
+    """``[settings]`` 의 양수 float 설정 하나를 읽는다.
+
+    미설정/무효/0 이하/비유한(nan·inf) 값은 default 로 폴백한다. A hand-edited
+    ``nan`` must not silently disable a rule (``ratio >= nan`` is always False).
+    """
     config = load_config()
     settings = config.get("settings")
     if not isinstance(settings, dict):
@@ -1062,7 +1077,7 @@ def _positive_setting(name: str, default: float) -> float:
         parsed = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         return default
     return parsed
 
@@ -1070,6 +1085,19 @@ def _positive_setting(name: str, default: float) -> float:
 def get_imminent_reset_hours() -> float:
     """``[settings] imminent_reset_hours`` — 이 시간 이내 리셋이면 소멸 임박 후보(기본 1h)."""
     return _positive_setting("imminent_reset_hours", DEFAULT_IMMINENT_RESET_HOURS)
+
+
+def get_altlane_pace_multiple() -> float:
+    """``[settings] altlane_pace_multiple`` — alt lane 승격을 여는 주간 pace 배수(기본 1.2x).
+
+    hk 2185: the value is compared against the weekly (7d) pace multiple
+    scopefuel already computes and prints (``pace_for`` ratio), so 1.2 means
+    "the pool is on track to use 1.2x its even weekly pace". Unset, invalid,
+    boolean or non-positive values fall back to the shipped default — a
+    malformed tuning key must never disable the rule silently.
+    """
+
+    return _positive_setting("altlane_pace_multiple", DEFAULT_ALTLANE_PACE_MULTIPLE)
 
 
 def get_imminent_remaining_pct() -> float:
@@ -1327,6 +1355,39 @@ def set_profile_subscribed(profile: str, value: bool | None) -> None:
     an unsubscribed pool; an explicit ``false`` overrides a subscribed pool —
     the two are not interchangeable with removal."""
     _set_subscribed_impl("profiles", profile, value)
+
+
+def set_setting(name: str, value: float | None) -> None:
+    """Write one documented ``[settings]`` tunable. ``None`` removes the key.
+
+    hk 2185: the alt-lane pace threshold ships as a config key so desk can
+    retune it with no code change; this writer is the supported surface
+    (``scopefuel policy setting <name> <value|none>``). Only names in
+    :data:`SETTING_KEYS` are accepted — writing a key nothing reads would be
+    a silent no-op. An empty ``[settings]`` table left by a removal is dropped
+    entirely, the same rule the subscribed writer applies.
+    """
+
+    if name not in SETTING_KEYS:
+        raise ValueError(f"unknown [settings] key {name!r} (known: {', '.join(sorted(SETTING_KEYS))})")
+    base = ("settings",)
+
+    def edit(doc: _Doc):
+        if value is None:
+            doc.remove_key(base + (name,))
+        else:
+            doc.set_value(base + (name,), float(value))
+        settings: dict[str, object] = dict(doc.config.get("settings") or {})
+        if value is None:
+            settings.pop(name, None)
+        else:
+            settings[name] = float(value)
+        if not settings:
+            doc.delete_table(base)
+        doc.touched.add(base)
+        return None, {base: settings or None}
+
+    _edit_config(edit)
 
 
 def list_policies(

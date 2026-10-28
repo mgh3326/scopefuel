@@ -42,6 +42,7 @@ from .model import (
 )
 from .policy import (
     get_active_override,
+    get_altlane_pace_multiple,
     get_boost,
     get_capacity_weight,
     get_cutoff,
@@ -56,7 +57,7 @@ from .policy import (
 )
 
 Grade = Literal["S+", "S", "A+", "A", "B", "C"]
-Gate = Literal["default", "escalation"]
+Gate = Literal["default", "escalation", "consult_only"]
 # #1340 (dr-1340-1): the billing class of a launch — "free" rides a no-budget
 # lane (the devin models-list Free tag), "paid" draws a real budget, and
 # "unknown" is the default. "unknown" sorts exactly like "free" — neutral —
@@ -1555,19 +1556,26 @@ def _e6_arm_profile(name: str, model: str, effort: str, reference: str, **kwargs
 # is spent through pi, where the thinking level IS the effort — wrk launches
 # ``--model anthropic/claude-*-5-5:<thinking>`` and maps ``--effort`` onto the
 # suffix, so these are ordinary effort-bearing profiles (launch.py carries them
-# in DEFAULT_LAUNCH_EFFORTS). They are unmeasured: each (profile, thinking level)
-# is a C-carrier E6 row that inherits no grade from claude-haiku, claude-sonnet
-# or claude-opus — the harness differs, and the stored numbers are the claude
-# subscription harness. pi accepts off, minimal, low, medium, high, xhigh and
-# max; hk 2080 maps wrk's efforts low..max one to one (ultra is refused, off and
-# minimal are not exposed), so the rungs are the catalog's own effort vocabulary
-# (CATALOG_EFFORT_RANKS) from low to max.
+# in DEFAULT_LAUNCH_EFFORTS). pi accepts off, minimal, low, medium, high, xhigh
+# and max; hk 2080 maps wrk's efforts low..max one to one (ultra is refused, off
+# and minimal are not exposed), so the rungs are the catalog's own effort
+# vocabulary (CATALOG_EFFORT_RANKS) from low to max.
+#
+# hk 2185 (operator desk op-1028-grades, director-1 FINAL): the placements are
+# no longer a conservative one-step-down estimate and no longer E6 measurement
+# rows. Each rung is an ordinary placement whose grade/gate come from the canon
+# rows the desk pushed 2026-10-28 — see ``ALTLANE_CANON_ROWS`` below. Where the
+# canon inherits (most rungs) the grade is the matching claude-code harness
+# profile's grade for the same effort; the canon's own re-placements are named
+# in ``ALTLANE_CANON_DIVERGENCES``. Basis label, verbatim:
+# "inherited from claude harness <source>, operator 2026-10-28, unmeasured under pi".
 PI_CREDIT_MODELS: dict[str, str] = {
     "pi-haiku55": "Claude Haiku 5.5",
     "pi-sonnet55": "Claude Sonnet 5.5",
     "pi-opus55": "Claude Opus 5.5",
 }
 PI_THINKING_RUNGS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+PI_CREDIT_BASIS = "inherited from claude harness"
 # Placement exclusions, recorded in the catalog notes: no builder placement
 # until reps exist (the same worker/tester-only rule as the devin-fusion and
 # grok lanes), and no MCP — pi has none, so a task that needs an MCP must not be
@@ -1579,31 +1587,152 @@ PI_CREDIT_PLACEMENT_NOTE = (
 )
 
 
-def _pi_credit_rung(profile: str, model: str, rung: str) -> Profile:
-    return _e6_arm_profile(profile, f"{model} (pi {rung})", rung, PI_CREDIT_PLACEMENT_NOTE)
-
-
 # hk 2141 (operator r1027cmdcode, plan GOAT per r1027cmdgoat): the Command
 # Code credit is spent through cmd, where ``--effort`` takes the model's own
 # levels — a real ``cmd -m deepseek/deepseek-v4.1-flash`` run on 2026-10-27
 # answered ``Supported: off, low, high, max``. The rungs are the catalog
 # vocabulary intersection low/high/max (off is not exposed, medium/xhigh are
-# not supported). Same model id as devin-ds41 but a different harness, so the
-# rows inherit no grade from the devin rows — the same worker/tester-only rule
-# as the pi credit lanes, and small first reps on a paid credit.
+# not supported). Same model id as devin-ds41 but a different harness.
+#
+# hk 2185 (operator desk op-1028-grades, director-1 FINAL): the canon places
+# ONLY @high = A+ (devin-ds41's grade). @low and @max are deliberately unplaced:
+# @max copied from devin-ds41-max (C) would sit below @high and the canon's
+# checkBenchCatalogMonotonicity refuses the whole batch, and @low has no source
+# rung. Basis label, verbatim: "inherited from devin ds41 <source>, operator
+# 2026-10-28, unmeasured under cmd".
 CMD_CREDIT_MODELS: dict[str, str] = {
     "cmd-dsflash41": "DeepSeek V4.1 Flash",
 }
 CMD_EFFORT_RUNGS: tuple[str, ...] = ("low", "high", "max")
+CMD_CREDIT_BASIS = "inherited from devin ds41"
 CMD_CREDIT_PLACEMENT_NOTE = (
     "AA 미측정 (cmd harness — commandcode credit · worker/tester 전용 · "
     "builder 배치 금지, reps 필요 · devin-ds41 동일 모델·상이 하네스 — 급 비상속 · "
-    "첫 reps 소액, 유료 credit)"
+    "첫 reps 소액, 유료 credit · host-gated by [local] cmd_dsflash41 (wrk hk 2180))"
 )
 
+# The alternative lanes the altlanes rule promotes (operator desk
+# op-1028-altlanes): three pi rungs on the anthropic-api credit and one cmd rung
+# on the commandcode subscription.
+ALTLANE_PROFILES: tuple[str, ...] = (*PI_CREDIT_MODELS, *CMD_CREDIT_MODELS)
 
-def _cmd_credit_rung(profile: str, model: str, rung: str) -> Profile:
-    return _e6_arm_profile(profile, f"{model} (cmd {rung})", rung, CMD_CREDIT_PLACEMENT_NOTE)
+# hk 2185 (director-1 10-28, overriding the first per-effort inheritance
+# attempt): the canon catalog already holds these rows — desk pushed them
+# 2026-10-28 (hk:doc catalog/b953/op-1028-altlanes-rows plus the
+# pi-sonnet55@max fix), decided_by operator-desk, ref desk op-1028-grades. The
+# bundled table must equal the canon rows EXACTLY — grade, gate, gate_reason
+# and annotation per effort — so the bundled snapshot, a seed push and the
+# served canon agree. A pure per-effort copy of the source rows does NOT hold
+# for every rung (the canon itself re-placed sonnet@medium and haiku@high, and
+# gates several rungs consult_only); those divergences are named in
+# ``ALTLANE_CANON_DIVERGENCES`` below and pinned by a test.
+#
+# cmd-dsflash41 carries ONLY @high = A+ (devin-ds41). @low and @max are
+# deliberately unplaced: @max as a copy of devin-ds41-max (C) sits below
+# @high (A+) and the canon's checkBenchCatalogMonotonicity refuses the whole
+# batch, and @low has no source rung. They stay unplaced everywhere (gate
+# refuses as not placed), matching the canon.
+ALTLANE_CANON_ROWS: tuple[tuple[str, str, Grade, Gate, str | None], ...] = (
+    ("pi-opus55", "low", "S", "default", None),
+    ("pi-opus55", "medium", "S+", "default", None),
+    ("pi-opus55", "high", "S+", "default", None),
+    ("pi-opus55", "xhigh", "S+", "default", None),
+    ("pi-opus55", "max", "S+", "escalation", OPUS_MAX_ESCALATION_REASON),
+    (
+        "pi-sonnet55",
+        "low",
+        "C",
+        "consult_only",
+        "실험 전용(H 팔) — SCOPEFUEL_E6_ARM 표식 + --operator-request hk:task/1786 로만 스폰, 추천 후보 아님",
+    ),
+    (
+        "pi-sonnet55",
+        "medium",
+        "B",
+        "consult_only",
+        "B급 claude 자리를 haiku@high 로 교체(r1027haikub) — 일반 추천 후보 아님, 필요 시 --operator-request",
+    ),
+    ("pi-sonnet55", "high", "A", "default", None),
+    ("pi-sonnet55", "xhigh", "A+", "default", None),
+    (
+        "pi-sonnet55",
+        "max",
+        "A+",
+        "consult_only",
+        "미측정 E6 측정 런그(#594 · 급 비상속) — SCOPEFUEL_E6_ARM=pi-sonnet55@max 표식이 있어야 연다; "
+        "source sonnet@max is the same unmeasured E6 rung (director-1 10-28 correction)",
+    ),
+    ("pi-haiku55", "medium", "C", "default", None),
+    ("pi-haiku55", "high", "B", "default", None),
+    (
+        "pi-haiku55",
+        "xhigh",
+        "B",
+        "consult_only",
+        "effort 단조 유지용 B 배치 — 실험 전용(SCOPEFUEL_E6_ARM + --operator-request "
+        "hk:task/1786), 추천 후보 아님",
+    ),
+    (
+        "pi-haiku55",
+        "max",
+        "B",
+        "consult_only",
+        "effort 단조 유지용 B 배치 — 실험 전용(SCOPEFUEL_E6_ARM + --operator-request "
+        "hk:task/1786), 추천 후보 아님",
+    ),
+    ("cmd-dsflash41", "high", "A+", "default", None),
+)
+# The canon source row each placement inherits from (the annotation names it).
+ALTLANE_CANON_SOURCES: dict[tuple[str, str], str] = {
+    **{("pi-opus55", rung): f"opus@{rung}" for rung in ("low", "medium", "high", "xhigh", "max")},
+    **{("pi-sonnet55", rung): f"sonnet@{rung}" for rung in ("low", "medium", "high", "xhigh", "max")},
+    **{("pi-haiku55", rung): f"haiku@{rung}" for rung in ("medium", "high", "xhigh", "max")},
+    ("cmd-dsflash41", "high"): "devin-ds41@high",
+}
+# Rungs whose canon grade is NOT the bundled source row's grade. All four are
+# canon-side re-placements the desk made before hk 2185 (r1027haikub and the
+# haiku effort ladder), so the canon — not the lagging bundled claude rows — is
+# the source of truth here. A later operator move on the canon must update this
+# table and the frozen canon fixture together.
+ALTLANE_CANON_DIVERGENCES: dict[tuple[str, str], str] = {
+    ("pi-sonnet55", "medium"): "canon sonnet@medium = B (r1027haikub); bundled sonnet@medium = C",
+    ("pi-haiku55", "high"): "canon haiku@high = B; bundled haiku@high = C",
+    ("pi-haiku55", "xhigh"): "canon haiku@xhigh = B consult_only; bundled haiku@xhigh is an E6 carrier C",
+    ("pi-haiku55", "max"): "canon haiku@max = B consult_only; bundled haiku@max is an E6 carrier C",
+}
+
+
+def _placed_grade(name: str, effort: str | None) -> Grade | None:
+    """The grade ``GRADE_TABLE`` places ``(name, effort)`` at, if any."""
+
+    wanted = effort or ""
+    for grade, rows in GRADE_TABLE.items():
+        for row in rows:
+            if row.name == name and (row.launcher_effort or "") == wanted:
+                return grade
+    return None
+
+
+def source_placement_grade(name: str, effort: str | None) -> Grade:
+    """The grade a source harness profile carries at one effort (bundled table).
+
+    An ordinary placement answers first; a rung that is still an unmeasured E6
+    carrier answers with its carrier grade (sonnet@max carries A+ so the sonnet
+    ladder stays monotonic; haiku@xhigh/max carry C). The per-effort source
+    comparison reads through this one function, so a later operator move on the
+    bundled source row is visible immediately.
+    """
+
+    placed = _placed_grade(name, effort)
+    return placed if placed is not None else e6_arm_carrier_grade(name, effort)
+
+
+def altlane_canon_grade(profile: str, effort: str) -> Grade:
+    """The canon grade one alt-lane rung is placed at (hk 2185)."""
+
+    return next(
+        grade for name, rung, grade, _gate, _reason in ALTLANE_CANON_ROWS if (name, rung) == (profile, effort)
+    )
 
 
 # #920: sonnet@max left the E6 table — the Sonnet 5.5 refresh places it at S
@@ -1697,20 +1826,11 @@ E6_ARM_RUNGS: tuple[Profile, ...] = (
         "claude-sonnet-5-5 AA-agent 미발표 — 벤더 TB4 max 70.6",
         aa_model_id="claude-sonnet-5-5",
     ),
-    # hk 2079 (operator r1026ocant, r1026pi, r1026piready): the Anthropic API
-    # credit rungs. One unmeasured rung per pi thinking level per profile.
-    *(
-        _pi_credit_rung(profile, model, rung)
-        for profile, model in PI_CREDIT_MODELS.items()
-        for rung in PI_THINKING_RUNGS
-    ),
-    # hk 2141: the commandcode credit rungs — one unmeasured row per effort the
-    # model accepts through cmd (off not exposed; medium/xhigh unsupported).
-    *(
-        _cmd_credit_rung(profile, model, rung)
-        for profile, model in CMD_CREDIT_MODELS.items()
-        for rung in CMD_EFFORT_RUNGS
-    ),
+    # hk 2185 (operator desk op-1028-grades FINAL): the pi Anthropic API credit
+    # rungs and the cmd commandcode rungs LEFT this measurement table. They are
+    # ordinary placements now (``ALTLANE_CANON_ROWS`` below) — the #920
+    # sonnet@max / #1297 devin-rung graduation shape. A placed rung is an
+    # ordinary row: no E6 marker, no carrier fold.
     # hk 2110 (operator r1027terra, b953): wrk adds codex-terra61 for
     # gpt-6.1-terra — a NEW model with no measurement anywhere. One rung per
     # effort the CLI accepts, all at the shared C carrier. Nothing is
@@ -1739,16 +1859,29 @@ E6_ARM_KEYS: frozenset[tuple[str, str]] = frozenset(
 # hk 2079: the credit rows have no builder placement until reps exist. The E6
 # marker opens a rung for the worker and tester seats only; any other seat
 # (builder, captain, reviewer, or none named) is refused even with the marker.
+# hk 2185: the rows are ordinary inherited placements now, but the seat rule
+# is unchanged — a placement is not a measurement, so the builder seat stays
+# closed on every credit rung (gate and policy launch alike).
 E6_WORKER_TESTER_ONLY_PROFILES: frozenset[str] = frozenset(PI_CREDIT_MODELS) | frozenset(CMD_CREDIT_MODELS)
 E6_WORKER_TESTER_SEATS: frozenset[str] = frozenset({"worker", "tester"})
 E6_WORKER_TESTER_ONLY_REASON = (
-    "worker/tester 전용 — 미측정 E6 런그는 builder 배치 금지 (reps 필요, devin-fusion/grok 과 같은 규칙)"
+    "worker/tester 전용 — 미측정 credit 런그는 builder 배치 금지 (reps 필요, devin-fusion/grok 과 같은 규칙)"
 )
 
 
 def worker_tester_rungs(profile: str) -> tuple[str, ...]:
-    """The registered E6 rungs of a worker/tester-only credit profile, in order."""
+    """The PLACED rungs of a worker/tester-only credit profile, in ladder order.
 
+    hk 2185: the rungs are ordinary placements now, so the vocabulary comes from
+    ``ALTLANE_CANON_ROWS`` — only rungs the canon actually places. cmd-dsflash41
+    is deliberately @high only (see ``ALTLANE_CANON_ROWS``); @low/@max are not
+    placed anywhere and the gate refuses them as not placed. A profile that is
+    still E6-only answers from the measurement table.
+    """
+
+    placed = tuple(rung for name, rung, _grade, _gate, _reason in ALTLANE_CANON_ROWS if name == profile)
+    if placed:
+        return placed
     return tuple(row.launcher_effort or "" for row in E6_ARM_RUNGS if row.name == profile)
 
 
@@ -1798,18 +1931,18 @@ def is_e6_unmeasured_key(profile: str, effort: str | None) -> bool:
     """Whether a catalog (profile, effort) key is an unmeasured E6 measurement key.
 
     A registered E6 rung is one. So is *any* effort key of a profile that
-    exists only as unmeasured E6 rows (hk 2079's credit profiles, hk 2110's
-    codex-terra61): a canon row for one at an effort-less or unregistered key
-    is the same measurement row under another spelling — it never becomes a
-    placement unless the canon moves it above its carrier grade (a real
-    measurement).
+    exists only as unmeasured E6 rows (hk 2110's codex-terra61): a canon row
+    for one at an effort-less or unregistered key is the same measurement row
+    under another spelling — it never becomes a placement unless the canon
+    moves it above its carrier grade (a real measurement).
+
+    hk 2185: the pi/cmd credit profiles are no longer E6-only — they carry
+    inherited placements (``ALTLANE_PLACEMENT_SOURCES``), so a key of theirs
+    is an ordinary placement and this answers False. The blanket membership
+    clause is gone: "unmeasured" is a property of the key, never the name.
     """
 
-    return (
-        (profile, effort or "") in E6_ARM_KEYS
-        or profile in E6_WORKER_TESTER_ONLY_PROFILES
-        or e6_only_profile(profile)
-    )
+    return (profile, effort or "") in E6_ARM_KEYS or e6_only_profile(profile)
 
 
 def e6_worker_tester_seat_denied(profile: str, role: str | None) -> bool:
@@ -1821,26 +1954,22 @@ def e6_worker_tester_seat_denied(profile: str, role: str | None) -> bool:
 
 
 def is_credit_row(profile: Profile) -> bool:
-    """A pi anthropic-api credit row (hk 2079)."""
+    """A paid-credit alt-lane row (pi anthropic-api / cmd commandcode, hk 2079)."""
 
     return profile.name in E6_WORKER_TESTER_ONLY_PROFILES
 
 
 def credit_row_offered(profile: Profile, providers: list[ProviderResult]) -> bool:
-    """Whether ``--recommend`` lists this credit row at its C carrier grade.
+    """Whether ``--recommend`` may list this credit row while its pool is usable.
 
-    Only each profile's default rung is offered, so the list carries one
-    parallel option per model instead of every thinking level; the other rungs
-    stay on the folded E6-unmeasured line, like every other E6 rung. The offer
-    follows the row's OWN pool (hk 2141): a fresh anthropic-api balance never
-    offers a commandcode row.
+    hk 2185: the rows are ordinary placements now, so the list is driven by the
+    grade table (every rung at its inherited grade) instead of the one-per-model
+    C-carrier offer hk 2079 shipped. This helper keeps the pool half of that
+    rule — the offer follows the row's OWN pool (hk 2141): a fresh anthropic-api
+    balance never offers a commandcode row.
     """
 
-    return (
-        is_credit_row(profile)
-        and profile.launcher_effort == e6_bare_rung(profile.name)
-        and credit_row_available(providers, profile_pool(profile.name)[0])
-    )
+    return is_credit_row(profile) and credit_row_available(providers, profile_pool(profile.name)[0])
 
 
 def credit_row_available(providers: list[ProviderResult], pool: str = "anthropic-api") -> bool:
@@ -1952,22 +2081,6 @@ def e6_arm_rung_for(profile: str, effort: str | None) -> Profile | None:
     return None
 
 
-def e6_bare_rung(profile: str) -> str | None:
-    """The launcher-default E6 rung of a profile: the one rung ``--recommend`` offers (hk 2079).
-
-    It is not a way to request the profile: a bare credit-profile spelling is
-    refused (credit_effort_required_reason), so this never names a rung for the
-    gate or launch. ``None`` for every profile without an E6 default rung.
-    """
-
-    # launch imports this module, so the table is read lazily (the same cycle
-    # break ``_launch_spelling`` uses).
-    from .launch import DEFAULT_LAUNCH_EFFORTS
-
-    rung = DEFAULT_LAUNCH_EFFORTS.get(profile)
-    return rung if rung is not None and e6_arm_rung_for(profile, rung) is not None else None
-
-
 def e6_arm_matches(marker: E6ArmRequest | None, profile: str, effort: str | None) -> bool:
     """Whether the marker names exactly this rung (alias-resolved, normalized)."""
 
@@ -2000,6 +2113,53 @@ _GRADE_ORDER: tuple[Grade, ...] = ("S+", "S", "A+", "A", "B", "C")
 # Public alias: the launch catalog ranks grades with the same ladder and must
 # not keep a second copy of it.
 REP_GRADES_ORDER: tuple[Grade, ...] = _GRADE_ORDER
+
+
+def altlane_annotation(profile: str, rung: str) -> str:
+    """The canon annotation: the basis label plus the source rung it inherited."""
+
+    harness = "pi" if profile in PI_CREDIT_MODELS else "cmd"
+    basis = PI_CREDIT_BASIS if harness == "pi" else CMD_CREDIT_BASIS
+    source = ALTLANE_CANON_SOURCES[(profile, rung)]
+    return f"{basis} {source}, operator 2026-10-28, unmeasured under {harness}"
+
+
+def _altlane_placement(profile: str, rung: str, grade: Grade, gate: Gate, gate_reason: str | None) -> Profile:
+    """One canon alt-lane placement row (hk 2185), verbatim from the canon."""
+
+    model = PI_CREDIT_MODELS.get(profile) or CMD_CREDIT_MODELS[profile]
+    harness = "pi" if profile in PI_CREDIT_MODELS else "cmd"
+    return Profile(
+        profile,
+        f"{model} ({harness} {rung})",
+        None,
+        gate=gate,
+        gate_reason=gate_reason,
+        launcher_effort=rung,
+        benchmark_effort=rung,
+        benchmark_annotation=altlane_annotation(profile, rung),
+        placement_note=PI_CREDIT_PLACEMENT_NOTE if harness == "pi" else CMD_CREDIT_PLACEMENT_NOTE,
+        # Both lanes spend a paid credit (anthropic-api / commandcode), never a
+        # subscription quota — the #1340 paid class.
+        billing="paid",
+    )
+
+
+def _install_altlane_placements() -> None:
+    """Place every canon alt-lane rung in ``GRADE_TABLE`` exactly as the canon has it.
+
+    Appended after the reviewed rows of each grade, so a healthy fixture keeps
+    today's order byte-for-byte: a credit row still sorts after the standard
+    lanes (``is_credit_row`` is the leading rank key) unless the altlanes rule
+    promotes it. Grade, gate and gate_reason are the canon's own (the frozen
+    ``tests/fixtures/hk2185/canon_rows.json``), not a re-derivation.
+    """
+
+    for profile, rung, grade, gate, gate_reason in ALTLANE_CANON_ROWS:
+        GRADE_TABLE[grade].append(_altlane_placement(profile, rung, grade, gate, gate_reason))
+
+
+_install_altlane_placements()
 _GRADE_BOUNDARY_EXEMPT_ANNOTATIONS = frozenset(
     {
         UNMEASURED_ANNOTATION,
@@ -2420,6 +2580,10 @@ GROK_RESTRICTED_REASON = "grok restricted to A and above (operator r1023grokup)"
 # candidate — it shows on the folded excluded line with this reason instead of
 # vanishing.
 E6_UNMEASURED_REASON = "E6 unmeasured (미측정 E6 측정 런그 — SCOPEFUEL_E6_ARM 표식 필요)"
+# hk 2185: the canon's consult_only fold reason, verbatim from
+# ``bench._catalog_grade_table`` — the bundled table uses the same line so the
+# two paths read identically.
+CONSULT_ONLY_ROW_REASON = "consult_only (operator-request spawn only — never a candidate)"
 
 
 def _is_grok_profile(name: str) -> bool:
@@ -2654,11 +2818,17 @@ PROVIDER_FAMILY_OVERRIDES: dict[str, str] = {
     "devin-argon-low": "google",
     # hk 2079: the pi Anthropic API rungs serve Claude models on the
     # anthropic-api credit pool. The family names the model vendor, so these
-    # are "anthropic" even though the quota pool is anthropic-api — and a
-    # different family from the claude subscription rows for tester separation.
-    "pi-haiku55": "anthropic",
-    "pi-sonnet55": "anthropic",
-    "pi-opus55": "anthropic",
+    # are "claude" — the same family the claude subscription rows get from
+    # profile_pool ("claude"). hk 2185 (operator desk op-1028-grades FINAL)
+    # pins this: pi-* are Anthropic family for tester-independence and consult,
+    # so a pi tester for a claude builder is refused as same-family.
+    "pi-haiku55": "claude",
+    "pi-sonnet55": "claude",
+    "pi-opus55": "claude",
+    # hk 2185: cmd-dsflash41 serves DeepSeek V4.1 Flash — the same family as
+    # devin-ds41 (the devin pool's family value), so a cmd tester for a devin
+    # builder is refused as same-family.
+    "cmd-dsflash41": "devin",
     # hk 2110: the codex quota pool serves OpenAI models — codex-terra61 is
     # gpt-6.1-terra, family "openai" for tester separation. The default would
     # report the pool id ("codex"), which is an account lane, not the vendor.
@@ -2786,6 +2956,97 @@ class _PaceHeadroom:
     unknowns: tuple[_PaceWindowVerdict, ...]
 
 
+# ── hk 2185 (operator desk op-1028-altlanes 1-4 FINAL): alt-lane promotion ───
+# A *ranking* rule, never a forced switch and never an exclusion. When a
+# primary pool's weekly (7d) pace multiple — the per-bucket pace field
+# scopefuel already prints, ``pace_for(...).ratio`` rendered ``1.73x`` — is at
+# or above the configured threshold (``[settings] altlane_pace_multiple``,
+# default 1.2x), the eligible alternative lanes rank above that primary for the
+# grade they are placed in. claude/codex stay listed as fallbacks, and the row
+# carries the reason naming the multiple.
+ALTLANE_PRIMARY_POOLS: tuple[str, ...] = ("claude", "codex")
+ALTLANE_WEEKLY_WINDOW = "7d"
+# Limit (b): never promote over claude/codex for S+ (hard-to-reverse
+# judgement), and never for a consult or tester-independence role — the family
+# split still wins there.
+ALTLANE_NO_PROMOTION_GRADES: frozenset[Grade] = frozenset({"S+"})
+ALTLANE_NO_PROMOTION_ROLES: frozenset[str] = frozenset({"tester", "reviewer", "consult"})
+# (profile, grade) keys with a recorded FAIL/BOUNCE at that grade. A callable is
+# accepted so a caller can defer the reps read until a promotion actually
+# applies — the CLI passes one, tests pass a plain set.
+PromotionBlocks = frozenset[tuple[str, str]] | Callable[[], frozenset[tuple[str, str]]]
+
+
+def _weekly_bucket(result: ProviderResult) -> Bucket | None:
+    """The pool's weekly (7d) bucket — the only window the trigger reads.
+
+    The 5h pace never triggers alone (altlanes4), so no other window is
+    consulted here. A bucket without a usable used_pct is not a measurement.
+    """
+
+    for bucket in result.buckets:
+        if bucket.window == ALTLANE_WEEKLY_WINDOW and _is_valid_used_pct(bucket.used_pct):
+            return bucket
+    return None
+
+
+def altlane_promotions(
+    providers: list[ProviderResult],
+    now: dt.datetime,
+    *,
+    grade: Grade,
+    role: str | None = None,
+    threshold: float | None = None,
+) -> dict[str, str]:
+    """Primary pool -> promotion reason, for the pools that trigger this grade.
+
+    Trigger (altlanes3 + altlanes4): the weekly 7d pace multiple is ``>=
+    threshold`` (``>=``, never ``>`` — 1.2x promotes at the default), with the
+    weekly pace-warning (``time_to_exhaust < hours_to_reset``) as the secondary
+    trigger. The threshold is read from ``[settings] altlane_pace_multiple`` at
+    call time, so desk retunes it with no code change.
+
+    Returns an empty mapping — no promotion, today's order — for a healthy
+    primary, for S+, and for a tester/consult role.
+    """
+
+    if grade in ALTLANE_NO_PROMOTION_GRADES:
+        return {}
+    if (role or "").strip().casefold() in ALTLANE_NO_PROMOTION_ROLES:
+        return {}
+    limit = get_altlane_pace_multiple() if threshold is None else threshold
+    triggered: dict[str, tuple[float, str]] = {}
+    for result in providers:
+        if result.id not in ALTLANE_PRIMARY_POOLS or result.error or result.warning:
+            continue
+        bucket = _weekly_bucket(result)
+        if bucket is None:
+            continue
+        assert bucket.used_pct is not None
+        pace = pace_for(bucket, now=now)
+        ratio = pace.ratio
+        if ratio is not None:
+            # A measurable multiple decides on its own: >= promotes, anything
+            # lower does not. The pace-warning condition (TTE < reset) is
+            # mathematically equivalent to a multiple above 1.0x, so letting it
+            # fire alongside a measurable 1.19x would silently defeat the 1.2x
+            # threshold (altlanes AC2 keeps the just-below-threshold order).
+            if ratio >= limit:
+                triggered[result.id] = (ratio, f"{result.id} 7d pace {ratio:.2f}x")
+            continue
+        # Secondary trigger (altlanes3): the weekly window exhausts before it
+        # resets. This is the fallback for a window whose multiple cannot be
+        # computed — the 5h pace never triggers alone, so only 7d is read.
+        verdicts = _pace_window_verdicts(
+            [(float(bucket.used_pct), bucket.window, bucket.resets_at)], now, stale=result.stale
+        )
+        if any(verdict.exhausts_before_reset for verdict in verdicts):
+            triggered[result.id] = (0.0, f"{result.id} 7d pace-warning")
+    # Hottest primary first; the pool id breaks a tie so the line is stable.
+    ordered = sorted(triggered.items(), key=lambda item: (-item[1][0], item[0]))
+    return {pool: reason for pool, (_rank, reason) in ordered}
+
+
 def _pace_headroom(verdicts: list[_PaceWindowVerdict]) -> _PaceHeadroom:
     """Return warning windows and their tightest TTE/reset ranking ratio."""
     warnings = tuple(verdict for verdict in verdicts if verdict.exhausts_before_reset)
@@ -2844,6 +3105,13 @@ class _Candidate:
     # hk 2079 (r1026prio): the anthropic-api credit marker — remaining balance
     # and days to expiry, rendered with the row. None for every other pool.
     credit_note: str | None = None
+    # hk 2185: the altlanes ranking preference. ``promoted`` lifts the credit
+    # row's leading rank key into the healthy tier (above the triggering
+    # primary); ``promotion`` is the reason text rendered on the row
+    # ("promoted: codex 7d pace 3.05x"). Both are ranking only — never an
+    # exclusion, never a quota claim.
+    promoted: bool = False
+    promotion: str | None = None
 
 
 @dataclass
@@ -3834,6 +4102,8 @@ def _alt_candidates(
     bench_scores: list[ModelScore] | None = None,
     model_prices: Mapping[str, ModelPrice] | None = None,
     grade_table: dict[Grade, list[Profile]] | None = None,
+    role: str | None = None,
+    promotion_blocks: PromotionBlocks | None = None,
 ) -> tuple[str, ...]:
     """같은 grade 안에서 exclude_profile 을 뺀 사용 가능한 정상(비-escalation) 후보 이름.
 
@@ -3841,6 +4111,10 @@ def _alt_candidates(
     대체 후보가 아니다 — gate 의 대안 나열 의미를 좁히지 않기 위해 건너뛴다.
     d1786ap: ``[borrowed G]`` 행도 같은 이유로 건너뛴다 — 한 급 위 배치 행의
     표시 나열이지 같은 급 후보가 아니다.
+
+    hk 2185: the gate ranks its alternatives on the same ``recommend`` order, so
+    the altlanes promotion (and its role/rep-evidence limits) is threaded
+    through here — a tester/consult gate request keeps the family split.
     """
     out = recommend(
         providers,
@@ -3853,6 +4127,8 @@ def _alt_candidates(
         grade_table=grade_table,
         # Non-SWE2 gates retain their existing alternatives and escalation eligibility.
         _swe2_model_scope=exclude_profile in SWE2_MODEL_SCOPE_PROFILES,
+        role=role,
+        promotion_blocks=promotion_blocks,
     )
     names: list[str] = []
     for line in out.splitlines():
@@ -4481,6 +4757,7 @@ def gate_check(
     retired_rungs: frozenset[tuple[str, str]] | None = None,
     consult_only_rungs: frozenset[tuple[str, str]] = frozenset(),
     policy_context: GatePolicyContext | None = None,
+    promotion_blocks: PromotionBlocks | None = None,
 ) -> GateResult:
     """profile 하나에 대한 스폰 가능 여부 판정. unknown profile 은 호출자(CLI)가 먼저 걸러낸다.
 
@@ -4659,6 +4936,37 @@ def gate_check(
             grade=None,
             reason=credit_effort_required_reason(canonical_profile),
         )
+    # hk 2185: the credit lanes are ordinary placements now, but their rung set
+    # is closed — an unregistered effort (off/default/bogus) names no row, and
+    # falling back to the profile's best placement would let a typo borrow a
+    # grade the profile was never placed at for that rung.
+    if (
+        canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
+        and rung is not None
+        and rung not in worker_tester_rungs(canonical_profile)
+    ):
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=(
+                f"not_placed: {canonical_profile}@{rung} — 카탈로그에 배치가 없다 "
+                f"(배치된 런그: {'|'.join(worker_tester_rungs(canonical_profile))})"
+            ),
+        )
+    # hk 2185: the credit lanes are ordinary placements now, but they are still
+    # worker/tester only until reps exist — the builder seat is refused before
+    # any quota judgement, exactly as it was under the E6 marker (hk 2079).
+    if e6_worker_tester_seat_denied(canonical_profile, role):
+        return GateResult(
+            ok=False,
+            profile=profile_name,
+            provider_id=provider_id,
+            grade=None,
+            reason=f"role_restricted: {canonical_profile} — {E6_WORKER_TESTER_ONLY_REASON}",
+            role_denied=True,
+        )
     rung_row = _find_rung(profile_name, rung, grade_table=table) if rung is not None else None
     # #716: --effort 는 명령 단위의 명시적 런그 지명이다 — 배치 행을 가리키면
     # 그 런그를 배치로 판정한다(escalation 대안 거부 생략). 표식으로만 골라진
@@ -4757,6 +5065,13 @@ def gate_check(
             )
 
     found = _find_profile(profile_name, grade_table=table)
+    # hk 2185: a placed row can itself carry the canon's consult_only gate (the
+    # pi rungs the desk marked). The catalog path also names it in
+    # ``consult_only_rungs``; reading the requested row's own gate keeps a
+    # bundled-only host — and a direct ``gate_check`` caller — on the same rule.
+    gate_row = rung_row[1] if rung_row is not None else (found[1] if found is not None else None)
+    if gate_row is not None and gate_row.gate == "consult_only":
+        consult_only = True
     if consult_only and profile_name not in CONSULT_ONLY_PROFILES:
         # Catalog consultation has no candidate placement; use fable's quota path.
         found = None
@@ -4818,25 +5133,22 @@ def gate_check(
             ),
         )
     if (
-        (
-            canonical_profile in E6_WORKER_TESTER_ONLY_PROFILES
-            or e6_only_profile(canonical_profile, grade_table=table)
-        )
+        e6_only_profile(canonical_profile, grade_table=table)
         and e6_admitted is None
         and not consult_only
         and (rung_row is None or rung_row[0] == e6_arm_carrier_grade(canonical_profile, rung))
     ):
-        # hk 2079 + hk 2110: the credit profiles exist only as unmeasured E6
-        # rows — and a worker/tester-only rung never borrows a measured sibling
-        # placement even when the canon carries one — while codex-terra61 is
-        # E6-only until the canon places it. A request is admitted either
-        # through the E6 marker on a registered rung, or when the canon placed
-        # the requested rung's own row above its carrier grade (a real
-        # measurement). A rung the canon has no placement for does not fall
-        # back to the profile's default placement here — that would let a
-        # measured sibling graduate it — and a carrier-grade row is unmeasured
-        # whatever its key. Both are refused, never admitted on the balance
-        # alone.
+        # hk 2110: an E6-only profile (codex-terra61) has no placement until the
+        # canon carries one. A request is admitted either through the E6 marker
+        # on a registered rung, or when the canon placed the requested rung's
+        # own row above its carrier grade (a real measurement). A rung the canon
+        # has no placement for does not fall back to the profile's default
+        # placement here — that would let a measured sibling graduate it — and a
+        # carrier-grade row is unmeasured whatever its key.
+        #
+        # hk 2185: the pi/cmd credit profiles are no longer E6-only — they carry
+        # inherited placements, so this branch never answers for them. Their
+        # seat and rung rules are enforced above.
         return GateResult(
             ok=False,
             profile=profile_name,
@@ -5106,6 +5418,10 @@ def gate_check(
             bench_scores=bench_scores,
             model_prices=model_prices,
             grade_table=table,
+            # hk 2185: the altlanes promotion ranks the gate's alternatives on
+            # the same order; a tester/consult seat keeps the family split.
+            role=role,
+            promotion_blocks=promotion_blocks,
         )
 
     escalation_override = False
@@ -5546,6 +5862,13 @@ def _recommend_rank_key(
     rows sort by the largest minimum TTE/reset ratio. Unknown windows have no
     headroom and stay in pace.
 
+    hk 2185 (altlanes): a *promoted* alt-lane row keeps the leading key of the
+    healthy tier instead of the credit tier, so it sorts above an over-pace
+    primary (which always carries a pace headroom — a weekly multiple of 1.2x
+    or more means TTE < reset) while a healthy measured row still ranks ahead
+    of it (unmeasured-last is the next dimension). With no promotion the key
+    is byte-identical to today's.
+
     #1318-2 round 3 (director-1 decision C): a single tuple key, no pairwise
     comparator — the round-2 comparator could express cyclic preferences
     (boost>one-up, one-up>missing, missing>boost) which are unreachable in a
@@ -5571,7 +5894,7 @@ def _recommend_rank_key(
     the same cost-first policy direction as the in-pool rule.
     """
     return (
-        0 if not is_credit_row(candidate.profile) else 1,
+        0 if not is_credit_row(candidate.profile) or candidate.promoted else 1,
         1 if candidate.pace_headroom is not None else 0,
         -(candidate.pace_headroom if candidate.pace_headroom is not None else 0.0),
         0 if _profile_has_benchmark_score(candidate.profile, bench_scores) else 1,
@@ -5794,9 +6117,11 @@ def _apply_area_exceptions(
         reordered = moving + rest
         # hk 2079 (r1026prio): the credit is a parallel option, so an area
         # preference reorders credit rows among themselves but never lifts one
-        # above a non-credit candidate.
-        reordered = [c for c in reordered if not is_credit_row(c.profile)] + [
-            c for c in reordered if is_credit_row(c.profile)
+        # above a non-credit candidate. hk 2185: a *promoted* alt-lane row is
+        # already above the triggering primary by the altlanes rule, so it
+        # keeps its promoted position — the area preference must not undo it.
+        reordered = [c for c in reordered if not is_credit_row(c.profile) or c.promoted] + [
+            c for c in reordered if is_credit_row(c.profile) and not c.promoted
         ]
         evaluation.included[start:] = reordered
 
@@ -5827,6 +6152,8 @@ def _evaluate(
     free_rate_limit: str | None = None,
     swe2_result: ProviderResult | None = None,
     swe2_model_scope: bool = True,
+    role: str | None = None,
+    promotion_blocks: PromotionBlocks | None = None,
 ) -> _Evaluation:
     # Filter the final table here, after CLI callers have merged a served canon
     # or catalog. This single candidate boundary also covers exclusion folds,
@@ -5974,6 +6301,23 @@ def _evaluate(
         rung_key = (profile.name, normalize_effort(profile.launcher_effort))
         borrowed_row = placed_grade != grade and rung_key in borrowed_rungs
         one_up = placed_grade != grade and not borrowed_row
+        # hk 2185: a consult_only placement is never a recommendation candidate
+        # (the canon path drops it in ``bench._catalog_grade_table``; this covers
+        # the bundled table and snapshot-mode fixtures). It folds with the same
+        # reason the canon path uses.
+        if profile.gate == "consult_only":
+            excluded.append(
+                _Excluded(
+                    profile,
+                    CONSULT_ONLY_ROW_REASON,
+                    provider_id=resolved_pool(profile)[0],
+                    kind="consult_only",
+                    placed_grade=placed_grade,
+                    one_up=one_up,
+                    borrowed=borrowed_row,
+                )
+            )
+            continue
         # r1023grokup: grok never lists below A — canon row or cross-grade
         # listing alike, it folds at B and C.
         if grade not in ("A+", "S", "S+", "A") and _is_grok_profile(profile.name):
@@ -6317,6 +6661,27 @@ def _evaluate(
         entry.placed_grade = upper_grade
         escalation.append(entry)
 
+    # hk 2185 (altlanes): the promotion is a pure ranking step applied AFTER
+    # every eligibility filter above — host/pool measurement, cutoff, policy,
+    # subscription, family split (via ``role``), one-up/borrowed listings and
+    # recorded failure evidence all already decided who is in ``included``. A
+    # row that is not listed here can never be promoted into view, and the
+    # grade it is promoted at is exactly its own placement.
+    promotions = altlane_promotions(providers, now, grade=grade, role=role)
+    if promotions:
+        reason = next(iter(promotions.values()))
+        blocks = promotion_blocks() if callable(promotion_blocks) else promotion_blocks
+        for candidate in included:
+            if (
+                candidate.profile.name in ALTLANE_PROFILES
+                and candidate.placed_grade == grade
+                and not candidate.one_up
+                and not candidate.borrowed
+                and (blocks is None or (candidate.profile.name, grade) not in blocks)
+            ):
+                candidate.promoted = True
+                candidate.promotion = f"promoted: {reason}"
+
     # Reassign only the existing table slots owned by one (grade, pool) group.
     # This changes order inside that pool without changing the sequence of pool
     # slots relative to any other pool, even when their quota sort keys tie.
@@ -6377,6 +6742,27 @@ def _evaluate(
             candidate, bench_scores, value_order, intra_pool_rank, slot_of[id(candidate)]
         )
     )
+    # hk 2185 (tester r1 B1): the sort key alone cannot guarantee "above the
+    # triggering primary" — a promoted row only joins the healthy tier, and the
+    # primary carries a pace headroom only for an effective spend class, outside
+    # the window's first 5%, non-stale, and when its weekly verdict warns. A
+    # preserve-class primary, an early window, or a threshold below 1.0x leaves
+    # the hot primary in the healthy tier, where its measured rows outrank the
+    # unmeasured alt. So the guarantee is a final placement: move every promoted
+    # row to just above the highest-ranked row of the triggering pool(s).
+    promoted = [candidate for candidate in included if candidate.promoted]
+    if promoted and promotions:
+        triggering = set(promotions)
+        trigger_positions = [
+            index
+            for index, candidate in enumerate(included)
+            if not candidate.promoted and resolved_pool(candidate.profile)[0] in triggering
+        ]
+        if trigger_positions:
+            insert_at = min(trigger_positions)
+            rest = [candidate for candidate in included if not candidate.promoted]
+            index = sum(1 for candidate in included[:insert_at] if not candidate.promoted)
+            included[:] = rest[:index] + promoted + rest[index:]
     return _Evaluation(
         grade=grade,
         included=included,
@@ -6406,6 +6792,8 @@ def recommend(
     area: str | None = None,
     area_exceptions: list[AreaException] | tuple[AreaException, ...] | None = None,
     catalog_model_ids: Mapping[tuple[str, str], str] | None = None,
+    role: str | None = None,
+    promotion_blocks: PromotionBlocks | None = None,
 ) -> str:
     today = today or dt.datetime.now(dt.UTC).date()
     now = now or dt.datetime.now(dt.UTC)
@@ -6426,6 +6814,8 @@ def recommend(
         free_rate_limit=free_rate_limit,
         swe2_result=swe2_result,
         swe2_model_scope=_swe2_model_scope,
+        role=role,
+        promotion_blocks=promotion_blocks,
     )
     included = evaluation.included
     excluded = evaluation.excluded
@@ -6671,24 +7061,28 @@ def recommend(
             profile_label = _text_label(cand.profile)
             usage = cand.windows_display
             credit_s = f" · {cand.credit_note}" if cand.credit_note else ""
+            # hk 2185: the altlanes reason rides the promoted row itself
+            # (e.g. "promoted: codex 7d pace 3.05x"); unpromoted rows are
+            # byte-identical to today.
+            promoted_s = f" · {cand.promotion}" if cand.promotion else ""
             if cand.imminent_exhaustion and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"  소멸 임박 우선 (boost 역전){bench}{placed_tag}{credit_s}"
+                    f"  소멸 임박 우선 (boost 역전){bench}{placed_tag}{credit_s}{promoted_s}"
                 )
             elif cand.urgent and cand.hours_to_reset is not None:
                 lines.append(
                     f"{rank}. 🔥 {profile_label:<24} {cand.provider_label} {usage}  "
                     f"{cand.pool_class:<7}"
                     f"잔여 {cand.remaining_pct:g}% · 리셋 {_format_hours(cand.hours_to_reset)}"
-                    f"{bench}{placed_tag}{credit_s}"
+                    f"{bench}{placed_tag}{credit_s}{promoted_s}"
                 )
             else:
                 lines.append(
                     f"{rank}. {profile_label:<24} {cand.provider_label} {usage}  {cand.pool_class:<7}"
-                    f"{bench}{placed_tag}{credit_s}"
+                    f"{bench}{placed_tag}{credit_s}{promoted_s}"
                 )
             if explain:
                 brake_explain = ""
@@ -6783,6 +7177,8 @@ def recommend_dict(
     area: str | None = None,
     area_exceptions: list[AreaException] | tuple[AreaException, ...] | None = None,
     catalog_model_ids: Mapping[tuple[str, str], str] | None = None,
+    role: str | None = None,
+    promotion_blocks: PromotionBlocks | None = None,
 ) -> dict[str, object]:
     """Structured ``--recommend`` rows — the same fold ``recommend()`` renders.
 
@@ -6813,6 +7209,8 @@ def recommend_dict(
         table=table,
         free_rate_limit=free_rate_limit,
         swe2_result=swe2_result,
+        role=role,
+        promotion_blocks=promotion_blocks,
     )
     if area is not None and area_exceptions:
         _apply_area_exceptions(evaluation, grade, area, area_exceptions, catalog_model_ids)
@@ -6859,6 +7257,10 @@ def recommend_dict(
         }
         if cand.credit_note:
             row["credit"] = cand.credit_note
+        # hk 2185: the altlanes reason is additive and appears only on a
+        # promoted row, so every unpromoted row stays byte-identical.
+        if cand.promotion:
+            row["promotion"] = cand.promotion
         rows.append(row)
     for item in evaluation.excluded:
         rows.append({**_row(item), "kind": item.kind, "reason": item.reason})

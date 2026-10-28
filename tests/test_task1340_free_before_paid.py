@@ -162,7 +162,14 @@ def test_paid_pin_is_ds41_and_the_fusion_rows_whose_launch_ids_are_priced():
     priced (dollar-input) model row: the "Sidekick: Free" tag on the row is
     the swe-2-medium helper's, not the rung's."""
     paid = {p.name for profiles in GRADE_TABLE.values() for p in profiles if p.billing == "paid"}
-    assert paid == {"devin-ds41", "devin-fusion-opus55", "devin-fusion-sonnet55"}
+    # hk 2185: the alt-lane credit rows are paid too (anthropic-api / commandcode
+    # spend a prepaid balance, never a subscription quota).
+    assert paid == {
+        "devin-ds41",
+        "devin-fusion-opus55",
+        "devin-fusion-sonnet55",
+        *recommend_mod.ALTLANE_PROFILES,
+    }
     assert not _launch_free_in_fixture(launch.LAUNCH_MODEL_IDS["devin-ds41"])
     uid_tags, _ = _fixture_model_tags(FIXTURE.read_text())
     assert "$4 / 1M Input" in uid_tags[launch.LAUNCH_MODEL_IDS["devin-fusion-opus55"]]
@@ -235,6 +242,11 @@ def test_non_devin_pools_hold_one_cost_class_so_their_order_is_mains():
             provider_id = profile_pool(profile.name)[0]
             if provider_id == "devin":
                 continue
+            # hk 2185: the two paid-credit pools (anthropic-api, commandcode) hold
+            # exactly one cost class too — paid — so their internal order is main's.
+            if profile.name in recommend_mod.ALTLANE_PROFILES:
+                assert profile.billing == "paid", profile.name
+                continue
             assert profile.billing == "unknown", profile.name
 
 
@@ -252,10 +264,13 @@ def test_recommend_dict_rows_carry_the_billing_marker():
     assert "free" in by_name["devin-swe2-medium"]
     assert "free" in by_name["devin-swe2-max"]
     assert by_name["devin-ds41"] == ["paid"]
-    # neutral default: every non-devin row stays unknown
+    # neutral default: every other non-devin row stays unknown; the alt-lane
+    # credit rows are the paid-credit exception (hk 2185).
     for row in payload["rows"]:
-        if profile_pool(row["profile"])[0] != "devin":
-            assert row["billing"] == "unknown", row
+        if profile_pool(row["profile"])[0] == "devin":
+            continue
+        expected_billing = "paid" if row["profile"] in recommend_mod.ALTLANE_PROFILES else "unknown"
+        assert row["billing"] == expected_billing, row
 
 
 # ── AC2: property tests over generated candidate sets ────────────────────────

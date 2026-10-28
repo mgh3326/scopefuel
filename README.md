@@ -402,6 +402,40 @@ hk 2007)로 제거되어 A+에는 나타나지 않습니다. 한 행이 두 급�
   나열에는 적용되지 않습니다 — BORROWED_RUNGS 는 그 둘의 명시적 운영자 예외이며,
   같은 행이 one-up 과 borrowed 양쪽 자격이면 borrowed 로 한 번만 나열합니다.
 
+### alt lane 승격 — 주간 pace 배수 (hk 2185, operator desk op-1028-altlanes)
+
+`--recommend`와 게이트의 대안 순위는 **주 1차 pool(claude·codex)의 주간(7d) pace
+배수**가 임계값 이상이면 대체 레인(pi-haiku55·pi-sonnet55·pi-opus55 — anthropic-api
+크레딧, cmd-dsflash41 — commandcode 구독)을 그 pool **위로** 올립니다. 배수는
+scopefuel이 이미 표에 출력하는 per-bucket pace 값 그대로입니다(예: `pace 1.73x` —
+`pace_for(...).ratio`, 새 계산 없음).
+
+- **트리거**: 7d 배수 `>=` 임계값(기본 **1.2x**, `>=`이지 `>`가 아닙니다), 또는
+  보조 트리거인 주간 pace-warning(`time_to_exhaust < hours_to_reset`). **5h pace는
+  단독으로 트리거하지 않습니다** — 7d 창만 읽습니다. 고정 주간 퍼센트는 어디에도
+  쓰지 않습니다.
+- **임계값은 config 키**입니다 — `[settings] altlane_pace_multiple`(양수 실수,
+  단위는 "주간 균등 pace 대비 배수"). 코드 수정 없이 desk가 조정합니다:
+  `scopefuel policy setting altlane_pace_multiple 1.5` / `... none`(기본값 복귀).
+  미설정·무효·0 이하는 기본 1.2로 폴백합니다.
+- **효과**: 승격된 행은 트리거한 1차 pool보다 위에, 그 행이 **배치된 급**에서만
+  나열되고, 줄에 `promoted: codex 7d pace 3.05x` 사유가 붙습니다. claude/codex는
+  fallback으로 계속 나열됩니다. 1차 pool이 건강하면 승격은 없고 오늘 순서 그대로
+  입니다. 여러 1차 pool이 동시에 트리거하면 가장 뜨거운 배수를 사유로 씁니다.
+- **한계**: S+에서는 절대 승격하지 않습니다(되돌리기 어려운 판단). tester/consult
+  역할(`--role tester|reviewer|consult`)에서는 가족 분리가 이깁니다. 배치 급 위로는
+  올리지 않습니다. 그 급에서 reps에 FAIL(`completed=0`) 또는 BOUNCE(blockers 기록)가
+  있는 alt는 승격하지 않습니다. 승격은 **모든 자격 필터 뒤의 순위 단계**라,
+  pool 측정 불가·cutoff·policy exclude·구독 해지·host 제약으로 빠진 행은 절대
+  승격으로 다시 나타나지 않습니다 — cmd-dsflash41은 host 별 `[local] cmd_dsflash41`
+  플래그(wrk hk 2180)로만 열리며, 그 host 필터는 승격 뒤에도 그대로 적용됩니다.
+- **배치**: pi-*·cmd-dsflash41의 급은 canon 카탈로그 행과 **정확히 같습니다**
+  (2026-10-28 desk push, ref `desk op-1028-grades`; basis "inherited from claude
+  harness … / devin ds41 …"). cmd-dsflash41은 `@high`(A+)만 배치됩니다 —
+  `@low`/`@max`는 배치하지 않으며 게이트는 `not_placed`로 거부합니다(max를
+  devin-ds41-max의 C로 복사하면 canon의 effort 단조성 검사가 batch 전체를
+  거부합니다). 모든 credit 런그는 worker/tester 전용이고 `--effort`가 필수입니다.
+
 ## Benchmark backend
 
 벤치 점수와 대표 실행 기록의 backend는 `auto`(기본)·`handoffkeep`·`local` 중 하나입니다.

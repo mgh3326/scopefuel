@@ -149,6 +149,22 @@ _EXPECTED_LABELS = {
 }
 
 
+# hk 2185: the alt-lane inherited placements carry one label per rung. They are
+# neither rep-measured nor borrowed, so the invariant below allows exactly their
+# own placed grade.
+_EXPECTED_LABELS.update(
+    {
+        (profile, rung): f"{profile} --effort {rung}"
+        for profile in (*recommend_mod.PI_CREDIT_MODELS, *recommend_mod.CMD_CREDIT_MODELS)
+        for rung in (
+            recommend_mod.PI_THINKING_RUNGS
+            if profile in recommend_mod.PI_CREDIT_MODELS
+            else recommend_mod.CMD_EFFORT_RUNGS
+        )
+    }
+)
+
+
 def _label(profile: Profile) -> str | None:
     """Pinned labels for candidates; barred model rows are outside the list."""
     model_id = profile.aa_agent_model_id or profile.benchmark_model_id
