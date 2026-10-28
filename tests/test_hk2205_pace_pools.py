@@ -190,6 +190,75 @@ def test_swe2_free_stays_first_when_its_pool_yields():
     assert paid_devin and min(paid_devin) > max(i for i, row in enumerate(rows) if row.get("promotion"))
 
 
+def test_swe2_free_stays_first_with_a_preserve_class_hot_pool():
+    """Tester r1 B1 — Mutant: let a promoted row land above SWE-2 free -> RED.
+
+    devin is hot AND a second pool is hot on the preserve class. A preserve
+    pool has no pace headroom, so its measured row outranks the unmeasured
+    SWE-2 free rows; the promoted block must still stay behind them.
+    """
+
+    devin = ProviderResult(
+        id="devin",
+        pool_class="spend",
+        buckets=[_bucket("7d", 75.0, 109.0), *_swe2_free_buckets()],  # 2.14x
+    )
+    providers = [
+        _weekly("claude", 75.0, reset_in_hours=98.5, pool_class="preserve"),  # ~1.8x preserve
+        _weekly("codex", 20.0, pool_class="preserve"),
+        devin,
+        _weekly("grok", 25.0),
+        _credit("anthropic-api"),
+        _credit("commandcode"),
+    ]
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW, swe2_result=devin)
+    rows = _candidates(payload)
+    free_names = {"devin-swe2", "devin-swe2-medium", "devin-swe2-max"}
+    first_promoted = next(i for i, row in enumerate(rows) if row.get("promotion"))
+    free_rows = [i for i, row in enumerate(rows) if row["profile"] in free_names]
+    assert free_rows and max(free_rows) < first_promoted
+
+
+def test_a_group_scoped_pool_never_decides_by_bucket_order():
+    """Tester r1 B2 — Mutant: read the first 7d bucket whatever its scope -> RED.
+
+    agy reports one 7d bucket per group (gemini, 3p). Neither bucket order may
+    change the verdict: a pool with no account-scope weekly bucket is unknown,
+    never a trigger and never "under-used".
+    """
+
+    def agy(*buckets: Bucket) -> ProviderResult:
+        return ProviderResult(id="agy", pool_class="preserve", buckets=list(buckets))
+
+    cool = _bucket("7d", 4.0, 120.0, scope=Scope("group", "gemini"))  # 0.2x
+    hot = _bucket("7d", 50.0, 120.0, scope=Scope("group", "3p"))  # 1.8x
+    for order in ((cool, hot), (hot, cool)):
+        providers = _healthy(_weekly("devin", 30.0), agy(*order))
+        assert recommend_mod.altlane_promotions(providers, NOW, grade="A") == {}, order
+        payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
+        assert not any(row.get("promotion") for row in _candidates(payload)), order
+
+
+def test_a_pool_with_no_weekly_account_bucket_is_never_under_used():
+    """Mutant: count an unmeasured pool as under-used -> this goes RED."""
+
+    five_h = _provider("grok", _bucket("5h", 95.0, 1.0))  # only a 5h window
+    providers = _healthy(_weekly("devin", 75.0, reset_in_hours=109.0), five_h)
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
+    grok_rows = [row for row in _candidates(payload) if row["provider"] == "grok"]
+    assert not any(row.get("promotion") for row in grok_rows)
+
+
+def test_an_early_window_pool_is_neither_trigger_nor_under_used():
+    """Mutant: guard the trigger but still count early-window pools as below -> RED."""
+
+    providers = _healthy(_weekly("devin", 75.0, reset_in_hours=109.0))  # devin 2.14x yields
+    providers[1] = _provider("codex", _bucket("7d", 9.0, 165.0), pool_class="preserve")  # ~2% elapsed
+    payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
+    codex_rows = [row for row in _candidates(payload) if row["provider"] == "codex"]
+    assert not any(row.get("promotion") for row in codex_rows)
+
+
 def test_every_healthy_pool_keeps_the_pre_change_order(tmp_path):
     """AC3 golden — Mutant: reorder a healthy pool -> this goes RED.
 

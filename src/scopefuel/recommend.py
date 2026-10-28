@@ -3024,15 +3024,18 @@ def _weekly_bucket(result: ProviderResult) -> Bucket | None:
     """The pool's weekly (7d) account bucket — the only window the trigger reads.
 
     The 5h pace never triggers alone (altlanes4), so no other window is
-    consulted here. A bucket without a usable used_pct is not a measurement,
-    and a model-scope row (the SWE-2 Free tags carry ``window ""``) is never
-    the account's weekly window anyway.
+    consulted here. A bucket without a usable used_pct is not a measurement.
+    hk 2205 (tester r1 B2): only the ACCOUNT-scope weekly bucket speaks for
+    the pool — a group-scoped pool (agy) emits one 7d bucket per group, so
+    reading the first arbitrary one flips the verdict with bucket order, and
+    a model-scope bucket is a rung's Free tag, never the account axis. A
+    group-only pool reads unknown: neither a trigger nor "under-used".
     """
 
     for bucket in result.buckets:
         if (
             bucket.window == ALTLANE_WEEKLY_WINDOW
-            and bucket.scope.kind != "model"
+            and bucket.scope.kind == "account"
             and _is_valid_used_pct(bucket.used_pct)
         ):
             return bucket
@@ -6884,6 +6887,24 @@ def _evaluate(
             rest = [candidate for candidate in included if not candidate.promoted]
             index = sum(1 for candidate in included[:insert_at] if not candidate.promoted)
             included[:] = rest[:index] + promoted + rest[index:]
+        # hk 2205 (tester r1 B1): SWE-2 free stays FIRST. The insert above
+        # only counts NON-free rows of the yielding pools, so a free-scope
+        # row sitting below the insert point (a preserve-class hot pool can
+        # outrank the unmeasured free rows) would end up under the promoted
+        # block. Stable-move every free-scope row that landed inside or
+        # below the block to just ahead of it; rows already above are
+        # untouched, and nothing moves when no promotion applies.
+        first_promoted = next(
+            (index for index, candidate in enumerate(included) if candidate.promoted),
+            None,
+        )
+        if first_promoted is not None:
+            tail = included[first_promoted:]
+            free_in_tail = [candidate for candidate in tail if candidate.free_scope]
+            if free_in_tail:
+                included[first_promoted:] = free_in_tail + [
+                    candidate for candidate in tail if not candidate.free_scope
+                ]
     return _Evaluation(
         grade=grade,
         included=included,
