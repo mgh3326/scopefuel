@@ -40,7 +40,9 @@ M1B_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "cmd_usage_m1b_screen
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _stubborn_stub_cmd(tmp_path: pathlib.Path, log: pathlib.Path | None = None) -> pathlib.Path:
+def _stubborn_stub_cmd(
+    tmp_path: pathlib.Path, log: pathlib.Path | None = None, banner: str | None = None
+) -> pathlib.Path:
     """cmd stub reproducing the m1b fixture: an Enter read in the same chunk
     as the typed text is swallowed — the /usage panel never renders.
 
@@ -48,7 +50,9 @@ def _stubborn_stub_cmd(tmp_path: pathlib.Path, log: pathlib.Path | None = None) 
     writes "/usage" and "\\r" back-to-back has both bytes queued and the stub
     reads them as ONE chunk (m1b's merged write) instead of racing a reader
     that was already blocked. Every chunk it reads is logged, so a test can
-    assert the Enter never shares the text's read.
+    assert the Enter never shares the text's read. A banner is printed before
+    the prompt (N23: a tip line that already mentions /usage must not count as
+    the typed text's echo).
     """
 
     script = tmp_path / "cmd-stubborn"
@@ -57,7 +61,8 @@ def _stubborn_stub_cmd(tmp_path: pathlib.Path, log: pathlib.Path | None = None) 
         "#!/usr/bin/env python3\n"
         "import os, sys, time, tty\n"
         "tty.setraw(sys.stdin.fileno())\n"  # a TUI reads keystrokes, not lines
-        "os.write(1, '❯ '.encode())\n"
+        + (f"os.write(1, {banner.encode()!r})\n" if banner else "")
+        + "os.write(1, '❯ '.encode())\n"
         # A TUI takes a moment to start reading keys; anything written in
         # that window is one read, exactly like m1b's merged "/usage\\r".
         "time.sleep(0.25)\n"
@@ -591,6 +596,120 @@ def test_silent_tui_gets_the_enter_from_the_echo_wait_fallback(monkeypatch, tmp_
     monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
     monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
     monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "5")
+    result = commandcode.fetch()
+    assert result.status == "ok"
+    assert len(result.buckets) == 3
+
+
+def test_banner_mentioning_usage_does_not_count_as_the_echo(monkeypatch, tmp_path):
+    """N23 (verdict r3): a tip line that already says "/usage" must not make
+
+    the echo check pass before the typed text is echoed. Mutant:
+    sent_mark = 0 (scan the whole screen) -> the Enter merges -> RED.
+    """
+
+    chunk_log = tmp_path / "banner-chunks.log"
+    stub = _stubborn_stub_cmd(tmp_path, log=chunk_log, banner="Tip: type /usage to see your plan usage\n")
+    monkeypatch.setattr(commandcode, "BINARY", str(stub))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "5")
+    result = commandcode.fetch()
+    assert result.status == "ok"
+    assert len(result.buckets) == 3
+    chunks = chunk_log.read_bytes().splitlines()
+    assert chunks[0] == b"/usage"
+    assert b"<CR>" in chunks[1]
+
+
+def test_exactly_one_enter_is_written_while_the_panel_is_slow(monkeypatch, tmp_path):
+    """N24 (verdict r3): a slow panel must not collect one Enter per tick.
+
+    Mutants: drop "not submitted" from either submit branch -> the stub
+    counts more than one carriage return -> RED.
+    """
+
+    cr_log = tmp_path / "cr.count"
+    script = tmp_path / "cmd-slow-panel"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time, tty, select\n"
+        "tty.setraw(sys.stdin.fileno())\n"
+        "os.write(1, '❯ '.encode())\n"
+        "crs = 0\n"
+        "first = None\n"
+        "last = 0.0\n"
+        "done = False\n"
+        "while True:\n"
+        "    r, _, _ = select.select([0], [], [], 0.05)\n"
+        "    if r:\n"
+        "        chunk = os.read(0, 4096)\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        if b'/usage' in chunk:\n"
+        "            os.write(1, '❯ /usage\\n'.encode())\n"
+        "        n = chunk.count(b'\\r')\n"
+        "        if n:\n"
+        "            crs += n\n"
+        f"            open({str(cr_log)!r}, 'w').write(str(crs))\n"
+        "            if first is None:\n"
+        "                first = time.monotonic()\n"
+        "    if first is not None and not done:\n"
+        "        now = time.monotonic()\n"
+        "        if now - last >= 0.3:\n"
+        "            os.write(1, b'loading...\\n')\n"
+        "            last = now\n"
+        "        if now - first >= 1.5:\n"
+        f"            os.write(1, {USAGE_TEXT.encode()!r} + b'\\n')\n"
+        "            done = True\n"
+        "    if done:\n"
+        "        time.sleep(1)\n"
+        "        break\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(commandcode, "BINARY", str(script))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "8")
+    result = commandcode.fetch()
+    assert result.status == "ok"
+    assert len(result.buckets) == 3
+    assert cr_log.read_text() == "1"
+
+
+def test_chatty_tui_that_never_echoes_still_gets_the_enter(monkeypatch, tmp_path):
+    """N25 (verdict r3): a TUI that keeps emitting output but never echoes the
+
+    typed text never idles, so only the in-loop ECHO_WAIT_S arm submits.
+    Mutant: drop that arm -> the probe times out -> RED.
+    """
+
+    script = tmp_path / "cmd-chatty"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time, tty, select\n"
+        "tty.setraw(sys.stdin.fileno())\n"
+        "os.write(1, '❯ '.encode())\n"
+        "while True:\n"
+        "    r, _, _ = select.select([0], [], [], 0.03)\n"
+        "    if r:\n"
+        "        chunk = os.read(0, 4096)\n"
+        "        if not chunk:\n"
+        "            break\n"
+        "        if b'\\r' in chunk:\n"
+        f"            os.write(1, {USAGE_TEXT.encode()!r} + b'\\n')\n"
+        "            time.sleep(1)\n"
+        "    else:\n"
+        "        os.write(1, b'.')\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(commandcode, "BINARY", str(script))
+    monkeypatch.setattr(commandcode, "PROBE_WORKDIR", tmp_path / "work")
+    monkeypatch.setattr(commandcode, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(commandcode, "READY_SETTLE_S", 0.05)
+    monkeypatch.setenv("SCOPEFUEL_COMMANDCODE_TIMEOUT_S", "6")
     result = commandcode.fetch()
     assert result.status == "ok"
     assert len(result.buckets) == 3
