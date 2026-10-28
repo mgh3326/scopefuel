@@ -54,10 +54,7 @@ CMD_DEFAULT_RUNG = {"cmd-dsflash41": "high"}
 # monotonicity, and @low has no source rung — both are deliberately unplaced.
 CMD_CANON = {(profile, rung): (grade, gate) for profile, rung, grade, gate, _r in ALTLANE_CANON_ROWS}
 CMD_ROWS = [
-    (profile, rung)
-    for profile in sorted(CMD_PROFILES)
-    for rung in CMD_RUNGS
-    if (profile, rung) in CMD_CANON
+    (profile, rung) for profile in sorted(CMD_PROFILES) for rung in CMD_RUNGS if (profile, rung) in CMD_CANON
 ]
 CMD_UNPLACED = [("cmd-dsflash41", rung) for rung in CMD_RUNGS if ("cmd-dsflash41", rung) not in CMD_CANON]
 CREDIT_EXPIRES = (TODAY + dt.timedelta(days=30)).isoformat()

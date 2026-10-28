@@ -481,8 +481,7 @@ def _alt_free_table():
     """
     table = _table()
     mapping = {
-        grade: [p for p in rows if p.name not in recommend.ALTLANE_PROFILES]
-        for grade, rows in table.items()
+        grade: [p for p in rows if p.name not in recommend.ALTLANE_PROFILES] for grade, rows in table.items()
     }
     if type(table) is dict:
         return mapping

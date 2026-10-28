@@ -1643,8 +1643,7 @@ ALTLANE_CANON_ROWS: tuple[tuple[str, str, Grade, Gate, str | None], ...] = (
         "low",
         "C",
         "consult_only",
-        "실험 전용(H 팔) — SCOPEFUEL_E6_ARM 표식 + --operator-request hk:task/1786 로만 스폰, "
-        "추천 후보 아님",
+        "실험 전용(H 팔) — SCOPEFUEL_E6_ARM 표식 + --operator-request hk:task/1786 로만 스폰, 추천 후보 아님",
     ),
     (
         "pi-sonnet55",
@@ -1685,18 +1684,9 @@ ALTLANE_CANON_ROWS: tuple[tuple[str, str, Grade, Gate, str | None], ...] = (
 )
 # The canon source row each placement inherits from (the annotation names it).
 ALTLANE_CANON_SOURCES: dict[tuple[str, str], str] = {
-    **{
-        ("pi-opus55", rung): f"opus@{rung}"
-        for rung in ("low", "medium", "high", "xhigh", "max")
-    },
-    **{
-        ("pi-sonnet55", rung): f"sonnet@{rung}"
-        for rung in ("low", "medium", "high", "xhigh", "max")
-    },
-    **{
-        ("pi-haiku55", rung): f"haiku@{rung}"
-        for rung in ("medium", "high", "xhigh", "max")
-    },
+    **{("pi-opus55", rung): f"opus@{rung}" for rung in ("low", "medium", "high", "xhigh", "max")},
+    **{("pi-sonnet55", rung): f"sonnet@{rung}" for rung in ("low", "medium", "high", "xhigh", "max")},
+    **{("pi-haiku55", rung): f"haiku@{rung}" for rung in ("medium", "high", "xhigh", "max")},
     ("cmd-dsflash41", "high"): "devin-ds41@high",
 }
 # Rungs whose canon grade is NOT the bundled source row's grade. All four are
@@ -1741,9 +1731,7 @@ def altlane_canon_grade(profile: str, effort: str) -> Grade:
     """The canon grade one alt-lane rung is placed at (hk 2185)."""
 
     return next(
-        grade
-        for name, rung, grade, _gate, _reason in ALTLANE_CANON_ROWS
-        if (name, rung) == (profile, effort)
+        grade for name, rung, grade, _gate, _reason in ALTLANE_CANON_ROWS if (name, rung) == (profile, effort)
     )
 
 
@@ -1891,9 +1879,7 @@ def worker_tester_rungs(profile: str) -> tuple[str, ...]:
     still E6-only answers from the measurement table.
     """
 
-    placed = tuple(
-        rung for name, rung, _grade, _gate, _reason in ALTLANE_CANON_ROWS if name == profile
-    )
+    placed = tuple(rung for name, rung, _grade, _gate, _reason in ALTLANE_CANON_ROWS if name == profile)
     if placed:
         return placed
     return tuple(row.launcher_effort or "" for row in E6_ARM_RUNGS if row.name == profile)
@@ -2138,9 +2124,7 @@ def altlane_annotation(profile: str, rung: str) -> str:
     return f"{basis} {source}, operator 2026-10-28, unmeasured under {harness}"
 
 
-def _altlane_placement(
-    profile: str, rung: str, grade: Grade, gate: Gate, gate_reason: str | None
-) -> Profile:
+def _altlane_placement(profile: str, rung: str, grade: Grade, gate: Gate, gate_reason: str | None) -> Profile:
     """One canon alt-lane placement row (hk 2185), verbatim from the canon."""
 
     model = PI_CREDIT_MODELS.get(profile) or CMD_CREDIT_MODELS[profile]
@@ -6136,9 +6120,9 @@ def _apply_area_exceptions(
         # above a non-credit candidate. hk 2185: a *promoted* alt-lane row is
         # already above the triggering primary by the altlanes rule, so it
         # keeps its promoted position — the area preference must not undo it.
-        reordered = [
-            c for c in reordered if not is_credit_row(c.profile) or c.promoted
-        ] + [c for c in reordered if is_credit_row(c.profile) and not c.promoted]
+        reordered = [c for c in reordered if not is_credit_row(c.profile) or c.promoted] + [
+            c for c in reordered if is_credit_row(c.profile) and not c.promoted
+        ]
         evaluation.included[start:] = reordered
 
     lines = [_area_explain_line(row, expired=False, catalog_model_ids=catalog_model_ids) for row in applied]

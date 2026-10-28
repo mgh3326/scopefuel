@@ -53,10 +53,7 @@ PI_DEFAULT_RUNG = {"pi-haiku55": "low", "pi-sonnet55": "high", "pi-opus55": "hig
 # hk 2185: only the rungs the canon places (pi-haiku55@low is retired upstream).
 CANON = {(profile, rung): (grade, gate) for profile, rung, grade, gate, _reason in ALTLANE_CANON_ROWS}
 PI_PLACED = [
-    (profile, rung)
-    for profile in sorted(PI_PROFILES)
-    for rung in PI_RUNGS
-    if (profile, rung) in CANON
+    (profile, rung) for profile in sorted(PI_PROFILES) for rung in PI_RUNGS if (profile, rung) in CANON
 ]
 PI_ROWS = PI_PLACED
 PI_DEFAULT_RUNGS = [(profile, rung) for profile, rung in PI_PLACED if CANON[(profile, rung)][1] == "default"]
@@ -1153,9 +1150,7 @@ def test_launch_admits_a_consult_only_credit_row_for_a_worker_with_marker_and_re
 
 
 @pytest.mark.parametrize("role", [None, "builder", "worker"])
-def test_gate_cli_keeps_the_request_and_seat_rules_on_a_consult_only_credit_row(
-    monkeypatch, capsys, role
-):
+def test_gate_cli_keeps_the_request_and_seat_rules_on_a_consult_only_credit_row(monkeypatch, capsys, role):
     assert _set_manual_credit_cli() == 0
     capsys.readouterr()
     view = _consult_only_view()
@@ -1224,9 +1219,7 @@ def test_recommend_does_not_restore_a_consult_only_credit_row():
     # The canon's own consult_only rungs (sonnet@medium, haiku@xhigh/max) never
     # become candidates either.
     assert not {
-        r["profile"]
-        for r in payload["rows"]
-        if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
+        r["profile"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
     } - {"pi-haiku55"}
 
 
@@ -1395,9 +1388,7 @@ def test_recommend_keeps_a_non_default_canon_gate_on_the_credit_row(gate):
         if r["profile"] == "pi-haiku55" and r["kind"] == "candidate" and r["launch"].endswith("medium")
     ]
     if gate == "escalation":
-        assert any(
-            r["kind"] == "escalation" and r["profile"] == "pi-haiku55" for r in payload["rows"]
-        )
+        assert any(r["kind"] == "escalation" and r["profile"] == "pi-haiku55" for r in payload["rows"])
     else:
         assert any(
             r["profile"] == "pi-haiku55" and r["effort"] == "medium" and "consult_only" in r["reason"]

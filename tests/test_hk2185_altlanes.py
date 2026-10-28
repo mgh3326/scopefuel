@@ -241,9 +241,7 @@ def test_pi_opus55_is_listed_at_s_plus_with_the_same_order():
     )
     # The escalation-gated opus@max rung sits in the escalation section, not as
     # a ranked candidate.
-    assert "pi-opus55" in {
-        row["profile"] for row in payload["rows"] if row["kind"] == "escalation"
-    }
+    assert "pi-opus55" in {row["profile"] for row in payload["rows"] if row["kind"] == "escalation"}
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +308,7 @@ def test_at_or_below_the_threshold_keeps_todays_order(used, tmp_path):
     # Today's exact order: the pre-change module lists the same non-alt names in
     # the same order for the same fixture.
     base = _base_recommend(tmp_path)
-    base_out = base.recommend(
-        providers, "A", today=TODAY, now=NOW, bench_scores=None, model_prices={}
-    )
+    base_out = base.recommend(providers, "A", today=TODAY, now=NOW, bench_scores=None, model_prices={})
     base_names = []
     for line in base_out.splitlines():
         if line[:1].isdigit():
@@ -344,7 +340,8 @@ def test_the_threshold_is_a_config_key_read_at_runtime(monkeypatch):
     providers = _healthy()
     providers[0] = _weekly(65.0)  # 1.3x — above the default, below 1.5
     promoted_at_default = next(
-        row for row in _candidates(recommend_dict(providers, "A", today=TODAY, now=NOW))
+        row
+        for row in _candidates(recommend_dict(providers, "A", today=TODAY, now=NOW))
         if row["profile"] == "pi-sonnet55"
     )
     assert promoted_at_default.get("promotion")
@@ -528,9 +525,9 @@ def test_a_recorded_failure_blocks_promotion_for_that_grade():
     assert "promotion" not in row
     # A different grade is unaffected.
     other = recommend_dict(providers, "A+", today=TODAY, now=NOW, promotion_blocks=blocked)
-    assert next(
-        row for row in _candidates(other) if row["profile"] == "pi-sonnet55"
-    )["promotion"].startswith("promoted:")
+    assert next(row for row in _candidates(other) if row["profile"] == "pi-sonnet55")["promotion"].startswith(
+        "promoted:"
+    )
 
 
 def test_a_lazy_promotion_block_is_only_read_when_a_promotion_applies():

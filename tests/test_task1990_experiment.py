@@ -490,16 +490,12 @@ def _drop_altlanes_text(text: str) -> str:
                 else:
                     entries[-1] += " · " + fragment
             kept_entries = [
-                entry
-                for entry in entries
-                if not entry.startswith(("pi-", "cmd-", "codex-terra61"))
+                entry for entry in entries if not entry.startswith(("pi-", "cmd-", "codex-terra61"))
             ]
             if len(kept_entries) != len(entries):
                 if not kept_entries:
                     continue
-                line = f"✗ 제외 ({total - (len(entries) - len(kept_entries))}): " + " · ".join(
-                    kept_entries
-                )
+                line = f"✗ 제외 ({total - (len(entries) - len(kept_entries))}): " + " · ".join(kept_entries)
         kept.append(line)
     numbered: list[str] = []
     rank = 0
@@ -569,9 +565,7 @@ def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
                 # alt-lane rows into the *base* module's table too (the canon can
                 # add profiles the base never heard of), so drop them on both
                 # sides before comparing.
-                expected_text, expected_payload = _drop_pi_credit_folds(
-                    expected[0], json.loads(expected[1])
-                )
+                expected_text, expected_payload = _drop_pi_credit_folds(expected[0], json.loads(expected[1]))
                 expected = (expected_text, json.dumps(expected_payload, ensure_ascii=False))
                 if grade == "A+":
                     # hk 2007: A+ is base minus exactly the borrowed opus --effort low
