@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import tarfile
@@ -198,15 +199,16 @@ def test_underpace_and_nonspend_outputs_match_49a25ed(tmp_path, monkeypatch):
         table = {grade: [] for grade in module.GRADE_TABLE}
         table["A"] = [profiles["sonnet"], profiles["codex-luna"]]
         providers = snapshot(module)
-        outputs.append(
-            (
-                module.recommend(providers, "A", today=TODAY, now=NOW, grade_table=table),
-                json.dumps(
-                    module.recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table),
-                    ensure_ascii=False,
-                ),
-            )
-        )
+        text = module.recommend(providers, "A", today=TODAY, now=NOW, grade_table=table)
+        payload = module.recommend_dict(providers, "A", today=TODAY, now=NOW, grade_table=table)
+        # hk 2205: a paid pool below its threshold (claude 0.7x) promotes above
+        # the hot codex (5.6x) — the marker is additive, so normalise it away
+        # before the byte comparison; the rank itself is unchanged here.
+        if module is recommend:
+            text = re.sub(r" · promoted: [^\n]+", "", text)
+            for row in payload["rows"]:
+                row.pop("promotion", None)
+        outputs.append((text, json.dumps(payload, ensure_ascii=False)))
     assert outputs[0] == outputs[1]
 
 
@@ -444,7 +446,9 @@ def test_credit_row_stays_below_overpace_standard_rows_and_standards_sort_by_hea
     # the multiple. The standard rows keep their headroom order among themselves.
     assert names.index("sonnet") < names.index("kimi-k3-low")
     assert names.index("pi-haiku55") < names.index("sonnet")
-    assert credit["promotion"].startswith("promoted: claude 7d pace ")
+    # hk 2205: kimi is a triggering pool too now, and it is the hotter one
+    # (4.9x over claude's 3.5x), so the reason names kimi.
+    assert credit["promotion"].startswith("promoted: kimi 7d pace ")
     assert (
         "pace-warning pool=claude window=7d"
         in next(row for row in rows if row["profile"] == "sonnet")["windows"]

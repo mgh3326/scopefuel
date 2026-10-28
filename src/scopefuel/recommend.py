@@ -2270,12 +2270,35 @@ def is_rep_measured(profile: Profile) -> bool:
     )
 
 
+def _one_up_qualifies(profile: Profile, upper: Grade) -> bool:
+    """Whether a row placed at ``upper`` may list one grade below.
+
+    The rep-measured rule (#1318) answers first. hk 2205 (comment 8097 defect
+    2): a canon-placed alt-lane rung whose basis is inherited — every
+    ``ALTLANE_CANON_ROWS`` entry is an inherited placement, decided by
+    operator-desk — qualifies the same way even though it is not rep-measured.
+    That is what lists cmd-dsflash41@high (canon A+) at A; its own placement
+    still caps it, and promotion never lifts it above A+.
+    """
+
+    if is_rep_measured(profile):
+        return True
+    if profile.name not in ALTLANE_PROFILES:
+        return False
+    rung = normalize_effort(profile.launcher_effort)
+    return any(
+        (name, effort) == (profile.name, rung) and canon_grade == upper
+        for name, effort, canon_grade, _gate, _reason in ALTLANE_CANON_ROWS
+    )
+
+
 def _one_up_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tuple[Profile, Grade]]:
     """Rep-measured rows placed exactly one grade above ``grade``.
 
     Only ordinary placements qualify: an escalation-gated row stays behind its
     gate (it is a conditional candidate, not a ranked one), and Sol profiles
-    never appear outside S+ (the ``_SOL_PROFILES`` rule stands).
+    never appear outside S+ (the ``_SOL_PROFILES`` rule stands). hk 2205:
+    canon-placed alt-lane rungs with an inherited basis qualify too.
     """
 
     grade_index = _GRADE_ORDER.index(grade)
@@ -2285,7 +2308,9 @@ def _one_up_profiles(grade: Grade, table: dict[Grade, list[Profile]]) -> list[tu
     return [
         (profile, upper)
         for profile in table.get(upper, [])
-        if profile.gate == "default" and profile.name not in _SOL_PROFILES and is_rep_measured(profile)
+        if profile.gate == "default"
+        and profile.name not in _SOL_PROFILES
+        and _one_up_qualifies(profile, upper)
     ]
 
 
@@ -2964,30 +2989,132 @@ class _PaceHeadroom:
 # default 1.2x), the eligible alternative lanes rank above that primary for the
 # grade they are placed in. claude/codex stay listed as fallbacks, and the row
 # carries the reason naming the multiple.
-ALTLANE_PRIMARY_POOLS: tuple[str, ...] = ("claude", "codex")
+#
+# hk 2205 (hk task 2205 + comment 8096): the rule generalises to EVERY paid
+# pool — devin (including the ds41 rungs), grok, codex, claude, and any future
+# paid pool that reports a weekly bucket. A paid pool at or above its own
+# threshold (``[pools.<pool>] altlane_pace_multiple`` overrides the settings
+# key) yields to the under-used lanes: pi on anthropic-api, cmd on
+# commandcode, and every paid pool measured below its own threshold. SWE-2
+# free is never part of the yielding set — it stays first whenever its grade
+# fits and it has quota (the candidate loop marks the model-scope rows).
 ALTLANE_WEEKLY_WINDOW = "7d"
-# Limit (b): never promote over claude/codex for S+ (hard-to-reverse
+# The pools the alt lanes ride. They are the under-used beneficiaries by
+# definition — a credit pool can never "yield" to its own lanes, so it is
+# neither a triggering pool nor a "below threshold" one.
+ALTLANE_POOLS: frozenset[str] = frozenset(
+    pool for profile in ALTLANE_PROFILES for pool, _group in (profile_pool(profile),) if pool
+)
+# Limit (b): never promote over a hot pool for S+ (hard-to-reverse
 # judgement), and never for a consult or tester-independence role — the family
 # split still wins there.
 ALTLANE_NO_PROMOTION_GRADES: frozenset[Grade] = frozenset({"S+"})
 ALTLANE_NO_PROMOTION_ROLES: frozenset[str] = frozenset({"tester", "reviewer", "consult"})
-# (profile, grade) keys with a recorded FAIL/BOUNCE at that grade. A callable is
-# accepted so a caller can defer the reps read until a promotion actually
+# (profile, effort, grade) keys with a recorded FAIL/BOUNCE at that grade —
+# effort is the rep's rung or None for a rep that names no rung (hk 2205:
+# blocks key by profile@rung, never by profile alone across rungs). A callable
+# is accepted so a caller can defer the reps read until a promotion actually
 # applies — the CLI passes one, tests pass a plain set.
-PromotionBlocks = frozenset[tuple[str, str]] | Callable[[], frozenset[tuple[str, str]]]
+PromotionBlocks = (
+    frozenset[tuple[str, str | None, str]] | Callable[[], frozenset[tuple[str, str | None, str]]]
+)
 
 
 def _weekly_bucket(result: ProviderResult) -> Bucket | None:
-    """The pool's weekly (7d) bucket — the only window the trigger reads.
+    """The pool's weekly (7d) account bucket — the only window the trigger reads.
 
     The 5h pace never triggers alone (altlanes4), so no other window is
     consulted here. A bucket without a usable used_pct is not a measurement.
+    hk 2205 (tester r1 B2): only the ACCOUNT-scope weekly bucket speaks for
+    the pool — a group-scoped pool (agy) emits one 7d bucket per group, so
+    reading the first arbitrary one flips the verdict with bucket order, and
+    a model-scope bucket is a rung's Free tag, never the account axis. A
+    group-only pool reads unknown: neither a trigger nor "under-used".
     """
 
     for bucket in result.buckets:
-        if bucket.window == ALTLANE_WEEKLY_WINDOW and _is_valid_used_pct(bucket.used_pct):
+        if (
+            bucket.window == ALTLANE_WEEKLY_WINDOW
+            and bucket.scope.kind == "account"
+            and _is_valid_used_pct(bucket.used_pct)
+        ):
             return bucket
     return None
+
+
+def _weekly_elapsed_fraction(bucket: Bucket, now: dt.datetime) -> float | None:
+    """Elapsed share of the bucket's window, the 8096 early-window check.
+
+    Same computation ``_pace_window_verdicts`` applies: window seconds minus
+    hours-to-reset, over window seconds. None when either endpoint is
+    unreadable — the caller treats it as unknown, never as evidence.
+    """
+
+    seconds = _window_seconds(bucket.window)
+    hours_to_reset = _hours_to_reset(bucket.resets_at, now)
+    if seconds is None or seconds <= 0 or hours_to_reset is None:
+        return None
+    return (seconds / 3600.0 - hours_to_reset) / (seconds / 3600.0)
+
+
+def _altlane_pace_scan(
+    providers: list[ProviderResult],
+    now: dt.datetime,
+    *,
+    threshold: float | None = None,
+) -> tuple[dict[str, tuple[float, str]], frozenset[str]]:
+    """(triggered pool -> (rank, reason), pools measured below their threshold).
+
+    Every provider result with a weekly account bucket is judged — hk 2205
+    drops the claude/codex membership list so a future paid pool needs no code
+    edit. A pool is *triggered* when its pace multiple is at or above its own
+    threshold (per-pool override first, settings key next), or — only when the
+    multiple cannot be computed — when its weekly pace-warning fires. A pool is
+    *below* only when the same multiple is measured under its threshold: an
+    early window (the first ``PACE_EARLY_WINDOW_FRACTION``), an unmeasurable
+    ratio and a missing bucket are all unknown, never "under-used".
+    """
+
+    triggered: dict[str, tuple[float, str]] = {}
+    below: set[str] = set()
+    for result in providers:
+        if result.id in ALTLANE_POOLS or result.error or result.warning:
+            continue
+        bucket = _weekly_bucket(result)
+        if bucket is None:
+            continue
+        assert bucket.used_pct is not None
+        limit = get_altlane_pace_multiple(result.id) if threshold is None else threshold
+        pace = pace_for(bucket, now=now)
+        ratio = pace.ratio
+        if ratio is not None:
+            # A measurable multiple decides on its own: >= promotes, anything
+            # lower does not. The pace-warning condition (TTE < reset) is
+            # mathematically equivalent to a multiple above 1.0x, so letting it
+            # fire alongside a measurable 1.19x would silently defeat the 1.2x
+            # threshold (altlanes AC2 keeps the just-below-threshold order).
+            # hk 2205 (8096): inside the first 5% of the window the multiple is
+            # too noisy to act on either way — the same early-window guard
+            # ``_pace_window_verdicts`` applies, so a 3x read at 2% elapsed
+            # neither yields nor counts as under-used.
+            elapsed = _weekly_elapsed_fraction(bucket, now)
+            if elapsed is None or elapsed < PACE_EARLY_WINDOW_FRACTION:
+                continue
+            if ratio >= limit:
+                triggered[result.id] = (ratio, f"{result.id} 7d pace {ratio:.2f}x")
+            else:
+                below.add(result.id)
+            continue
+        # Secondary trigger (altlanes3): the weekly window exhausts before it
+        # resets. This is the fallback for a window whose multiple cannot be
+        # computed — the 5h pace never triggers alone, so only 7d is read, and
+        # an early window reads unknown there too.
+        verdicts = _pace_window_verdicts(
+            [(float(bucket.used_pct), bucket.window, bucket.resets_at)], now, stale=result.stale
+        )
+        if any(verdict.exhausts_before_reset for verdict in verdicts):
+            triggered[result.id] = (0.0, f"{result.id} 7d pace-warning")
+    return triggered, frozenset(below)
 
 
 def altlane_promotions(
@@ -2998,50 +3125,24 @@ def altlane_promotions(
     role: str | None = None,
     threshold: float | None = None,
 ) -> dict[str, str]:
-    """Primary pool -> promotion reason, for the pools that trigger this grade.
+    """Yielding pool -> promotion reason, for the pools that trigger this grade.
 
-    Trigger (altlanes3 + altlanes4): the weekly 7d pace multiple is ``>=
-    threshold`` (``>=``, never ``>`` — 1.2x promotes at the default), with the
-    weekly pace-warning (``time_to_exhaust < hours_to_reset``) as the secondary
-    trigger. The threshold is read from ``[settings] altlane_pace_multiple`` at
-    call time, so desk retunes it with no code change.
+    Trigger (altlanes3 + altlanes4, hk 2205): the weekly 7d pace multiple is
+    ``>=`` the pool's own threshold (``>=``, never ``>`` — 1.2x promotes at the
+    default), with the weekly pace-warning (``time_to_exhaust <
+    hours_to_reset``) as the secondary trigger. The threshold is read from
+    ``[settings] altlane_pace_multiple`` (with a ``[pools.<pool>]`` override of
+    the same key) at call time, so desk retunes it with no code change.
 
-    Returns an empty mapping — no promotion, today's order — for a healthy
-    primary, for S+, and for a tester/consult role.
+    Returns an empty mapping — no promotion, today's order — for every-healthy
+    pools, for S+, and for a tester/consult role.
     """
 
     if grade in ALTLANE_NO_PROMOTION_GRADES:
         return {}
     if (role or "").strip().casefold() in ALTLANE_NO_PROMOTION_ROLES:
         return {}
-    limit = get_altlane_pace_multiple() if threshold is None else threshold
-    triggered: dict[str, tuple[float, str]] = {}
-    for result in providers:
-        if result.id not in ALTLANE_PRIMARY_POOLS or result.error or result.warning:
-            continue
-        bucket = _weekly_bucket(result)
-        if bucket is None:
-            continue
-        assert bucket.used_pct is not None
-        pace = pace_for(bucket, now=now)
-        ratio = pace.ratio
-        if ratio is not None:
-            # A measurable multiple decides on its own: >= promotes, anything
-            # lower does not. The pace-warning condition (TTE < reset) is
-            # mathematically equivalent to a multiple above 1.0x, so letting it
-            # fire alongside a measurable 1.19x would silently defeat the 1.2x
-            # threshold (altlanes AC2 keeps the just-below-threshold order).
-            if ratio >= limit:
-                triggered[result.id] = (ratio, f"{result.id} 7d pace {ratio:.2f}x")
-            continue
-        # Secondary trigger (altlanes3): the weekly window exhausts before it
-        # resets. This is the fallback for a window whose multiple cannot be
-        # computed — the 5h pace never triggers alone, so only 7d is read.
-        verdicts = _pace_window_verdicts(
-            [(float(bucket.used_pct), bucket.window, bucket.resets_at)], now, stale=result.stale
-        )
-        if any(verdict.exhausts_before_reset for verdict in verdicts):
-            triggered[result.id] = (0.0, f"{result.id} 7d pace-warning")
+    triggered, _below = _altlane_pace_scan(providers, now, threshold=threshold)
     # Hottest primary first; the pool id breaks a tie so the line is stable.
     ordered = sorted(triggered.items(), key=lambda item: (-item[1][0], item[0]))
     return {pool: reason for pool, (_rank, reason) in ordered}
@@ -3112,6 +3213,11 @@ class _Candidate:
     # exclusion, never a quota claim.
     promoted: bool = False
     promotion: str | None = None
+    # hk 2205: the row rides a SWE-2 Free model-scope bucket (hk 1614). A
+    # free-bucket row never counts toward the yielding paid pool's rows — the
+    # free quota has no pace multiple — so SWE-2 free stays FIRST when its
+    # pool's account axis triggers promotion.
+    free_scope: bool = False
 
 
 @dataclass
@@ -6644,6 +6750,7 @@ def _evaluate(
                 one_up=one_up,
                 borrowed=borrowed_row,
                 credit_note=credit_note,
+                free_scope=free_swe2_bucket,
             )
         )
 
@@ -6670,15 +6777,30 @@ def _evaluate(
     promotions = altlane_promotions(providers, now, grade=grade, role=role)
     if promotions:
         reason = next(iter(promotions.values()))
+        # hk 2205: the yielding pool's rows cede to the under-used lanes — the
+        # alt lanes (pi on anthropic-api, cmd on commandcode) unconditionally,
+        # plus every paid pool measured below its own threshold. A pool with
+        # no weekly measurement is unknown, never "under-used".
+        _triggered_pools, below_pools = _altlane_pace_scan(providers, now)
         blocks = promotion_blocks() if callable(promotion_blocks) else promotion_blocks
         for candidate in included:
-            if (
+            # The row's own placement must cover the requested grade: an
+            # exact-grade row, or a one-up row whose placed grade sits exactly
+            # one above (hk 2205 defect 2 — promotion never lifts a row above
+            # its own placement, so a placed A+ one-up row may promote at A).
+            placed_covers = candidate.placed_grade == grade or (
+                candidate.one_up and upper_grade is not None and candidate.placed_grade == upper_grade
+            )
+            under_used = (
                 candidate.profile.name in ALTLANE_PROFILES
-                and candidate.placed_grade == grade
-                and not candidate.one_up
-                and not candidate.borrowed
-                and (blocks is None or (candidate.profile.name, grade) not in blocks)
-            ):
+                or resolved_pool(candidate.profile)[0] in below_pools
+            )
+            rung = normalize_effort(candidate.profile.launcher_effort)
+            blocked = blocks is not None and (
+                (candidate.profile.name, rung, grade) in blocks
+                or (candidate.profile.name, None, grade) in blocks
+            )
+            if placed_covers and under_used and not candidate.borrowed and not blocked:
                 candidate.promoted = True
                 candidate.promotion = f"promoted: {reason}"
 
@@ -6756,13 +6878,44 @@ def _evaluate(
         trigger_positions = [
             index
             for index, candidate in enumerate(included)
-            if not candidate.promoted and resolved_pool(candidate.profile)[0] in triggering
+            if not candidate.promoted
+            and not candidate.free_scope
+            and resolved_pool(candidate.profile)[0] in triggering
         ]
         if trigger_positions:
             insert_at = min(trigger_positions)
             rest = [candidate for candidate in included if not candidate.promoted]
-            index = sum(1 for candidate in included[:insert_at] if not candidate.promoted)
+            # hk 2205 (tester r2 B3): seat the block at the earlier of the
+            # first yielding-pool row and the first already-promoted row.
+            # Counting only non-promoted rows above ``insert_at`` re-seats an
+            # unknown-weekly pool's row (kiro's 30d-only, agy's group-only)
+            # above the whole block — and above SWE-2 free.
+            first_promoted_row = next(
+                (index for index, candidate in enumerate(included) if candidate.promoted),
+                insert_at,
+            )
+            index = sum(
+                1 for candidate in included[: min(insert_at, first_promoted_row)] if not candidate.promoted
+            )
             included[:] = rest[:index] + promoted + rest[index:]
+        # hk 2205 (tester r1 B1): SWE-2 free stays FIRST. The insert above
+        # only counts NON-free rows of the yielding pools, so a free-scope
+        # row sitting below the insert point (a preserve-class hot pool can
+        # outrank the unmeasured free rows) would end up under the promoted
+        # block. Stable-move every free-scope row that landed inside or
+        # below the block to just ahead of it; rows already above are
+        # untouched, and nothing moves when no promotion applies.
+        first_promoted = next(
+            (index for index, candidate in enumerate(included) if candidate.promoted),
+            None,
+        )
+        if first_promoted is not None:
+            tail = included[first_promoted:]
+            free_in_tail = [candidate for candidate in tail if candidate.free_scope]
+            if free_in_tail:
+                included[first_promoted:] = free_in_tail + [
+                    candidate for candidate in tail if not candidate.free_scope
+                ]
     return _Evaluation(
         grade=grade,
         included=included,
