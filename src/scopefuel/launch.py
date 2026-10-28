@@ -36,6 +36,7 @@ from .recommend import (
     ASTRA_FORBIDDEN_SEATS,
     ASTRA_ROLE_PROFILES,
     BARRED_MODEL_DECISION_REF,
+    CREDIT_PLACED_SEAT_REASON,
     E6_ARM_RUNGS,
     E6_WORKER_TESTER_ONLY_PROFILES,
     E6_WORKER_TESTER_ONLY_REASON,
@@ -48,7 +49,9 @@ from .recommend import (
     _operator_request_ref_valid,
     astra_purpose_allowed,
     barred_model_id_for_profile,
+    credit_builder_seat_denied,
     credit_effort_required_reason,
+    credit_placed_seat_denied,
     e6_arm_carrier_grade,
     e6_arm_matches,
     e6_arm_rung_for,
@@ -63,6 +66,7 @@ from .recommend import (
     profile_subscription,
     provider_family,
     round_ext_role_allowed,
+    worker_tester_rungs,
 )
 
 GATE_DEFAULT = "default"
@@ -777,6 +781,18 @@ def resolve_launch(
         # a launcher default, and never the canon's best-graded sibling. The same line
         # the gate prints.
         raise LaunchError(credit_effort_required_reason(canonical))
+    # hk 2185: the credit rung vocabulary is closed. A canon row under an
+    # unregistered key (off/default/bogus) must not become launchable just
+    # because the canon carries it — pi/cmd would reject the effort anyway.
+    if (
+        canonical in E6_WORKER_TESTER_ONLY_PROFILES
+        and requested is not None
+        and requested not in worker_tester_rungs(canonical)
+    ):
+        raise LaunchError(
+            f"profile '{profile}': not placed at effort '{requested}' "
+            f"(placed rungs: {'|'.join(worker_tester_rungs(canonical))})"
+        )
     if (
         requested is None
         and marker is not None
@@ -968,9 +984,20 @@ def resolve_launch(
     )
 
     # hk 2079: the anthropic-api credit rows are worker/tester only until reps
-    # exist — any other seat is refused even with the E6 marker.
+    # exist — any other seat is refused even with the E6 marker. hk 2185: the
+    # rows are ordinary inherited placements now, so the same seat rule applies
+    # without a marker (a placement is not a measurement).
+    # op-1028-seattask: a placed rung may also take the builder seat; an E6
+    # marker carrier keeps the worker/tester-only rule.
     if opened_arm is not None and e6_worker_tester_seat_denied(canonical, role):
         raise LaunchError(f"role_restricted: {opened_arm} — {E6_WORKER_TESTER_ONLY_REASON}")
+    if opened_arm is None and credit_placed_seat_denied(canonical, role):
+        raise LaunchError(f"role_restricted: {canonical}@{resolved_effort} — {CREDIT_PLACED_SEAT_REASON}")
+    # A rung the catalog does not place takes a sibling's row (the fallback
+    # above); that borrowed row must not open a builder seat (hk 2188 r3, 219-a).
+    own_row = row if (row.profile, row.effort) == (canonical, resolved_effort) else None
+    if opened_arm is None and credit_builder_seat_denied(canonical, role, own_row):
+        raise LaunchError(f"role_restricted: {canonical}@{resolved_effort} — {E6_WORKER_TESTER_ONLY_REASON}")
 
     # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라
     # 카탈로그·snapshot·arm 어떤 경로로도 동일하게 닫히고 --operator-request 가

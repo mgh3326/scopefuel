@@ -1,0 +1,10 @@
+# SYNTHETIC — m1b's /usage probe finished at stage=unparsed (6383 bytes).
+# No desk capture has arrived; this stands in for its shape: the prompt and
+# plan header render, the monthly and 5-hour rows are readable, and the
+# screen is clipped before the weekly row's label — so the parse must fail
+# closed naming the missing window, never borrow a number.
+❯ /usage
+GOAT Plan · active
+0% used · 95 requests this month · 31 days to renew
+5-hour 1% · resets in 3h 52m
+usage · requests · resets

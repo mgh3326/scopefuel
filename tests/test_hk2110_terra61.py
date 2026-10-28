@@ -166,7 +166,10 @@ def test_pool_is_codex_and_family_is_openai():
 
 def test_terra61_is_e6_only_but_not_worker_tester_only():
     assert e6_only_profile(PROFILE) is True
-    assert e6_only_profile("pi-haiku55") is True  # the hk 2079 shape
+    # hk 2185: the pi/cmd credit rungs are ordinary inherited placements now,
+    # so they are not E6-only any more.
+    assert e6_only_profile("pi-haiku55") is False
+    assert e6_only_profile("cmd-dsflash41") is False
     assert e6_only_profile("codex-sol") is False  # placed profiles are not
     assert e6_only_profile("opus") is False
     # hk 2110: unlike the pi credit rungs the builder seat is allowed.

@@ -38,6 +38,7 @@ from . import (
 from .cache import collect
 from .model import SCHEMA, ProviderResult, account_tag, overall_mark, overall_usage_mark
 from .policy import (
+    SETTING_KEYS,
     ConfigEditError,
     clear_policy,
     config_path,
@@ -46,6 +47,7 @@ from .policy import (
     list_profile_subscriptions,
     set_policy,
     set_profile_subscribed,
+    set_setting,
 )
 from .providers import default_order, kimi, registry
 from .recommend import grade_help_text
@@ -268,6 +270,20 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "state",
         choices=["on", "off", "clear"],
         help="on/off=프로필 플래그 명시, clear=프로필 키 제거(풀 수준으로 폴백)",
+    )
+
+    setting_parser = policy_sub.add_parser(
+        "setting",
+        help="hk 2185: [settings] 튜닝 키 (예: altlane_pace_multiple 1.2) — 코드 수정 없이 조정",
+    )
+    setting_parser.add_argument(
+        "name",
+        choices=sorted(SETTING_KEYS),
+        help="[settings] 키 이름",
+    )
+    setting_parser.add_argument(
+        "value",
+        help="양수 실수, 또는 'none' 으로 키 제거(기본값으로 폴백)",
     )
 
     launch_parser = policy_sub.add_parser(
@@ -1160,6 +1176,34 @@ def _policy_command(
             return 2
         return 0
 
+    if args.policy_command == "setting":
+        # hk 2185 — the alt-lane pace threshold is a documented [settings] key,
+        # so desk can retune it after merge with no code change. 'none' removes
+        # the key and the shipped default applies again.
+        if args.value.strip().lower() == "none":
+            value: float | None = None
+        else:
+            try:
+                value = float(args.value)
+            except ValueError:
+                parser.error(f"{args.name} 값이 수치가 아닙니다: {args.value!r}")
+            if not math.isfinite(value) or value <= 0:
+                parser.error(f"{args.name} 은 0 초과 유한 실수여야 합니다: {args.value!r}")
+        try:
+            set_setting(args.name, value)
+        except ConfigEditError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"settings.{args.name} removed — 기본값으로 폴백"
+            if value is None
+            else f"settings.{args.name}={value:g}"
+        )
+        return 0
+
     if args.policy_command == "launch":
         return _policy_launch_command(args)
 
@@ -1329,6 +1373,47 @@ def _inflight_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# hk 2205 (comment 8097 defect 1): a rep counts as a BOUNCE only when the
+# lane's OWN impl/fix work was sent back — a verify or reviewer rep's
+# ``blockers_found`` is that tester succeeding at its job, never a mark
+# against the lane. The rep roles that can bounce a lane's own work.
+_PROMOTION_BOUNCE_ROLES: frozenset[str] = frozenset({"impl", "fix"})
+
+
+def _promotion_blocks() -> frozenset[tuple[str, str | None, str]]:
+    """(profile, effort, grade) keys with a recorded FAIL or BOUNCE at that grade.
+
+    hk 2185 (altlanes2 limit b): a lane with a recorded failure or BOUNCE at a
+    grade is not promoted for that grade. The evidence is the reps store — a
+    FAIL is ``completed=0`` (cap exhausted without completing, for ANY role)
+    and a BOUNCE is a recorded blocker (``blockers_found > 0``) on the lane's
+    own impl/fix work only — a verify/reviewer rep's blockers are its success,
+    not the lane's failure (hk 2205 defect 1). Blocks key by ``profile@rung``:
+    a rep carrying an effort blocks that rung; a rep naming none blocks the
+    profile's whole grade (``effort=None`` key). A read failure fails OPEN for
+    ranking only: the promotion is a preference, never a quota claim, so an
+    unreachable reps store must not break ``--recommend``.
+    """
+
+    try:
+        reps = bench.read_reps()
+    except Exception:  # noqa: BLE001 — ranking-only evidence, never a gate
+        return frozenset()
+    blocked: set[tuple[str, str | None, str]] = set()
+    for rep in reps:
+        if not rep.grade:
+            continue
+        failed = rep.completed == 0
+        bounced = (
+            rep.blockers_found is not None
+            and rep.blockers_found > 0
+            and (rep.role or "").strip().casefold() in _PROMOTION_BOUNCE_ROLES
+        )
+        if failed or bounced:
+            blocked.add((rep.profile, rep.effort, rep.grade))
+    return frozenset(blocked)
+
+
 def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
     now = dt.datetime.now(dt.UTC)
     area = getattr(args, "recommend_area", None)
@@ -1389,6 +1474,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
             area=area,
             area_exceptions=area_exceptions,
             catalog_model_ids=catalog_model_ids,
+            promotion_blocks=_promotion_blocks,
         )
         payload["catalog"] = catalog.label
         print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
@@ -1411,6 +1497,7 @@ def _recommend_command(args: argparse.Namespace, fetchers: dict[str, object]) ->
                 area=area,
                 area_exceptions=area_exceptions,
                 catalog_model_ids=catalog_model_ids,
+                promotion_blocks=_promotion_blocks,
             )
         )
         # Provenance line, always printed: a table that silently came from the
@@ -1741,6 +1828,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
         grade_table=grade_table,
         **_gate_args(args),
         **_gate_rung_args(args),
+        promotion_blocks=_promotion_blocks,
     )
     if result.unmeasurable and result.reason.startswith(recommend.SWE2_MEASUREMENT_UNAVAILABLE):
         target = next((item for item in automatic_results if item.id == "devin"), None)
@@ -1757,6 +1845,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                 grade_table=grade_table,
                 **_gate_args(args),
                 **_gate_rung_args(args),
+                promotion_blocks=_promotion_blocks,
             )
 
     # Manual observations are considered only after the automatic path is
@@ -1790,6 +1879,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                     grade_table=grade_table,
                     **_gate_args(args),
                     **_gate_rung_args(args),
+                    promotion_blocks=_promotion_blocks,
                 )
                 if failure_kind != "auth"
                 and target.buckets
@@ -1821,6 +1911,7 @@ def _gate_command(args: argparse.Namespace, fetchers: dict[str, object]) -> int:
                         grade_table=grade_table,
                         **_gate_args(args),
                         **_gate_rung_args(args),
+                        promotion_blocks=_promotion_blocks,
                     )
                     result = _manual_gate_audit(replace(result, unknown_plan=None), resolution, now=now)
                 elif resolution is not None:

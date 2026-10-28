@@ -402,6 +402,55 @@ hk 2007)로 제거되어 A+에는 나타나지 않습니다. 한 행이 두 급�
   나열에는 적용되지 않습니다 — BORROWED_RUNGS 는 그 둘의 명시적 운영자 예외이며,
   같은 행이 one-up 과 borrowed 양쪽 자격이면 borrowed 로 한 번만 나열합니다.
 
+### alt lane 승격 — 주간 pace 배수 (hk 2185 · hk 2205: 모든 유료 pool)
+
+`--recommend`와 게이트의 대안 순위는 **유료 pool 의 주간(7d) pace 배수**가 그 pool의
+임계값 이상이면 그 pool의 행을 under-used 레인 **아래로** 양보시킵니다. hk 2185는
+claude·codex만 트리거했지만 hk 2205는 **모든 유료 pool**로 일반화합니다 —
+devin(ds41 런그 포함)·grok·codex·claude와 이후의 유료 pool 전부. 양보를 받는
+under-used 레인은 대체 레인(pi-haiku55·pi-sonnet55·pi-opus55 — anthropic-api
+크레딧, cmd-dsflash41 — commandcode 구독)과 **자기 임계값 아래로 측정된 모든 유료
+pool**입니다. SWE-2 free는 급이 맞고 쿼터가 있으면 항상 첫 자리를 지킵니다(모델
+범위 free 버킷은 양보하는 pool 행으로 세지 않습니다). 배수는 scopefuel이 이미
+표에 출력하는 per-bucket pace 값 그대로입니다(예: `pace 1.73x` —
+`pace_for(...).ratio`, 새 계산 없음).
+
+- **트리거**: 7d 배수 `>=` 임계값(기본 **1.2x**, `>=`이지 `>`가 아닙니다), 또는
+  보조 트리거인 주간 pace-warning(`time_to_exhaust < hours_to_reset`). **5h pace는
+  단독으로 트리거하지 않습니다** — 7d 창만 읽습니다. 고정 주간 퍼센트는 어디에도
+  쓰지 않습니다. 창의 처음 5%(`PACE_EARLY_WINDOW_FRACTION`)는 노이즈라 배수가
+  읽혀도 트리거도 "임계값 아래" 판정도 하지 않습니다(hk 2205, comment 8096 —
+  `_pace_window_verdicts`와 같은 guard).
+- **임계값은 config 키**입니다 — `[settings] altlane_pace_multiple`(양수 실수,
+  단위는 "주간 균등 pace 대비 배수")가 기본이고, 같은 이름을 `[pools.<pool>]` 아래에
+  두면 pool 별 override 가 됩니다(예: `[pools.devin] altlane_pace_multiple = 2.0`).
+  코드 수정 없이 desk가 조정합니다:
+  `scopefuel policy setting altlane_pace_multiple 1.5` / `... none`(기본값 복귀).
+  미설정·무효·0 이하는 기본 1.2로 폴백합니다.
+- **효과**: 승격된 행은 양보하는 pool의 행보다 위에, 그 행의 배치 급이 커버하는
+  범위에서만 나열되고, 줄에 `promoted: devin 7d pace 3.05x` 사유가 붙습니다.
+  양보한 pool의 행은 fallback으로 계속 나열됩니다. 모든 pool이 건강하면 승격은
+  없고 오늘 순서 그대로입니다. 여러 pool이 동시에 트리거하면 가장 뜨거운 배수를
+  사유로 씁니다.
+- **한계**: S+에서는 절대 승격하지 않습니다(되돌리기 어려운 판단). tester/consult
+  역할(`--role tester|reviewer|consult`)에서는 가족 분리가 이깁니다. 배치 급 위로는
+  올리지 않습니다 — canon 배치 alt 런그는 rep-실측이 아니어도 한 급 아래에
+  `[one-up]`로 나열되고(hk 2205, comment 8097 defect 2), 그 one-up 행도 승격할 수
+  있습니다(배치 A+가 요청 A를 커버합니다). 그 급에서 reps에 FAIL(`completed=0`,
+  역할 불문) 또는 레인 자신의 impl/fix 작업의 BOUNCE(blockers 기록)이 있으면
+  승격하지 않습니다 — verify/reviewer rep의 blockers_found는 테스터가 일을 한
+  것이지 레인의 실패가 아닙니다(comment 8097 defect 1). 승격은 **모든 자격 필터
+  뒤의 순위 단계**라, pool 측정 불가·cutoff·policy exclude·구독 해지·host 제약으로
+  빠진 행은 절대 승격으로 다시 나타나지 않습니다 — cmd-dsflash41은 host 별
+  `[local] cmd_dsflash41` 플래그(wrk hk 2180)로만 열리며, 그 host 필터는 승격
+  뒤에도 그대로 적용됩니다.
+- **배치**: pi-*·cmd-dsflash41의 급은 canon 카탈로그 행과 **정확히 같습니다**
+  (2026-10-28 desk push, ref `desk op-1028-grades`; basis "inherited from claude
+  harness … / devin ds41 …"). cmd-dsflash41은 `@high`(A+)만 배치됩니다 —
+  `@low`/`@max`는 배치하지 않으며 게이트는 `not_placed`로 거부합니다(max를
+  devin-ds41-max의 C로 복사하면 canon의 effort 단조성 검사가 batch 전체를
+  거부합니다). 모든 credit 런그는 worker/tester 전용이고 `--effort`가 필수입니다.
+
 ## Benchmark backend
 
 벤치 점수와 대표 실행 기록의 backend는 `auto`(기본)·`handoffkeep`·`local` 중 하나입니다.

@@ -64,6 +64,85 @@ _REAPER_SWEEP_PASSES = 4
 _REAPER_SWEEP_GAP_S = 0.4
 
 
+_LOCK_NAME = ".probe.lock"
+_RECLAIM_NAME = ".probe.lock.reclaim"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return False
+    return True
+
+
+def _lock_path(workdir: Path) -> Path:
+    return Path(workdir) / _LOCK_NAME
+
+
+def _try_lock_fd(path: Path) -> int | None:
+    """Open ``path`` and take a non-blocking exclusive flock; None when held."""
+
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return None
+    return fd
+
+
+def _read_lock_owner(path: Path) -> int | None:
+    """The owner pid recorded in the lock file, or None when unreadable/absent."""
+
+    try:
+        raw = path.read_text().strip().splitlines()[0]
+        pid = int(raw)
+    except (OSError, IndexError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _reclaim_lock_fd(path: Path) -> int | None:
+    """Reclaim a lock whose recorded owner is dead.
+
+    The flock belongs to the *inode*, and a dead caller's fd may still pin it
+    (an inherited descriptor — e.g. a reaper — keeps the lock long after its
+    owner is gone). Replacing the path with a fresh inode gives new callers a
+    lockable file. The post-acquire inode check closes the race where two
+    reclaimers each lock their own replacement: whoever's inode is no longer
+    the published one releases and reports a miss.
+    """
+
+    tmp = path.with_name(_RECLAIM_NAME)
+    try:
+        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(tfd)
+        os.replace(tmp, path)
+    except OSError:
+        return None
+    fd = _try_lock_fd(path)
+    if fd is None:
+        return None
+    try:
+        if os.stat(path).st_ino != os.fstat(fd).st_ino:
+            os.close(fd)
+            return None
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return None
+    return fd
+
+
 @contextlib.contextmanager
 def single_probe_lock(workdir: Path):
     """Admit one probe at a time per ``workdir``.
@@ -74,17 +153,32 @@ def single_probe_lock(workdir: Path):
     caller is told the pool is busy instead of adding to the pile. The
     lock is an flock on a file descriptor, so the kernel releases it if
     the holder is SIGKILLed.
+
+    hk 2182: the holder records its pid inside the lock file. A blocked
+    caller whose recorded owner is *dead* reclaims the lock by replacing the
+    file — an fd inherited by a detached process (a reaper, a daemon child)
+    can otherwise pin the inode forever after the caller itself is gone.
+    A held lock with no readable owner is left alone: an unlabelled holder
+    is treated as live rather than risk two probes at once.
     """
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(workdir / ".probe.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    path = _lock_path(workdir)
+    fd = _try_lock_fd(path)
+    if fd is None:
+        owner = _read_lock_owner(path)
+        if owner is not None and not _pid_alive(owner):
+            fd = _reclaim_lock_fd(path)
+    if fd is None:
+        yield False
+        return
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
         except OSError:
-            yield False
-            return
+            pass  # a missing owner record degrades to the pre-2182 lock
         try:
             yield True
         finally:
@@ -93,6 +187,30 @@ def single_probe_lock(workdir: Path):
     finally:
         with contextlib.suppress(OSError):
             os.close(fd)
+
+
+def probe_in_flight(workdir: Path) -> bool:
+    """Is a live probe holding ``workdir``'s single-probe lock right now?
+
+    A free lock answers False outright. A held lock answers True only while
+    its recorded owner is alive — a dead owner's fd-pinned inode is
+    reclaimable, so callers must not mistake it for a running probe. A held
+    lock with no readable owner stays True: an unknown holder is assumed
+    live rather than risk a double probe.
+    """
+
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    path = _lock_path(workdir)
+    fd = _try_lock_fd(path)
+    if fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return False
+    owner = _read_lock_owner(path)
+    if owner is None:
+        return True
+    return _pid_alive(owner)
 
 
 def register(pgid: int, cwd: Path) -> None:

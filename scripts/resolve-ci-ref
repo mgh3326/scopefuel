@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Resolve a user-supplied ref (40-hex sha, branch, or tag) to a commit sha.
+# Prints the sha on stdout; exits non-zero if the ref does not resolve.
+set -euo pipefail
+
+ref="${1:?usage: resolve-ci-ref <ref> <owner/repo>}"
+repo="${2:?usage: resolve-ci-ref <ref> <owner/repo>}"
+
+if ! sha="$(gh api "repos/${repo}/commits/${ref}" --jq '.sha' 2>/dev/null)"; then
+  echo "resolve-ci-ref: ref does not resolve: ${ref}" >&2
+  exit 1
+fi
+if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "resolve-ci-ref: ref did not resolve to a commit sha: ${ref}" >&2
+  exit 1
+fi
+printf '%s\n' "$sha"

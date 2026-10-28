@@ -1,11 +1,15 @@
-"""hk 2079: the anthropic-api credit pool and its pi E6 rungs.
+"""hk 2079: the anthropic-api credit pool and its pi rungs.
 
 The operator's Anthropic API credit (haiku/sonnet/opus 5.5) is spent IN
 PARALLEL with the claude subscription CLI, through pi (no MCP).  It is a
 separate pool, it has no automatic probe, and its balance is a manual
-observation.  The pi rungs (one per profile and thinking level) are unmeasured
-E6 catalog rows: marker-gated, worker/tester only, and they inherit no grade
-from the claude rows.
+observation.
+
+hk 2185 (operator desk op-1028-grades FINAL) supersedes the original E6
+contract: the pi rungs are ordinary per-effort PLACEMENTS now, each inheriting
+the claude-code harness profile's grade for the same model and effort. They
+keep the worker/tester-only seat rule and the closed rung vocabulary (the
+thinking level is the effort), and the E6 marker is inert for them.
 
 Each test docstring names the mutant it kills where the brief lists one.
 """
@@ -21,10 +25,11 @@ import pytest
 from scopefuel import bench, cli, launch, manual, providers, recommend
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.recommend import (
-    E6_ARM_ANNOTATION,
+    ALTLANE_CANON_ROWS,
     E6_ARM_KEYS,
     E6_ARM_MARKER_ENV,
     GRADE_TABLE,
+    altlane_annotation,
     e6_arm_rung_for,
     gate_check,
     profile_pool,
@@ -45,8 +50,32 @@ PI_PROFILES: dict[str, str] = {
 PI_RUNGS = ("low", "medium", "high", "xhigh", "max")
 # The rung a bare spelling names — it mirrors the claude profile of the same model.
 PI_DEFAULT_RUNG = {"pi-haiku55": "low", "pi-sonnet55": "high", "pi-opus55": "high"}
-PI_ROWS = [(profile, rung) for profile in sorted(PI_PROFILES) for rung in PI_RUNGS]
+# hk 2185: only the rungs the canon places (pi-haiku55@low is retired upstream).
+CANON = {(profile, rung): (grade, gate) for profile, rung, grade, gate, _reason in ALTLANE_CANON_ROWS}
+PI_PLACED = [
+    (profile, rung) for profile in sorted(PI_PROFILES) for rung in PI_RUNGS if (profile, rung) in CANON
+]
+PI_ROWS = PI_PLACED
+PI_DEFAULT_RUNGS = [(profile, rung) for profile, rung in PI_PLACED if CANON[(profile, rung)][1] == "default"]
+# hk 2185: the source claude-harness profile whose grade each pi rung inherits.
+PI_SOURCE = {"pi-haiku55": "haiku", "pi-sonnet55": "sonnet", "pi-opus55": "opus"}
 CREDIT_EXPIRES = (TODAY + dt.timedelta(days=30)).isoformat()
+
+
+def _placed_grade(profile: str, rung: str) -> str | None:
+    for grade, rows in GRADE_TABLE.items():
+        for row in rows:
+            if row.name == profile and row.launcher_effort == rung:
+                return grade
+    return None
+
+
+def _placed_gate(profile: str, rung: str) -> str | None:
+    for rows in GRADE_TABLE.values():
+        for row in rows:
+            if row.name == profile and row.launcher_effort == rung:
+                return row.gate
+    return None
 
 
 def _marker(profile: str, rung: str) -> str:
@@ -140,10 +169,14 @@ def test_pool_is_anthropic_api_not_claude(profile):
     """Mutant: map the pi profiles to the claude pool -> this goes RED."""
 
     assert profile_pool(profile) == ("anthropic-api", None)
-    assert provider_family(profile) == "anthropic"
+    # hk 2185 (op-1028-grades FINAL): pi-* are Anthropic FAMILY, the same family
+    # value the claude subscription rows carry — a pi tester for a claude
+    # builder is refused as same-family.
+    assert provider_family(profile) == "claude"
     # Control: the subscription rows stay on the claude pool.
     assert profile_pool("sonnet") == ("claude", None)
     assert provider_family("sonnet") == "claude"
+    assert provider_family(profile) == provider_family("sonnet")
 
 
 def test_unregistered_pi_spelling_does_not_inherit_the_route():
@@ -172,58 +205,62 @@ def test_anthropic_api_has_no_automatic_probe():
 
 
 # ---------------------------------------------------------------------------
-# 2. catalog rows — the claude-grade mutant
+# 2. catalog rows — the inherited-placement mutant
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
-def test_catalog_row_is_the_unmeasured_c_carrier(profile, rung):
-    """Mutant: copy the claude grade into the pi rows -> this goes RED."""
+def test_catalog_row_is_the_inherited_placement(profile, rung):
+    """Mutant: hand-copy a grade instead of inheriting it -> this goes RED."""
 
     rows = [entry for entry in bench.catalog_snapshot() if entry.key == (profile, rung)]
     assert len(rows) == 1
     (row,) = rows
-    assert row.grade == "C"
+    assert row.grade == _placed_grade(profile, rung) == CANON[(profile, rung)][0]
     assert row.score is None
     assert row.pool == "anthropic-api"
     assert row.model_id == PI_PROFILES[profile]
-    assert row.gate == "default"
+    assert row.gate == _placed_gate(profile, rung) == CANON[(profile, rung)][1]
     assert row.benchmark_source is None
-    assert row.benchmark_annotation.startswith(E6_ARM_ANNOTATION)
-    assert "#594" in row.benchmark_annotation
-    # The placement exclusion is recorded in the catalog notes.
-    assert "worker/tester" in row.benchmark_annotation
-    assert "MCP" in row.benchmark_annotation
-    assert "pi" in row.benchmark_annotation
+    # hk 2185: the canon annotation, verbatim.
+    assert row.benchmark_annotation == altlane_annotation(profile, rung)
+    assert row.benchmark_annotation.startswith("inherited from claude harness")
 
 
-def test_no_grade_inheritance_from_the_claude_rows():
-    """Mutant: copy the claude grade into the pi rows -> this goes RED."""
+def test_pi_canon_rows_inherit_from_the_claude_rows():
+    """Each canon row inherits the claude row's grade per effort — read, not copied.
 
-    # Control: the claude rows really do sit above C, so "C" is not a default.
-    claude_grades = {
-        grade
-        for grade, profiles in GRADE_TABLE.items()
-        for placed in profiles
-        if placed.name in {"haiku", "sonnet", "opus"}
-    }
-    assert claude_grades - {"C"}
-    # The pi profiles are not placements at any grade.
-    assert all(placed.name not in PI_PROFILES for profiles in GRADE_TABLE.values() for placed in profiles)
-    # And every catalog row for them is the C carrier, whatever the claude rows say.
-    rows = [entry for entry in bench.catalog_snapshot() if entry.profile in PI_PROFILES]
-    assert len(rows) == len(PI_ROWS)
-    assert {entry.grade for entry in rows} == {"C"}
-    assert {entry.score for entry in rows} == {None}
+    The canon itself re-placed a few claude rungs before hk 2185
+    (``ALTLANE_CANON_DIVERGENCES``); those are named, not silently accepted.
+    """
+
+    diverged = set()
+    for profile, rung, grade, _gate, _reason in ALTLANE_CANON_ROWS:
+        if profile not in PI_SOURCE:
+            continue
+        source = recommend.ALTLANE_CANON_SOURCES[(profile, rung)]
+        source_profile, _, source_effort = source.partition("@")
+        if (profile, rung) in recommend.ALTLANE_CANON_DIVERGENCES:
+            diverged.add((profile, rung))
+            assert grade != recommend.source_placement_grade(source_profile, source_effort)
+            continue
+        assert grade == recommend.source_placement_grade(source_profile, source_effort), (profile, rung)
+    assert diverged == set(recommend.ALTLANE_CANON_DIVERGENCES)
+    # Control: the source rows really do span several grades, so this is not a
+    # constant comparison.
+    opus_grades = {recommend.source_placement_grade("opus", rung) for rung in PI_RUNGS}
+    sonnet_grades = {recommend.source_placement_grade("sonnet", rung) for rung in PI_RUNGS}
+    assert len(opus_grades) > 1 and len(sonnet_grades) > 1
 
 
 @pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
-def test_pi_rows_are_in_the_e6_arm_table(profile, rung):
-    assert (profile, rung) in E6_ARM_KEYS
-    row = e6_arm_rung_for(profile, rung)
-    assert row is not None
-    assert row.benchmark is None
-    assert row.launcher_effort == rung
+def test_pi_rows_are_ordinary_placements_not_e6_arms(profile, rung):
+    """hk 2185: a placed rung is an ordinary row — no marker, no carrier fold."""
+
+    assert (profile, rung) not in E6_ARM_KEYS
+    assert e6_arm_rung_for(profile, rung) is None
+    assert recommend.is_e6_unmeasured_key(profile, rung) is False
+    assert recommend.e6_only_profile(profile) is False
 
 
 @pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
@@ -236,12 +273,14 @@ def test_launch_spelling_takes_the_effort_flag(profile, rung):
     assert launch.LAUNCH_MODEL_IDS[profile] == PI_PROFILES[profile]
 
 
-def test_a_served_canon_without_the_pi_rows_still_passes_the_validity_floor():
-    """The pi profiles exist only as E6 rows; an unseeded canon is not a rejected one."""
+def test_a_served_canon_without_the_pi_rows_is_rejected_until_reseeded():
+    """The pi rows are placements now, so an unseeded canon is incomplete (fail closed)."""
 
     entries = [entry for entry in bench.catalog_snapshot() if entry.profile not in PI_PROFILES]
     assert len(entries) < len(bench.catalog_snapshot())
-    assert bench._server_catalog_rejection(entries) is None
+    rejection = bench._server_catalog_rejection(entries)
+    assert rejection is not None
+    assert "missing 3 snapshot profiles" in rejection
 
 
 # ---------------------------------------------------------------------------
@@ -632,13 +671,16 @@ def test_zero_remaining_balance_is_not_admitted():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
-def test_gate_refuses_a_rung_without_the_marker_as_unmeasured(profile, rung):
+@pytest.mark.parametrize(("profile", "rung"), PI_DEFAULT_RUNGS)
+def test_gate_admits_a_placed_rung_without_the_marker(profile, rung):
+    """hk 2185: a placed rung needs no E6 marker — the marker is inert for pi."""
+
     credit = _credit_result()
     result = gate_check([credit], profile, role="worker", effort=rung, today=TODAY, now=NOW)
-    assert result.ok is False
-    assert "e6_arm_required" in result.reason
-    assert f"SCOPEFUEL_E6_ARM={_marker(profile, rung)}" in result.reason
+    assert result.ok is True, result.reason
+    assert result.provider_id == "anthropic-api"
+    assert result.grade == CANON[(profile, rung)][0]
+    assert result.e6_arm is None
 
 
 @pytest.mark.parametrize("with_marker", [False, True])
@@ -654,38 +696,32 @@ def test_gate_refuses_the_bare_spelling_even_with_a_marker(profile, with_marker)
     assert result.reason.startswith("effort_required:")
 
 
-def test_gate_refuses_a_marker_that_names_another_rung_or_profile():
+def test_gate_refuses_an_unregistered_rung_whatever_the_marker_names():
+    """The rung vocabulary is closed: an unregistered effort names no placement."""
+
     credit = _credit_result()
-    for marker in ("pi-sonnet55@low", "pi-haiku55@high", "sonnet@high"):
+    for rung in ("bogus", "off", "default", "ultra"):
         result = gate_check(
             [credit],
             "pi-sonnet55",
             role="worker",
-            effort="high",
-            e6_arm=marker,
+            effort=rung,
+            e6_arm=f"pi-sonnet55@{rung}",
             today=TODAY,
             now=NOW,
         )
-        assert result.ok is False, marker
-        assert "e6_arm_required" in result.reason
+        assert result.ok is False, rung
+        assert "not_placed" in result.reason
 
 
 @pytest.mark.parametrize("role", ["worker", "tester"])
-@pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
-def test_gate_admits_with_the_marker_when_credit_is_fresh_and_positive(profile, rung, role):
+@pytest.mark.parametrize(("profile", "rung"), PI_DEFAULT_RUNGS)
+def test_gate_admits_when_credit_is_fresh_and_positive(profile, rung, role):
     credit = _credit_result()
-    result = gate_check(
-        [credit],
-        profile,
-        role=role,
-        effort=rung,
-        e6_arm=_marker(profile, rung),
-        today=TODAY,
-        now=NOW,
-    )
+    result = gate_check([credit], profile, role=role, effort=rung, today=TODAY, now=NOW)
     assert result.ok is True, result.reason
     assert result.provider_id == "anthropic-api"
-    assert result.e6_arm == _marker(profile, rung)
+    assert result.grade == CANON[(profile, rung)][0]
     assert result.used_pct == pytest.approx(25.0)
 
 
@@ -693,15 +729,7 @@ def test_three_hour_old_credit_observation_still_admits_pi_sonnet55():
     """Mutant: reapply the 2h TTL to credit -> this admission goes RED."""
 
     credit = _credit_result(measured_at=NOW - dt.timedelta(hours=3))
-    result = gate_check(
-        [credit],
-        "pi-sonnet55",
-        role="worker",
-        effort="high",
-        e6_arm="pi-sonnet55@high",
-        today=TODAY,
-        now=NOW,
-    )
+    result = gate_check([credit], "pi-sonnet55", role="worker", effort="high", today=TODAY, now=NOW)
     assert result.ok is True, result.reason
     assert result.provider_id == "anthropic-api"
 
@@ -717,36 +745,27 @@ def test_twenty_five_hour_old_v1_credit_observation_fails_closed_as_unmeasurable
     )
     assert resolution.applied is False
     result = gate_check(
-        [resolution.result],
-        "pi-sonnet55",
-        role="worker",
-        effort="high",
-        e6_arm="pi-sonnet55@high",
-        today=TODAY,
-        now=NOW,
+        [resolution.result], "pi-sonnet55", role="worker", effort="high", today=TODAY, now=NOW
     )
     assert result.ok is False
     assert result.unmeasurable is True
 
 
 @pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
-def test_gate_refuses_the_builder_role_for_the_marker(profile, rung):
-    """Mutant: drop the builder refusal -> this goes RED."""
+def test_gate_builder_seat_only_on_placed_default_rungs(profile, rung):
+    """op-1028-seattask: a placed default-gate credit rung takes the builder seat;
+    consult_only and escalation rungs stay worker/tester only.
+    Mutants: restore the blanket builder refusal, or drop the default-gate
+    condition -> this goes RED."""
 
     credit = _credit_result()
-    result = gate_check(
-        [credit],
-        profile,
-        role="builder",
-        effort=rung,
-        e6_arm=_marker(profile, rung),
-        today=TODAY,
-        now=NOW,
-    )
-    assert result.ok is False
-    assert result.role_denied is True
-    assert "worker/tester" in result.reason
-    assert result.e6_arm == _marker(profile, rung)
+    result = gate_check([credit], profile, role="builder", effort=rung, today=TODAY, now=NOW)
+    if CANON[(profile, rung)][1] == "default":
+        assert result.ok is True, result.reason
+    else:
+        assert result.ok is False
+        assert result.role_denied is True
+        assert "worker/tester" in result.reason
 
 
 @pytest.mark.parametrize("role", [None, "", "captain", "reviewer", "orch"])
@@ -754,15 +773,7 @@ def test_gate_refuses_every_seat_other_than_worker_and_tester(role):
     """The brief says worker or tester only — an unnamed seat is not a worker."""
 
     credit = _credit_result()
-    result = gate_check(
-        [credit],
-        "pi-sonnet55",
-        role=role,
-        effort="high",
-        e6_arm="pi-sonnet55@high",
-        today=TODAY,
-        now=NOW,
-    )
+    result = gate_check([credit], "pi-sonnet55", role=role, effort="high", today=TODAY, now=NOW)
     assert result.ok is False
     assert result.role_denied is True
 
@@ -770,15 +781,7 @@ def test_gate_refuses_every_seat_other_than_worker_and_tester(role):
 @pytest.mark.parametrize("profile", sorted(PI_PROFILES))
 def test_gate_reason_names_anthropic_api_not_claude(profile):
     credit = _credit_result()
-    result = gate_check(
-        [credit],
-        profile,
-        role="worker",
-        effort="high",
-        e6_arm=_marker(profile, "high"),
-        today=TODAY,
-        now=NOW,
-    )
+    result = gate_check([credit], profile, role="worker", effort="high", today=TODAY, now=NOW)
     assert result.ok is True
     assert result.provider_id == "anthropic-api"
     assert "pool=anthropic-api" in result.reason
@@ -820,7 +823,6 @@ def test_stale_manual_value_refuses_admission():
 
 def test_gate_cli_refuses_when_the_manual_value_is_missing(monkeypatch, capsys):
     monkeypatch.setattr(cli, "registry", lambda: {"claude": _claude_result})
-    monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
     rc = cli.main(["gate", "-m", "pi-sonnet55", "--effort", "high", "--role", "worker", "--no-cache"])
     captured = capsys.readouterr()
     assert rc == 4
@@ -831,22 +833,24 @@ def test_gate_cli_refuses_when_the_manual_value_is_stale(monkeypatch, capsys):
     stale_measured = (dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)).isoformat()
     _record_credit(measured_at=manual.parse_timestamp(stale_measured), ttl_s=900.0)
     monkeypatch.setattr(cli, "registry", lambda: {"claude": _claude_result})
-    monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
     rc = cli.main(["gate", "-m", "pi-sonnet55", "--effort", "high", "--role", "worker", "--no-cache"])
     captured = capsys.readouterr()
     assert rc == 4
     assert "credit" in captured.err
 
 
-def test_gate_cli_refuses_without_the_marker(monkeypatch, capsys):
+def test_gate_cli_admits_without_the_marker(monkeypatch, capsys):
+    """hk 2185: the E6 marker is inert for a placed credit rung."""
+
     assert _set_manual_credit_cli() == 0
     capsys.readouterr()
     monkeypatch.setattr(cli, "registry", lambda: {"claude": _claude_result})
     monkeypatch.delenv(E6_ARM_MARKER_ENV, raising=False)
     rc = cli.main(["gate", "-m", "pi-sonnet55", "--effort", "high", "--role", "worker", "--no-cache"])
     captured = capsys.readouterr()
-    assert rc == 3
-    assert "e6_arm_required" in captured.err + captured.out
+    assert rc == 0, captured.err
+    assert "pool=anthropic-api" in captured.out
+    # A bare spelling still names no rung.
     rc = cli.main(["gate", "-m", "pi-sonnet55", "--role", "worker", "--no-cache"])
     captured = capsys.readouterr()
     assert rc == 3
@@ -858,7 +862,6 @@ def test_gate_cli_allow_line_shows_pool_credit_and_days_left(monkeypatch, capsys
     capsys.readouterr()
     stored_entry = manual.load_store()["history"][-1]
     monkeypatch.setattr(cli, "registry", lambda: {"claude": _claude_result})
-    monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
     record_path = tmp_path / "gate.json"
     rc = cli.main(
         [
@@ -883,7 +886,7 @@ def test_gate_cli_allow_line_shows_pool_credit_and_days_left(monkeypatch, capsys
     assert "(in " in captured.out
     record = json.loads(record_path.read_text())
     assert record["provider_id"] == "anthropic-api"
-    assert record["e6_arm"] == "pi-sonnet55@high"
+    assert record.get("e6_arm") is None
     (observation,) = record["manual_observations"]
     assert observation["credit"]["remaining_usd"] == 150.0
 
@@ -893,50 +896,51 @@ def test_gate_cli_allow_line_shows_pool_credit_and_days_left(monkeypatch, capsys
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
-def test_launch_resolves_the_marked_rung_with_the_anthropic_model_id(profile, rung):
-    decision = launch.resolve_launch(
-        profile, effort=rung, role="worker", e6_arm=_marker(profile, rung), view=_snapshot_view()
-    )
+@pytest.mark.parametrize(("profile", "rung"), PI_DEFAULT_RUNGS)
+def test_launch_resolves_the_rung_with_the_anthropic_model_id(profile, rung):
+    decision = launch.resolve_launch(profile, effort=rung, role="worker", view=_snapshot_view())
     assert decision.model_id == PI_PROFILES[profile]
     assert decision.pool == "anthropic-api"
-    assert decision.family == "anthropic"
+    assert decision.family == "claude"
     assert decision.effort == rung
-    assert decision.grade == "C"
+    assert decision.grade == CANON[(profile, rung)][0]
+    assert decision.e6_arm is None
 
 
-@pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
+@pytest.mark.parametrize(("profile", "rung"), PI_DEFAULT_RUNGS)
 def test_launch_resolves_from_the_bundled_row_when_the_served_canon_is_silent(profile, rung):
-    """A served canon not yet seeded with the pi rows must not hide the marked rung."""
+    """A served canon not yet seeded with the pi rows must not hide the placement."""
 
     view = launch.CatalogView(
         entries=tuple(entry for entry in bench.catalog_snapshot() if entry.profile == "sonnet"),
         source=bench.CATALOG_SOURCE_CACHE,
         age_s=0.0,
     )
-    decision = launch.resolve_launch(
-        profile, effort=rung, role="worker", e6_arm=_marker(profile, rung), view=view
-    )
+    decision = launch.resolve_launch(profile, effort=rung, role="worker", view=view)
     assert (decision.model_id, decision.pool, decision.effort) == (
         PI_PROFILES[profile],
         "anthropic-api",
         rung,
     )
-    # Without the marker the same silent canon is still a refusal, never a fallback.
-    with pytest.raises(launch.LaunchError):
-        launch.resolve_launch(profile, effort=rung, role="worker", view=view)
+    assert decision.grade == CANON[(profile, rung)][0]
 
 
-def test_launch_refuses_without_the_marker_and_for_the_builder_seat():
+def test_launch_builder_seat_only_on_placed_default_rungs():
+    """op-1028-seattask. Mutants: restore the blanket builder refusal, or drop
+    the default-gate condition -> this goes RED."""
+
     view = _snapshot_view()
-    with pytest.raises(launch.LaunchError, match="e6_arm_required"):
-        launch.resolve_launch("pi-sonnet55", effort="high", role="worker", view=view)
     with pytest.raises(launch.LaunchError, match="effort_required"):
         launch.resolve_launch("pi-sonnet55", role="worker", view=view)
+    decision = launch.resolve_launch("pi-sonnet55", effort="high", role="builder", view=view)
+    assert decision.effort == "high"
+    # consult_only (sonnet@medium) and escalation (opus@max) stay worker/tester only.
     with pytest.raises(launch.LaunchError, match="role_restricted"):
-        launch.resolve_launch(
-            "pi-sonnet55", effort="high", role="builder", e6_arm="pi-sonnet55@high", view=view
-        )
+        launch.resolve_launch("pi-sonnet55", effort="medium", role="builder", view=view)
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch("pi-opus55", effort="max", role="builder", view=view)
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch("pi-sonnet55", effort="high", role=None, view=view)
 
 
 # ---------------------------------------------------------------------------
@@ -1019,10 +1023,20 @@ def test_credit_rows_are_not_listed_without_a_usable_balance():
     assert not set(_ranked_names(out)) & set(PI_PROFILES)
 
 
-def test_credit_rows_are_not_listed_above_their_carrier_grade():
+def test_credit_rows_are_listed_only_at_their_placed_grade():
+    """hk 2185: each rung is listed at the grade it inherits, never another —
+    plus hk 2205's canon one-up listing exactly one grade below, tagged."""
+
     credit = _credit_result()
-    out = recommend_text([_claude_result(), credit], "A", today=TODAY, now=NOW)
-    assert not set(_ranked_names(out)) & set(PI_PROFILES)
+    order = ("S+", "S", "A+", "A", "B", "C")
+    for index, grade in enumerate(order):
+        out = recommend_text([_claude_result(), credit], grade, today=TODAY, now=NOW)
+        listed = set(_ranked_names(out)) & set(PI_PROFILES)
+        expected = {p for p, r in PI_ROWS if CANON[(p, r)] == (grade, "default")}
+        if index > 0:
+            upper = order[index - 1]
+            expected |= {p for p, r in PI_ROWS if CANON[(p, r)] == (upper, "default")}
+        assert listed == expected, (grade, listed, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,46 +1058,82 @@ def _consult_only_view(profile: str = "pi-sonnet55", rung: str = "high") -> laun
     "marker", ["pi-sonnet55@bogus", "pi-sonnet55@ultra", "pi-sonnet55@off", "pi-sonnet55@default"]
 )
 @pytest.mark.parametrize("role", [None, "builder", "worker"])
-def test_gate_cli_refuses_a_marker_that_names_an_unregistered_rung(monkeypatch, capsys, marker, role):
-    """F1: a marker rung that is not a registered row opens nothing, with or without --effort."""
+def test_gate_cli_ignores_a_marker_that_names_an_unregistered_rung(monkeypatch, capsys, marker, role):
+    """hk 2185: the marker is inert for pi; only --effort names a rung."""
 
     assert _set_manual_credit_cli() == 0
     capsys.readouterr()
     monkeypatch.setattr(cli, "registry", lambda: {})
     monkeypatch.setenv(E6_ARM_MARKER_ENV, marker)
-    for extra, needle in (([], "effort_required"), (["--effort", "high"], "e6_arm_required")):
-        argv = ["gate", "-m", "pi-sonnet55", "--no-cache", *extra]
-        if role is not None:
-            argv += ["--role", role]
-        rc = cli.main(argv)
-        captured = capsys.readouterr()
-        assert rc in {3, 5}, captured.out + captured.err
-        assert needle in captured.out + captured.err
+    # A bare spelling still names no rung.
+    argv = ["gate", "-m", "pi-sonnet55", "--no-cache"]
+    if role is not None:
+        argv += ["--role", role]
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    assert rc == 3, captured.out + captured.err
+    assert "effort_required" in captured.out + captured.err
+    # --effort names a registered rung, so the stale marker changes nothing.
+    argv = ["gate", "-m", "pi-sonnet55", "--effort", "high", "--no-cache"]
+    if role is not None:
+        argv += ["--role", role]
+    rc = cli.main(argv)
+    captured = capsys.readouterr()
+    # op-1028-seattask: pi-sonnet55@high is a placed default rung, so the
+    # builder seat is admitted like worker; no seat named still refuses.
+    assert rc == (5 if role is None else 0), captured.out + captured.err
 
 
-@pytest.mark.parametrize("effort", [None, "high", "low"])
 @pytest.mark.parametrize("rung", ["bogus", "ultra", "off", "default"])
 @pytest.mark.parametrize("role", [None, "builder", "worker", "tester"])
-def test_gate_refuses_every_unregistered_marker_rung_for_every_seat(rung, role, effort):
+def test_gate_refuses_every_unregistered_rung_for_every_seat(rung, role):
     credit = _credit_result()
     result = gate_check(
         [credit],
         "pi-sonnet55",
         role=role,
-        effort=effort,
+        effort=rung,
         e6_arm=f"pi-sonnet55@{rung}",
         today=TODAY,
         now=NOW,
     )
     assert result.ok is False
-    assert ("effort_required" if effort is None else "e6_arm_required") in result.reason
+    assert "not_placed" in result.reason
+
+
+@pytest.mark.parametrize("marker", ["pi-sonnet55@bogus", "pi-sonnet55@off", "sonnet@high"])
+def test_a_marker_naming_another_rung_or_profile_is_inert(marker):
+    """hk 2185: --effort names the rung; a stale marker opens and closes nothing."""
+
+    credit = _credit_result()
+    result = gate_check(
+        [credit],
+        "pi-sonnet55",
+        role="worker",
+        effort="high",
+        e6_arm=marker,
+        today=TODAY,
+        now=NOW,
+    )
+    assert result.ok is True, result.reason
+    assert result.e6_arm is None
 
 
 @pytest.mark.parametrize("role", [None, "builder", "worker"])
-def test_launch_refuses_a_consult_only_credit_row_without_the_marker(role):
-    """F2: a consult_only gate on an unmeasured credit row keeps the marker rule."""
+def test_launch_admits_a_consult_only_credit_row_only_for_worker_and_tester(role):
+    """F2: a consult_only gate on a credit row keeps the request and seat rules."""
 
-    with pytest.raises(launch.LaunchError):
+    if role == "worker":
+        decision = launch.resolve_launch(
+            "pi-sonnet55",
+            effort="high",
+            role=role,
+            operator_request="hk:task/2079",
+            view=_consult_only_view(),
+        )
+        assert decision.gate == "consult_only"
+        return
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
         launch.resolve_launch(
             "pi-sonnet55",
             effort="high",
@@ -1123,7 +1173,7 @@ def test_launch_admits_a_consult_only_credit_row_for_a_worker_with_marker_and_re
 
 
 @pytest.mark.parametrize("role", [None, "builder", "worker"])
-def test_gate_cli_keeps_the_marker_rule_on_a_consult_only_credit_row(monkeypatch, capsys, role):
+def test_gate_cli_keeps_the_request_and_seat_rules_on_a_consult_only_credit_row(monkeypatch, capsys, role):
     assert _set_manual_credit_cli() == 0
     capsys.readouterr()
     view = _consult_only_view()
@@ -1145,7 +1195,8 @@ def test_gate_cli_keeps_the_marker_rule_on_a_consult_only_credit_row(monkeypatch
         argv += ["--role", role]
     rc = cli.main(argv)
     captured = capsys.readouterr()
-    assert rc in {3, 5}, captured.out + captured.err
+    # worker: admitted on the request; builder/none: the seat rule refuses.
+    assert rc == (0 if role == "worker" else 5), captured.out + captured.err
 
 
 def test_gate_keeps_the_seat_rule_on_a_consult_only_credit_row_with_the_marker():
@@ -1168,23 +1219,32 @@ def test_gate_keeps_the_seat_rule_on_a_consult_only_credit_row_with_the_marker()
 
 
 def test_recommend_does_not_restore_a_consult_only_credit_row():
-    """F3: the canon's consult_only exclusion stays; the offering only replaces the E6 fold."""
+    """F3: the canon's consult_only exclusion stays — a placement is not an offer.
 
-    view = _consult_only_view()
+    hk 2185: pi-haiku55@high is a B default placement; a canon consult_only gate
+    on it removes it from the B candidates while the other B rows stay.
+    """
+
+    view = _consult_only_view(profile="pi-haiku55", rung="high")
     table = bench._catalog_grade_table(view)
     assert table is not None
-    payload = recommend.recommend_dict([_credit_result()], "C", today=TODAY, now=NOW, grade_table=table)
-    rows = [r for r in payload["rows"] if r["profile"] == "pi-sonnet55" and r["kind"] == "candidate"]
-    assert not rows, rows
+    credit = _credit_result()
+    payload = recommend.recommend_dict([credit], "B", today=TODAY, now=NOW, grade_table=table)
+    assert not [
+        r
+        for r in payload["rows"]
+        if r["profile"] == "pi-haiku55" and r["kind"] == "candidate" and r["launch"].endswith("high")
+    ]
     assert any(
-        r["profile"] == "pi-sonnet55" and r["effort"] == "high" and "consult_only" in r["reason"]
+        r["profile"] == "pi-haiku55" and r["effort"] == "high" and "consult_only" in r["reason"]
         for r in payload["excluded"]
     )
-    # The other default rungs are still offered, once each.
-    offered = {
+    # The canon's own consult_only rungs (sonnet@medium, haiku@xhigh/max) never
+    # become candidates either. hk 2205: pi-sonnet55@high (canon A) is allowed —
+    # it lists at B as a canon one-up row.
+    assert not {
         r["profile"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
-    }
-    assert offered == {"pi-haiku55", "pi-opus55"}
+    } - {"pi-sonnet55"}
 
 
 @pytest.mark.parametrize(
@@ -1219,6 +1279,7 @@ def test_hand_edited_credit_store_is_rejected(edit):
 
 @pytest.mark.parametrize("pool", sorted(providers.BUILTIN))
 def test_used_is_still_required_for_every_probed_pool(pool, capsys):
+    window = "credit" if pool == "commandcode" else "7d"
     rc = cli.main(
         [
             "manual",
@@ -1226,7 +1287,7 @@ def test_used_is_still_required_for_every_probed_pool(pool, capsys):
             "--pool",
             pool,
             "--window",
-            "7d",
+            window,
             "--measured-at",
             "now",
             "--reason",
@@ -1235,7 +1296,11 @@ def test_used_is_still_required_for_every_probed_pool(pool, capsys):
     )
     captured = capsys.readouterr()
     assert rc == 2
-    assert "--used" in captured.err
+    if pool == "commandcode":
+        assert "--remaining" in captured.err
+        assert "--expires-on" in captured.err
+    else:
+        assert "--used" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -1301,7 +1366,7 @@ def test_a_carrier_row_under_another_key_does_not_hide_the_registered_rung(monke
     view, table = _canon_with_pi_row_at(effort, keep_registered=True)
     _serve_canon(monkeypatch, view, table)
     monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
-    for role, expected in (("worker", 0), ("tester", 0), ("builder", 5), (None, 5)):
+    for role, expected in (("worker", 0), ("tester", 0), ("builder", 0), (None, 5)):
         argv = ["gate", "-m", "pi-sonnet55", "--effort", "high", "--no-cache"]
         if role is not None:
             argv += ["--role", role]
@@ -1311,22 +1376,28 @@ def test_a_carrier_row_under_another_key_does_not_hide_the_registered_rung(monke
 
 @pytest.mark.parametrize("keep_registered", [True, False])
 @pytest.mark.parametrize("effort", ["", "bogus", "off", "default"])
-def test_recommend_lists_one_default_rung_whatever_other_keys_the_canon_carries(effort, keep_registered):
+def test_recommend_lists_the_placed_rungs_whatever_other_keys_the_canon_carries(effort, keep_registered):
+    """hk 2185: only placed rungs list, once each; an extra canon key adds nothing.
+
+    At C the pi-sonnet55 rungs are low (consult_only) and medium (B) — neither is
+    a C candidate, so the C surface carries no pi-sonnet55 row whatever the canon
+    says about the extra key.
+    """
+
     _, table = _canon_with_pi_row_at(effort, keep_registered=keep_registered)
     payload = recommend.recommend_dict([_credit_result()], "C", today=TODAY, now=NOW, grade_table=table)
     launches = [
         r["launch"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] == "pi-sonnet55"
     ]
-    # Only the registered default rung is ever offered, and only if the canon carries it.
-    assert launches == (["pi-sonnet55 --effort high"] if keep_registered else [])
+    assert launches == []
 
 
 @pytest.mark.parametrize("gate", ["escalation", "consult_only"])
 def test_recommend_keeps_a_non_default_canon_gate_on_the_credit_row(gate):
-    """F6: the offering replaces only a plain default-gate E6 fold."""
+    """F6: a canon gate on a placed credit rung is honoured, never overridden."""
 
     entries = tuple(
-        replace(entry, gate=gate) if entry.key == ("pi-sonnet55", "high") else entry
+        replace(entry, gate=gate) if entry.key == ("pi-haiku55", "medium") else entry
         for entry in bench.catalog_snapshot()
     )
     view = launch.CatalogView(entries, source=bench.CATALOG_SOURCE_CACHE, age_s=0)
@@ -1334,10 +1405,21 @@ def test_recommend_keeps_a_non_default_canon_gate_on_the_credit_row(gate):
     assert table is not None
     credit = _credit_result()
     payload = recommend.recommend_dict([credit], "C", today=TODAY, now=NOW, grade_table=table)
-    assert not [r for r in payload["rows"] if r["profile"] == "pi-sonnet55" and r["kind"] == "candidate"]
-    assert any(r["profile"] == "pi-sonnet55" and r["effort"] == "high" for r in payload["excluded"])
+    # The gated rung never becomes a candidate.
+    assert not [
+        r
+        for r in payload["rows"]
+        if r["profile"] == "pi-haiku55" and r["kind"] == "candidate" and r["launch"].endswith("medium")
+    ]
+    if gate == "escalation":
+        assert any(r["kind"] == "escalation" and r["profile"] == "pi-haiku55" for r in payload["rows"])
+    else:
+        assert any(
+            r["profile"] == "pi-haiku55" and r["effort"] == "medium" and "consult_only" in r["reason"]
+            for r in payload["excluded"]
+        )
     text = recommend_text([credit], "C", today=TODAY, now=NOW, grade_table=table)
-    assert "pi-sonnet55 --effort high " not in "\n".join(
+    assert "pi-haiku55 --effort medium " not in "\n".join(
         line for line in text.splitlines() if line[:1].isdigit()
     )
 
@@ -1369,8 +1451,8 @@ def _canon_with_measured_siblings(extra_effort: str):
 
 @pytest.mark.parametrize("extra", ["off", "bogus", "default"])
 @pytest.mark.parametrize("role", [None, "builder", "worker"])
-def test_a_measured_sibling_does_not_graduate_an_unmeasured_key_in_the_gate(extra, role):
-    """F8: an unknown rung never borrows the profile's default placement (a measured sibling)."""
+def test_an_unknown_rung_never_borrows_a_sibling_placement_in_the_gate(extra, role):
+    """F8: an unknown rung names no row — a placed sibling cannot stand in for it."""
 
     _, table = _canon_with_measured_siblings(extra)
     credit = _credit_result()
@@ -1386,32 +1468,39 @@ def test_a_measured_sibling_does_not_graduate_an_unmeasured_key_in_the_gate(extr
             now=NOW,
         )
         assert result.ok is False, result.reason
+        assert "not_placed" in result.reason
 
 
 @pytest.mark.parametrize("extra", ["off", "bogus", "default"])
 @pytest.mark.parametrize("role", [None, "builder", "worker"])
-def test_a_measured_sibling_does_not_graduate_an_unmeasured_key_in_launch(extra, role):
+def test_an_unknown_rung_never_borrows_a_sibling_placement_in_launch(extra, role):
     view, _ = _canon_with_measured_siblings(extra)
-    with pytest.raises(launch.LaunchError, match="e6_arm_required"):
+    with pytest.raises(launch.LaunchError, match="not placed at effort"):
         launch.resolve_launch("pi-sonnet55", effort=extra, role=role, view=view)
 
 
 def test_a_canon_placed_credit_rung_is_an_ordinary_placement():
-    """Control: graduation is the canon moving the rung's own row above the carrier."""
+    """A canon move is an ordinary re-placement; the worker/tester seat rule stays."""
 
     view, table = _canon_with_measured_siblings("off")
-    decision = launch.resolve_launch("pi-sonnet55", effort="high", role="builder", view=view)
+    decision = launch.resolve_launch("pi-sonnet55", effort="high", role="worker", view=view)
     assert (decision.effort, decision.grade) == ("high", "B")
     credit = _credit_result()
     result = gate_check(
-        [credit], "pi-sonnet55", role="builder", effort="high", grade_table=table, today=TODAY, now=NOW
+        [credit], "pi-sonnet55", role="worker", effort="high", grade_table=table, today=TODAY, now=NOW
     )
     assert result.ok is True, result.reason
-    # The unmeasured sibling rungs stay marker-gated next to it.
-    refused = gate_check(
-        [credit], "pi-sonnet55", role="builder", effort="low", grade_table=table, today=TODAY, now=NOW
+    assert result.grade == "B"
+    # op-1028-seattask: a placed default rung takes the builder seat too; a
+    # call that names no seat is still refused.
+    builder = gate_check(
+        [credit], "pi-sonnet55", role="builder", effort="high", grade_table=table, today=TODAY, now=NOW
     )
-    assert refused.ok is False
+    assert builder.ok is True, builder.reason
+    refused = gate_check(
+        [credit], "pi-sonnet55", role=None, effort="high", grade_table=table, today=TODAY, now=NOW
+    )
+    assert refused.ok is False and refused.role_denied is True
 
 
 def _area_prefer(profile: str, effort: str, area: str, model_id: str):
@@ -1435,7 +1524,7 @@ def test_an_area_preference_never_lifts_a_credit_row_above_a_subscription_row():
     """F9: the credit is a parallel option on the final ranking too."""
 
     credit = _credit_result()
-    exception = _area_prefer("pi-sonnet55", "high", "python", "anthropic/claude-sonnet-5-5")
+    exception = _area_prefer("pi-haiku55", "medium", "python", "anthropic/claude-haiku-5-5")
     kwargs = dict(
         today=TODAY,
         now=NOW,
@@ -1443,7 +1532,7 @@ def test_an_area_preference_never_lifts_a_credit_row_above_a_subscription_row():
         model_prices={},
         area="python",
         area_exceptions=[exception],
-        catalog_model_ids={("pi-sonnet55", "high"): "anthropic/claude-sonnet-5-5"},
+        catalog_model_ids={("pi-haiku55", "medium"): "anthropic/claude-haiku-5-5"},
     )
     payload = recommend.recommend_dict([_claude_result(), credit], "C", **kwargs)
     names = [r["profile"] for r in payload["rows"] if r["kind"] == "candidate"]
@@ -1452,7 +1541,7 @@ def test_an_area_preference_never_lifts_a_credit_row_above_a_subscription_row():
     assert credit_idx and other_idx, names
     assert max(other_idx) < min(credit_idx), names
     # The preference still orders the credit rows among themselves.
-    assert [names[i] for i in credit_idx][0] == "pi-sonnet55", names
+    assert names[credit_idx[0]] == "pi-haiku55", names
     text = recommend_text([_claude_result(), credit], "C", **kwargs)
     ranked = _ranked_names(text)
     assert [i for i, n in enumerate(ranked) if n in PI_PROFILES][0] > max(
@@ -1542,27 +1631,22 @@ def test_a_bare_launch_is_refused_in_the_round_4_mixed_canon(monkeypatch, capsys
     assert result.reason == recommend.credit_effort_required_reason("pi-sonnet55")
 
 
-@pytest.mark.parametrize(("profile", "rung"), PI_ROWS)
+@pytest.mark.parametrize(("profile", "rung"), PI_DEFAULT_RUNGS)
 def test_an_explicit_effort_selects_exactly_that_rung(profile, rung):
-    """The marker opens the rung --effort names, in launch and in the gate, and nothing else."""
+    """--effort names the rung in launch and in the gate; a marker adds nothing."""
 
     view = _snapshot_view()
-    decision = launch.resolve_launch(
-        profile, effort=rung, role="worker", e6_arm=_marker(profile, rung), view=view
-    )
-    assert (decision.effort, decision.e6_arm) == (rung, _marker(profile, rung))
+    decision = launch.resolve_launch(profile, effort=rung, role="worker", view=view)
+    assert (decision.effort, decision.e6_arm) == (rung, None)
     credit = _credit_result()
-    admitted = gate_check(
-        [credit], profile, role="worker", effort=rung, e6_arm=_marker(profile, rung), today=TODAY, now=NOW
-    )
+    admitted = gate_check([credit], profile, role="worker", effort=rung, today=TODAY, now=NOW)
     assert admitted.ok is True, admitted.reason
+    # A marker naming another rung is inert — --effort still selects the rung.
     other = next(candidate for candidate in PI_RUNGS if candidate != rung)
-    with pytest.raises(launch.LaunchError, match="e6_arm_required"):
-        launch.resolve_launch(profile, effort=rung, role="worker", e6_arm=_marker(profile, other), view=view)
-    mismatched = gate_check(
+    still = gate_check(
         [credit], profile, role="worker", effort=rung, e6_arm=_marker(profile, other), today=TODAY, now=NOW
     )
-    assert mismatched.ok is False and "e6_arm_required" in mismatched.reason
+    assert still.ok is True, still.reason
     # A marker alone names no rung.
     with pytest.raises(launch.LaunchError, match="effort_required"):
         launch.resolve_launch(profile, role="worker", e6_arm=_marker(profile, rung), view=view)
@@ -1577,8 +1661,16 @@ def test_gate_and_launch_print_the_same_line_for_a_bare_spelling(profile):
 
 
 def test_the_credit_rows_are_accounted_once_each_on_the_c_surface():
-    """The pi fold entries stripped by the existing byte-identical tests stay covered here."""
+    """Every C-placed pi rung is accounted for exactly once on the C surface."""
 
+    c_rows = sorted((p, r) for p, r in PI_ROWS if _placed_grade(p, r) == "C")
+    # hk 2205: the canon B-placed default rung (pi-haiku55@high) also surfaces
+    # at C — as a one-up listing one grade below its own placement.
+    b_one_up = sorted(
+        (p, r) for p, r in PI_ROWS if _placed_grade(p, r) == "B" and _placed_gate(p, r) == "default"
+    )
+    c_rows = sorted([*c_rows, *b_one_up])
+    c_candidates = {(p, r) for p, r in c_rows if _placed_gate(p, r) == "default"}
     for credit_state in ("missing", "fresh"):
         providers_ = [_claude_result()]
         if credit_state == "fresh":
@@ -1592,13 +1684,13 @@ def test_the_credit_rows_are_accounted_once_each_on_the_c_surface():
             for r in payload["rows"]
             if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
         ] + [(r["profile"], r["effort"]) for r in payload["excluded"] if r["profile"] in PI_PROFILES]
-        assert sorted(keys) == sorted(PI_ROWS), (credit_state, keys)
+        assert sorted(keys) == c_rows, (credit_state, keys)
         fold = next(line for line in text.splitlines() if line.startswith("✗ 제외"))
         assert int(fold.split("(", 1)[1].split(")", 1)[0]) == len(payload["excluded"])
         offered = {
             r["profile"] for r in payload["rows"] if r["kind"] == "candidate" and r["profile"] in PI_PROFILES
         }
-        assert offered == (set(PI_PROFILES) if credit_state == "fresh" else set())
+        assert offered == ({p for p, _r in c_candidates} if credit_state == "fresh" else set())
 
 
 # ---------------------------------------------------------------------------
@@ -1627,3 +1719,31 @@ def test_the_credit_pool_is_pace_unknown_and_needs_no_pace_override():
     assert result.pace_override_ref is None
     assert "pace-unknown window=credit" in result.reason
     assert "pace_exhaustion" not in result.reason
+
+
+def _canon_without(profile: str, effort: str):
+    """The served canon minus one placed credit rung (hk 2188 r3, 219-a)."""
+
+    entries = [entry for entry in bench.catalog_snapshot() if entry.key != (profile, effort)]
+    entries = bench._catalog_from_payload({"catalog": [entry.as_dict() for entry in entries]})
+    view = launch.CatalogView(tuple(entries), source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    return view, table
+
+
+def test_an_unplaced_credit_rung_never_takes_the_builder_seat():
+    """A rung the served canon does not place borrows a sibling row; the builder
+    seat must stay refused in both launch and gate (hk 2188 r3, 219-a).
+    Mutants: drop the unplaced clause, or pass the borrowed row -> RED."""
+
+    view, table = _canon_without("pi-sonnet55", "xhigh")
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch("pi-sonnet55", effort="xhigh", role="builder", view=view)
+    # The same placed sibling still takes the builder seat on its own rung.
+    assert launch.resolve_launch("pi-sonnet55", effort="high", role="builder", view=view).effort == "high"
+    credit = _credit_result()
+    refused = gate_check(
+        [credit], "pi-sonnet55", role="builder", effort="xhigh", grade_table=table, today=TODAY, now=NOW
+    )
+    assert refused.ok is False and refused.role_denied is True

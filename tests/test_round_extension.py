@@ -436,9 +436,22 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
             ).encode()
         ), profile
         assert decision.render().encode() == baseline["launch_text"][profile].encode(), profile
+    # hk 2185: the alt-lane canon rows are ordinary placements now (candidates at
+    # their grades and escalation entries for the escalation-gated rungs). This
+    # baseline predates them, so compare against the same table without them —
+    # the placement of those rows is pinned by the hk 2185 tests.
+    alt_free_table = {
+        grade: [p for p in profiles if p.name not in recommend.ALTLANE_PROFILES]
+        for grade, profiles in recommend.GRADE_TABLE.items()
+    }
     for grade, expected in baseline["recommend"].items():
         actual = recommend.recommend(
-            _healthy_s_plus_providers(), grade, today=TODAY, now=NOW, bench_scores=[]
+            _healthy_s_plus_providers(),
+            grade,
+            today=TODAY,
+            now=NOW,
+            bench_scores=[],
+            grade_table=alt_free_table,
         )
 
         # hk 1729 adds two unmeasured B rows. Their placement is asserted in
@@ -453,6 +466,15 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
         def _strip_fusion(text: str) -> str:
             out = []
             for line in text.splitlines():
+                if line[:1].isdigit():
+                    # hk 2185: the alt-lane canon rows are ranked candidates at
+                    # their placed grades now; drop them and renumber so the
+                    # main baseline still compares every prior line.
+                    token = line.split(". ", 1)[1].split()[0]
+                    if token in recommend.ALTLANE_PROFILES:
+                        continue
+                    out.append(line)
+                    continue
                 if not line.startswith("✗ 제외"):
                     if "devin-fusion-sol61" not in line:
                         out.append(line)
@@ -468,7 +490,17 @@ def test_ordinary_defaults_and_recommendations_unchanged_except_fusion_sol_rows(
                 ]
                 if entries:
                     out.append(f"✗ 제외 ({len(entries)}): " + " · ".join(entries))
-            return "\n".join(out)
+            # Renumber the surviving ranked lines (1..N, in order).
+            numbered = []
+            rank = 0
+            for line in out:
+                if line[:1].isdigit():
+                    rank += 1
+                    rest = line.split(". ", 1)[1]
+                    numbered.append(f"{rank}. {rest}")
+                else:
+                    numbered.append(line)
+            return "\n".join(numbered)
 
         actual = _strip_fusion(actual).replace(" · pace-unknown window=30d", "")
         assert actual.encode() == expected.encode(), grade

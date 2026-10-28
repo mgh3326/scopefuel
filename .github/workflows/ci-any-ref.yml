@@ -1,0 +1,91 @@
+name: CI (any ref)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact ref to test - a 40-hex sha or a branch name (no merge with main)
+        required: true
+        type: string
+      suite:
+        description: Which suites to run
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - test
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  resolve:
+    name: resolve ref
+    runs-on: ubuntu-latest
+    # No concurrency group here: keying it on inputs.ref alone lets a
+    # same-ref different-suite dispatch cancel a resolve mid-flight and the
+    # run dies silently (hk 2199 / comment 8104, one job earlier).
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          SHA="$(scripts/resolve-ci-ref "$INPUT_REF" "$GITHUB_REPOSITORY")"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: ci at target ref
+    needs: resolve
+    # Concurrency is keyed on the RESOLVED sha plus the suite (hk 2199): a
+    # dispatch by branch name and one by its sha share a key, and a lint/test
+    # dispatch on the same sha cancels only the same suite, never a run of a
+    # different suite on that sha.
+    concurrency:
+      group: ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      suite: ${{ inputs.suite }}
+
+  status:
+    name: post ci-ok status
+    # A completed dispatch posts a COMMIT STATUS named ci-ok on the target sha;
+    # PR CI reports a CHECK RUN named ci-ok. For fixed-base drafts the gate reads
+    # the commit status on the exact head, which only exists for suite=all —
+    # partial suites post ci-ok-<suite> and name their check ci-ok (<suite>).
+    if: always() && needs.resolve.result == 'success'
+    needs: [resolve, ci]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ci-any-ref-status-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}
+      cancel-in-progress: true
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      RESULT: ${{ needs.ci.result }}
+      SUITE: ${{ inputs.suite }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Post commit status on target sha
+        run: |
+          case "$RESULT" in
+            success)   STATE=success ;;
+            cancelled) STATE=error ;;
+            *)         STATE=failure ;;
+          esac
+          # Only a full run earns the gate context; partial suites get ci-ok-<suite>.
+          if [[ "$SUITE" == all ]]; then CONTEXT=ci-ok; else CONTEXT="ci-ok-$SUITE"; fi
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$STATE" \
+            -f context="$CONTEXT" \
+            -f target_url="$RUN_URL" \
+            -f description="exact-head CI ($SUITE): $RESULT"

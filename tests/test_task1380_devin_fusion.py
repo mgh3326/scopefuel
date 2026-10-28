@@ -26,6 +26,7 @@ from scopefuel import bench, cli, launch
 from scopefuel.model import Bucket, ProviderResult, Scope
 from scopefuel.providers import devin
 from scopefuel.recommend import (
+    ALTLANE_PROFILES,
     DEVIN_FUSION_ANNOTATION,
     GRADE_TABLE,
     PROFILE_ALIASES,
@@ -321,11 +322,12 @@ def test_at_b_every_measured_row_precedes_the_first_fusion_row():
     evaluation = _b_evaluation(_equal_quota_providers())
     included = evaluation.included
     first_fusion = next(i for i, c in enumerate(included) if c.profile.name in FUSION_PROFILES)
-    # Sanity: both fusion rows are present and adjacent at the tail of B.
-    assert [c.profile.name for c in included[first_fusion:]] == [
-        "devin-fusion-opus55",
-        "devin-fusion-sonnet55",
-    ]
+    # Sanity: both fusion rows are present and adjacent at the tail of B. hk 2185
+    # adds the unmeasured paid-credit alt-lane rows after them (credit rows sort
+    # last), which is the same unmeasured-tail rule this test pins.
+    tail = [c.profile.name for c in included[first_fusion:]]
+    assert tail[:2] == ["devin-fusion-opus55", "devin-fusion-sonnet55"]
+    assert set(tail[2:]) <= set(ALTLANE_PROFILES)
     for candidate in included[first_fusion:]:
         assert not _is_measured(candidate), candidate.profile.name
     # And concretely: the rep-measured one-ups at B sit ahead of the lane.
