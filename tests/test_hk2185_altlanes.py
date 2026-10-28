@@ -293,18 +293,22 @@ def test_promoted_alt_ranks_above_a_preserve_class_trigger():
     )
 
 
-def test_promoted_alt_ranks_above_an_early_window_trigger():
-    """Tester r1 B1: the first 5% of the weekly window has no pace verdict."""
+def test_an_early_window_ratio_never_triggers():
+    """hk 2205 comment 8096: the first 5% of the weekly window is too noisy.
+
+    Mutant: read the ratio without the elapsed-fraction guard -> this goes
+    RED. A 4.2x read at ~1% elapsed is exactly the noisy early window
+    ``_pace_window_verdicts`` marks unknown — it neither yields nor counts as
+    under-used, so today's order stands.
+    """
 
     providers = _healthy()
-    providers[0] = _provider("claude", _bucket("7d", 5.0, 166.0))  # 4.2x, pace unknown
+    providers[0] = _provider("claude", _bucket("7d", 5.0, 166.0))  # 4.2x, ~1% elapsed
+    assert altlane_promotions(providers, NOW, grade="A") == {}
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
     names = _names(payload)
-    assert names.index("pi-sonnet55") < names.index("sonnet")
-    assert (
-        next(row for row in _candidates(payload) if row["profile"] == "pi-sonnet55")["promotion"]
-        == "promoted: claude 7d pace 4.20x"
-    )
+    assert names.index("pi-sonnet55") > names.index("sonnet")
+    assert not any(row.get("promotion") for row in _candidates(payload))
 
 
 def test_promoted_alt_ranks_above_a_trigger_below_1x_threshold():
@@ -337,13 +341,24 @@ def test_promotion_never_lifts_a_rung_above_its_placed_grade():
 
     providers = _healthy()
     providers[0] = _weekly(75.0)
-    for grade in ("S+", "S", "A+", "A", "B", "C"):
+    order = ("S+", "S", "A+", "A", "B", "C")
+    for index, grade in enumerate(order):
         payload = recommend_dict(providers, grade, today=TODAY, now=NOW)
         placed_here = {
             profile
             for profile, rung, row_grade, gate, _r in ALTLANE_CANON_ROWS
             if row_grade == grade and gate == "default"
         }
+        # hk 2205 (8097): a canon-placed rung may also list ONE grade below its
+        # own placement, tagged [one-up] — promotion never lifts it above that
+        # placement, so the cap still holds.
+        if index > 0:
+            upper = order[index - 1]
+            placed_here |= {
+                profile
+                for profile, rung, row_grade, gate, _r in ALTLANE_CANON_ROWS
+                if row_grade == upper and gate == "default"
+            }
         listed = {name for name in _names(payload) if name in ALTLANE_PROFILES}
         assert listed <= placed_here, (grade, listed, placed_here)
 
@@ -581,9 +596,15 @@ def test_a_recorded_failure_blocks_promotion_for_that_grade():
 
     providers = _healthy()
     providers[0] = _weekly(75.0)
-    blocked = frozenset({("pi-sonnet55", "A")})
+    # hk 2205: block keys are (profile, rung, grade) — a rep with no rung
+    # carries effort None and blocks the profile's whole grade.
+    blocked = frozenset({("pi-sonnet55", "high", "A")})
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW, promotion_blocks=blocked)
-    row = next(row for row in _candidates(payload) if row["profile"] == "pi-sonnet55")
+    row = next(
+        row
+        for row in _candidates(payload)
+        if row["launch"] == "pi-sonnet55 --effort high"
+    )
     assert "promotion" not in row
     # A different grade is unaffected.
     other = recommend_dict(providers, "A+", today=TODAY, now=NOW, promotion_blocks=blocked)
@@ -595,9 +616,9 @@ def test_a_recorded_failure_blocks_promotion_for_that_grade():
 def test_a_lazy_promotion_block_is_only_read_when_a_promotion_applies():
     calls = {"n": 0}
 
-    def blocks() -> frozenset[tuple[str, str]]:
+    def blocks() -> frozenset[tuple[str, str | None, str]]:
         calls["n"] += 1
-        return frozenset({("pi-sonnet55", "A")})
+        return frozenset({("pi-sonnet55", "high", "A")})
 
     healthy = _healthy()
     recommend_dict(healthy, "A", today=TODAY, now=NOW, promotion_blocks=blocks)
@@ -609,23 +630,33 @@ def test_a_lazy_promotion_block_is_only_read_when_a_promotion_applies():
 
 
 def test_the_cli_reads_failures_from_the_reps_store(monkeypatch):
-    """The CLI's block set comes from reps: completed=0 or a recorded blocker."""
+    """The CLI's block set comes from reps: completed=0 or an impl/fix blocker.
+
+    hk 2205 (8097 defect 1): a verify/reviewer rep's blockers_found is the
+    tester succeeding, never the lane's failure; blocks key by (profile, rung,
+    grade), and any completed=0 rep blocks whatever its role.
+    """
 
     class Rep:
-        def __init__(self, profile, grade, completed, blockers):
+        def __init__(self, profile, grade, completed, blockers, role="impl", effort=None):
             self.profile = profile
             self.grade = grade
             self.completed = completed
             self.blockers_found = blockers
+            self.role = role
+            self.effort = effort
 
     reps = [
-        Rep("pi-sonnet55", "A", 0, 0),  # FAIL
-        Rep("pi-haiku55", "C", 1, 2),  # BOUNCE
+        Rep("pi-sonnet55", "A", 0, 0, role="verify", effort="high"),  # FAIL — any role
+        Rep("pi-haiku55", "C", 1, 2, role="impl"),  # BOUNCE — the lane's own work
+        Rep("pi-sonnet55", "A", 1, 3, role="verify"),  # tester success — never a block
+        Rep("pi-sonnet55", "A", 1, 3, role="reviewer"),  # reviewer success — never a block
         Rep("pi-opus55", "S+", 1, 0),  # clean pass — no block
-        Rep("sonnet", "A", 0, 0),  # not an alt lane — ignored
     ]
     monkeypatch.setattr(bench, "read_reps", lambda **kwargs: reps)
-    assert cli._promotion_blocks() == frozenset({("pi-sonnet55", "A"), ("pi-haiku55", "C")})
+    assert cli._promotion_blocks() == frozenset(
+        {("pi-sonnet55", "high", "A"), ("pi-haiku55", None, "C")}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +673,13 @@ def test_an_ineligible_alt_is_never_promoted_into_view():
     providers = [_weekly(75.0), broken, _credit("commandcode")]
     payload = recommend_dict(providers, "A", today=TODAY, now=NOW)
     assert "pi-sonnet55" not in _names(payload)
-    assert not any(row.get("promotion") for row in _candidates(payload))
+    # An alt row whose own pool IS measured still promotes — the fold is per
+    # pool, so only the anthropic-api rows stay out.
+    assert not any(
+        row.get("promotion")
+        for row in _candidates(payload)
+        if row["provider"] == "anthropic-api"
+    )
 
 
 def test_an_alt_with_an_unsubscribed_or_excluded_pool_is_not_promoted():

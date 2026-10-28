@@ -466,6 +466,13 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
             and _listed(profile)
         ]
+        # hk 2205: the name-first-match slot is computed over the UNFILTERED
+        # physical order — the gate/consult_only folds happen after entries
+        # are built, so a gated sibling rung (pi-sonnet55@medium, canon B)
+        # still claims the profile's slot before an appended one-up row.
+        physical = [profile for profile in GRADE_TABLE[grade]]
+        physical += [profile for profile, _placed in _one_up_profiles(grade, GRADE_TABLE)]
+        physical += [profile for profile, _placed in recommend_mod._borrowed_profiles(grade, GRADE_TABLE)]
         expected[grade] = [
             label(profile)
             for profile, _one_up in sorted(
@@ -480,7 +487,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
                     # below "free"/"unknown" at equal quota/boost standing.
                     item[0].billing == "paid",
                     next(
-                        index for index, candidate in enumerate(ordered) if candidate[0].name == item[0].name
+                        index for index, candidate in enumerate(physical) if candidate.name == item[0].name
                     ),
                 ),
             )
