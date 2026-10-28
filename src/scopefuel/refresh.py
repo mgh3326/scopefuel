@@ -234,6 +234,34 @@ def spawn(pool: str, *, background: bool) -> int:
     return subprocess.run(command, check=False).returncode
 
 
+def spawn_detached(pool: str) -> bool:
+    """Launch the bounded worker detached and quiet — for in-collect background refresh.
+
+    hk 2182: short-budget callers (the daemon's ``--json`` polls, gate,
+    --recommend) must not run a PTY probe they cannot finish, but a stale
+    cache still needs a measurement. This detached worker owns its own
+    60s budget and writes the cache when done; the pool and provider locks
+    make a second concurrent worker a no-op.
+    """
+
+    command = [sys.executable, "-m", "scopefuel.cli", "refresh", pool, "--_worker"]
+    try:
+        path = log_path(pool)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab") as log_file:
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=log_file,
+                close_fds=True,
+                start_new_session=True,
+            )
+        return True
+    except OSError:
+        return False
+
+
 def _admitted_landing(entry: dict, before_fetched: float | None, now: float) -> ProviderResult | None:
     """An in-flight landing counts only when strictly newer than the pre-wait entry."""
     fetched = entry.get("fetched_at")
