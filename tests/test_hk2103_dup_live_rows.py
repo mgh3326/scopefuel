@@ -170,10 +170,7 @@ def test_duplicate_live_row_launch_refuses_like_the_gate(
     captured = capsys.readouterr()
     assert (gate_rc, launch_rc) == (3, 3), captured.out + captured.err
     text = captured.out + captured.err
-    assert "live canon rows" in text
-    assert profile in text
-    assert effort in text
-    assert "2" in text
+    assert f"profile '{profile}' has 2 live canon rows for rung '{effort}'" in text
 
 
 def test_duplicate_refusal_names_the_fallback_rung_holding_the_rows(monkeypatch, capsys):
