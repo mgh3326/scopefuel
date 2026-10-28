@@ -981,7 +981,10 @@ def resolve_launch(
         raise LaunchError(f"role_restricted: {opened_arm} — {E6_WORKER_TESTER_ONLY_REASON}")
     if opened_arm is None and credit_placed_seat_denied(canonical, role):
         raise LaunchError(f"role_restricted: {canonical}@{resolved_effort} — {CREDIT_PLACED_SEAT_REASON}")
-    if opened_arm is None and credit_builder_seat_denied(canonical, role, row):
+    # A rung the catalog does not place takes a sibling's row (the fallback
+    # above); that borrowed row must not open a builder seat (hk 2188 r3, 219-a).
+    own_row = row if (row.profile, row.effort) == (canonical, resolved_effort) else None
+    if opened_arm is None and credit_builder_seat_denied(canonical, role, own_row):
         raise LaunchError(f"role_restricted: {canonical}@{resolved_effort} — {E6_WORKER_TESTER_ONLY_REASON}")
 
     # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라

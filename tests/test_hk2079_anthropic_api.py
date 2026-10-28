@@ -1707,3 +1707,31 @@ def test_the_credit_pool_is_pace_unknown_and_needs_no_pace_override():
     assert result.pace_override_ref is None
     assert "pace-unknown window=credit" in result.reason
     assert "pace_exhaustion" not in result.reason
+
+
+def _canon_without(profile: str, effort: str):
+    """The served canon minus one placed credit rung (hk 2188 r3, 219-a)."""
+
+    entries = [entry for entry in bench.catalog_snapshot() if entry.key != (profile, effort)]
+    entries = bench._catalog_from_payload({"catalog": [entry.as_dict() for entry in entries]})
+    view = launch.CatalogView(tuple(entries), source=bench.CATALOG_SOURCE_CACHE, age_s=0)
+    table = bench._catalog_grade_table(view)
+    assert table is not None
+    return view, table
+
+
+def test_an_unplaced_credit_rung_never_takes_the_builder_seat():
+    """A rung the served canon does not place borrows a sibling row; the builder
+    seat must stay refused in both launch and gate (hk 2188 r3, 219-a).
+    Mutants: drop the unplaced clause, or pass the borrowed row -> RED."""
+
+    view, table = _canon_without("pi-sonnet55", "xhigh")
+    with pytest.raises(launch.LaunchError, match="role_restricted"):
+        launch.resolve_launch("pi-sonnet55", effort="xhigh", role="builder", view=view)
+    # The same placed sibling still takes the builder seat on its own rung.
+    assert launch.resolve_launch("pi-sonnet55", effort="high", role="builder", view=view).effort == "high"
+    credit = _credit_result()
+    refused = gate_check(
+        [credit], "pi-sonnet55", role="builder", effort="xhigh", grade_table=table, today=TODAY, now=NOW
+    )
+    assert refused.ok is False and refused.role_denied is True
