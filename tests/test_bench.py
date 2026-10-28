@@ -32,20 +32,6 @@ def _score(
     )
 
 
-def _insert_approved_aa_rows(path):
-    conn = bench.connect(path)
-    try:
-        conn.executemany(
-            "INSERT INTO model_scores "
-            "(model_id, effort, harness, source, metric, score, rank, captured_at, "
-            "time_per_task_min, cost_per_task_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-            [(*row[:5], 50.0, None, "2026-08-01T00:00:00+00:00") for row in bench.AA_AGENT_MEASUREMENTS],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 @pytest.fixture
 def bench_home(tmp_path, monkeypatch):
     data_home = tmp_path / "xdg-data"

@@ -2,17 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import threading
 
 from scopefuel import cache
 from scopefuel.model import Bucket, ProviderResult, Scope
-
-
-def _write_creds(tmp_path):
-    path = tmp_path / "auth.json"
-    path.write_text(json.dumps({"tokens": {"access_token": "tok"}}))
-    return path
 
 
 def test_cache_falls_back_to_stale_snapshot_with_age(monkeypatch):

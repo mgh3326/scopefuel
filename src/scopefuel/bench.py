@@ -5198,7 +5198,7 @@ def _put_rep_batches(
 def _precheck_push_reps(backend: BenchBackend, reps: list[_RemoteRep], *, offset: int) -> None:
     """Refuse differing holders before each rep PUT, on either dialect."""
 
-    remote_before = _fetch_reps_for_migrate(backend, {item.record.profile for item in reps})
+    remote_before = _fetch_reps_for_identity(backend, {item.record.profile for item in reps})
     by_origin: dict[int, list[_RemoteRep]] = {}
     for remote in remote_before:
         by_origin.setdefault(remote.origin_id, []).append(remote)
@@ -5929,7 +5929,7 @@ def write_rep_grade_annotations(
         conn.close()
 
 
-# --- task #714: one-time local bench.db reps -> handoffkeep migration --------
+# --- legacy rep identity readers ------------------------------------------
 #
 # The server keys rep dedup on ``(created_by, origin_id)`` and stamps
 # ``created_by`` itself from the bearer-token identity, so two things the wire
@@ -5980,7 +5980,7 @@ def _unstamp_rep_notes(notes: str | None) -> str | None:
 _MIGRATE_REP_WINDOW = 5000  # handoffkeep GET /v1/bench/reps limit cap (queryLimit)
 
 
-def _fetch_reps_for_migrate(backend: BenchBackend, profiles: set[str]) -> list[_RemoteRep]:
+def _fetch_reps_for_identity(backend: BenchBackend, profiles: set[str]) -> list[_RemoteRep]:
     """Fetch remote reps for dedup and reconcile inside the server's GET window.
 
     The server returns only the newest ``limit`` rows (``ORDER BY id DESC``,
@@ -6007,7 +6007,7 @@ def _fetch_reps_for_migrate(backend: BenchBackend, profiles: set[str]) -> list[_
         )
         if len(page) >= _MIGRATE_REP_WINDOW:
             raise BenchBackendError(
-                f"reps migrate: remote reps for profile {profile!r} fill the server's "
+                f"rep identity check: remote reps for profile {profile!r} fill the server's "
                 f"{_MIGRATE_REP_WINDOW}-row read window — remote completeness cannot be "
                 "proven, so dedup and reconcile are unreliable"
             )
@@ -6058,17 +6058,6 @@ def _rep_content_index(reps: list[_RemoteRep]) -> dict[tuple, list[_RemoteRep]]:
     for item in reps:
         index.setdefault(_rep_content_key(item.record), []).append(item)
     return index
-
-
-# --- task #755: one-time server_id repair for cached rep rows ----------------
-#
-# Cache rows written before the server pk was captured (write-through echoes
-# of ``reps add``/``push-local``, and rows cached by pre-#755 migrate runs)
-# show ``origin:<origin_id>`` — a host-derived key in a band far above any
-# server pk — where the server row is e.g. srv:1107. This pass binds the real
-# pk. A cached row may only take the id of a remote row that provably is the
-# same rep: ``origin_id`` alone collides across machines by default, so
-# matching on it could pin another client's pk onto this cache row.
 
 
 _REP_GRADE_ORDER: tuple[str, ...] = ("S+", "S", "A+", "A", "B", "C")
