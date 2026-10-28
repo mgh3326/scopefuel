@@ -522,8 +522,7 @@ HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET=<service token client secret>
 라고 알립니다(값은 출력하지 않음).
 
 로컬 SQLite는 캐시가 되며, 읽기 실패는 캐시와 나이를 표시해 계속 동작하고, 쓰기 실패는
-종료코드 2로 끝납니다. `scopefuel bench push-local`은 기존 로컬 점수·reps를 지우지 않고 한 번
-이관할 때 사용합니다. 급 배치는 `scopefuel bench grades set`에서 deviation reference를 반드시
+종료코드 2로 끝납니다. 급 배치는 `scopefuel bench grades set`에서 deviation reference를 반드시
 함께 남겨야 합니다.
 
 ### reps id와 쓰기 규칙 (task #1384)
@@ -563,15 +562,6 @@ migrate 밴드 `[2^40, 2^40+2^48)`와 겹치지 않음). `reps list`의 `id=`는
 drop은 서버에 요청하지 않고 다른 대기 행이나 확인된 행을 건드리지 않습니다. 삭제 후에만 동일한
 add를 새 쓰기로 시작할 수 있습니다. 옛 서버는 충돌 시 조용히 덮어쓰므로 fail-closed 바인딩과 아래
 shadow 규칙이 로컬 정직성을 지킵니다.
-
-`bench push-local`도 같은 밴드를 씁니다: DB에 한 번 저장한 무작위 128-bit install id,
-로컬 rowid와 전체 canonical rep 내용의 SHA-256을 밴드에 접습니다. hostname 변경은 키를 바꾸지
-않으며, 새 DB 또는 내용이 바뀐 재사용 rowid는 새 키를 얻습니다. DB를 복사하면 install id도
-공유하므로 같은 복사본의 동일 행은 멱등 처리되고 내용이 달라진 행은 별개로 기록됩니다.
-각 PUT 직전에 migrate와 같은 GET pre-check로 다른 내용이 차지한 origin을 거부합니다.
-기존 DB는 install 메타 테이블 생성과 pending 상태 열 추가로 업그레이드되고 기존 페이로드는
-보존됩니다. `reps migrate`는 기존 migrate 밴드를 그대로 씁니다.
-fleet의 push-local 중단과 mbp 레인 전용 reps add 운영 규칙은 계속 유지됩니다.
 
 **shadow 규칙(캐시가 서버와 모순될 때).** refetch한 서버 행 `srv:S`의 내용이 같은 `server_id`의
 캐시 행과 다르면 그 캐시 사본은 덮어쓰인 rep의 증거입니다 — 서버 행이 `srv:S`로 표시되고 로컬
@@ -678,18 +668,7 @@ CLI 호출 자체가 갱신하므로 1회 재시도합니다.
 
 ## 새 provider 추가
 
-대부분은 **TOML 한 장**으로 끝납니다 — 코드도, 릴리스도 필요 없습니다.
-
-```bash
-mkdir -p ~/.config/scopefuel/providers
-$EDITOR ~/.config/scopefuel/providers/myplan.toml
-scopefuel --only myplan
-```
-
-포맷과 예제는 [docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요. 프로세스 탐색·OAuth
-갱신·다단계 호출처럼 스펙의 틀을 벗어나는 provider는 Python entry-point 플러그인으로 붙입니다.
-같은 `id`를 정의하면 **선언형 스펙이 내장 provider를 완전 대체**합니다 — 엔드포인트가 깨졌을 때 릴리스를
-기다리지 않고 사용자가 직접 고칠 수 있게 한 의도적 설계입니다.
+Provider는 내장 Python 모듈로 추가합니다. [개발 안내](docs/adding-a-provider.md)를 따르세요.
 
 **grok 사용량 소스와 한계.** 웹 화면과 일치하는 주간 게이트는 인증된 `grok` CLI의
 대화형 `/usage` 출력에서 `Weekly limit: N%`와 `Next reset: Month D, HH:MM`을 읽는다.
@@ -709,7 +688,7 @@ provider는 운영 의도에 따라 두 class로 구분됩니다.
 - **spend**: 고사용을 정상으로 본다. reset 전 24시간 미만, 70% 미만 bucket이 있으면
   **WASTE** 권고를 낸다. `kiro`, `clinepass`, `agy`, `grok`, `kimi`, `devin`.
 
-선언형 TOML 스펙에서 `class = "preserve" | "spend"`로 지정할 수 있으며(같은 `id`로 내장 provider를 대체할 때도 전체 대체 스펙에 `class` 지정 가능), Python 플러그인 메타데이터 또는 반환 `ProviderResult.pool_class`로도 설정할 수 있습니다. 자세한 내용은 [docs/adding-a-provider.md](docs/adding-a-provider.md)를 보세요.
+내장 registry의 fetcher 메타데이터와 `ProviderResult.pool_class`로 class를 지정합니다.
 
 ### 두 축: `mark`와 `usage_mark`
 

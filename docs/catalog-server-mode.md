@@ -244,7 +244,7 @@ rejects a blank one rather than filling it in.
 
 When the seeding host's tunnel endpoint is plaintext http and the persistent
 `allow_plaintext_catalog` opt-in is not written yet, `push-catalog` takes a
-per-call `--allow-plaintext-http` (the same opt-in `reps migrate` carries): it
+per-call `--allow-plaintext-http`: it
 applies to that invocation only and is never recorded to the config file. The
 flag does not make the hop safe — the bearer token crosses it in the clear, so
 use it only over a trusted private tunnel (WireGuard/Tailscale), never a
@@ -318,7 +318,7 @@ origin_id)` and `created_by` is derived from the bearer token, so hosts that
 share a token share one key space. Since #1384 the client picks `origin_id`
 as a random draw in the reserved band `[2^62, 2^63)` (`2^62 +
 secrets.randbits(62)`) — disjoint from legacy counter ids and from the
-`reps migrate` band `[2^40, 2^40+2^48)` — so two hosts can no longer collide
+legacy migration band `[2^40, 2^40+2^48)` — so two hosts can no longer collide
 on the same key.
 
 `reps list` names every id with its store: `srv:<id>` for a confirmed server
@@ -345,11 +345,6 @@ Client write path, in order:
    rejects the whole batch; the client prints `origin:<id>` and
    `srv:<conflict_server_id>` (plus the differing field names when the
    server row is readable), exits 2, and never retries under a fresh id.
-
-`bench push-local` uses the same band: each local row's `origin_id` is a
-stable SHA-256 hash of `(hostname, profile, local rowid)`, so a re-run is an
-idempotent resend and identical local rowids on different hosts cannot
-collide. `reps migrate` keeps its own hashed band unchanged.
 
 **Shadow rule.** The server row is authoritative for a server id: on
 refetch, a cache row whose `server_id` S holds different content on the

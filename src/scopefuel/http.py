@@ -81,7 +81,7 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     CPython 기본 HTTPRedirectHandler 는 Content-Length/Content-Type 외의 헤더를
     redirect 요청에 그대로 복사한다 — Authorization bearer 가 다른 origin 이나
-    https→http 다운그레이드로 새는 CWE-319. spec.py 처럼 자격이 Authorization 이
+    https→http 다운그레이드로 새는 CWE-319. 자격이 Authorization 이
     아닌 헤더에 실리는 호출자도 있어, 헤더를 지우는 대신 cross-origin redirect
     자체를 거부한다. 거부하면 호출자는 3xx 를 HttpError 로 받는다.
 

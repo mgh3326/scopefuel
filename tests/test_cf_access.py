@@ -284,7 +284,7 @@ def _reps_backend():
 
 # Every request kind scopefuel sends to handoffkeep. Reads go through the real
 # fetchers; writes through _handoffkeep_request (what push-catalog, reps add,
-# grades set, scores sync and push-local all call) and quota_share._request.
+# grades set and scores sync call) and quota_share._request.
 REQUEST_KINDS = {
     "catalog GET": lambda: bench._fetch_catalog(_catalog_backend()),
     "scores GET": lambda: bench._fetch_scores(_catalog_backend()),
@@ -1043,7 +1043,6 @@ def cli_env(tmp_path):
         "XDG_DATA_HOME": str(tmp_path / "xdg-data"),
         "HANDOFFKEEP_CONFIG": str(tmp_path / "hk-fixture.env"),
         "SCOPEFUEL_CACHE": str(tmp_path / "snapshots.json"),
-        "SCOPEFUEL_SPEC_DIR": str(tmp_path / "specs"),
         "LANG": "C.UTF-8",
         "PYTHONIOENCODING": "utf-8",
     }

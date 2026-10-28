@@ -2,10 +2,8 @@
 
 ``reps list``/``reps add`` must never print a bare ambiguous id: ``srv:<pk>``
 is the server row, ``origin:<key>`` a server-bound rep whose pk is not yet
-known locally, ``local:<rowid>`` a local-store row. ``reps refresh-ids``
-backfills ``server_id`` in the cache, keyed by the server's own
-``(created_by, origin_id)`` upsert identity plus identical content — a
-key-only match could pin another client's pk onto this host's cache row.
+known locally, ``local:<rowid>`` a local-store row. Server ids bind to the
+server's own ``(created_by, origin_id)`` upsert identity plus identical content.
 No test reaches the network — ``bench.request_json`` is replaced.
 """
 
@@ -362,104 +360,6 @@ def test_local_backend_labels_local(tmp_path, monkeypatch, capsys):
     assert not _BARE_ID.search(out), out
 
 
-def test_refresh_ids_dry_run_then_apply_is_idempotent(tmp_path, monkeypatch, capsys):
-    fake = _remote_backend(tmp_path, monkeypatch)
-    fake.reps.extend(
-        [
-            _remote_row(id=101, origin_id=500),
-            _remote_row(id=102, origin_id=501),
-            _remote_row(id=103, origin_id=502, notes="different rep", task_ref="alien"),
-            _remote_row(id=104, origin_id=504, created_by="other-client"),
-            _remote_row(id=105, origin_id=504),
-        ]
-    )
-    _seed_cache_row(
-        tmp_path, cache_key="origin:500", origin_id=500
-    )  # anonymous echo -> binds + learns created_by
-    _seed_cache_row(
-        tmp_path, cache_key="ops:501", origin_id=501, created_by=CLIENT
-    )  # exact (created_by, origin_id) pair
-    _seed_cache_row(
-        tmp_path,
-        cache_key="other:501",
-        origin_id=501,
-        created_by="other-client",
-        task_ref="alien-copy",
-    )  # pair exists for ops, not other-client -> must not take srv:102
-    _seed_cache_row(
-        tmp_path,
-        cache_key="origin:502",
-        origin_id=502,
-        task_ref="502",
-        notes="mine",
-    )  # origin id slot held by a different rep -> conflict
-    _seed_cache_row(tmp_path, cache_key="origin:503", origin_id=503)  # no server copy -> unmatched
-    _seed_cache_row(
-        tmp_path, cache_key="origin:504", origin_id=504
-    )  # two same-content remote rows -> ambiguous
-    _seed_cache_row(
-        tmp_path, cache_key="ops:900", origin_id=900, server_id=900, created_by=CLIENT
-    )  # already bound -> untouched, not a candidate
-
-    assert cli.main(["reps", "refresh-ids"]) == 0
-    out = capsys.readouterr().out
-    assert "dry-run" in out
-    assert "candidates=6" in out
-    assert "filled=2" in out
-    assert "fill origin:500 -> srv:101" in out
-    assert "fill ops:501 -> srv:102" in out
-    assert "unmatched other:501" in out
-    assert "conflict origin:502" in out
-    assert "ambiguous origin:504" in out
-    conn = _cache_db(tmp_path)
-    try:
-        bound = conn.execute("SELECT COUNT(*) FROM bench_cache_reps WHERE server_id IS NOT NULL").fetchone()[
-            0
-        ]
-    finally:
-        conn.close()
-    assert bound == 1  # dry-run wrote nothing
-
-    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
-    conn = _cache_db(tmp_path)
-    try:
-        rows = {
-            row["cache_key"]: row
-            for row in conn.execute(
-                "SELECT cache_key, server_id, created_by FROM bench_cache_reps"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-    assert rows["origin:500"]["server_id"] == 101
-    assert rows["origin:500"]["created_by"] == CLIENT  # learned from the server row
-    assert rows["ops:501"]["server_id"] == 102
-    assert rows["other:501"]["server_id"] is None  # created_by mismatch: not bound
-    assert rows["origin:502"]["server_id"] is None  # different rep's content: not bound
-    assert rows["origin:503"]["server_id"] is None
-    assert rows["origin:504"]["server_id"] is None
-    assert rows["ops:900"]["server_id"] == 900
-
-    capsys.readouterr()
-    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
-    out = capsys.readouterr().out
-    assert "candidates=4" in out  # only the still-unbound rows remain
-    assert "filled=0" in out
-
-    _stamp_reps_cache_fresh()
-    assert cli.main(["reps", "list"]) == 0
-    out = capsys.readouterr().out
-    assert "id=srv:101" in out and "id=srv:102" in out
-    assert "id=origin:503" in out
-    assert not _BARE_ID.search(out), out
-
-
-def test_refresh_ids_requires_handoffkeep(tmp_path, monkeypatch, capsys):
-    _local_backend(tmp_path, monkeypatch)
-    assert cli.main(["reps", "refresh-ids"]) == 2
-    assert "requires the handoffkeep backend" in capsys.readouterr().err
-
-
 def test_display_refs_match_grades_ref_vocabulary(tmp_path, monkeypatch, capsys):
     """The labels reps list prints are the refs grades already speaks.
 
@@ -487,48 +387,6 @@ def test_display_refs_match_grades_ref_vocabulary(tmp_path, monkeypatch, capsys)
             f"srv:{number}",
         )
     assert grades.resolve_refs("origin:42", backend_name="handoffkeep", host="h") == ()
-    assert not _BARE_ID.search(out), out
-
-
-def test_mutant_wrong_source_and_wrong_row_binding(tmp_path, monkeypatch, capsys):
-    """Directed mutants: a row shown with the wrong source, or server_id bound
-    to a row that is not the same rep (created_by or content mismatch)."""
-
-    fake = _remote_backend(tmp_path, monkeypatch)
-    # Remote holds rep #7 for client 'other-client'; this host's cache has an
-    # anonymous echo with the same origin_id but different content, plus a
-    # created_by='other-client' row with identical content.
-    fake.reps.append(_remote_row(id=77, origin_id=7, created_by="other-client", task_ref="alien-7"))
-    _seed_cache_row(tmp_path, cache_key="origin:7", origin_id=7, task_ref="mine-7", notes="own echo")
-    _seed_cache_row(
-        tmp_path,
-        cache_key="other:7",
-        origin_id=7,
-        created_by="other-client",
-        task_ref="alien-7",
-    )
-
-    result = bench.refresh_rep_server_ids(apply=True)
-    # other:7 binds — (created_by, origin_id) pair + identical content proves
-    # the same rep. origin:7 does not — the only key-holder's content differs.
-    assert result.filled == [("other:7", 77)]
-    assert result.conflicts == ["origin:7"]
-
-    conn = _cache_db(tmp_path)
-    try:
-        rows = {
-            row["cache_key"]: row["server_id"]
-            for row in conn.execute("SELECT cache_key, server_id FROM bench_cache_reps").fetchall()
-        }
-    finally:
-        conn.close()
-    assert rows == {"origin:7": None, "other:7": 77}
-
-    _stamp_reps_cache_fresh()
-    assert cli.main(["reps", "list"]) == 0
-    out = capsys.readouterr().out
-    assert "id=srv:77" in out
-    assert "id=origin:7" in out  # still honest about its source
     assert not _BARE_ID.search(out), out
 
 
@@ -593,100 +451,6 @@ def test_add_retry_never_binds_a_foreign_twin(tmp_path, monkeypatch, capsys):
     assert f"id=origin:{origin}" in out
     assert "id=srv:60000" in out  # the twin is real remote state — labeled as such
     assert not _BARE_ID.search(out), out
-
-
-def test_refresh_echo_needs_a_proven_window(tmp_path, monkeypatch, capsys):
-    """Tester round-1 regression: an echo may not fill from a partial window.
-
-    Two same-content holders of origin_id=777 under different clients; the
-    unfiltered page hides one of them, so the visible singleton is a fake
-    proof — the rep's own profile page exposes the true ambiguity.
-    """
-
-    fake = _remote_backend(tmp_path, monkeypatch)
-    fake.reps.append(_remote_row(id=60000, origin_id=777, task_ref="dup"))
-    fake.reps.append(_remote_row(id=1000, origin_id=777, created_by="other-client", task_ref="dup"))
-    for i in range(4999):
-        fake.reps.append(
-            _remote_row(
-                id=70000 + i,
-                origin_id=900_000 + i,
-                profile="filler",
-                task_ref=f"f{i}",
-            )
-        )
-    _seed_cache_row(tmp_path, cache_key="origin:777", origin_id=777, task_ref="dup")
-
-    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
-    out = capsys.readouterr().out
-    assert "ambiguous origin:777" in out
-    assert "fill origin:777" not in out
-    conn = _cache_db(tmp_path)
-    try:
-        row = conn.execute("SELECT server_id FROM bench_cache_reps WHERE cache_key = 'origin:777'").fetchone()
-    finally:
-        conn.close()
-    assert row["server_id"] is None
-
-
-def test_refresh_echo_binds_via_complete_profile_window(tmp_path, monkeypatch, capsys):
-    """A full unfiltered page must not block provable fills: every rival twin
-    shares the rep's profile, so a complete profile page is still a proof."""
-
-    fake = _remote_backend(tmp_path, monkeypatch)
-    fake.reps.append(_remote_row(id=60000, origin_id=777))
-    for i in range(5000):
-        fake.reps.append(
-            _remote_row(
-                id=70000 + i,
-                origin_id=900_000 + i,
-                profile="filler",
-                task_ref=f"f{i}",
-            )
-        )
-    _seed_cache_row(tmp_path, cache_key="origin:777", origin_id=777)
-
-    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
-    out = capsys.readouterr().out
-    assert "fill origin:777 -> srv:60000" in out
-    conn = _cache_db(tmp_path)
-    try:
-        row = conn.execute(
-            "SELECT server_id, created_by FROM bench_cache_reps WHERE cache_key = 'origin:777'"
-        ).fetchone()
-    finally:
-        conn.close()
-    assert (row["server_id"], row["created_by"]) == (60000, CLIENT)
-
-
-def test_refresh_echo_window_blocked_when_no_window_proves(tmp_path, monkeypatch, capsys):
-    """No complete window at all -> window-limited, never a guessed pk."""
-
-    fake = _remote_backend(tmp_path, monkeypatch)
-    # Every fetched page is full: 5000 same-profile fillers crowd out the one
-    # real holder (id=1), so neither the unfiltered nor the profile page can
-    # show all rivals.
-    for i in range(5000):
-        fake.reps.append(
-            _remote_row(
-                id=70000 + i,
-                origin_id=900_000 + i,
-                task_ref=f"f{i}",
-            )
-        )
-    fake.reps.append(_remote_row(id=1, origin_id=777))
-    _seed_cache_row(tmp_path, cache_key="origin:777", origin_id=777)
-
-    assert cli.main(["reps", "refresh-ids", "--apply"]) == 0
-    out = capsys.readouterr().out
-    assert "window-limited origin:777" in out
-    assert "fill origin:777" not in out
-    conn = _cache_db(tmp_path)
-    try:
-        row = conn.execute("SELECT server_id FROM bench_cache_reps WHERE cache_key = 'origin:777'").fetchone()
-    finally:
-        conn.close()
-    assert row["server_id"] is None
 
 
 def test_anonymous_echo_never_inherits_an_anonymous_server_binding(tmp_path, monkeypatch):

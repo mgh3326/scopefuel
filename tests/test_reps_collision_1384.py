@@ -189,12 +189,6 @@ def _remote(monkeypatch, home, mode: str = "new") -> FakeRepStore:
     return fake
 
 
-def _migrate_push_local():
-    """Record the required per-install migration inputs before a local push."""
-
-    return cli.main(["bench", "push-local-migrate", "--apply", "--legacy-created-by", "legacy-shared"])
-
-
 def _add_args(task="1384", notes="rep", **overrides) -> list[str]:
     args = [
         "reps",
@@ -573,34 +567,8 @@ def test_cache_shadow_moves_contradicted_row_to_lost(tmp_path, monkeypatch, caps
     assert f"id=lost:{origin}" in captured.out
 
 
-def test_push_local_uses_stable_banded_ids_and_is_idempotent(tmp_path, monkeypatch, capsys):
-    """push_local derives a stable band key per local row, so a re-run
-    resends the same origin_id and the server stays at one row."""
-
-    home = tmp_path / "hosta"
-    _client_env(home, monkeypatch, backend="local")
-    monkeypatch.setattr(bench, "request_json", lambda *a, **k: pytest.fail("network called"))
-    assert cli.main(_add_args(task="local-rep", notes="kept locally")) == 0
-    capsys.readouterr()
-
-    fake = _remote(monkeypatch, home)
-    assert _migrate_push_local() == 0
-    capsys.readouterr()
-    scores, reps = bench.push_local()
-    assert (scores, reps) == (0, 1)
-    assert len(fake.reps) == 1
-    first = dict(fake.reps[0])
-    assert BAND_BASE <= first["origin_id"] < BAND_TOP
-    assert first["task_ref"] == "local-rep"
-
-    scores, reps = bench.push_local()
-    assert (scores, reps) == (0, 1)
-    assert len(fake.reps) == 1  # resend, not a duplicate
-    assert fake.reps[0] == first  # same server id, same content, same key
-
-
 def test_migrate_still_uses_its_own_band(tmp_path, monkeypatch):
-    """reps migrate keeps the [2^40, 2^40+2^48) band — untouched by #1384."""
+    """Legacy identity readers preserve their reserved id band."""
 
     origin = bench._migrate_origin_id("host", "profile", 7)
     assert (1 << 40) <= origin < (1 << 40) + (1 << 48)
@@ -652,78 +620,6 @@ def _unreadable_conflict_row(monkeypatch, fake: FakeRepStore, real_fetch_reps) -
         return real_fetch_reps(backend, query=query)
 
     monkeypatch.setattr(bench, "_fetch_reps", flaky)
-
-
-def test_409_error_chain_has_no_self_reference(tmp_path, monkeypatch):
-    """Mutant guard: ``raise _annotate_rep_conflict(...) from exc`` with the
-    annotate result being ``exc`` itself made BenchRepConflictError its own
-    __cause__ (the hk 1403 OOM). For each call site — add_rep, migrate and
-    push_local — with the conflicting server row unreadable, the raised chain
-    must be acyclic and the walked error must still name both ids."""
-
-    real_fetch_reps = bench._fetch_reps
-
-    # add_rep -> _write_reps_handoffkeep -> PUT 409 -> annotate.
-    fake = _remote(monkeypatch, tmp_path / "add")
-    origin = BAND_BASE + 777
-    fake.reps.append(_remote_row(id=1, origin_id=origin, task_ref="victim", notes="held by A"))
-    monkeypatch.setattr(bench, "_new_rep_origin_id", lambda: origin)
-    _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
-    with pytest.raises(bench.BenchRepConflictError) as excinfo:
-        bench.add_rep(
-            profile="builder-devin-max",
-            model_id="swe-2-max",
-            task_ref="attacker",
-            tier="T1",
-            role="impl",
-            rounds=1,
-            blockers_found=0,
-            completed=1,
-            notes="B's rep",
-        )
-    _assert_acyclic_chain(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, bench.BenchRepConflictError)
-    assert f"origin:{origin}" in str(excinfo.value) and "srv:1" in str(excinfo.value)
-
-    # migrate_reps -> PUT 409 -> annotate (pre-PUT reads must still succeed).
-    mig = tmp_path / "migrate"
-    _client_env(mig, monkeypatch, backend="local")
-    bench.add_rep(**_local_rep("local-1"))
-    fake = _remote(monkeypatch, mig)
-    origin = bench._migrate_origin_id("mig-host", "builder-devin-max", 1)
-    fake.reps.append(_remote_row(id=5, origin_id=origin, task_ref="occupied", notes="[src:mig-host] x"))
-    _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
-    with pytest.raises(bench.BenchRepConflictError) as excinfo:
-        bench.migrate_reps(host="mig-host", apply=True, force=True)
-    _assert_acyclic_chain(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, bench.BenchRepConflictError)
-    assert f"origin:{origin}" in str(excinfo.value) and "srv:5" in str(excinfo.value)
-
-    # push_local -> PUT 409 -> annotate.
-    pl = tmp_path / "pushlocal"
-    _client_env(pl, monkeypatch, backend="local")
-    bench.add_rep(**_local_rep("push-1"))
-    fake = _remote(monkeypatch, pl)
-    monkeypatch.setattr(bench, "_fetch_reps", real_fetch_reps)
-    assert _migrate_push_local() == 0
-    record = bench._read_local_reps_for_push()[0]
-    origin = bench._push_local_origin_id(bench._rep_install_id(None), record)
-    # The pre-check is clear; a concurrent writer occupies the slot just
-    # before PUT. Exercise the actual 409 annotate path, not the pre-check.
-    original_request = fake.__call__
-
-    def concurrent_writer(url, **kwargs):
-        if kwargs.get("method") == "PUT":
-            fake.reps.append(_remote_row(id=7, origin_id=origin, task_ref="occupied", notes="different rep"))
-        return original_request(url, **kwargs)
-
-    monkeypatch.setattr(bench, "request_json", concurrent_writer)
-    _unreadable_conflict_row(monkeypatch, fake, real_fetch_reps)
-    with pytest.raises(bench.BenchRepConflictError) as excinfo:
-        bench.push_local()
-    _assert_acyclic_chain(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, bench.BenchRepConflictError)
-    assert f"origin:{origin}" in str(excinfo.value) and "srv:7" in str(excinfo.value)
 
 
 def test_retryable_503_resends_the_same_pending_payload(tmp_path, monkeypatch, capsys):

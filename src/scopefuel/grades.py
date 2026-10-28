@@ -101,7 +101,7 @@ final rep — the latest *counted* rep stands.
 *   Reps whose ``grade`` is empty are ungraded passes — shown, never counted:
     the rule claims "can do grade-G work", and a pass on a task of unrecorded
     difficulty cannot establish G. ``reps add`` requires ``--grade``; pre-E6
-    rows stay ungraded until ``reps backfill`` writes an annotation row linked
+    stored annotations can supply their task grade, linked
     by the rep's ref — the original row is never rewritten, and every
     application is disclosed in the proposal.
 """
@@ -851,7 +851,7 @@ def gather_reps(
 
 
 def _apply_grade_annotations(evidence: RepsEvidence, *, path=None) -> None:
-    """Overlay ``reps backfill`` annotations onto ungraded evidence rows.
+    """Overlay stored grade annotations onto ungraded evidence rows.
 
     The rep row itself is never rewritten — the annotation is applied to the
     in-memory copy the rule sees, and every application is disclosed via
@@ -1086,101 +1086,6 @@ def degraded_reasons(view: bench.CatalogView, evidence: RepsEvidence) -> list[st
 # ---------------------------------------------------------------------------
 # Grade backfill — annotations linked by rep ref; originals never touched
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class BackfillReport:
-    """The plan ``reps backfill`` computed — what --apply would/did write."""
-
-    mapping: dict[str, str]
-    planned: list[bench.RepGradeAnnotation] = field(default_factory=list)
-    already_annotated: list[tuple[str, str]] = field(default_factory=list)  # (ref, grade)
-    skipped_graded: list[tuple[str, str, str]] = field(default_factory=list)  # (ref, task_ref, grade)
-    conflicting_annotations: list[tuple[str, str, str]] = field(
-        default_factory=list
-    )  # (ref, existing grade, mapped grade)
-    missing_tasks: list[str] = field(default_factory=list)
-    applied: int = 0
-
-
-def backfill_rep_grades(
-    *,
-    mapping: dict[str, str],
-    apply: bool = False,
-    source: str = "reps backfill",
-    host: str | None = None,
-    allow_plaintext_http: bool = False,
-    path=None,
-) -> BackfillReport:
-    """Annotate ungraded reps with their task's grade — never a rewrite.
-
-    Every rep the canonical evidence view counts (server ref when migrated,
-    local ref otherwise) whose ``task_ref`` is a mapping key and whose
-    ``grade`` is empty gets a ``rep_grade_annotations`` row linked by that
-    ref. ``gather_reps`` then overlays the grade, so proposals evaluate the
-    rep as graded while the original row stays byte-identical. An already
-    graded rep, an existing annotation, and a task with no counted reps are
-    reported, never silently changed.
-    """
-    if not isinstance(mapping, dict) or not mapping:
-        raise bench.BenchError("backfill mapping must be a non-empty task-ref -> grade object")
-    clean: dict[str, str] = {}
-    for task_ref, grade in mapping.items():
-        if not isinstance(task_ref, str) or not task_ref.strip():
-            raise bench.BenchError("backfill mapping task refs must be non-blank strings")
-        if grade not in bench.REP_GRADES:
-            raise bench.BenchError(
-                f"backfill grade for task {task_ref} must be one of {', '.join(bench.REP_GRADES)}"
-            )
-        clean[task_ref.strip()] = grade
-
-    # An empty catalog view still runs the full canonical-ref + exclusion
-    # machinery — only counted rows can earn an annotation.
-    empty_view = bench.CatalogView(
-        entries=(),
-        source=bench.CATALOG_SOURCE_SNAPSHOT,
-        backend=bench.BENCH_BACKEND_LOCAL,
-        reason="reps backfill",
-    )
-    evidence = gather_reps(view=empty_view, host=host, allow_plaintext_http=allow_plaintext_http, path=path)
-    report = BackfillReport(mapping=clean)
-    by_task: dict[str, list[EvidenceRep]] = {}
-    for row in evidence.counted:
-        if row.rep.task_ref:
-            by_task.setdefault(row.rep.task_ref, []).append(row)
-
-    for task_ref, grade in clean.items():
-        rows = by_task.get(task_ref, [])
-        if not rows:
-            report.missing_tasks.append(task_ref)
-            continue
-        for row in rows:
-            if row.rep.grade and not row.grade_backfilled:
-                report.skipped_graded.append((row.ref, task_ref, row.rep.grade))
-            elif row.grade_backfilled:
-                # An effective annotation already governs this row — including
-                # one that reached it through migration fan-out (local:<id> ->
-                # srv:<id>). Judging by the row's post-overlay grade keeps a
-                # re-backfill at a different grade a reported conflict on the
-                # canonical ref instead of a second annotation that splits the
-                # rep's grade across the migration boundary.
-                if row.rep.grade == grade:
-                    report.already_annotated.append((row.ref, grade))
-                else:
-                    report.conflicting_annotations.append((row.ref, row.rep.grade, grade))
-            else:
-                report.planned.append(
-                    bench.RepGradeAnnotation(
-                        rep_ref=row.ref,
-                        grade=grade,
-                        task_ref=task_ref,
-                        source=source,
-                        recorded_at=bench._utc_now(),
-                    )
-                )
-    if apply and report.planned:
-        report.applied = bench.write_rep_grade_annotations(report.planned, path=path)
-    return report
 
 
 # ---------------------------------------------------------------------------
