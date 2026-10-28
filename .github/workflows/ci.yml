@@ -19,7 +19,7 @@ on:
         type: string
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'workflow_call' && github.run_id || github.ref }}
+  group: ci-${{ github.workflow }}-${{ inputs.ref && github.run_id || github.ref }}
   cancel-in-progress: true
 
 permissions:

@@ -24,9 +24,9 @@ jobs:
   resolve:
     name: resolve ref
     runs-on: ubuntu-latest
-    concurrency:
-      group: ci-any-ref-resolve-${{ inputs.ref }}
-      cancel-in-progress: true
+    # No concurrency group here: keying it on inputs.ref alone lets a
+    # same-ref different-suite dispatch cancel a resolve mid-flight and the
+    # run dies silently (hk 2199 / comment 8104, one job earlier).
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
@@ -47,7 +47,7 @@ jobs:
     # dispatch on the same sha cancels only the same suite, never a run of a
     # different suite on that sha.
     concurrency:
-      group: ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}
+      group: ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -66,7 +66,7 @@ jobs:
     needs: [resolve, ci]
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}
+      group: ci-any-ref-status-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}
       cancel-in-progress: true
     env:
       GH_TOKEN: ${{ github.token }}

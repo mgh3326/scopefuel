@@ -89,14 +89,17 @@ def validate(wf_text: str, ci_text: str) -> None:
     ))
     union_needed = {k: max(LEVELS[d[k]] for d in [callee_top, *callee_jobs]) for k in
                     {k for d in [callee_top, *callee_jobs] for k in d}}
+    assert union_needed.keys() == caller_grants.keys(), \
+        f"calling job must grant exactly the callee's declared scopes: {caller_grants} vs {union_needed}"
     for scope, need in union_needed.items():
-        assert scope in caller_grants, f"calling job must grant the callee's {scope} scope"
-        assert LEVELS[caller_grants[scope]] >= need, f"grant level too low for {scope}"
-    assert caller_grants.get("statuses") in (None, "none"), \
-        "calling job must not need statuses:write"
+        assert LEVELS[caller_grants[scope]] == need, \
+            f"grant level for {scope} must be exactly {need}, not wider"
 
     # Refusal: a failed resolve must skip ci and the status job.
     assert "needs: resolve" in ci_call.group(0)
+    status_block = job_block(wf_text, "status")
+    assert "permissions:" not in status_block, \
+        "the status job must not widen its permissions beyond the workflow block"
     status_if = re.search(r"(?ms)^  status:.*?^    if: (.*)$", wf_text)
     assert status_if and "needs.resolve.result == 'success'" in status_if.group(1), \
         "status job must be gated on resolve success"
@@ -104,22 +107,43 @@ def validate(wf_text: str, ci_text: str) -> None:
 
     # Concurrency (hk 2199): the group is keyed on the RESOLVED sha plus the
     # suite on the ci and status jobs, never on inputs.ref alone. The resolve
-    # job may keep a short per-input group.
+    # job carries NO group: keying it on inputs.ref alone lets a same-ref
+    # different-suite dispatch cancel a resolve mid-flight and the run dies
+    # silently. The ci and status jobs use DIFFERENT namespaces so a
+    # superseded run's status job can never cancel the newer run's ci job.
     assert re.search(r"(?m)^concurrency:", wf_text) is None, \
         "the concurrency group must live on the ci/status jobs, not top level"
+    resolve_block = job_block(wf_text, "resolve")
+    assert not re.search(r"(?m)^    concurrency:", resolve_block), \
+        "the resolve job must not carry a concurrency group"
+    groups = {}
     for job in ("ci", "status"):
         block = job_block(wf_text, job)
         group = re.search(r"(?ms)^    concurrency:\n      group: ([^\n]+)", block)
         assert group, f"{job} job must carry a concurrency group"
-        group = group.group(1)
-        assert "needs.resolve.outputs.sha" in group, \
-            f"{job} concurrency group must key on the resolved sha, got {group!r}"
-        assert "inputs.suite" in group, \
-            f"{job} concurrency group must key on the suite, got {group!r}"
-        assert "inputs.ref" not in group, \
-            f"{job} concurrency group must not key on inputs.ref, got {group!r}"
+        groups[job] = group.group(1)
+        assert "needs.resolve.outputs.sha" in groups[job], \
+            f"{job} concurrency group must key on the resolved sha, got {groups[job]!r}"
+        assert "inputs.suite" in groups[job], \
+            f"{job} concurrency group must key on the suite, got {groups[job]!r}"
+        assert "inputs.ref" not in groups[job], \
+            f"{job} concurrency group must not key on inputs.ref, got {groups[job]!r}"
         assert re.search(r"(?m)^      cancel-in-progress: true", block), \
             f"{job} job must keep cancel-in-progress"
+    assert groups["ci"] != groups["status"], \
+        "ci and status must use different group namespaces"
+
+    # Callee collapse guard: inside a reusable workflow github.event_name is
+    # the CALLER's event (workflow_dispatch for ci-any-ref), so a callee
+    # top-level group must reach github.run_id for any-ref calls or every
+    # dispatch shares one key.
+    callee_conc = re.search(r"(?m)^concurrency: *(.+)$", ci_text) or \
+        re.search(r"(?m)^concurrency:\n(?:  .*\n)+", ci_text)
+    assert callee_conc is None or ("github.run_id" in callee_conc.group(0) and
+        ("inputs.ref" in callee_conc.group(0)
+         or "workflow_dispatch" in callee_conc.group(0)
+         or "workflow_call" in callee_conc.group(0))), \
+        "the callee concurrency group must be unique per any-ref dispatch"
 
     assert "uses: ./.github/workflows/ci.yml" in wf_text, \
         "must reuse ci.yml via workflow_call, not copy jobs"
@@ -144,6 +168,9 @@ def validate(wf_text: str, ci_text: str) -> None:
     ), "partial suites must post ci-ok-<suite>, never ci-ok"
     assert 'context="ci-ok"' not in status_section, \
         "context must not be unconditionally ci-ok"
+    contexts = set(re.findall(r"context=[^\s]+", status_section))
+    assert contexts == {'context="$CONTEXT"'}, \
+        f"the only context writer must be context=\"$CONTEXT\", got {contexts}"
 
     # check-run surface: the ci-ok job is renamed for partial suites so a
     # dispatch can never mint a check named exactly 'ci-ok' either.
@@ -156,14 +183,14 @@ def validate(wf_text: str, ci_text: str) -> None:
 
     # no ${{ inputs.* }} expansion inside any run: body (template injection).
     for name, text in (("ci-any-ref.yml", wf_text), ("ci.yml", ci_text)):
-        for match in re.finditer(r"(?m)^([ ]*)run: *([^\n]*)$", text):
+        for match in re.finditer(r"(?m)^([ ]*)-? *run: *([^\n]*)$", text):
             indent, tail = len(match.group(1)), match.group(2).strip()
-            assert "${{ inputs." not in tail, \
+            assert not re.search(r"\$\{\{\s*inputs\.", tail), \
                 f"{name}: inputs.* must reach run bodies via env, not expansion"
             if tail.startswith(("|", ">")):
                 rest = text[match.end() + 1:]
                 body = re.match(rf"(?: {{{indent + 1},}}[^\n]*\n?)*", rest).group(0)
-                assert "${{ inputs." not in body, \
+                assert not re.search(r"\$\{\{\s*inputs\.", body), \
                     f"{name}: inputs.* must reach run bodies via env, not expansion"
 
     # ref must reach the runner via env, never expanded into shell text.
@@ -235,26 +262,52 @@ expect_red(mutant_inline, ci, "inline-inputs-in-run")
 
 # Mutant 5: drop the sha from the group key -> must be RED.
 mutant_no_sha = wf.replace(
-    "ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
-    "ci-any-ref-${{ inputs.suite }}",
+    "ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-ci-${{ inputs.suite }}",
 )
 expect_red(mutant_no_sha, ci, "drop-sha-from-group")
 
 # Mutant 6: drop the suite from the group key -> must be RED.
 mutant_no_suite = wf.replace(
-    "ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
-    "ci-any-ref-${{ needs.resolve.outputs.sha }}",
+    "ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-ci-${{ needs.resolve.outputs.sha }}",
 )
 expect_red(mutant_no_suite, ci, "drop-suite-from-group")
 
 # Mutant 7: key the group on inputs.ref again -> must be RED.
 mutant_ref_key = wf.replace(
-    "ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
-    "ci-any-ref-${{ inputs.ref }}-${{ inputs.suite }}",
+    "ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-ci-${{ inputs.ref }}-${{ inputs.suite }}",
 )
 expect_red(mutant_ref_key, ci, "group-on-inputs-ref")
 
-print("structural checks ok (incl. 7 mutants)")
+# Mutant 8: the resolve job carries an inputs.ref group again -> must be RED.
+mutant_resolve = wf.replace(
+    "    outputs:\n      sha:",
+    "    concurrency:\n      group: ci-any-ref-resolve-${{ inputs.ref }}\n      cancel-in-progress: true\n    outputs:\n      sha:",
+)
+expect_red(mutant_resolve, ci, "resolve-group-on-inputs-ref")
+
+# Mutant 9: ci and status share one group namespace -> must be RED.
+mutant_same_group = wf.replace(
+    "ci-any-ref-status-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+)
+expect_red(mutant_same_group, ci, "shared-group-namespace")
+
+# Mutant 10: the callee group collapses to the ref (no run_id) -> must be RED.
+if "github.run_id" in ci:
+    mutant_callee = ci.replace("github.run_id", "github.ref")
+    expect_red(wf, mutant_callee, "callee-group-collapses")
+
+# Mutant 11: a second status writer mints ci-ok -> must be RED.
+mutant_ctx2 = wf.replace(
+    '-f context="$CONTEXT"',
+    '-f context="$CONTEXT" -f context=ci-ok',
+)
+expect_red(mutant_ctx2, ci, "extra-ci-ok-writer")
+
+print("structural checks ok (incl. 11 mutants)")
 PY
 
 # --- live-ish harness: resolver + checkout simulation against a fixture repo ---
@@ -322,16 +375,27 @@ for suite in all test; do
 done
 
 # (e) group key: eval the workflow's own group template with two shas/suites.
-group_line="$(grep -oF 'ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}' "$root/.github/workflows/ci-any-ref.yml" | head -1)"
+# shellcheck disable=SC2016  # single-quoted grep pattern is intentional
+group_line="$(grep -oF 'ci-any-ref-ci-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}' "$root/.github/workflows/ci-any-ref.yml" | head -1)"
 [[ -n "$group_line" ]]
 group_key() {  # $1 sha, $2 suite
   local sha="$1" suite="$2"
+  # shellcheck disable=SC2016  # literal ${{ }} template text is intentional
   printf '%s' "${group_line//'${{ needs.resolve.outputs.sha }}'/$sha}" |
     sed "s/\${{ inputs\.suite }}/$suite/"
 }
 [[ "$(group_key "$SHA_A" all)" == "$(group_key "$SHA_A" all)" ]]       # same sha+suite -> one key
 [[ "$(group_key "$SHA_A" all)" != "$(group_key "$SHA_A" test)" ]]     # different suite -> different key
 [[ "$(group_key "$SHA_A" all)" != "$(group_key "$SHA_B" all)" ]]      # different sha -> different key
+
+# state mapping: eval the workflow's own case block for each result.
+state_case="$(sed -n '/case "\$RESULT" in/,/esac/p' "$root/.github/workflows/ci-any-ref.yml")"
+[[ -n "$state_case" ]]
+check_state() { RESULT="$1" bash -c "$state_case"$'\nprintf \'%s\' "$STATE"'; }
+[[ "$(check_state success)" == success ]]
+[[ "$(check_state cancelled)" == error ]]
+[[ "$(check_state failure)" == failure ]]
+[[ "$(check_state skipped)" == failure ]]
 
 # (b) status target: simulate the status step against the resolved sha.
 TARGET_SHA="$SHA_A"
