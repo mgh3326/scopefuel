@@ -219,6 +219,38 @@ def test_swe2_free_stays_first_with_a_preserve_class_hot_pool():
     assert free_rows and max(free_rows) < first_promoted
 
 
+def test_an_unknown_weekly_pool_cannot_jump_swe2_free_or_the_block():
+    """Tester r2 B3 — Mutant: seat the block below non-promoted rows -> RED.
+
+    kiro emits only a 30d "credits" bucket (and agy only group-scoped 7d
+    buckets), so the pool is unknown — never a trigger, never under-used.
+    Its non-promoted row must not be re-seated above the promoted block or
+    above SWE-2 free.
+    """
+
+    kiro = _provider("kiro", _bucket("30d", 85.0, 24.0 * 27))  # 30d credits only
+    devin = ProviderResult(
+        id="devin",
+        pool_class="preserve",
+        buckets=[_bucket("7d", 20.0, 109.0), *_swe2_free_buckets()],
+    )
+    providers = [
+        _weekly("claude", 90.0),  # 1.8x hot
+        _weekly("codex", 10.0, pool_class="preserve"),
+        devin,
+        _weekly("grok", 25.0),
+        _credit("anthropic-api"),
+        _credit("commandcode"),
+        kiro,
+    ]
+    payload = recommend_dict(providers, "C", today=TODAY, now=NOW, swe2_result=devin)
+    rows = _candidates(payload)
+    assert rows[0]["profile"].startswith("devin-swe2")
+    kiro_rows = [i for i, row in enumerate(rows) if row["provider"] == "kiro"]
+    first_promoted = next(i for i, row in enumerate(rows) if row.get("promotion"))
+    assert all(i > first_promoted for i in kiro_rows)
+
+
 def test_a_group_scoped_pool_never_decides_by_bucket_order():
     """Tester r1 B2 — Mutant: read the first 7d bucket whatever its scope -> RED.
 

@@ -6885,7 +6885,18 @@ def _evaluate(
         if trigger_positions:
             insert_at = min(trigger_positions)
             rest = [candidate for candidate in included if not candidate.promoted]
-            index = sum(1 for candidate in included[:insert_at] if not candidate.promoted)
+            # hk 2205 (tester r2 B3): seat the block at the earlier of the
+            # first yielding-pool row and the first already-promoted row.
+            # Counting only non-promoted rows above ``insert_at`` re-seats an
+            # unknown-weekly pool's row (kiro's 30d-only, agy's group-only)
+            # above the whole block — and above SWE-2 free.
+            first_promoted_row = next(
+                (index for index, candidate in enumerate(included) if candidate.promoted),
+                insert_at,
+            )
+            index = sum(
+                1 for candidate in included[: min(insert_at, first_promoted_row)] if not candidate.promoted
+            )
             included[:] = rest[:index] + promoted + rest[index:]
         # hk 2205 (tester r1 B1): SWE-2 free stays FIRST. The insert above
         # only counts NON-free rows of the yielding pools, so a free-scope
