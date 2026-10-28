@@ -55,7 +55,7 @@ from scopefuel.recommend import (
 NOW = dt.datetime(2026, 10, 28, 12, 0, tzinfo=dt.UTC)
 TODAY = NOW.date()
 # The head this branch was cut from — the "today" order the golden compares to.
-BASE_COMMIT = "70d29e8"
+BASE_COMMIT = "70d29e87700f59a088ef1745e49e25bb1273364c"
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "hk2185"
 CANON_ROWS = json.loads((FIXTURES / "canon_rows.json").read_text(encoding="utf-8"))
 
