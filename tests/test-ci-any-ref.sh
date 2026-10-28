@@ -134,16 +134,49 @@ def validate(wf_text: str, ci_text: str) -> None:
         "ci and status must use different group namespaces"
 
     # Callee collapse guard: inside a reusable workflow github.event_name is
-    # the CALLER's event (workflow_dispatch for ci-any-ref), so a callee
-    # top-level group must reach github.run_id for any-ref calls or every
-    # dispatch shares one key.
+    # the CALLER's event (workflow_dispatch for ci-any-ref), so evaluate the
+    # callee's group template under that caller context and require a
+    # distinct key per dispatch. A workflow_call-only branch is dead code in
+    # the callee and must NOT satisfy this (that was the r1 collapse bug).
     callee_conc = re.search(r"(?m)^concurrency: *(.+)$", ci_text) or \
         re.search(r"(?m)^concurrency:\n(?:  .*\n)+", ci_text)
-    assert callee_conc is None or ("github.run_id" in callee_conc.group(0) and
-        ("inputs.ref" in callee_conc.group(0)
-         or "workflow_dispatch" in callee_conc.group(0)
-         or "workflow_call" in callee_conc.group(0))), \
-        "the callee concurrency group must be unique per any-ref dispatch"
+    if callee_conc is not None:
+        group_tmpl = re.search(r'group:\s*"([^"]+)"', callee_conc.group(0)) or \
+            re.search(r'group:\s*([^\n]+)', callee_conc.group(0))
+        group_tmpl = group_tmpl.group(1).strip().strip('"') if group_tmpl else \
+            callee_conc.group(0)
+
+        def eval_group(run_id: int) -> str:
+            ctx = {
+                "github.event_name": "workflow_dispatch",
+                "github.workflow": "CI (any ref)",
+                "github.run_id": str(run_id),
+                "github.ref": "refs/heads/main",
+                "inputs.ref": "a" * 40,
+                "github.event.pull_request.number": "",
+                "github.event.before": "",
+            }
+
+            def expr_value(expr: str) -> object:
+                expr = expr.strip()
+                for token in sorted(ctx, key=len, reverse=True):
+                    expr = expr.replace(token, repr(ctx[token]))
+                expr = re.sub(r"github[.\w-]*|inputs[.\w-]*", "''", expr)
+                expr = expr.replace("&&", " and ").replace("||", " or ")
+                try:
+                    return eval(expr, {"__builtins__": {}}, {})
+                except Exception:
+                    return ""
+
+            def render(m: re.Match) -> str:
+                value = expr_value(m.group(1))
+                return str(value) if value else ""
+
+            return re.sub(r"\$\{\{([^}]*)\}\}", render, group_tmpl)
+
+        keys = {eval_group(rid) for rid in (11, 12, 13)}
+        assert len(keys) == 3, \
+            f"callee concurrency group must be unique per any-ref dispatch, got {keys}"
 
     assert "uses: ./.github/workflows/ci.yml" in wf_text, \
         "must reuse ci.yml via workflow_call, not copy jobs"
@@ -300,6 +333,18 @@ if "github.run_id" in ci:
     mutant_callee = ci.replace("github.run_id", "github.ref")
     expect_red(wf, mutant_callee, "callee-group-collapses")
 
+# Mutant 10b: the r1 bug shape — a workflow_call-only branch is dead in a
+# reusable callee, so the group collapses onto github.ref -> must be RED.
+callee_block = re.search(r"(?m)^concurrency: *(.+)$", ci) or \
+    re.search(r"(?m)^concurrency:\n(?:  .*\n)+", ci)
+if callee_block is not None:
+    mutant_callee2 = ci.replace(
+        callee_block.group(0),
+        'concurrency:\n  group: "ci-${{ github.workflow }}-${{ github.event_name == \'workflow_call\' && github.run_id || github.ref }}"\n  cancel-in-progress: true',
+        1,
+    )
+    expect_red(wf, mutant_callee2, "callee-group-workflow-call-only")
+
 # Mutant 11: a second status writer mints ci-ok -> must be RED.
 mutant_ctx2 = wf.replace(
     '-f context="$CONTEXT"',
@@ -307,7 +352,7 @@ mutant_ctx2 = wf.replace(
 )
 expect_red(mutant_ctx2, ci, "extra-ci-ok-writer")
 
-print("structural checks ok (incl. 11 mutants)")
+print("structural checks ok (incl. 12 mutants)")
 PY
 
 # --- live-ish harness: resolver + checkout simulation against a fixture repo ---
@@ -389,6 +434,7 @@ group_key() {  # $1 sha, $2 suite
 [[ "$(group_key "$SHA_A" all)" != "$(group_key "$SHA_B" all)" ]]      # different sha -> different key
 
 # state mapping: eval the workflow's own case block for each result.
+# shellcheck disable=SC2016  # single-quoted sed pattern is intentional
 state_case="$(sed -n '/case "\$RESULT" in/,/esac/p' "$root/.github/workflows/ci-any-ref.yml")"
 [[ -n "$state_case" ]]
 check_state() { RESULT="$1" bash -c "$state_case"$'\nprintf \'%s\' "$STATE"'; }
