@@ -93,6 +93,14 @@ _EXPECTED_LABELS = {
     ("sonnet", "xhigh"): "sonnet --effort xhigh",
 }
 
+# hk 2185: the alt-lane canon placements carry one label per placed rung.
+_EXPECTED_LABELS.update(
+    {
+        (profile, rung): f"{profile} --effort {rung}"
+        for profile, rung, _grade, _gate, _reason in recommend_mod.ALTLANE_CANON_ROWS
+    }
+)
+
 
 @pytest.fixture(autouse=True)
 def local_task_backend(tmp_path, monkeypatch):
@@ -428,7 +436,7 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
         profiles = [
             profile
             for profile in GRADE_TABLE[grade]
-            if profile.gate != "escalation"
+            if profile.gate not in ("escalation", "consult_only")
             and not recommend_mod.is_barred_model_id(profile.aa_agent_model_id or profile.benchmark_model_id)
             and _listed(profile)
         ]
@@ -463,6 +471,10 @@ def test_b1_base_order_oracle_and_priced_aplus_pool_sequence(monkeypatch):
             for profile, _one_up in sorted(
                 ordered,
                 key=lambda item: (
+                    # hk 2185 / hk 2079: a paid-credit row sorts after every
+                    # standard-lane row unless the altlanes rule promotes it
+                    # (no promotion here — every primary is healthy).
+                    recommend_mod.is_credit_row(item[0]),
                     item[0].benchmark is None,
                     # #1340: the paid-within-pool dimension — "paid" sinks
                     # below "free"/"unknown" at equal quota/boost standing.

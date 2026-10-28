@@ -939,7 +939,15 @@ def test_every_recommended_profile_in_a_partly_seeded_catalog_can_be_launched():
         for profile in profiles:
             barred = recommend.barred_model_id_for_profile(profile.name, grade_table=table)
             try:
-                launch.resolve_launch(profile.name, operator_request=True, view=view)
+                # hk 2185: the paid-credit profiles are worker/tester only and
+                # name their rung with --effort — launch the row it was listed at.
+                launch.resolve_launch(
+                    profile.name,
+                    effort=profile.launcher_effort or None,
+                    role="worker",
+                    operator_request=True,
+                    view=view,
+                )
             except launch.LaunchError as exc:
                 if barred is None:
                     unlaunchable.append(f"{profile.name}: {exc}")
@@ -1415,7 +1423,10 @@ def test_a_one_row_catalog_against_a_full_cache_is_still_rejected(catalog_server
     # hk 2079: 83 = those 68 + the 15 pi credit E6 rows (3 profiles x 5 rungs).
     # hk 2110: 88 = those 83 + the 5 codex-terra61 E6 rows (1 profile).
     # hk 2141: 91 = those 88 + the 3 cmd-dsflash41 credit E6 rows.
-    assert _cached_catalog_count() == 91
+    # hk 2185: 88 again — the pi/cmd rows are canon placements now, not E6 rows:
+    # 14 pi placements (haiku@low is retired upstream) + 1 cmd@high placement
+    # (@low/@max deliberately unplaced) replace the 15 + 3 E6 rows.
+    assert _cached_catalog_count() == 88
 
 
 def test_no_cache_keeps_the_bundle_floor(catalog_server):

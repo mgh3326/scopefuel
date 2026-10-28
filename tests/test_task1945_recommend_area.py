@@ -459,25 +459,45 @@ def _rank_of(out: str, label: str) -> int | None:
 
 
 def _rec(grade, **kwargs):
+    table = kwargs.pop("grade_table", None)
     return recommend.recommend(
         _providers(**kwargs.pop("provider_used", {})),
         grade,
         today=TODAY,
         now=NOW,
-        grade_table=_table(),
+        grade_table=_table() if table is None else table,
         bench_scores=None,
         model_prices={},
         **kwargs,
     )
 
 
+def _alt_free_table():
+    """The runtime table without the hk 2185 alt-lane placements.
+
+    The area golden predates those rows; removing them (and their fold entries)
+    preserves the guard for every prior line. Their own placement is pinned by
+    the hk 2185 tests.
+    """
+    table = _table()
+    mapping = {
+        grade: [p for p in rows if p.name not in recommend.ALTLANE_PROFILES]
+        for grade, rows in table.items()
+    }
+    if type(table) is dict:
+        return mapping
+    dropped = [d for d in getattr(table, "dropped", []) if d.profile.name not in recommend.ALTLANE_PROFILES]
+    return type(table)(mapping, dropped=dropped, canon_keys=getattr(table, "canon_keys", None))
+
+
 def _rec_dict(grade, **kwargs):
+    table = kwargs.pop("grade_table", None)
     return recommend.recommend_dict(
         _providers(**kwargs.pop("provider_used", {})),
         grade,
         today=TODAY,
         now=NOW,
-        grade_table=_table(),
+        grade_table=_table() if table is None else table,
         bench_scores=None,
         model_prices={},
         **kwargs,
@@ -534,7 +554,7 @@ def test_without_area_text_matches_the_main_golden(area_server, grade):
         _exception("grok", "medium", "blender", "exclude", expires_with_model_id="grok-4.6"),
     ]
     golden = (FIXTURES / f"{grade.replace('+', 'p')}-text.txt").read_text(encoding="utf-8")
-    assert _strip_pace_verdicts(_rec(grade)) == golden
+    assert _strip_pace_verdicts(_rec(grade, grade_table=_alt_free_table())) == golden
 
 
 @pytest.mark.parametrize("grade", ["S+", "A+", "A"])
@@ -547,7 +567,7 @@ def test_without_area_json_matches_the_main_golden(area_server, grade):
         _exception("sonnet", "high", "blender", "prefer"),
     ]
     golden = json.loads((FIXTURES / f"{grade.replace('+', 'p')}-json.json").read_text(encoding="utf-8"))
-    actual = _rec_dict(grade)
+    actual = _rec_dict(grade, grade_table=_alt_free_table())
     for row in actual["rows"]:
         if "windows" in row:
             row["windows"] = _strip_pace_verdicts(row["windows"])

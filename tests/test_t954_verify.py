@@ -152,11 +152,16 @@ def test_x4_cache_stale_never_widens_any_non_default_gate(catalog_server):
     assert gated, "the seed must carry at least one escalation-style gate"
     refused = 0
     for entry in gated:
+        # hk 2185: the paid-credit rows are worker/tester only, so name a worker
+        # seat — otherwise the seat rule refuses before the stale-gate check this
+        # test is about.
         with pytest.raises(launch.LaunchError, match="stale") as info:
-            launch.resolve_launch(entry.profile, effort=entry.effort or None)
+            launch.resolve_launch(entry.profile, effort=entry.effort or None, role="worker")
         assert "cannot widen" in str(info.value)
         refused += 1
-        decision = launch.resolve_launch(entry.profile, effort=entry.effort or None, operator_request=True)
+        decision = launch.resolve_launch(
+            entry.profile, effort=entry.effort or None, role="worker", operator_request=True
+        )
         assert decision.catalog_source == "cache-stale" and decision.catalog_stale is True
     assert refused == len(gated)
     assert view.stale is True

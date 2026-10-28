@@ -443,36 +443,99 @@ def _drop_aplus_opus_low_payload(payload):
     return {**payload, "rows": rows, "excluded": excluded}, dropped
 
 
-def _drop_pi_credit_folds(text, payload):
-    """The current output minus the folded E6-unmeasured entries of the E6-only rows.
+def _drop_altlanes_text(text: str) -> str:
+    """The text minus the hk 2185 alt-lane canon rows, renumbered.
 
-    hk 2079 adds the pi anthropic-api profiles as E6 rows, and every E6 carrier
-    row rides the folded excluded line at C (hk 1862's accounting). hk 2110 adds
-    the codex-terra61 rungs the same way, and hk 2141 adds cmd-dsflash41. The
-    pre-1990 base has no such rows, so those fold entries are removed from the
-    current output and the fold count corrected. Ranked rows are not touched,
-    so a row leaking in as a candidate still fails the comparison.
+    The base has no such rows. hk 2185 makes them ordinary placements, so they
+    appear as ranked candidates at their grades and as escalation entries; this
+    removes every one of those lines (and their fold entries) and renumbers, so
+    the comparison still pins every prior line. Their placement is pinned by the
+    hk 2185 tests, not here.
     """
-    lines = []
-    for line in text.split("\n"):
+    from scopefuel.recommend import ALTLANE_PROFILES
+
+    kept: list[str] = []
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if line[:1].isdigit():
+            token = line.split(". ", 1)[1].split()[0]
+            if token in ALTLANE_PROFILES:
+                continue
+            kept.append(line)
+            continue
+        # An escalation entry is a 3-line block: the indented row plus its
+        # 근거/status lines. Drop the whole block for an alt-lane profile.
+        stripped = line.strip()
+        if stripped.startswith(tuple(f"{p} " for p in ALTLANE_PROFILES)) or stripped.startswith(
+            tuple(f"{p} --effort " for p in ALTLANE_PROFILES)
+        ):
+            while index < len(lines) and lines[index].startswith("    "):
+                index += 1
+            continue
         fold = re.match(r"^✗ 제외 \((\d+)\): (.*)$", line)
         if fold:
-            items = fold.group(2).split(" · ")
-            kept = [item for item in items if not item.startswith(("pi-", "cmd-", "codex-terra61"))]
-            if len(kept) != len(items):
-                assert kept, text
-                count = int(fold.group(1)) - (len(items) - len(kept))
-                line = f"✗ 제외 ({count}): " + " · ".join(kept)
-        lines.append(line)
-    payload = {
+            # Entries can themselves contain " · " (e.g. the codex-sol reason), so
+            # regroup the split fragments into entries (an entry starts with
+            # "<profile>[@<effort>] — ") before removing the alt-lane ones.
+            total = int(fold.group(1))
+            entries: list[str] = []
+            for fragment in fold.group(2).split(" · "):
+                if not entries or re.match(
+                    r"^[A-Za-z0-9_.-]+(?:\[[^\]]*\])?(?:@[A-Za-z0-9_.-]+)? — ", fragment
+                ):
+                    entries.append(fragment)
+                else:
+                    entries[-1] += " · " + fragment
+            kept_entries = [
+                entry
+                for entry in entries
+                if not entry.startswith(("pi-", "cmd-", "codex-terra61"))
+            ]
+            if len(kept_entries) != len(entries):
+                if not kept_entries:
+                    continue
+                line = f"✗ 제외 ({total - (len(entries) - len(kept_entries))}): " + " · ".join(
+                    kept_entries
+                )
+        kept.append(line)
+    numbered: list[str] = []
+    rank = 0
+    for line in kept:
+        if line[:1].isdigit():
+            rank += 1
+            numbered.append(f"{rank}. {line.split('. ', 1)[1]}")
+        else:
+            numbered.append(line)
+    return "\n".join(numbered)
+
+
+def _drop_altlanes_payload(payload):
+    from scopefuel.recommend import ALTLANE_PROFILES
+
+    return {
         **payload,
+        "rows": [row for row in payload["rows"] if row["profile"] not in ALTLANE_PROFILES],
         "excluded": [
             entry
             for entry in payload["excluded"]
             if not entry["profile"].startswith(("pi-", "cmd-", "codex-terra61"))
         ],
     }
-    return "\n".join(lines), payload
+
+
+def _drop_pi_credit_folds(text, payload):
+    """The current output minus the hk 2185 alt-lane rows (and the E6 folds).
+
+    hk 2079/hk 2110/hk 2141 added the pi/cmd/codex-terra61 rows; hk 2185 makes
+    the pi/cmd rows ordinary canon placements. The pre-1990 base has no such
+    rows, so both the ranked/escalation lines and the fold entries are removed
+    and the ranks renumbered. A non-alt row leaking in still fails the
+    comparison.
+    """
+    return _drop_altlanes_text(text), _drop_altlanes_payload(payload)
 
 
 def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
@@ -502,6 +565,14 @@ def test_recommend_all_grades_text_json_byte_identical(tmp_path, monkeypatch):
                 )
                 outputs[0] = (current_text, json.dumps(current_payload, ensure_ascii=False))
                 expected = outputs[1]
+                # A canon view built from the current snapshot carries the hk 2185
+                # alt-lane rows into the *base* module's table too (the canon can
+                # add profiles the base never heard of), so drop them on both
+                # sides before comparing.
+                expected_text, expected_payload = _drop_pi_credit_folds(
+                    expected[0], json.loads(expected[1])
+                )
+                expected = (expected_text, json.dumps(expected_payload, ensure_ascii=False))
                 if grade == "A+":
                     # hk 2007: A+ is base minus exactly the borrowed opus --effort low
                     # row (text: renumbered ranks; JSON: the row dropped). Not a skip.
@@ -556,8 +627,8 @@ def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
             expected = capsys.readouterr()
             if grade != "A+":
                 if output:
-                    actual_payload = json.loads(actual.out)
-                    expected_payload = json.loads(expected.out)
+                    actual_payload = _drop_altlanes_payload(json.loads(actual.out))
+                    expected_payload = _drop_altlanes_payload(json.loads(expected.out))
                     pace_unknown_profiles = {
                         row["profile"]
                         for row in actual_payload["rows"]
@@ -570,14 +641,18 @@ def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
                     ), argv
                     assert actual.err == expected.err, argv
                 else:
-                    assert _strip_pace_verdicts(actual.out) == expected.out, argv
+                    assert _drop_altlanes_text(_strip_pace_verdicts(actual.out)) == _drop_altlanes_text(
+                        expected.out
+                    ), argv
                     assert actual.err == expected.err, argv
                 continue
             # hk 2007: A+ is base minus exactly the borrowed opus --effort low row.
             assert actual.err == expected.err, argv
             if output:
-                payload, dropped = _drop_aplus_opus_low_payload(json.loads(expected.out))
-                actual_payload = json.loads(actual.out)
+                payload, dropped = _drop_aplus_opus_low_payload(
+                    _drop_altlanes_payload(json.loads(expected.out))
+                )
+                actual_payload = _drop_altlanes_payload(json.loads(actual.out))
                 pace_unknown_profiles = {
                     row["profile"]
                     for row in actual_payload["rows"]
@@ -591,8 +666,8 @@ def test_cli_recommend_all_grades_byte_identical(tmp_path, monkeypatch, capsys):
                 )
                 assert actual_normalized == expected_normalized, argv
             else:
-                text, dropped = _drop_aplus_opus_low_text(expected.out)
-                assert _strip_pace_verdicts(actual.out) == text, argv
+                text, dropped = _drop_aplus_opus_low_text(_drop_altlanes_text(expected.out))
+                assert _drop_altlanes_text(_strip_pace_verdicts(actual.out)) == text, argv
             a_plus_dropped += int(dropped)
     assert a_plus_dropped > 0
 
@@ -798,7 +873,12 @@ def test_implicit_live_snapshot_gate_matches_base(tmp_path, monkeypatch, catalog
     monkeypatch.setattr(base_recommend, "_inflight_gate", lambda *a, **k: None)
     table = base_bench._catalog_grade_table(view)
     assert table is not None
+    from scopefuel.recommend import ALTLANE_PROFILES
+
     for profile in sorted({e.profile for e in view.entries}):
+        if profile in ALTLANE_PROFILES:
+            # hk 2185: the base has no alt-lane placements to compare against.
+            continue
         actual = catalog_gate(view, profile, None)
         args = base_cli.build_parser(["claude", "codex"]).parse_args(["gate", "-m", profile])
         expected = base_recommend.gate_check(

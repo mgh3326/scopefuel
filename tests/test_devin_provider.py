@@ -1838,6 +1838,9 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
     expected |= {"devin-swe2-max", "devin-ds41-max"}
     # hk 1885: sonnet@low is an unscored C row (director-1 2026-10-23).
     expected |= {"sonnet"}
+    # hk 2185: the alt-lane canon placements that land at C (pi-haiku55@medium,
+    # pi-sonnet55@low consult_only) are unscored C rows too.
+    expected |= {"pi-haiku55", "pi-sonnet55"}
     actual = {p.name for p in GRADE_TABLE["C"] if p.benchmark is None}
     assert actual == expected
     medium = next(p for p in GRADE_TABLE["A"] if p.name == "devin-swe2-medium")
@@ -1845,8 +1848,7 @@ def test_task631_other_unscored_c_rows_keep_their_placements():
     snapshot = {
         entry.profile: entry
         for entry in launch.snapshot_entries()
-        if entry.profile in expected
-        and (entry.effort == "low" if entry.profile in {"codex-luna", "sonnet"} else entry.effort == "")
+        if entry.profile in expected and entry.grade == "C" and entry.score is None
     }
     assert set(snapshot) == expected
     assert all(entry.grade == "C" and entry.score is None for entry in snapshot.values())

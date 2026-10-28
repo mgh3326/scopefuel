@@ -63,6 +63,7 @@ from .recommend import (
     profile_subscription,
     provider_family,
     round_ext_role_allowed,
+    worker_tester_rungs,
 )
 
 GATE_DEFAULT = "default"
@@ -777,6 +778,18 @@ def resolve_launch(
         # a launcher default, and never the canon's best-graded sibling. The same line
         # the gate prints.
         raise LaunchError(credit_effort_required_reason(canonical))
+    # hk 2185: the credit rung vocabulary is closed. A canon row under an
+    # unregistered key (off/default/bogus) must not become launchable just
+    # because the canon carries it — pi/cmd would reject the effort anyway.
+    if (
+        canonical in E6_WORKER_TESTER_ONLY_PROFILES
+        and requested is not None
+        and requested not in worker_tester_rungs(canonical)
+    ):
+        raise LaunchError(
+            f"profile '{profile}': not placed at effort '{requested}' "
+            f"(placed rungs: {'|'.join(worker_tester_rungs(canonical))})"
+        )
     if (
         requested is None
         and marker is not None
@@ -956,9 +969,12 @@ def resolve_launch(
     )
 
     # hk 2079: the anthropic-api credit rows are worker/tester only until reps
-    # exist — any other seat is refused even with the E6 marker.
-    if opened_arm is not None and e6_worker_tester_seat_denied(canonical, role):
-        raise LaunchError(f"role_restricted: {opened_arm} — {E6_WORKER_TESTER_ONLY_REASON}")
+    # exist — any other seat is refused even with the E6 marker. hk 2185: the
+    # rows are ordinary inherited placements now, so the same seat rule applies
+    # without a marker (a placement is not a measurement).
+    if e6_worker_tester_seat_denied(canonical, role):
+        seat_label = opened_arm or f"{canonical}@{resolved_effort}"
+        raise LaunchError(f"role_restricted: {seat_label} — {E6_WORKER_TESTER_ONLY_REASON}")
 
     # task #742 — 구독 해지는 게이트 규칙보다 먼저 선다. 플래그는 config 상태라
     # 카탈로그·snapshot·arm 어떤 경로로도 동일하게 닫히고 --operator-request 가
