@@ -98,66 +98,6 @@ def test_schema_and_xdg_path_are_exact(bench_home):
     assert ".cache" not in str(path)
 
 
-def test_rob1194_approved_26_row_backfill_and_cost_coverage(bench_home):
-    path = bench.db_path()
-    _insert_approved_aa_rows(path)
-
-    before = bench.read_scores(path=path)
-    assert len(before) == 26
-    assert all(row.time_per_task_min is None and row.cost_per_task_usd is None for row in before)
-
-    assert bench.backfill_aa_agent_metrics(path=path) == 26
-    assert bench.backfill_aa_agent_metrics(path=path) == 0
-
-    rows = bench.read_scores(path=path)
-    measurements = {
-        (row.model_id, row.effort, row.harness, row.source, row.metric): (
-            row.time_per_task_min,
-            row.cost_per_task_usd,
-        )
-        for row in rows
-    }
-    expected = {row[:5]: (row[5], row[6]) for row in bench.AA_AGENT_MEASUREMENTS}
-    assert measurements == expected
-    assert len(measurements) == 26
-    assert sum(cost is not None for _, cost in measurements.values()) == 12
-    assert measurements[("gpt-5.6-sol", "xhigh", "codex", "AA-agent", "agentic")] == (7.4, 5.24)
-
-
-def test_rob1194_backfill_fails_closed_on_partial_key_set(bench_home):
-    path = bench.db_path()
-    bench.upsert_scores([_score()])
-    with pytest.raises(bench.BenchError, match="key mismatch"):
-        bench.backfill_aa_agent_metrics(path=path)
-
-
-def test_rob1194_time_cost_mutation_is_detected_and_repaired(bench_home):
-    path = bench.db_path()
-    _insert_approved_aa_rows(path)
-    assert bench.backfill_aa_agent_metrics(path=path) == 26
-
-    conn = sqlite3.connect(path)
-    try:
-        conn.execute(
-            "UPDATE model_scores SET time_per_task_min = ?, cost_per_task_usd = ? "
-            "WHERE model_id = ? AND effort = ? AND harness = ? AND source = ? AND metric = ?",
-            (7.5, 99.0, "gpt-5.6-sol", "xhigh", "codex", "AA-agent", "agentic"),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    mutated = next(
-        row for row in bench.read_scores(path=path) if row.model_id == "gpt-5.6-sol" and row.effort == "xhigh"
-    )
-    assert (mutated.time_per_task_min, mutated.cost_per_task_usd) != (7.4, 5.24)
-    assert bench.backfill_aa_agent_metrics(path=path) == 1
-    repaired = next(
-        row for row in bench.read_scores(path=path) if row.model_id == "gpt-5.6-sol" and row.effort == "xhigh"
-    )
-    assert (repaired.time_per_task_min, repaired.cost_per_task_usd) == (7.4, 5.24)
-
-
 def test_rob1194_read_scores_keeps_legacy_db_read_only(tmp_path):
     path = tmp_path / "legacy.db"
     conn = sqlite3.connect(path)
@@ -395,19 +335,6 @@ def test_show_keeps_source_metric_harness_effort_rows_separate(bench_home, capsy
     assert "codex" in out and "57.1" in out
     assert "unspecified" in out
     assert "2026-07-31T12:00:00+00:00" in out
-
-
-def test_rob1194_bench_show_exposes_time_and_cost(bench_home):
-    path = bench.db_path()
-    _insert_approved_aa_rows(path)
-    assert bench.backfill_aa_agent_metrics(path=path) == 26
-
-    shown = bench.show_scores("gpt-5.6-luna", path=path)
-
-    assert "time_per_task_min" in shown
-    assert "cost_per_task_usd" in shown
-    assert "3.4" in shown and "8.0" in shown
-    assert "$5.24" not in shown
 
 
 def test_fresh_show_persists_grade_seed_idempotently_and_preserves_newer_value(bench_home):
@@ -925,98 +852,6 @@ def test_sync_parses_effort_suffix_into_column(bench_home, monkeypatch):
     assert len(unspecified_rows) == 1 and unspecified_rows[0].score == 76.7
 
 
-def test_migrate_aa_model_effort_suffixes_backfills_existing_rows(bench_home):
-    # 마이그레이션 전 상태 시뮬레이션: 접미사가 model_id 에 남고 effort=NULL.
-    bench.upsert_scores(
-        [
-            bench.ModelScore(
-                model_id="gpt-5-6-terra-xhigh",
-                effort=None,
-                harness=None,
-                source="AA-model",
-                metric="coding_index",
-                score=70.6,
-                rank=None,
-                captured_at="2026-07-31T00:00:00+00:00",
-            )
-        ]
-    )
-    migrated = bench.migrate_aa_model_effort_suffixes()
-    assert migrated == 1
-    rows = bench.read_scores("gpt-5-6-terra")
-    aa_model_rows = [row for row in rows if row.source == "AA-model"]
-    assert len(aa_model_rows) == 1
-    assert aa_model_rows[0].effort == "xhigh"
-    assert aa_model_rows[0].model_id == "gpt-5-6-terra"
-
-    # idempotent
-    assert bench.migrate_aa_model_effort_suffixes() == 0
-
-
-def test_migrate_leaves_no_suffix_and_already_parsed_rows_untouched(bench_home):
-    bench.upsert_scores(
-        [
-            bench.ModelScore(
-                model_id="gpt-5-6-terra",
-                effort=None,
-                harness=None,
-                source="AA-model",
-                metric="coding_index",
-                score=76.7,
-                rank=None,
-                captured_at="2026-07-31T00:00:00+00:00",
-            ),
-            bench.ModelScore(
-                model_id="claude-opus-5",
-                effort="xhigh",
-                harness=None,
-                source="AA-model",
-                metric="coding_index",
-                score=77.0,
-                rank=None,
-                captured_at="2026-07-31T00:00:00+00:00",
-            ),
-        ]
-    )
-    assert bench.migrate_aa_model_effort_suffixes() == 0
-    rows = bench.read_scores("gpt-5-6-terra")
-    assert next(r for r in rows if r.source == "AA-model").effort is None
-
-
-def test_migrate_preserves_newer_normalized_target_on_collision(bench_home):
-    bench.upsert_scores(
-        [
-            bench.ModelScore(
-                model_id="gpt-5-6-terra-xhigh",
-                effort=None,
-                harness=None,
-                source="AA-model",
-                metric="coding_index",
-                score=70.6,
-                rank=None,
-                captured_at="2026-07-31T00:00:00+00:00",
-            ),
-            bench.ModelScore(
-                model_id="gpt-5-6-terra",
-                effort="xhigh",
-                harness=None,
-                source="AA-model",
-                metric="coding_index",
-                score=72.4,
-                rank=None,
-                captured_at="2026-08-01T00:00:00+00:00",
-            ),
-        ]
-    )
-
-    assert bench.migrate_aa_model_effort_suffixes() == 1
-    rows = bench.read_scores("gpt-5-6-terra")
-    assert len(rows) == 1
-    assert rows[0].score == 72.4
-    assert rows[0].captured_at == "2026-08-01T00:00:00+00:00"
-    assert bench.read_scores("gpt-5-6-terra-xhigh") == []
-
-
 def test_fresh_seed_uses_claude_code_for_opus_agent(bench_home):
     bench.seed_scores()
     opus = next(row for row in bench.read_scores("claude-opus-5") if row.source == "AA-agent")
@@ -1027,28 +862,6 @@ def test_fresh_seed_uses_claude_code_for_opus_agent(bench_home):
 def test_score_input_rejects_retired_and_arbitrary_efforts(bench_home, effort):
     with pytest.raises(bench.BenchError, match="unsupported effort"):
         bench.upsert_scores([_score(effort=effort)])
-
-
-def test_cli_bench_migrate_effort_command(bench_home, capsys):
-    from scopefuel import cli
-
-    bench.upsert_scores(
-        [
-            bench.ModelScore(
-                model_id="gpt-5-6-terra-high",
-                effort=None,
-                harness=None,
-                source="AA-model",
-                metric="coding_index",
-                score=67.1,
-                rank=None,
-                captured_at="2026-07-31T00:00:00+00:00",
-            )
-        ]
-    )
-    assert cli.main(["bench", "migrate-effort"]) == 0
-    out = capsys.readouterr().out
-    assert "migrated 1 row(s)" in out
 
 
 # ------------------------------------------------------------------ ROB-1190 ②-4/②-5: AA-agent priority

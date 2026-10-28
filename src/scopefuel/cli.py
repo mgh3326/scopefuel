@@ -351,11 +351,6 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
     bench_parser = subparsers.add_parser("bench", help="출처별 벤치 점수 SQLite DB")
     bench_sub = bench_parser.add_subparsers(dest="bench_command", required=True)
     bench_sub.add_parser("sync", help="공식 Artificial Analysis 모델 점수 동기화")
-    bench_sub.add_parser(
-        "migrate-effort", help="기존 AA-model 행의 model_id effort 접미사를 effort 컬럼으로 백필"
-    )
-    bench_sub.add_parser("backfill-aa-metrics", help="승인된 AA-agent 26행의 실행시간·비용 메타데이터 백필")
-
     bench_show = bench_sub.add_parser("show", help="모델의 출처별 벤치 점수 보기")
     bench_show.add_argument("model_id", help="정규화 모델 식별자")
 
@@ -363,43 +358,6 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
     bench_import.add_argument("file", help="[[scores]] 또는 [[model_scores]] TOML 파일")
 
     bench_sub.add_parser("coverage", help="프로필별 출처(AA-agent/AA-model/openrouter) 커버리지")
-    bench_sub.add_parser("push-local", help="기존 로컬 bench 행을 handoffkeep으로 1회 이관")
-    legacy_push_local = bench_sub.add_parser(
-        "push-local-migrate",
-        help="legacy push-local row identity를 dry-run 확인하고 로컬에 기록",
-        description=(
-            "Dry run is the default. Nothing is sent to the server in either mode.\n"
-            "Classes: confirmed, never-pushed, conflict, ambiguous.\n"
-            "push-local refuses until conflict and ambiguous rows are resolved."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    legacy_push_local.add_argument(
-        "--legacy-created-by",
-        required=True,
-        action="append",
-        metavar="NAME",
-        help="legacy server creator id (repeat for multiple ids; required)",
-    )
-    legacy_push_local.add_argument(
-        "--legacy-host",
-        action="append",
-        default=[],
-        metavar="NAME",
-        help="former hostname (repeatable; current hostname is always included)",
-    )
-    legacy_push_local.add_argument(
-        "--apply",
-        action="store_true",
-        help="write confirmed mappings and migration inputs to the local bench DB",
-    )
-    legacy_push_local.add_argument(
-        "--accept-new",
-        type=int,
-        metavar="ROWID",
-        help="with --apply, record an explicit accept-new decision for one conflict/ambiguous row",
-    )
-
     grades_parser = bench_sub.add_parser("grades", help="서버 정본 급 배치 관리")
     grades_sub = grades_parser.add_subparsers(dest="grades_command", required=True)
     grades_set = grades_sub.add_parser("set", help="프로필의 서버 급 배치 설정")
@@ -498,55 +456,6 @@ def build_parser(available: list[str], manual_pools: frozenset[str] = frozenset(
         "--allow-plaintext-http",
         action="store_true",
         help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
-    )
-
-    reps_backfill = reps_sub.add_parser(
-        "backfill",
-        help="task->grade 매핑 파일로 기존 rep의 과제 급을 주석 행으로 보충 (원행 불변, 기본 dry-run)",
-    )
-    reps_backfill.add_argument(
-        "--mapping",
-        required=True,
-        help="task-ref -> grade JSON 매핑 파일",
-    )
-    reps_backfill.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
-    reps_backfill.add_argument(
-        "--allow-plaintext-http",
-        action="store_true",
-        help="이번 실행 한정 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
-    )
-    reps_backfill.add_argument(
-        "--host", help="migrated-local 매칭에 쓸 출처 호스트 (기본: 이 머신의 hostname)"
-    )
-
-    reps_migrate = reps_sub.add_parser(
-        "migrate", help="로컬 bench.db reps를 handoffkeep reps 저장소로 1회 이관 (기본 dry-run)"
-    )
-    reps_migrate.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
-    reps_migrate.add_argument(
-        "--allow-plaintext-http",
-        action="store_true",
-        help="이번 실행 한정으로 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
-    )
-    reps_migrate.add_argument("--host", help="이관 행에 기록할 출처 호스트 (기본: 이 머신의 hostname)")
-    reps_migrate.add_argument(
-        "--sample", type=_nonnegative_int, default=5, help="dry-run 에서 보일 to-insert 샘플 수"
-    )
-    reps_migrate.add_argument(
-        "--force",
-        action="store_true",
-        help="원격이 같은 derived id 로 다른 rep 을 이미 갖고 있어도 덮어쓰기 진행",
-    )
-
-    reps_refresh = reps_sub.add_parser(
-        "refresh-ids",
-        help="캐시된 rep 행의 server_id 를 서버 사본에서 채우는 1회 복구 (기본 dry-run)",
-    )
-    reps_refresh.add_argument("--apply", action="store_true", help="실제로 기록 (기본은 dry-run)")
-    reps_refresh.add_argument(
-        "--allow-plaintext-http",
-        action="store_true",
-        help="이번 실행 한정으로 평문 http endpoint 허용 (allow_plaintext_reps 의 1회성 대안)",
     )
 
     grades_parser = subparsers.add_parser(
@@ -2158,46 +2067,8 @@ def _push_catalog_command(args: argparse.Namespace) -> int:
 def _bench_command(args: argparse.Namespace) -> int:
     if args.bench_command == "sync":
         return bench.run_sync(stderr=sys.stderr)
-    if args.bench_command == "migrate-effort":
-        count = bench.migrate_aa_model_effort_suffixes()
-        print(f"bench migrate-effort: migrated {count} row(s)")
-        return 0
-    if args.bench_command == "backfill-aa-metrics":
-        count = bench.backfill_aa_agent_metrics()
-        print(f"bench backfill-aa-metrics: updated {count} row(s)")
-        return 0
     if args.bench_command == "coverage":
         print(bench.coverage_report())
-        return 0
-    if args.bench_command == "push-local":
-        try:
-            score_count, rep_count = bench.push_local()
-        except bench.BenchError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        print(f"bench push-local: pushed {score_count} score(s), {rep_count} rep(s)")
-        return 0
-    if args.bench_command == "push-local-migrate":
-        try:
-            result = bench.migrate_push_local(
-                legacy_created_by=args.legacy_created_by,
-                legacy_host=args.legacy_host,
-                apply=args.apply,
-                accept_new=args.accept_new,
-            )
-        except bench.BenchError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        for class_name in bench._LEGACY_PUSH_LOCAL_CLASSES:
-            print(f"{class_name}: {len(result.classes[class_name])}")
-        for class_name in ("conflict", "ambiguous"):
-            for record in result.classes[class_name]:
-                server_ids = ",".join(str(value) for value in result.server_ids.get(record.id, ()))
-                print(f"{class_name} rowid={record.id} profile={record.profile} server_ids={server_ids}")
-        if result.applied:
-            print(f"bench push-local-migrate applied: wrote {result.mappings_written} mapping(s)")
-        else:
-            print("bench push-local-migrate dry-run: nothing is sent to the server; pass --apply to write")
         return 0
     if args.bench_command == "grades":
         if args.grades_command == "list":
@@ -2376,107 +2247,6 @@ def _reps_command(args: argparse.Namespace) -> int:
             return 0
         for comparison in comparisons:
             print(bench.format_rep_comparison(comparison))
-        return 0
-    if args.reps_command == "backfill":
-        try:
-            raw = json.loads(pathlib.Path(args.mapping).read_text(encoding="utf-8"))
-            report = grades.backfill_rep_grades(
-                mapping=raw,
-                apply=args.apply,
-                source=args.mapping,
-                host=args.host,
-                allow_plaintext_http=args.allow_plaintext_http,
-            )
-        except (OSError, ValueError, TypeError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        mode = "applied" if args.apply else "dry-run"
-        print(f"reps backfill ({mode}): mapping {len(report.mapping)} task(s)")
-        for annotation in report.planned:
-            print(f"  annotate {annotation.rep_ref} grade={annotation.grade} task={annotation.task_ref}")
-        for ref, grade in report.already_annotated:
-            print(f"  already annotated {ref} grade={grade}")
-        for ref, task_ref, grade in report.skipped_graded:
-            print(f"  already graded {ref} task={task_ref} grade={grade} (kept)")
-        for ref, existing, mapped in report.conflicting_annotations:
-            print(f"  conflict {ref} annotation grade={existing} vs mapped {mapped} (kept)")
-        for task_ref in report.missing_tasks:
-            print(f"  no counted reps for task {task_ref}")
-        if args.apply:
-            print(f"reps backfill: wrote {report.applied} annotation row(s); original reps untouched")
-        else:
-            print("reps backfill: dry-run — rerun with --apply to write the annotations")
-        return 0
-    if args.reps_command == "migrate":
-        try:
-            result = bench.migrate_reps(
-                apply=args.apply,
-                host=args.host,
-                allow_plaintext_http=args.allow_plaintext_http,
-                force=args.force,
-            )
-        except bench.BenchError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        if not result.applied:
-            overwrite = f" would-overwrite={len(result.would_overwrite)}" if result.would_overwrite else ""
-            print(
-                f"reps migrate (dry-run) host={result.host} local={result.local_count} "
-                f"already-present={result.present_count} to-insert={len(result.pending)}{overwrite}"
-            )
-            for rep in result.pending[: args.sample]:
-                print(f"  {bench.format_rep(rep)}")
-            if result.would_overwrite:
-                print(
-                    "warning: --apply will refuse these rows without --force "
-                    "(derived id already taken by a different remote rep)"
-                )
-            print("pass --apply to write")
-            return 0
-        print(
-            f"reps migrate applied host={result.host} inserted={result.inserted_count} "
-            f"skipped={result.present_count}"
-        )
-        print(
-            f"reconcile: local={result.local_count} remote-this-host={result.remote_for_host} "
-            f"missing={len(result.missing)} extra-remote={result.extra_remote_count}"
-        )
-        for rep in result.missing[:10]:
-            print(f"  missing: {bench.format_rep(rep)}")
-        if len(result.missing) > 10:
-            print(f"  ... +{len(result.missing) - 10} more")
-        if result.missing:
-            return 2
-        return 0
-    if args.reps_command == "refresh-ids":
-        try:
-            result = bench.refresh_rep_server_ids(
-                apply=args.apply,
-                allow_plaintext_http=args.allow_plaintext_http,
-            )
-        except bench.BenchError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        mode = "applied" if args.apply else "dry-run"
-        incomplete = " remote-window-incomplete" if result.window_incomplete else ""
-        print(
-            f"reps refresh-ids ({mode}): candidates={result.candidates} "
-            f"filled={len(result.filled)} unmatched={len(result.unmatched)} "
-            f"conflicts={len(result.conflicts)} ambiguous={len(result.ambiguous)} "
-            f"window-limited={len(result.window_blocked)}{incomplete}"
-        )
-        for cache_key, server_id in result.filled:
-            print(f"  fill {cache_key} -> srv:{server_id}")
-        for cache_key in result.unmatched:
-            print(f"  unmatched {cache_key}")
-        for cache_key in result.conflicts:
-            print(f"  conflict {cache_key} (server holds the id slot under a different rep)")
-        for cache_key in result.ambiguous:
-            print(f"  ambiguous {cache_key} (multiple same-content server rows)")
-        for cache_key in result.window_blocked:
-            print(f"  window-limited {cache_key} (remote window incomplete — cannot prove the server row)")
-        if not args.apply:
-            print("pass --apply to write")
         return 0
     return 2
 

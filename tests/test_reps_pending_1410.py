@@ -6,11 +6,8 @@ the actual a2ad282 client before implementing this change.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import pathlib
-import shutil
-import socket
 import sqlite3
 
 import pytest
@@ -18,7 +15,6 @@ from test_reps_collision_1384 import (
     BAND_BASE,
     _add_args,
     _client_env,
-    _migrate_push_local,
     _remote,
     _remote_row,
     _seed_cache_row,
@@ -48,73 +44,6 @@ def _expire():
         conn.commit()
     finally:
         conn.close()
-
-
-@pytest.mark.parametrize("mode", ["old", "new"])
-def test_s1_same_hostname_installs_keep_both_reps(tmp_path, monkeypatch, mode):
-    monkeypatch.setattr(socket, "gethostname", lambda: "same-host")
-    first, second = tmp_path / "a", tmp_path / "b"
-    _local(first, monkeypatch, notes="identical independent evidence")
-    fake = _remote(monkeypatch, first, mode)
-    assert _migrate_push_local() == 0
-    assert bench.push_local() == (0, 1)
-    _local(second, monkeypatch, notes="identical independent evidence")
-    _client_env(second, monkeypatch)
-    assert _migrate_push_local() == 0
-    assert bench.push_local() == (0, 1)
-    assert len(fake.reps) == 2
-    assert {row["notes"] for row in fake.reps} == {"identical independent evidence"}
-    assert len({row["origin_id"] for row in fake.reps}) == 2
-
-
-@pytest.mark.parametrize("mode", ["old", "new"])
-@pytest.mark.parametrize("recreate", [False, True])
-def test_s1_reused_rowid_keeps_both_contents(tmp_path, monkeypatch, mode, recreate):
-    _local(tmp_path, monkeypatch, notes="original")
-    fake = _remote(monkeypatch, tmp_path, mode)
-    assert _migrate_push_local() == 0
-    bench.push_local()
-    if recreate:
-        bench.db_path().unlink()
-    else:
-        conn = bench.connect()
-        conn.execute("DELETE FROM reps")
-        conn.commit()
-        conn.close()
-    _local(tmp_path, monkeypatch, notes="replacement")
-    _client_env(tmp_path, monkeypatch)
-    if recreate:
-        assert _migrate_push_local() == 0
-    bench.push_local()
-    assert {row["notes"] for row in fake.reps} == {"original", "replacement"}
-    assert len({row["origin_id"] for row in fake.reps}) == 2
-
-
-@pytest.mark.parametrize("mode", ["old", "new"])
-def test_s1_hostname_change_does_not_duplicate(tmp_path, monkeypatch, mode):
-    _local(tmp_path, monkeypatch)
-    fake = _remote(monkeypatch, tmp_path, mode)
-    monkeypatch.setattr(socket, "gethostname", lambda: "before")
-    assert _migrate_push_local() == 0
-    bench.push_local()
-    before = [dict(row) for row in fake.reps]
-    monkeypatch.setattr(socket, "gethostname", lambda: "after")
-    bench.push_local()
-    assert fake.reps == before
-
-
-@pytest.mark.parametrize("mode", ["old", "new"])
-def test_s1_precheck_refuses_held_origin_without_put(tmp_path, monkeypatch, mode):
-    _local(tmp_path, monkeypatch)
-    fake = _remote(monkeypatch, tmp_path, mode)
-    assert _migrate_push_local() == 0
-    bench.push_local()
-    fake.reps[0]["notes"] = "held by different content"
-    puts = fake.hits["PUT"]
-    with pytest.raises(bench.BenchError, match="refus|overwrite"):
-        bench.push_local()
-    assert fake.hits["PUT"] == puts
-    assert fake.reps[0]["notes"] == "held by different content"
 
 
 def test_s2_compare_only_server_confirmed_and_grades_unchanged(tmp_path, monkeypatch, capsys):
@@ -368,83 +297,6 @@ def test_new_server_postwrite_contradiction_keeps_pending(tmp_path, monkeypatch,
     _expire()
     mine = next(row for row in bench.read_reps() if row.notes == "mine")
     assert bench.rep_ref(mine).startswith("origin:") and mine.pending_state == "pending"
-
-
-def test_install_id_lifecycle_and_copy(tmp_path, monkeypatch):
-    first, copied = tmp_path / "first", tmp_path / "copied"
-    _local(first, monkeypatch)
-    fake = _remote(monkeypatch, first)
-    assert _migrate_push_local() == 0
-    bench.push_local()
-    install_id = bench._rep_install_id(None)
-    assert len(install_id) == 32 and len(bytes.fromhex(install_id)) == 16
-    source = bench.db_path()
-    _client_env(copied, monkeypatch)
-    target = bench.db_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, target)
-    assert bench._rep_install_id(None) == install_id
-    bench.push_local()
-    assert len(fake.reps) == 1  # copied evidence is the same evidence
-    conn = bench.connect()
-    conn.execute("UPDATE reps SET notes = 'changed after copy'")
-    conn.commit()
-    conn.close()
-    bench.push_local()
-    assert len(fake.reps) == 2
-    target.unlink()
-    assert bench._rep_install_id(None) != install_id
-
-
-@pytest.mark.parametrize("damage", ["corrupt", "duplicate"])
-def test_bad_install_meta_fails_closed(tmp_path, monkeypatch, damage):
-    _local(tmp_path, monkeypatch)
-    fake = _remote(monkeypatch, tmp_path)
-    install_id = bench._rep_install_id(None)
-    conn = bench._cache_connect()
-    if damage == "corrupt":
-        conn.execute("UPDATE bench_install_meta SET install_id = 'not a random id'")
-    else:
-        conn.execute("DROP TABLE bench_install_meta")
-        conn.execute("CREATE TABLE bench_install_meta (singleton INTEGER, install_id TEXT)")
-        conn.executemany("INSERT INTO bench_install_meta VALUES (1, ?)", [(install_id,), (install_id,)])
-    conn.commit()
-    conn.close()
-    with pytest.raises(bench.BenchBackendError, match="corrupt install identity"):
-        bench.push_local()
-    assert fake.hits["PUT"] == 0
-
-
-def test_precheck_runs_before_every_push_put(tmp_path, monkeypatch):
-    _local(tmp_path, monkeypatch)
-    fake = _remote(monkeypatch, tmp_path)
-    assert _migrate_push_local() == 0
-    record = bench._read_local_reps_for_push()[0]
-    records = [dataclasses.replace(record, id=i) for i in range(1, 502)]
-    monkeypatch.setattr(bench, "_read_local_reps_for_push", lambda **kw: records)
-    origin = bench._push_local_origin_id(bench._rep_install_id(None), records[-1])
-    fake.after_put = lambda: fake.reps.append(_remote_row(id=900, origin_id=origin, notes="held"))
-    with pytest.raises(bench.BenchRepConflictError):
-        bench.push_local()
-    assert fake.hits["PUT"] == 1
-    assert all(row["origin_id"] != origin for batch in fake.put_payloads for row in batch)
-
-
-def test_origin_hash_uses_all_canonical_fields_and_normalizes_timestamp(tmp_path, monkeypatch):
-    _local(tmp_path, monkeypatch)
-    record = bench._read_local_reps_for_push()[0]
-    install_id = bench._rep_install_id(None)
-    origin = bench._push_local_origin_id(install_id, record)
-    for field in bench._REP_COLUMNS:
-        if field == "id":
-            continue
-        old = getattr(record, field)
-        changed = 123 if old is None else old + 1 if isinstance(old, int) else old + " changed"
-        assert (
-            bench._push_local_origin_id(install_id, dataclasses.replace(record, **{field: changed})) != origin
-        )
-    same_instant = dataclasses.replace(record, recorded_at="2026-10-23T09:00:00+09:00")
-    assert bench._push_local_origin_id(install_id, same_instant) == origin
 
 
 def test_drop_unbound_pending_removes_only_its_local_echo(tmp_path, monkeypatch, capsys):

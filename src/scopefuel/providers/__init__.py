@@ -1,9 +1,5 @@
 """Provider 레지스트리.
 
-우선순위(뒤가 이김): 내장 Python provider < 선언형 TOML 스펙 < entry-point 플러그인.
-스펙이 내장을 덮어쓸 수 있게 한 것은 의도적이다 — 엔드포인트가 깨졌을 때
-릴리스를 기다리지 않고 사용자가 TOML 한 장으로 고칠 수 있어야 한다.
-
 각 fetcher는 callable이며 `.pool_class` 메타데이터를 가질 수 있다.
 registry는 성공/예외/캐시 폴백 모두에서 이 메타데이터를 authoritative class로 사용한다.
 """
@@ -58,32 +54,22 @@ BUILTIN: dict[str, Fetcher] = {
 }
 
 
-def _entry_point_providers() -> dict[str, Fetcher]:
-    try:
-        from importlib.metadata import entry_points
-    except ImportError:  # pragma: no cover
-        return {}
-    found: dict[str, Fetcher] = {}
-    for ep in entry_points(group="scopefuel.providers"):
-        try:
-            loaded = ep.load()
-            explicit_class = getattr(loaded, "pool_class", None)
-            if explicit_class is not None:
-                found[ep.name] = _with_class(loaded, _normalize_pool_class(explicit_class))
-            else:
-                found[ep.name] = loaded
-        except Exception:  # 플러그인 하나가 도구 전체를 막지 않는다
-            continue
-    return found
+_warned_unknown_pools: set[tuple[str, str]] = set()
 
 
 def registry() -> dict[str, Fetcher]:
-    from ..spec import discover_specs
+    import sys
 
-    merged: dict[str, Fetcher] = dict(BUILTIN)
-    merged.update(discover_specs())
-    merged.update(_entry_point_providers())
-    return merged
+    from .. import policy
+
+    pools = policy.load_config().get("pools")
+    if isinstance(pools, dict):
+        for name in pools.keys() - BUILTIN.keys():
+            key = (str(policy.config_path()), name)
+            if key not in _warned_unknown_pools:
+                _warned_unknown_pools.add(key)
+                print("scopefuel: warning: unknown pool section ignored", file=sys.stderr)
+    return dict(BUILTIN)
 
 
 def default_order(names: list[str]) -> list[str]:

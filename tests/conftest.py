@@ -86,11 +86,10 @@ def fixture_text():
 
 @pytest.fixture(autouse=True)
 def isolated_cache(tmp_path, monkeypatch):
-    """실제 홈 디렉터리 캐시/스펙/설정을 건드리지 않는다."""
+    """실제 홈 디렉터리 캐시/설정을 건드리지 않는다."""
     from scopefuel import bench
 
     monkeypatch.setenv("SCOPEFUEL_CACHE", str(tmp_path / "snapshots.json"))
-    monkeypatch.setenv("SCOPEFUEL_SPEC_DIR", str(tmp_path / "specs"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     # #593: the bench backend now defaults to ``auto`` and discovers handoffkeep

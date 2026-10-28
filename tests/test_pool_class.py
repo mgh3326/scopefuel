@@ -395,63 +395,6 @@ def test_legacy_cache_without_pool_class_defaults_to_registry_class(monkeypatch,
     assert result.pool_class == "spend"
 
 
-def test_spec_supports_class_spend(tmp_path, monkeypatch):
-    from scopefuel import spec
-
-    creds = tmp_path / "auth.json"
-    creds.write_text(json.dumps({"tokens": {"access_token": "tok"}}))
-    monkeypatch.setattr(spec, "request_json", lambda *a, **k: {"usage": 12, "reset": "2099-01-01T00:00:00Z"})
-    provider = spec.make_provider(
-        {
-            "id": "myplan",
-            "class": "spend",
-            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
-            "request": {"url": "https://example.test/u"},
-            "buckets": [
-                {
-                    "label": "5h",
-                    "window": "5h",
-                    "used_pct_path": ["usage"],
-                    "resets_at_path": ["reset"],
-                }
-            ],
-        }
-    )
-    assert provider.pool_class == "spend"
-    result = provider()
-    assert result.pool_class == "spend"
-
-
-def test_spec_rejects_invalid_class(tmp_path):
-    from scopefuel import spec
-
-    with pytest.raises(spec.SpecError, match="class"):
-        spec.make_provider(
-            {
-                "id": "bad",
-                "class": "gold",
-                "request": {"url": "https://example.test/u"},
-            }
-        )
-
-
-def test_spec_omitted_class_defaults_preserve(tmp_path, monkeypatch):
-    from scopefuel import spec
-
-    creds = tmp_path / "auth.json"
-    creds.write_text(json.dumps({"tokens": {"access_token": "tok"}}))
-    monkeypatch.setattr(spec, "request_json", lambda *a, **k: {"usage": 12})
-    provider = spec.make_provider(
-        {
-            "id": "myplan",
-            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
-            "request": {"url": "https://example.test/u"},
-            "buckets": [{"label": "5h", "window": "5h", "used_pct_path": ["usage"]}],
-        }
-    )
-    assert provider.pool_class == "preserve"
-
-
 # ------------------------------------------------------------------ regression tests for audit findings
 
 
@@ -488,53 +431,7 @@ def test_invalid_numeric_matrix_does_not_emit_progress_or_waste(invalid_val):
     assert "nanx" not in brf and "infx" not in brf
 
 
-def test_toml_and_agy_bool_ingestion_end_to_end(tmp_path, monkeypatch):
-    from scopefuel import spec
-    from scopefuel.providers import agy
-
-    creds = tmp_path / "auth.json"
-    creds.write_text(json.dumps({"tokens": {"access_token": "tok"}}))
-    monkeypatch.setattr(spec, "request_json", lambda *a, **k: {"usage": True, "remaining": True})
-    provider_used = spec.make_provider(
-        {
-            "id": "myplan",
-            "class": "spend",
-            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
-            "request": {"url": "https://example.test/u"},
-            "buckets": [{"label": "5h", "window": "5h", "used_pct_path": ["usage"]}],
-        }
-    )
-    res1 = provider_used()
-    assert res1.buckets[0].used_pct is None
-
-    provider_rem = spec.make_provider(
-        {
-            "id": "myplan2",
-            "class": "spend",
-            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
-            "request": {"url": "https://example.test/u"},
-            "buckets": [{"label": "5h", "window": "5h", "remaining_fraction_path": ["remaining"]}],
-        }
-    )
-    res2 = provider_rem()
-    assert res2.buckets[0].used_pct is None
-
-    # test agy local with bool
-    raw_local = {
-        "response": {
-            "groups": [
-                {
-                    "displayName": "Gemini Models",
-                    "buckets": [{"window": "5h", "remainingFraction": True}],
-                }
-            ]
-        }
-    }
-    agy_res = agy._from_local(raw_local)
-    assert agy_res.buckets[0].used_pct is None
-
-
-def test_plugin_callable_non_mutation_slots_and_precedence(monkeypatch):
+def test_fetcher_callable_non_mutation_slots_and_precedence(monkeypatch):
     # 1. Plain function without pool_class metadata
     def plain_plugin():
         return ProviderResult(id="custom", pool_class="spend", buckets=[bucket(50.0)])
@@ -827,25 +724,6 @@ def test_invalid_used_pct_rejects_overflow():
     assert _is_valid_used_pct(2**1024) is False
 
 
-def test_spec_used_pct_catches_overflow(monkeypatch, tmp_path):
-    from scopefuel import spec
-
-    creds = tmp_path / "auth.json"
-    creds.write_text(json.dumps({"tokens": {"access_token": "tok"}}))
-    monkeypatch.setattr(spec, "request_json", lambda *a, **k: {"usage": 10**1000})
-    provider = spec.make_provider(
-        {
-            "id": "myplan",
-            "class": "spend",
-            "credentials": {"file": str(creds), "token_path": ["tokens", "access_token"]},
-            "request": {"url": "https://example.test/u"},
-            "buckets": [{"label": "5h", "window": "5h", "used_pct_path": ["usage"]}],
-        }
-    )
-    result = provider()
-    assert result.buckets[0].used_pct is None
-
-
 # ------------------------------------------------------------------ warning+stale brief precedence (Fix 5)
 
 
@@ -997,7 +875,7 @@ def test_invalid_cache_entry_class_normalized_on_read(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("invalid", [123, True, "", "gold", None])
-def test_entry_point_class_normalized(invalid):
+def test_fetcher_class_normalized(invalid):
     from scopefuel.providers import _with_class
 
     def dummy():
@@ -1464,3 +1342,19 @@ def test_waste_only_usage_mark_stays_ok():
     assert waste.verdict_at(NOW).waste is True
     assert overall_mark([waste], now=NOW) == "ok"
     assert overall_usage_mark([waste], now=NOW) == "ok"
+
+
+def test_agy_bool_ingestion_end_to_end():
+    from scopefuel.providers import agy
+
+    raw_local = {
+        "response": {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [{"window": "5h", "remainingFraction": True}],
+                }
+            ]
+        }
+    }
+    assert agy._from_local(raw_local).buckets[0].used_pct is None

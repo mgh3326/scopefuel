@@ -396,35 +396,6 @@ def test_reps_write_under_the_catalog_only_opt_in_fails_closed(hk_plaintext):
     assert fake.hits[("GET", "catalog")] == 1
 
 
-def test_push_local_routes_each_scope_to_its_own_opt_in(hk_plaintext):
-    """push_local resolves catalog and reps backends separately: each scope's
-    rows go out only when that scope's opt-in is on."""
-
-    fake, config = hk_plaintext
-    config.write_text('[bench]\nbackend = "local"\n', encoding="utf-8")
-    bench.upsert_scores([_score_row()])
-    _add_rep()
-
-    config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_reps = true\n', encoding="utf-8")
-    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_catalog"):
-        bench.push_local()
-    assert fake.hits[("PUT", "scores")] == 0
-
-    config.write_text('[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\n', encoding="utf-8")
-    with pytest.raises(bench.BenchBackendError, match="allow_plaintext_reps"):
-        bench.push_local()
-    assert fake.hits[("PUT", "reps")] == 0
-
-    config.write_text(
-        '[bench]\nbackend = "handoffkeep"\nallow_plaintext_catalog = true\nallow_plaintext_reps = true\n',
-        encoding="utf-8",
-    )
-    bench.migrate_push_local(legacy_created_by=["legacy-shared"], apply=True)
-    assert bench.push_local() == (1, 1)
-    assert fake.hits[("PUT", "scores")] == 1
-    assert fake.hits[("PUT", "reps")] == 1
-
-
 # --- AC1/AC4: the alias and https -------------------------------------------
 
 
