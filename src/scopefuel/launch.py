@@ -926,6 +926,7 @@ def resolve_launch(
     # the profile-default row's permissive gate while the canon has gated the
     # high rung specifically.
     matched = [row for row in rows if row.effort == resolved_effort]
+    matched_effort = resolved_effort
     if not matched and e6_open and not _retired_rung(view, canonical, resolved_effort):
         # The canon is silent about this rung (a server that has not been seeded
         # with the E6 rows yet). The bundled measurement row is the answer — the
@@ -957,6 +958,7 @@ def resolve_launch(
         # nothing about takes the profile's default placement, which is never
         # more permissive than that default row already is.
         matched = [row for row in rows if row.effort == fallback_effort]
+        matched_effort = fallback_effort
         if not matched:
             available = ", ".join(sorted(r.effort or "(default)" for r in rows))
             raise LaunchError(
@@ -968,7 +970,7 @@ def resolve_launch(
         # launch must not quietly take the first. Fail closed for every
         # profile, not only the credit profiles.
         raise LaunchError(
-            f"profile '{profile}' has {len(matched)} live canon rows for rung '{resolved_effort}'; "
+            f"profile '{profile}' has {len(matched)} live canon rows for rung '{matched_effort}'; "
             "refusing to pick one"
         )
     row = matched[0]

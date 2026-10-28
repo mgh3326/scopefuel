@@ -33,8 +33,10 @@ from scopefuel.providers import BUILTIN
 from scopefuel.recommend import E6_ARM_MARKER_ENV
 
 # origin/main — the launch contract this task must keep byte-identical
-# wherever a rung still holds exactly one live row.
-BASE = "43b99e4f75050c2ec6150d06912641eac2f1b6ad"
+# wherever a rung still holds exactly one live row.  Pinned at the main the
+# branch last merged, so profiles the canon gained since the original PR base
+# (cmd-dsflash41, codex-terra61) resolve under the same code on both sides.
+BASE = "92eb842ce9f13c9badd1e2908adf58fcd1466aab"
 NOW = dt.datetime.now(dt.UTC).replace(microsecond=0)
 TODAY = NOW.date()
 CREDIT_EXPIRES = (TODAY + dt.timedelta(days=30)).isoformat()
@@ -172,6 +174,29 @@ def test_duplicate_live_row_launch_refuses_like_the_gate(
     assert profile in text
     assert effort in text
     assert "2" in text
+
+
+def test_duplicate_refusal_names_the_fallback_rung_holding_the_rows(monkeypatch, capsys):
+    """Requested rung absent, duplicate rows on the fallback rung: name the fallback.
+
+    grok is placed at low/medium and silent about high, so
+    ``--effort high`` falls back to the default placement (medium).  When the twin
+    lives on that fallback rung the refusal must name the rung actually holding
+    the duplicate rows, not the requested one.  Mutant: restore
+    ``resolved_effort`` in the message and the refusal says rung 'high'.
+    """
+
+    view = _dup_view("grok", "medium", twin_first=False, gate="consult_only")
+    _serve_canon(monkeypatch, view)
+    monkeypatch.delenv(E6_ARM_MARKER_ENV, raising=False)
+
+    rc = cli.main(["policy", "launch", "grok", "--effort", "high"])
+    captured = capsys.readouterr()
+    assert rc == 3
+    text = captured.out + captured.err
+    assert "live canon rows" in text
+    assert "rung 'medium'" in text
+    assert "rung 'high'" not in text
 
 
 def test_two_rows_for_different_efforts_are_not_duplicates(monkeypatch, capsys):
@@ -364,23 +389,30 @@ def test_policy_set_still_refuses_an_unknown_pool(policy_config, capsys, monkeyp
 # ---------------------------------------------------------------------------
 
 
-def test_an_all_retired_credit_profile_with_the_marker_gets_the_retired_refusal(monkeypatch, capsys):
+def test_an_all_retired_e6_only_profile_with_the_marker_gets_the_retired_refusal(monkeypatch, capsys):
     """The canon retired every row — the answer is 'retired in the catalog',
     not 'set the marker' (the marker is already set).
 
-    Mutant: drop ``and not e6_open`` and the marker-set case goes RED.
+    codex-terra61 is the remaining E6-only shape: the pi credit profiles are
+    placed rungs since hk 2188, so an all-retired pi canon already reads
+    "retired" with or without the marker.  Mutant: drop ``and not e6_open``
+    and the marker-set case goes RED.
     """
 
     rows = [
-        ({**entry.as_dict(), "retired_at": RETIRED_AT} if entry.profile == "pi-sonnet55" else entry.as_dict())
+        (
+            {**entry.as_dict(), "retired_at": RETIRED_AT}
+            if entry.profile == "codex-terra61"
+            else entry.as_dict()
+        )
         for entry in bench.catalog_snapshot()
     ]
     entries = bench._catalog_from_payload({"catalog": rows})
     view = launch.CatalogView(entries=tuple(entries), source="server", backend="handoffkeep", age_s=0)
     _serve_canon(monkeypatch, view)
 
-    monkeypatch.setenv(E6_ARM_MARKER_ENV, "pi-sonnet55@high")
-    rc = cli.main(["policy", "launch", "pi-sonnet55", "--effort", "high", "--role", "worker"])
+    monkeypatch.setenv(E6_ARM_MARKER_ENV, "codex-terra61@high")
+    rc = cli.main(["policy", "launch", "codex-terra61", "--effort", "high", "--role", "worker"])
     captured = capsys.readouterr()
     assert rc == 3
     assert "retired in the catalog" in captured.out + captured.err
@@ -388,7 +420,7 @@ def test_an_all_retired_credit_profile_with_the_marker_gets_the_retired_refusal(
 
     # Without the marker the same canon still arms the caller: e6_arm_required.
     monkeypatch.delenv(E6_ARM_MARKER_ENV, raising=False)
-    rc = cli.main(["policy", "launch", "pi-sonnet55", "--effort", "high", "--role", "worker"])
+    rc = cli.main(["policy", "launch", "codex-terra61", "--effort", "high", "--role", "worker"])
     captured = capsys.readouterr()
     assert rc == 3
     assert "e6_arm_required" in captured.out + captured.err
