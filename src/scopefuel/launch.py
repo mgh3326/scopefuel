@@ -866,9 +866,12 @@ def resolve_launch(
     from_snapshot = False
     if not rows:
         mentioned = any(entry.profile == canonical for entry in view.entries)
-        if mentioned and e6_only_profile(canonical):
-            # hk 2079 + hk 2110: a profile that exists only as unmeasured E6
-            # rows has no placement to fall back on — name the marker it needs.
+        if mentioned and e6_only_profile(canonical) and not e6_open:
+            # hk 2079 + hk 2110: an E6-only profile has no placement to fall
+            # back on — name the marker it needs. hk 2103: when e6_open already
+            # names the rung but the live set is empty, every row was retired;
+            # use the "retired in the catalog" refusal below instead of asking
+            # for a marker that is already set.
             raise LaunchError(
                 f"e6_arm_required: {canonical}@{requested} requires SCOPEFUEL_E6_ARM={canonical}@{requested}"
                 if requested is not None
@@ -923,6 +926,7 @@ def resolve_launch(
     # the profile-default row's permissive gate while the canon has gated the
     # high rung specifically.
     matched = [row for row in rows if row.effort == resolved_effort]
+    matched_effort = resolved_effort
     if not matched and e6_open and not _retired_rung(view, canonical, resolved_effort):
         # The canon is silent about this rung (a server that has not been seeded
         # with the E6 rows yet). The bundled measurement row is the answer — the
@@ -954,11 +958,21 @@ def resolve_launch(
         # nothing about takes the profile's default placement, which is never
         # more permissive than that default row already is.
         matched = [row for row in rows if row.effort == fallback_effort]
+        matched_effort = fallback_effort
         if not matched:
             available = ", ".join(sorted(r.effort or "(default)" for r in rows))
             raise LaunchError(
                 f"profile '{profile}' has no '{resolved_effort}' rung in the catalog (have: {available})"
             )
+    if len(matched) > 1:
+        # hk 2103: two live canon rows for one rung are ambiguous — the gate
+        # collects every row for the key (a consult_only twin refuses), so
+        # launch must not quietly take the first. Fail closed for every
+        # profile, not only the credit profiles.
+        raise LaunchError(
+            f"profile '{profile}' has {len(matched)} live canon rows for rung '{matched_effort}'; "
+            "refusing to pick one"
+        )
     row = matched[0]
     # The arm is opened only when the resolved row *is* the unmeasured rung the
     # marker named — a canon row placed above C is an ordinary row, and the marker

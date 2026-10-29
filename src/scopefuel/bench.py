@@ -2958,10 +2958,14 @@ def _server_catalog_rejection(
 ) -> str | None:
     """The validity floor a fetched catalog must pass before it may be canon.
 
-    Returns the rejection detail, or ``None`` when the catalog stands. Two
-    rejections: an empty catalog, and a catalog that never mentions a profile
-    the ratchet covers — *mentioned* means present as a row, live or retired,
-    so a legitimate server-side retirement still passes.
+    Returns the rejection detail, or ``None`` when the catalog stands. Three
+    rejections: an empty catalog, a catalog that never mentions a profile the
+    ratchet covers — *mentioned* means present as a row, live or retired, so a
+    legitimate server-side retirement still passes — and (hk 2103) a catalog
+    that holds two live rows for one ``(profile, effort)`` key: ``policy
+    launch`` refuses such a rung outright, so the bad canon is refused here
+    too instead of quietly committing a row-count answer the gate and launch
+    disagree on.
 
     The ratchet is the **last-good committed cache** (#1768): a fetched
     catalog that drops a profile the fleet already trusted is the #667
@@ -2982,6 +2986,14 @@ def _server_catalog_rejection(
 
     if not entries:
         return "empty catalog"
+    live_counts: dict[tuple[str, str], int] = {}
+    for entry in entries:
+        if not entry.retired_at:
+            live_counts[entry.key] = live_counts.get(entry.key, 0) + 1
+    duplicated = sorted(key for key, count in live_counts.items() if count > 1)
+    if duplicated:
+        named = ", ".join(f"{profile}@{effort}" if effort else profile for profile, effort in duplicated)
+        return f"duplicate live catalog rows: {named}"
     fetched = {entry.profile for entry in entries}
     row_word = "row" if len(entries) == 1 else "rows"
     if last_good:
